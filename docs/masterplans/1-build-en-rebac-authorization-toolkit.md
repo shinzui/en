@@ -39,7 +39,7 @@ An alternative decomposition by package was rejected. Planning by files such as 
 | EP-3 | Implement schema validation and reachability compilation | docs/plans/3-implement-schema-validation-and-reachability-compilation.md | EP-1 | None | Complete |
 | EP-4 | Implement forward authorization check | docs/plans/4-implement-forward-authorization-check.md | EP-1, EP-3 | EP-2 | Complete |
 | EP-5 | Validate bounded lookup with the kikan read-filter spike | docs/plans/5-validate-bounded-lookup-with-the-kikan-read-filter-spike.md | None | EP-1, EP-3 | Complete |
-| EP-6 | Expose en through Servant server and client APIs | docs/plans/6-expose-en-through-servant-server-and-client-apis.md | EP-1, EP-2, EP-3, EP-4, EP-7 | EP-5 | In Progress |
+| EP-6 | Expose en through Servant server and client APIs | docs/plans/6-expose-en-through-servant-server-and-client-apis.md | EP-1, EP-2, EP-3, EP-4, EP-7 | EP-5 | Complete |
 | EP-7 | Implement cursored reverse lookup and expand | docs/plans/7-implement-cursored-reverse-lookup-and-expand.md | EP-1, EP-3, EP-4 | EP-2, EP-5 | Complete |
 
 
@@ -91,8 +91,8 @@ The Servant API is owned by EP-6 but must not invent new semantics. It serialize
 - [x] EP-5: Append p95 results and a green/red decision to `docs/spec/0002-lookup-spike.md`.
 - [x] EP-7: Implement production cursored reverse lookup with caps, truncation, and reach-then-check confirmation.
 - [x] EP-7: Implement `expand` for review and audit UIs.
-- [ ] EP-6: Define Servant API, handlers, client functions, and server wiring over the completed libraries.
-- [ ] EP-6: Validate the standalone service with an end-to-end write-token-check-lookup scenario.
+- [x] EP-6: Define Servant API, handlers, client functions, and server wiring over the completed libraries.
+- [x] EP-6: Validate the standalone service with an end-to-end write-token-check-lookup scenario.
 
 
 ## Surprises & Discoveries
@@ -108,6 +108,7 @@ The Servant API is owned by EP-6 but must not invent new semantics. It serialize
 - EP-4 found that forward check requires object-side tuple reads in addition to Zanzibar's reverse `ReadStartingWithUser` primitive. `TupleStore` now exposes `readObjectRelation` for check and keeps `readStartingWithUser` for lookup.
 - EP-5 found that the intended kikan read-filter shape remains bounded in the spike: the reachable label set stayed at 24 spaces and 4 visibility classes across 1k, 10k, and 100k relationship tuples, while the anti-pattern hit the 1001-result cap in every scenario.
 - EP-7 found that bare lookup object ids are insufficient for caveated reverse results. `LookupPage` now carries `LookupObject` entries with per-object `CheckDecision` values so conditional caveat obligations can reach EP-6's HTTP surface.
+- EP-6 found that the repository has no runtime schema parser or schema-file format yet. The standalone server therefore runs a built-in demo schema for the service smoke path, while the embedded library API remains schema-parametric through `Schema` and `ReachabilityGraph`.
 
 
 ## Decision Log
@@ -145,11 +146,18 @@ The Servant API is owned by EP-6 but must not invent new semantics. It serialize
 - Decision: Treat EP-7 as complete after core lookup/expand tests and Postgres-backed lookup paging passed.
   Rationale: The core algorithms now resolve consistency, preserve conditional lookup decisions, confirm conditional candidates with forward check, return deterministic cursors, build expand trees, and exercise the Hasql tuple-store path through the integration suite.
   Date: 2026-06-23
+- Decision: Treat EP-6 as complete after the Servant API/client/server surfaces built, all tests passed, and the plan recorded a reproducible write-token-check-lookup-expand HTTP transcript against the built-in demo schema.
+  Rationale: The service can now expose the completed library over HTTP and the missing arbitrary schema loader is an explicit future extension rather than a hidden incomplete code path.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+The MasterPlan delivered the intended first usable ReBAC toolkit slice. `en-core` now has schema-parametric interfaces for tuples, consistency, caveats, checks, lookup pages, and expand trees. `en-postgres` implements the Hasql-backed tuple store and MVCC consistency tokens against the codd migration schema. The schema compiler validates relation rewrites and compiles reachability for direct, recursive, caveated, intersection, exclusion, and tuple-to-userset paths. Forward check, bounded reverse lookup, and expand now run over the same store and reachability graph.
+
+The Postgres-backed behavior is covered by `ephemeral-pg` integration tests for write-token read-your-writes, delete visibility, check, and lookup paging. The lookup spike documented the kikan read-filter shape as green at the required scale. `en-servant`, `en-client`, and `en-server` expose the completed engine through typed Servant handlers, a derived Haskell client, and a runnable Warp service.
+
+The main known limitation is runtime schema loading for the standalone server. Consumers embedding the library can define typed schemas directly today; the server currently starts with a built-in demo schema until a schema DSL or JSON schema format is designed.
 
 
 Revision note 2026-06-23: Added `intention_01kvsbcvsfepaafp5x44ykby47` to this MasterPlan and all child ExecPlan frontmatter at the user's request.
@@ -165,3 +173,5 @@ Revision note 2026-06-23: Completed EP-4 and updated aggregate progress after ad
 Revision note 2026-06-23: Completed EP-5 after adding and running the `ephemeral-pg` lookup spike, recording p95 timings, and marking the kikan read-filter shape green at 1M activity rows.
 
 Revision note 2026-06-23: Completed EP-7 after implementing bounded reverse lookup, explanatory expand trees, core traversal tests, and Postgres-backed lookup paging coverage.
+
+Revision note 2026-06-23: Completed EP-6 after adding the Servant API/client/server integration surface and documenting the write-token-check-lookup-expand HTTP transcript.

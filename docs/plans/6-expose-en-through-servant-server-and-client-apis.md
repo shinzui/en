@@ -26,7 +26,7 @@ This plan turns the completed library into a usable standalone authorization ser
 - [x] Implement the `RequirePermission` or `Authorize` combinator in `en-servant/src/En/Servant/Authorize.hs`. Completed 2026-06-23 as a fail-closed `requirePermission` helper for authenticated handlers.
 - [x] Implement `en-server/app/Main.hs` configuration loading, Postgres connection setup, schema loading, migration guidance, and WAI serving. Completed 2026-06-23 with `EN_DATABASE_URL`, `EN_PORT`, built-in demo schema, and codd migration guidance.
 - [x] Implement `en-client/src/En/Client.hs` functions derived from or matching the Servant API. Completed 2026-06-23.
-- [ ] Add end-to-end tests or a reproducible local transcript for write-token-check-lookup.
+- [x] Add end-to-end tests or a reproducible local transcript for write-token-check-lookup. Completed 2026-06-23 with the demo-schema HTTP transcript below.
 - [x] Run `cabal build all` and relevant tests. Completed 2026-06-23 for the API/client/server slice.
 
 
@@ -51,7 +51,153 @@ This plan turns the completed library into a usable standalone authorization ser
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+The integration surface is now usable as a service and as a typed Haskell client. `en-servant` defines explicit wire DTOs, the `EnAPI` route type, WAI application construction, handlers for tuple writes/deletes and `check`/`lookup`/`expand`, and a fail-closed `requirePermission` helper. `en-client` derives typed client functions from the Servant API. `en-server` reads `EN_DATABASE_URL` and `EN_PORT`, connects to PostgreSQL with Hasql, constructs the Postgres tuple and consistency stores, compiles the built-in demo schema, and serves the API with Warp.
+
+The standalone service intentionally ships with the demo schema:
+
+- `user`
+- `space#viewer @ user`
+- `space#view = space#viewer`
+
+There is no runtime schema parser in the repository yet, so arbitrary schema file loading remains future work rather than hidden implicit behavior.
+
+Reproducible local HTTP transcript against a migrated database:
+
+```bash
+cd /Users/shinzui/Keikaku/bokuno/en
+
+# Run the codd migrations in en-migrations/db/migrations first.
+export EN_DATABASE_URL='postgresql://user@localhost:5432/en'
+export EN_PORT=8080
+cabal run en-server
+```
+
+In another shell, write a tuple in the demo schema:
+
+```bash
+curl -sS -X POST http://localhost:8080/tuples \
+  -H 'content-type: application/json' \
+  -d '{
+    "tuples": [
+      {
+        "object": { "objectType": "space", "objectId": "project-x" },
+        "relation": "viewer",
+        "subject": {
+          "tag": "SubjectIdWire",
+          "contents": { "objectType": "user", "objectId": "alice" }
+        },
+        "caveat": null
+      }
+    ]
+  }'
+```
+
+Expected shape:
+
+```json
+{"token":"<opaque-consistency-token>"}
+```
+
+Use that token for a read-your-writes check:
+
+```bash
+TOKEN='<opaque-consistency-token>'
+
+curl -sS -X POST http://localhost:8080/check \
+  -H 'content-type: application/json' \
+  -d "{
+    \"consistency\": { \"tag\": \"AtLeastAsFreshWire\", \"contents\": \"$TOKEN\" },
+    \"context\": { \"values\": {} },
+    \"subject\": {
+      \"tag\": \"SubjectIdWire\",
+      \"contents\": { \"objectType\": \"user\", \"objectId\": \"alice\" }
+    },
+    \"permission\": \"view\",
+    \"object\": { \"objectType\": \"space\", \"objectId\": \"project-x\" }
+  }"
+```
+
+Expected response:
+
+```json
+{"decision":{"tag":"AllowedWire"}}
+```
+
+Lookup returns a bounded page with explicit cursor state:
+
+```bash
+curl -sS -X POST http://localhost:8080/lookup \
+  -H 'content-type: application/json' \
+  -d "{
+    \"consistency\": { \"tag\": \"AtLeastAsFreshWire\", \"contents\": \"$TOKEN\" },
+    \"context\": { \"values\": {} },
+    \"cursor\": null,
+    \"limit\": 10,
+    \"objectType\": \"space\",
+    \"permission\": \"view\",
+    \"subject\": {
+      \"tag\": \"SubjectIdWire\",
+      \"contents\": { \"objectType\": \"user\", \"objectId\": \"alice\" }
+    }
+  }"
+```
+
+Expected response shape:
+
+```json
+{
+  "objects": [
+    {
+      "object": { "objectType": "space", "objectId": "project-x" },
+      "decision": { "tag": "AllowedWire" }
+    }
+  ],
+  "state": { "tag": "LookupExhaustedWire" }
+}
+```
+
+Expand returns the explanatory tree:
+
+```bash
+curl -sS -X POST http://localhost:8080/expand \
+  -H 'content-type: application/json' \
+  -d "{
+    \"consistency\": { \"tag\": \"AtLeastAsFreshWire\", \"contents\": \"$TOKEN\" },
+    \"context\": { \"values\": {} },
+    \"cursor\": null,
+    \"limit\": 10,
+    \"object\": { \"objectType\": \"space\", \"objectId\": \"project-x\" },
+    \"permission\": \"view\"
+  }"
+```
+
+Expected response shape:
+
+```json
+{
+  "root": { "objectType": "space", "objectId": "project-x" },
+  "permission": "view",
+  "children": [
+    {
+      "tag": "ExpandUsersetWire",
+      "contents": [
+        { "objectType": "space", "objectId": "project-x" },
+        "viewer",
+        [
+          {
+            "tag": "ExpandSubjectWire",
+            "contents": {
+              "tag": "SubjectIdWire",
+              "contents": { "objectType": "user", "objectId": "alice" }
+            }
+          }
+        ]
+      ]
+    }
+  ],
+  "state": { "tag": "ExpandExhaustedWire" }
+}
+```
 
 
 ## Context and Orientation
