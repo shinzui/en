@@ -24,10 +24,12 @@ import En.Expand (ExpandLimit (..), ExpandRequest (..), ExpandState (..), Expand
 import En.Lookup (
     LookupCursor (..),
     LookupLimit (..),
+    LookupObject (..),
     LookupPage (..),
     LookupRequest (..),
     LookupState (..),
  )
+import En.Lookup qualified as Lookup
 import En.Reachability (
     EntryKind,
     EntryPoint (..),
@@ -106,6 +108,14 @@ main = do
     assertEqual "delegation caveat is conditional with missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}])) =<< check consistencyStore tupleStore graph MinimizeLatency missingAutonomyContext (SubjectId user) (RelationName "view") intention
     assertEqual "expired delegation caveat denies access" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency expiredContext (SubjectId user) (RelationName "view") intention
     assertEqual "recursive graph respects depth limit" (Left ResolutionLimitExceeded) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
+    assertEqual "lookup returns direct and recursive view spaces" (Right (lookupPage [allowed childSpace, allowed space] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    assertEqual "lookup follows userset subjects" (Right (lookupPage [allowed guestSpace, allowed usersetMemberSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId agencyUser) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    assertEqual "lookup confirms intersection candidates" (Right (lookupPage [allowed auditedSpace, allowed exclusionSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOwner) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    assertEqual "lookup omits denied intersection candidates" (Right (lookupPage [] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOnly) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    assertEqual "lookup confirms exclusion candidates" (Right (lookupPage [allowed exclusionSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOnly) (RelationName "member_not_owner") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    assertEqual "lookup preserves caveat obligations" (Right (lookupPage [conditional intention [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}]] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "intention") missingAutonomyContext (LookupLimit 10) Nothing)
+    assertEqual "lookup paginates deterministically first page" (Right (lookupPage [allowed childSpace] (LookupHasMore (LookupCursor "1")))) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) Nothing)
+    assertEqual "lookup paginates deterministically second page" (Right (lookupPage [allowed space] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) (Just (LookupCursor "1")))
     pure ()
 
 sampleTuple :: Tuple
@@ -164,7 +174,7 @@ sampleLookupRequest =
 sampleLookupPage :: LookupPage
 sampleLookupPage =
     LookupPage
-        { objects = [space]
+        { objects = [allowed space]
         , state = LookupTruncated (LookupCursor "cursor")
         }
 
@@ -197,6 +207,22 @@ sampleCaveatDefinition =
                 , (CaveatParameterName "until", ParameterTimestamp)
                 ]
         }
+
+lookupRequest :: Subject -> RelationName -> ObjectType -> CaveatContext -> LookupLimit -> Maybe LookupCursor -> LookupRequest
+lookupRequest subject permission objectType context limit cursor =
+    LookupRequest{subject, permission, objectType, context, limit, cursor}
+
+lookupPage :: [LookupObject] -> LookupState -> LookupPage
+lookupPage objects state =
+    LookupPage{objects, state}
+
+allowed :: ObjectRef -> LookupObject
+allowed object =
+    LookupObject{object, decision = Allowed}
+
+conditional :: ObjectRef -> [CaveatObligation] -> LookupObject
+conditional object obligations =
+    LookupObject{object, decision = Conditional obligations}
 
 kikanSchema :: Schema
 kikanSchema =

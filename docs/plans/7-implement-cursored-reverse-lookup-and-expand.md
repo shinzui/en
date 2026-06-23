@@ -20,25 +20,32 @@ This plan implements the production reverse-query surface. After it is complete,
 
 ## Progress
 
-- [ ] Implement reverse expansion over the compiled reachability graph using the bounded page/cursor API from EP-1.
-- [ ] Preserve direct versus conditional entrypoint behavior from EP-3.
-- [ ] Confirm conditional candidates by calling EP-4 forward `check`.
-- [ ] Propagate caveat obligations or missing context through lookup results.
-- [ ] Enforce result caps, recursion/depth limits, deadlines if configured, and deterministic cursor resume.
-- [ ] Add tests for direct union lookup, userset lookup, tuple-to-userset lookup, caveated lookup, intersection/exclusion confirmation, cycles, and pagination.
+- [x] Implement reverse expansion over the compiled reachability graph using the bounded page/cursor API from EP-1. Completed 2026-06-23.
+- [x] Preserve direct versus conditional entrypoint behavior from EP-3. Completed 2026-06-23.
+- [x] Confirm conditional candidates by calling EP-4 forward `check`. Completed 2026-06-23.
+- [x] Propagate caveat obligations or missing context through lookup results. Completed 2026-06-23.
+- [x] Enforce result caps, recursion/depth limits, deadlines if configured, and deterministic cursor resume. Completed 2026-06-23 except no deadline option exists yet in the core request type.
+- [x] Add tests for direct union lookup, userset lookup, tuple-to-userset lookup, caveated lookup, intersection/exclusion confirmation, cycles, and pagination. Completed 2026-06-23 for core lookup behavior.
 - [ ] Implement `expand` result construction for audit/review use.
 - [ ] Run `cabal build all` and relevant tests.
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- The EP-1 `LookupPage` shape carried only `[ObjectRef]`, which could not preserve conditional caveat obligations. Lookup now returns `LookupObject` values with the object and its `CheckDecision`, so EP-6 can expose conditional lookup results without losing information.
+- Recursive tuple-to-userset lookup needs a bounded transitive walk. Treating a repeated relation as an immediate error prevents valid parent/container schemas from returning descendants, so the implementation skips the currently-recursive branch while computing base objects and then expands descendants with a depth cap.
 
 
 ## Decision Log
 
 - Decision: Use reach-then-check for conditional lookup entrypoints.
   Rationale: The initial spec chooses the SpiceDB-style skeleton: reverse expansion produces candidates, and forward check confirms intersection, exclusion, and caveated paths.
+  Date: 2026-06-23
+- Decision: Add `ConsistencyStore` to lookup.
+  Rationale: Lookup must honor the same consistency-token resolution boundary as forward `check`; using only `TupleStore` would either ignore `AtLeastAsFresh`/`AtExactSnapshot` tokens or duplicate datastore-specific token logic in core traversal.
+  Date: 2026-06-23
+- Decision: Carry per-object `CheckDecision` in lookup results.
+  Rationale: Conditional caveated paths are valid lookup results but cannot be represented by a bare object id. The result page now preserves `Allowed` versus `Conditional` for each object.
   Date: 2026-06-23
 
 

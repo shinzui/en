@@ -40,7 +40,7 @@ An alternative decomposition by package was rejected. Planning by files such as 
 | EP-4 | Implement forward authorization check | docs/plans/4-implement-forward-authorization-check.md | EP-1, EP-3 | EP-2 | Complete |
 | EP-5 | Validate bounded lookup with the kikan read-filter spike | docs/plans/5-validate-bounded-lookup-with-the-kikan-read-filter-spike.md | None | EP-1, EP-3 | Complete |
 | EP-6 | Expose en through Servant server and client APIs | docs/plans/6-expose-en-through-servant-server-and-client-apis.md | EP-1, EP-2, EP-3, EP-4, EP-7 | EP-5 | Not Started |
-| EP-7 | Implement cursored reverse lookup and expand | docs/plans/7-implement-cursored-reverse-lookup-and-expand.md | EP-1, EP-3, EP-4 | EP-2, EP-5 | Not Started |
+| EP-7 | Implement cursored reverse lookup and expand | docs/plans/7-implement-cursored-reverse-lookup-and-expand.md | EP-1, EP-3, EP-4 | EP-2, EP-5 | In Progress |
 
 
 ## Dependency Graph
