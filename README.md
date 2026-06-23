@@ -46,3 +46,5 @@ Experimental — scaffolding + initial spec. See [`docs/spec/0001-en-overview.md
 for the design, and the kikan contract **C13** (`shinzui/kikan` →
 `docs/architecture/evolution/contracts.md`) for the cross-system role and the first consumer's
 requirements.
+
+User-facing integration docs start at [`docs/user/README.md`](docs/user/README.md).
