@@ -20,25 +20,32 @@ This plan turns the completed library into a usable standalone authorization ser
 
 ## Progress
 
-- [ ] Define JSON/wire types for tuples, subjects, caveats, consistency, decisions, lookup pages, expand trees, and errors.
-- [ ] Define the Servant API type in `en-servant/src/En/Servant/API.hs`.
-- [ ] Implement handlers that wire schema, reachability graph, tuple store, check, lookup, expand, write, and delete.
-- [ ] Implement the `RequirePermission` or `Authorize` combinator in `en-servant/src/En/Servant/Authorize.hs`.
-- [ ] Implement `en-server/app/Main.hs` configuration loading, Postgres connection setup, schema loading, migration guidance, and WAI serving.
-- [ ] Implement `en-client/src/En/Client.hs` functions derived from or matching the Servant API.
+- [x] Define JSON/wire types for tuples, subjects, caveats, consistency, decisions, lookup pages, expand trees, and errors. Completed 2026-06-23.
+- [x] Define the Servant API type in `en-servant/src/En/Servant/API.hs`. Completed 2026-06-23.
+- [x] Implement handlers that wire schema, reachability graph, tuple store, check, lookup, expand, write, and delete. Completed 2026-06-23.
+- [x] Implement the `RequirePermission` or `Authorize` combinator in `en-servant/src/En/Servant/Authorize.hs`. Completed 2026-06-23 as a fail-closed `requirePermission` helper for authenticated handlers.
+- [x] Implement `en-server/app/Main.hs` configuration loading, Postgres connection setup, schema loading, migration guidance, and WAI serving. Completed 2026-06-23 with `EN_DATABASE_URL`, `EN_PORT`, built-in demo schema, and codd migration guidance.
+- [x] Implement `en-client/src/En/Client.hs` functions derived from or matching the Servant API. Completed 2026-06-23.
 - [ ] Add end-to-end tests or a reproducible local transcript for write-token-check-lookup.
-- [ ] Run `cabal build all` and relevant tests.
+- [x] Run `cabal build all` and relevant tests. Completed 2026-06-23 for the API/client/server slice.
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- The repository has no runtime schema parser yet. The standalone `en-server` therefore starts with a small built-in demo schema (`user`, `space#viewer`, `space#view`) and clear migration guidance rather than pretending arbitrary schema loading exists.
+- `NoFieldSelectors` required enabling `OverloadedRecordDot` in the Servant/client/server packages before using unprefixed record fields ergonomically.
 
 
 ## Decision Log
 
 - Decision: Make this the final integration plan.
   Rationale: HTTP and client surfaces should serialize stable library semantics. Building them before core decisions settle would freeze placeholder APIs.
+  Date: 2026-06-23
+- Decision: Use explicit wire DTOs in `en-servant`.
+  Rationale: Core types intentionally have no JSON instances yet. Dedicated request/response types keep the wire format explicit and let EP-6 expose conditional lookup decisions, cursors, errors, and expand trees without coupling core internals to Aeson.
+  Date: 2026-06-23
+- Decision: Start `en-server` with a built-in demo schema until schema loading exists.
+  Rationale: No schema parser or configuration format is present in the repository. The service can still be runnable and useful for the required write-token-check-lookup scenario over the demo schema, while arbitrary schema loading remains a future extension.
   Date: 2026-06-23
 
 

@@ -1,16 +1,16 @@
-cabal-version:      3.0
-name:               en-server
-version:            0.1.0.0
-synopsis:           Standalone en authorization service
+cabal-version: 3.0
+name:          en-server
+version:       0.1.0.0
+synopsis:      Standalone en authorization service
 description:
   A thin application layer wiring en-core's engine over en-postgres' store and
   serving en-servant's API. The deployable standalone form of the toolkit
   (the library form is en-core embedded directly).
 
-license:            MIT
-author:             Nadeem Bitar
-maintainer:         nadeem@gmail.com
-category:           Security, Authorization
+license:       MIT
+author:        Nadeem Bitar
+maintainer:    nadeem@gmail.com
+category:      Security, Authorization
 
 common warnings
   ghc-options:
@@ -20,16 +20,25 @@ common warnings
 common shared
   default-language:   GHC2024
   default-extensions:
+    BlockArguments
+    DuplicateRecordFields
+    NoFieldSelectors
+    OverloadedRecordDot
     OverloadedStrings
 
 executable en-server
-  import:          warnings, shared
-  hs-source-dirs:  app
-  main-is:         Main.hs
-  ghc-options:     -threaded -rtsopts -with-rtsopts=-N
+  import:         warnings, shared
+  hs-source-dirs: app
+  main-is:        Main.hs
+  ghc-options:    -threaded -rtsopts -with-rtsopts=-N
   build-depends:
     , base           >=4.19 && <5
+    , containers
     , en-core
     , en-migrations
     , en-postgres
     , en-servant
+    , hasql
+    , text
+    , time
+    , warp
