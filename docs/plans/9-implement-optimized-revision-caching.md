@@ -40,6 +40,9 @@ None yet.
 - Decision: Keep `FullyConsistent` uncached.
   Rationale: `FullyConsistent` is the explicit request for the current head revision. Caching it would make the mode misleading and reduce safety.
   Date: 2026-06-23
+- Decision: Build on MasterPlan 3 EP-14's corrected snapshot comparator rather than the pre-hardening `snapshotIncludes`.
+  Rationale: MasterPlan 3 is implemented in full before this MasterPlan (see `docs/masterplans/2-add-caching-support-to-en.md` Decision Log), so EP-14's faithful `comparePgSnapshot`/`snapshotIncludes` and stabilized token codec are already in `en-postgres/src/En/Postgres/Revision.hs`. Sharing a snapshot across `MinimizeLatency` requests is only safe atop a correct partial order, so this plan must not reintroduce the old probe approximation and must preserve EP-14's `AtLeastAsFresh = max(optimized, token)` semantics.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
@@ -60,6 +63,8 @@ SELECT pg_current_snapshot()::text
 Consistency resolution lives in `en-postgres/src/En/Postgres/Revision.hs`. `resolveConsistencyRequest` selects `optimized` for `MinimizeLatency`, selects `headRevision` for `FullyConsistent`, and for `AtLeastAsFresh token` compares the optimized revision with the token revision. That means an optimized revision may be cached as long as it remains a valid snapshot and the comparison logic still chooses the token revision when read-your-writes requires it.
 
 The current tests for revision resolution are in `en-postgres/test/Main.hs`. Integration tests using a real PostgreSQL instance are in `en-postgres/integration-test/Main.hs`.
+
+**Cross-MasterPlan prerequisite (MasterPlan 3 EP-14, already complete).** This plan's MasterPlan (`docs/masterplans/2-add-caching-support-to-en.md`) sequences MasterPlan 3 (en hardening) in full *before* this MasterPlan, so MasterPlan 3 EP-14 (`docs/plans/14-harden-consistency-faithful-snapshot-visibility-gc-window-and-token-reconciliation.md`) is a **completed prerequisite** by the time you implement this plan. EP-14 rewrites the same file you edit (`en-postgres/src/En/Postgres/Revision.hs`): it replaces the finite-probe `snapshotIncludes` with a faithful, oracle-tested partial-order comparator, stabilizes the token codec (base64 / ISO-8601 expiry), adds a GC-window token check, and keeps `optimizedRevision` aliased to `headRevision` (it explicitly leaves quantization to *this* plan). Two consequences for your work: (1) build your quantized/cached optimized revision on EP-14's corrected `comparePgSnapshot`/`snapshotIncludes` — do not reintroduce the probe approximation — and confirm `resolveConsistencyRequest`'s `AtLeastAsFresh` path still computes `max(optimized, token)` so a cached optimized revision never silently overrides a fresher token; (2) expect EP-14's edits to `Revision.hs` already present in the tree (corrected comparator, token format, `gcWindow` field on `ConsistencyConfig`) and add the cache alongside them. Do not change EP-14's comparator or `AtLeastAsFresh` semantics.
 
 
 ## Plan of Work

@@ -41,6 +41,9 @@ None yet.
 - Decision: Include `CaveatContext` in decision cache keys.
   Rationale: Caveats can turn the same graph path into `Allowed`, `Denied`, or `Conditional` depending on request-time facts.
   Date: 2026-06-23
+- Decision: Cache the `CheckDecision` from `En.Check`'s monadic `runCheck` subproblem evaluation, treating MasterPlan 3 EP-15's `En.Decision` as the type seam (not the cache target), and keep the cache key batch-friendly for MasterPlan 3 EP-19.
+  Rationale: MasterPlan 3 is implemented in full before this MasterPlan (see `docs/masterplans/2-add-caching-support-to-en.md` Decision Log), so `En.Decision` already exists and `CheckDecision` is re-exported through `En.Check`. The expensive, cacheable work is the tuple-reading subproblem evaluation, not the pure `En.Decision` combinators. Keeping the key a plain per-pair tuple under one resolved revision (no per-call state) lets MasterPlan 3 EP-19's `BatchCheck` reuse entries across requests with no EP-19-specific code.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
@@ -71,6 +74,10 @@ resolves consistency and calls a private `runCheck`, which recursively evaluates
 `en-core/src/En/Lookup.hs` imports `check` and uses it inside `confirmCandidates` for conditional entrypoints. Caching should help those confirmation checks too. The existing uncached lookup API should stay available; add a cached variant only if needed for service wiring.
 
 The prerequisite plan `docs/plans/10-add-core-cache-interfaces-and-configuration.md` adds `DecisionKey` or `SubproblemKey` and a bounded `Cache`.
+
+**Cross-MasterPlan prerequisite (MasterPlan 3 EP-15, already complete).** This plan's MasterPlan (`docs/masterplans/2-add-caching-support-to-en.md`) sequences MasterPlan 3 (en hardening) in full *before* this MasterPlan, so MasterPlan 3 EP-15 (`docs/plans/15-generalize-the-caveat-evaluator-and-unify-the-decision-algebra.md`) is a **completed prerequisite**. EP-15 extracts the three-valued algebra into a shared module `En.Decision` (exporting `CheckDecision (..)`, `CaveatObligation (..)`, and the union/intersection/exclusion/gate combinators) and rewires `En.Check`/`En.Lookup` to import it; `En.Check` re-exports `CheckDecision`/`CaveatObligation` so its public interface is unchanged. EP-15 also makes caveat evaluation schema-driven (`En.Caveat.evaluateCaveat`) and adds a `caveats` map to `ReachabilityGraph`. **What this means for you:** the thing you cache is the `CheckDecision` returned by `En.Check`'s monadic `runCheck` subproblem evaluation (the part that reads tuples) — `En.Decision` is only the *type seam* that fixes the `CheckDecision` shape your key maps to; the pure combinators in `En.Decision` are cheap and are not worth caching. Import `CheckDecision` via `En.Check` (or `En.Decision`); both compile. Do not change EP-15's three-valued results — caching must be observationally identical to the uncached engine. Your `CaveatContext` cache-key field must reflect EP-15's schema-driven caveat semantics (the same context that drives `evaluateCaveat`).
+
+**Cross-MasterPlan consumer (MasterPlan 3 EP-19, BatchCheck).** MasterPlan 3 EP-19 (`docs/plans/19-add-batchcheck-for-graphql-field-capability-and-candidate-filtering.md`) evaluates many `(subject, permission, object)` pairs under one resolved revision for the kikan GraphQL gateway, and composes on top of this plan's cache: EP-19 owns the per-request batch surface and a within-call subproblem memo, while *this* plan's per-revision decision cache is what makes pairs overlapping *across* requests cheap. Because MasterPlan 3 lands first, EP-19 has already shipped as a correct `check` fold *without* this cache; landing this plan upgrades its cross-request efficiency. For that to be drop-in, keep the cache key a plain per-pair tuple under one resolved revision with **no per-call state** (exactly the key listed in Milestone 2), so a batch fold over `checkCached` reuses entries with no EP-19-specific cache code.
 
 
 ## Plan of Work

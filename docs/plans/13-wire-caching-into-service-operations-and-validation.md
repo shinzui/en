@@ -144,6 +144,8 @@ If `cabal test all` reports that some packages have no test suites, record that 
 
 Acceptance requires the service to build and the cache-enabled path to be observable. At minimum, a cache-enabled test or transcript must prove that an authorization request still returns the correct decision and that the second identical request at the same resolved revision hits a cache or avoids repeated underlying work. The production docs must accurately describe what is implemented and what remains future work.
 
+Cross-MasterPlan (optional, soft): because MasterPlan 3 (en hardening) is implemented in full before this MasterPlan (see `docs/masterplans/2-add-caching-support-to-en.md`), MasterPlan 3 EP-17's `tasty-bench` suite (`docs/plans/17-strengthen-the-lookup-spike-and-add-performance-regression-benchmarks.md`) already exists and is kept independent of cache configuration. You may reuse that harness to measure cache-hit performance (e.g. run the same `check`/`lookup` workload with caches on vs off) instead of writing a bespoke benchmark. This is optional and does not block acceptance — counting-store transcripts proving fewer underlying reads are sufficient.
+
 
 ## Idempotence and Recovery
 
