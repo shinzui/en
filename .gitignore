@@ -21,3 +21,6 @@ cabal-dev
 .direnv
 .pre-commit-config.yaml
 db/
+.claude/
+.agents/
+CLAUDE.local.md
