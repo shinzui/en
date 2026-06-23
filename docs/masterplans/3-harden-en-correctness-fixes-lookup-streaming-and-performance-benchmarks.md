@@ -4,6 +4,7 @@ slug: harden-en-correctness-fixes-lookup-streaming-and-performance-benchmarks
 title: "Harden en: correctness fixes, lookup streaming, and performance benchmarks"
 kind: master-plan
 created_at: 2026-06-23T16:35:18Z
+intention: "intention_01kvv5mecvechb6c6jv3p3zv4a"
 ---
 
 

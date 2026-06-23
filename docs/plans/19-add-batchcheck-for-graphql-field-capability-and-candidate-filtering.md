@@ -4,6 +4,7 @@ slug: add-batchcheck-for-graphql-field-capability-and-candidate-filtering
 title: "Add BatchCheck for GraphQL field-capability and candidate filtering"
 kind: exec-plan
 created_at: 2026-06-23T20:26:36Z
+intention: "intention_01kvv5mecvechb6c6jv3p3zv4a"
 master_plan: "docs/masterplans/3-harden-en-correctness-fixes-lookup-streaming-and-performance-benchmarks.md"
 ---
 

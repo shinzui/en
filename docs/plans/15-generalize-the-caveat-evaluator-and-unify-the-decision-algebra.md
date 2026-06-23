@@ -4,6 +4,7 @@ slug: generalize-the-caveat-evaluator-and-unify-the-decision-algebra
 title: "Generalize the caveat evaluator and unify the decision algebra"
 kind: exec-plan
 created_at: 2026-06-23T16:37:01Z
+intention: "intention_01kvv5mecvechb6c6jv3p3zv4a"
 master_plan: "docs/masterplans/3-harden-en-correctness-fixes-lookup-streaming-and-performance-benchmarks.md"
 ---
 
