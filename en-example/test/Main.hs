@@ -5,12 +5,12 @@ import Servant (Handler, ServerError (..), runHandler)
 import En.Example.Host (
     DocumentView (..),
     ResolverError (..),
-    consistencyStore,
-    failingConsistencyStore,
-    inMemoryTupleStore,
     mkEnv,
     resolveDocument,
     resolveSecret,
+    runConsistencyStoreFailing,
+    runConsistencyStoreInMemory,
+    runTupleStoreInMemory,
     secretReaderTuple,
     userRef,
     viewDocument,
@@ -24,12 +24,12 @@ main = do
     let alice = userRef "alice"
         bob = userRef "bob"
         tupleStore =
-            inMemoryTupleStore
+            runTupleStoreInMemory
                 [ viewerTuple "doc1" alice
                 , secretReaderTuple "s1" alice
                 ]
-        env = mkEnv consistencyStore tupleStore
-        failingEnv = mkEnv failingConsistencyStore tupleStore
+        env = mkEnv runConsistencyStoreInMemory tupleStore
+        failingEnv = mkEnv runConsistencyStoreFailing tupleStore
     assertEqual "allowed route returns success" Nothing =<< httpCodeOf (viewDocument env (SubjectId alice) "doc1")
     assertEqual "denied route returns 403" (Just 403) =<< httpCodeOf (viewDocument env (SubjectId bob) "doc1")
     assertEqual "conditional route returns 403" (Just 403) =<< httpCodeOf (viewSecret env (SubjectId alice) "s1")

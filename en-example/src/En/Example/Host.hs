@@ -1,3 +1,5 @@
+{-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeOperators #-}
 
 module En.Example.Host (
@@ -5,9 +7,10 @@ module En.Example.Host (
     ResolverError (..),
     GuardedAPI,
     exampleSchema,
-    inMemoryTupleStore,
-    consistencyStore,
-    failingConsistencyStore,
+    ExampleEffects,
+    runTupleStoreInMemory,
+    runConsistencyStoreInMemory,
+    runConsistencyStoreFailing,
     mkEnv,
     server,
     app,
@@ -25,7 +28,10 @@ module En.Example.Host (
 import Data.Aeson (FromJSON, ToJSON)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
-import Data.Text qualified as Text
+import Effectful (Eff, IOE, runEff)
+import Effectful qualified
+import Effectful.Dispatch.Dynamic (interpret_)
+import Effectful.Error.Static (Error, runErrorNoCallStack, throwError)
 import GHC.Generics (Generic)
 import Servant (
     Application,
@@ -40,22 +46,16 @@ import Servant (
  )
 
 import En.Check (CheckDecision (..), check)
+import En.Conformance.Kikan qualified as Kikan
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
-import En.Effect.TupleStore (
-    PageState (..),
-    StoreCursor (..),
-    TuplePage (..),
-    TupleRow (..),
-    TupleRowId (..),
-    TupleStore (..),
-    UsersetQuery (..),
- )
+import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
 import En.Reachability (compile)
-import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
+import En.Revision (Consistency (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
 import En.Schema.Builder qualified as Schema
-import En.Servant.Authorize (AuthorizationEnv (..), requirePermission)
+import En.Servant.Authorize (requirePermission)
+import En.Servant.Seam (Env (..))
 import En.Tuple (
     CaveatContext (..),
     ObjectRef (..),
@@ -96,19 +96,27 @@ exampleSchema =
             ]
         ]
 
-mkEnv :: ConsistencyStore IO -> TupleStore IO -> AuthorizationEnv
+type ExampleEffects = '[ConsistencyStore, TupleStore, Error EnError, IOE]
+
+type ConsistencyInterpreter =
+    forall a. Eff ExampleEffects a -> Eff '[TupleStore, Error EnError, IOE] a
+
+type TupleInterpreter =
+    forall a. Eff '[TupleStore, Error EnError, IOE] a -> Eff '[Error EnError, IOE] a
+
+mkEnv :: ConsistencyInterpreter -> TupleInterpreter -> Env ExampleEffects
 mkEnv cStore tStore =
-    AuthorizationEnv
-        { consistencyStore = cStore
-        , tupleStore = tStore
+    Env
+        { runPorts = runEff . runErrorNoCallStack . tStore . cStore
         , graph = either (error . show) id (compile exampleSchema)
+        , maxBatchSize = 400
         }
 
-server :: AuthorizationEnv -> Subject -> Server GuardedAPI
+server :: Env ExampleEffects -> Subject -> Server GuardedAPI
 server env subject =
     viewDocument env subject
 
-app :: AuthorizationEnv -> Subject -> Application
+app :: Env ExampleEffects -> Subject -> Application
 app env subject =
     serve guardedApi (server env subject)
 
@@ -116,108 +124,55 @@ guardedApi :: Proxy GuardedAPI
 guardedApi =
     Proxy
 
-viewDocument :: AuthorizationEnv -> Subject -> Text -> Handler DocumentView
+viewDocument :: Env ExampleEffects -> Subject -> Text -> Handler DocumentView
 viewDocument env subject docId = do
     requirePermission env MinimizeLatency emptyContext subject (RelationName "view") (documentRef docId)
     pure (DocumentView docId)
 
-viewSecret :: AuthorizationEnv -> Subject -> Text -> Handler DocumentView
+viewSecret :: Env ExampleEffects -> Subject -> Text -> Handler DocumentView
 viewSecret env subject secretId = do
     requirePermission env MinimizeLatency emptyContext subject (RelationName "view") (secretRef secretId)
     pure (DocumentView secretId)
 
-resolveDocument :: AuthorizationEnv -> Subject -> Text -> IO (Either ResolverError DocumentView)
+resolveDocument :: Env ExampleEffects -> Subject -> Text -> IO (Either ResolverError DocumentView)
 resolveDocument env subject docId =
     resolveWithGate env subject (documentRef docId) (DocumentView docId)
 
-resolveSecret :: AuthorizationEnv -> Subject -> Text -> IO (Either ResolverError DocumentView)
+resolveSecret :: Env ExampleEffects -> Subject -> Text -> IO (Either ResolverError DocumentView)
 resolveSecret env subject secretId =
     resolveWithGate env subject (secretRef secretId) (DocumentView secretId)
 
-resolveWithGate :: AuthorizationEnv -> Subject -> ObjectRef -> DocumentView -> IO (Either ResolverError DocumentView)
-resolveWithGate env subject object result =
-    check env.consistencyStore env.tupleStore env.graph MinimizeLatency emptyContext subject (RelationName "view") object >>= \case
+resolveWithGate :: Env ExampleEffects -> Subject -> ObjectRef -> DocumentView -> IO (Either ResolverError DocumentView)
+resolveWithGate Env{runPorts, graph} subject object result =
+    runPorts (check graph MinimizeLatency emptyContext subject (RelationName "view") object) >>= \case
         Right Allowed -> pure (Right result)
         Right Denied -> pure (Left ResolverForbidden)
         Right (Conditional _) -> pure (Left ResolverForbidden)
         Left _ -> pure (Left ResolverForbidden)
 
-inMemoryTupleStore :: [Tuple] -> TupleStore IO
-inMemoryTupleStore tuples =
-    TupleStore
-        { readObjectRelation = \_ object relation limit cursor ->
-            pure (pageTuples limit cursor [tuple | tuple <- tuples, tuple.object == object, tuple.relation == relation])
-        , readStartingWithUser = \_ query ->
-            pure
-                ( pageTuples
-                    query.queryLimit
-                    query.queryCursor
-                    [ tuple
-                    | tuple <- tuples
-                    , tuple.object.objectType == query.queryType
-                    , tuple.relation == query.queryRelation
-                    , tuple.subject `elem` query.querySubjects
-                    ]
-                )
-        , writeTuples = \_ -> pure (ConsistencyToken "example-write")
-        , deleteTuples = \_ -> pure (ConsistencyToken "example-delete")
-        , headRevision = pure testRevision
-        , optimizedRevision = pure testRevision
-        , oldestRetainedXid = pure 0
-        , reapDeletedTuples = \_ -> pure 0
-        }
+runTupleStoreInMemory :: [Tuple] -> Eff (TupleStore : es) a -> Eff es a
+runTupleStoreInMemory =
+    Kikan.runTupleStoreInMemory
 
-pageTuples :: Int -> Maybe StoreCursor -> [Tuple] -> TuplePage
-pageTuples limit cursor tuples =
-    let start =
-            maybe 0 decodeCursor cursor
-        indexed =
-            drop start (zip [start + 1 ..] tuples)
-        (visible, extra) =
-            splitAt limit indexed
-        rows =
-            uncurry tupleRow <$> visible
-        state =
-            case extra of
-                [] -> Exhausted
-                _ ->
-                    let cursorIndex =
-                            case visible of
-                                [] -> start
-                                visibleRows -> fst (last visibleRows)
-                     in HasMore (StoreCursor (showText cursorIndex))
-     in TuplePage{rows, state}
+runConsistencyStoreInMemory :: Eff (ConsistencyStore : es) a -> Eff es a
+runConsistencyStoreInMemory =
+    interpret_ \case
+        DecodeToken token ->
+            pure (TokenMetadata token testRevision (DatastoreId "en-example") (SchemaHash "schema") Nothing)
+        ValidateToken _ ->
+            pure ()
+        ResolveConsistency consistency ->
+            pure ResolvedConsistency{consistency, revision = testRevision}
 
-tupleRow :: Int -> Tuple -> TupleRow
-tupleRow index tuple =
-    TupleRow
-        { rowId = TupleRowId (showText index)
-        , tuple = tuple
-        , createdAt = testRevision
-        , deletedAt = Nothing
-        }
-
-decodeCursor :: StoreCursor -> Int
-decodeCursor (StoreCursor cursorText) =
-    case reads (Text.unpack cursorText) of
-        [(value, "")] -> value
-        _ -> 0
-
-consistencyStore :: ConsistencyStore IO
-consistencyStore =
-    ConsistencyStore
-        { decodeToken = \token ->
-            pure (Right (TokenMetadata token testRevision (DatastoreId "en-example") (SchemaHash "schema") Nothing))
-        , validateToken = \_ -> pure (Right ())
-        , resolveConsistency = \consistency ->
-            pure (Right ResolvedConsistency{consistency, revision = testRevision})
-        }
-
-failingConsistencyStore :: ConsistencyStore IO
-failingConsistencyStore =
-    consistencyStore
-        { resolveConsistency = \_ -> pure (Left (StoreError "injected"))
-        }
+runConsistencyStoreFailing :: (Error EnError Effectful.:> es) => Eff (ConsistencyStore : es) a -> Eff es a
+runConsistencyStoreFailing =
+    interpret_ \case
+        DecodeToken token ->
+            pure (TokenMetadata token testRevision (DatastoreId "en-example") (SchemaHash "schema") Nothing)
+        ValidateToken _ ->
+            pure ()
+        ResolveConsistency _ ->
+            throwError (StoreError "injected")
 
 viewerTuple :: Text -> ObjectRef -> Tuple
 viewerTuple docId viewer =
@@ -265,7 +220,3 @@ emptyContext =
 testRevision :: Revision
 testRevision =
     Revision "example-revision"
-
-showText :: (Show a) => a -> Text
-showText =
-    Text.pack . show

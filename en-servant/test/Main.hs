@@ -4,9 +4,14 @@ module Main (main) where
 
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
+import Effectful (IOE, runEff)
+import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Servant (Handler, ServerError (..), runHandler, type (:<|>) (..))
 
-import En.Conformance.Kikan (consistencyStore, fixtureTuples, inMemoryTupleStore, kikanGraph)
+import En.Conformance.Kikan (fixtureTuples, kikanGraph, runConsistencyStoreInMemory, runTupleStoreInMemory)
+import En.Effect.ConsistencyStore (ConsistencyStore)
+import En.Effect.TupleStore (TupleStore)
+import En.Error (EnError)
 import En.Servant.API (
     BatchCheckPairWire (..),
     BatchCheckRequestWire (..),
@@ -14,7 +19,7 @@ import En.Servant.API (
     CaveatContextWire (..),
     CheckDecisionWire (..),
     ConsistencyWire (..),
-    EnServer (..),
+    Env (..),
     ObjectRefWire (..),
     SubjectWire (..),
     server,
@@ -23,9 +28,12 @@ import En.Servant.API (
 main :: IO ()
 main = do
     let env =
-            EnServer
-                { consistencyStore
-                , tupleStore = inMemoryTupleStore fixtureTuples
+            Env
+                { runPorts =
+                    runEff
+                        . runErrorNoCallStack
+                        . runTupleStoreInMemory fixtureTuples
+                        . runConsistencyStoreInMemory
                 , graph = kikanGraph
                 , maxBatchSize = 10
                 }
@@ -45,7 +53,9 @@ main = do
         oversized = request{pairs = [pair "alice" "view" "project-x", pair "bob" "view" "project-x"]}
     assertEqual "oversized batch returns 400" (Just 400) =<< httpCodeOf (batchHandler smallEnv oversized)
 
-batchHandler :: EnServer -> BatchCheckRequestWire -> Handler BatchCheckResponseWire
+type TestEffects = '[ConsistencyStore, TupleStore, Error EnError, IOE]
+
+batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler BatchCheckResponseWire
 batchHandler env =
     batch
   where

@@ -4,7 +4,8 @@
 module En.Servant.API (
     EnAPI,
     apiProxy,
-    EnServer (..),
+    EnServer,
+    Env (..),
     server,
     app,
     ObjectRefWire (..),
@@ -42,13 +43,15 @@ module En.Servant.API (
 ) where
 
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (FromJSON, ToJSON, encode)
+import Data.Aeson (FromJSON, ToJSON)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Text.Encoding qualified as Text
 import Data.Time (UTCTime)
 import Data.Word (Word64)
+import Effectful (Eff, IOE)
+import Effectful qualified
+import Effectful.Error.Static (Error)
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
 import Servant (
@@ -60,9 +63,7 @@ import Servant (
     Proxy (..),
     ReqBody,
     Server,
-    ServerError (..),
     err400,
-    err500,
     serve,
     throwError,
     type (:<|>) (..),
@@ -71,13 +72,13 @@ import Servant (
 
 import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..), check, checkMany)
 import En.Effect.ConsistencyStore (ConsistencyStore)
-import En.Effect.TupleStore (TupleStore (..))
+import En.Effect.TupleStore (TupleStore, deleteTuples, writeTuples)
 import En.Error (EnError)
 import En.Expand qualified as Expand
 import En.Lookup qualified as Lookup
-import En.Reachability (ReachabilityGraph)
 import En.Revision (Consistency (..), ConsistencyToken (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
+import En.Servant.Seam (EnServer, Env (..), ErrorWire (..), jsonError, runEngine)
 import En.Tuple (
     CaveatContext (..),
     CaveatPayload (..),
@@ -99,14 +100,7 @@ type EnAPI =
 apiProxy :: Proxy EnAPI
 apiProxy = Proxy
 
-data EnServer = EnServer
-    { consistencyStore :: !(ConsistencyStore IO)
-    , tupleStore :: !(TupleStore IO)
-    , graph :: !ReachabilityGraph
-    , maxBatchSize :: !Int
-    }
-
-server :: EnServer -> Server EnAPI
+server :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> Server EnAPI
 server env =
     writeTuplesHandler env
         :<|> deleteTuplesHandler env
@@ -115,7 +109,7 @@ server env =
         :<|> lookupHandler env
         :<|> expandHandler env
 
-app :: EnServer -> Application
+app :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> Application
 app =
     serve apiProxy . server
 
@@ -316,35 +310,28 @@ newtype WriteTuplesResponseWire = WriteTuplesResponseWire
     deriving stock (Eq, Show, Generic)
     deriving anyclass (FromJSON, ToJSON)
 
-newtype ErrorWire = ErrorWire
-    { error :: Text
-    }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
-
-writeTuplesHandler :: EnServer -> WriteTuplesRequestWire -> Handler WriteTuplesResponseWire
+writeTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> WriteTuplesRequestWire -> Handler WriteTuplesResponseWire
 writeTuplesHandler env request = do
     tuples <- traverseOr400 tupleFromWire request.tuples
-    token <- liftIO (env.tupleStore.writeTuples tuples)
+    token <- runEngine env (writeTuples tuples)
     pure (tokenToWire token)
 
-deleteTuplesHandler :: EnServer -> DeleteTuplesRequestWire -> Handler WriteTuplesResponseWire
+deleteTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> DeleteTuplesRequestWire -> Handler WriteTuplesResponseWire
 deleteTuplesHandler env request = do
     tuples <- traverseOr400 tupleFromWire request.tuples
-    token <- liftIO (env.tupleStore.deleteTuples tuples)
+    token <- runEngine env (deleteTuples tuples)
     pure (tokenToWire token)
 
-checkHandler :: EnServer -> CheckRequestWire -> Handler CheckResponseWire
+checkHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es) => Env es -> CheckRequestWire -> Handler CheckResponseWire
 checkHandler env request = do
     consistency <- either400 (consistencyFromWire request.consistency)
     context <- either400 (contextFromWire request.context)
     subject <- either400 (subjectFromWire request.subject)
     object <- either400 (objectRefFromWire request.object)
     decision <-
-        liftIO
+        runEngine
+            env
             ( check
-                env.consistencyStore
-                env.tupleStore
                 env.graph
                 consistency
                 context
@@ -352,10 +339,9 @@ checkHandler env request = do
                 (RelationName request.permission)
                 object
             )
-            >>= eitherEngine
     pure CheckResponseWire{decision = decisionToWire decision}
 
-batchCheckHandler :: EnServer -> BatchCheckRequestWire -> Handler BatchCheckResponseWire
+batchCheckHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) => Env es -> BatchCheckRequestWire -> Handler BatchCheckResponseWire
 batchCheckHandler env request = do
     if length request.pairs > env.maxBatchSize
         then throwError (jsonError err400 "batch exceeds maximum batch size")
@@ -364,16 +350,14 @@ batchCheckHandler env request = do
     context <- either400 (contextFromWire request.context)
     pairs <- traverseOr400 pairFromWire request.pairs
     decisions <-
-        liftIO
+        runEngine
+            env
             ( checkMany
-                env.consistencyStore
-                env.tupleStore
                 env.graph
                 consistency
                 context
                 pairs
             )
-            >>= eitherEngine
     pure BatchCheckResponseWire{decisions = decisionToWire <$> decisions}
   where
     pairFromWire :: BatchCheckPairWire -> Either Text BatchPair
@@ -386,18 +370,17 @@ batchCheckHandler env request = do
                 )
             <*> objectRefFromWire wire.object
 
-lookupHandler :: EnServer -> LookupRequestWire -> Handler LookupPageWire
+lookupHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> LookupRequestWire -> Handler LookupPageWire
 lookupHandler env request = do
     consistency <- either400 (consistencyFromWire request.consistency)
     context <- either400 (contextFromWire request.context)
     subject <- either400 (subjectFromWire request.subject)
-    deadline <- liftIO (lookupDeadline request.deadlineMillis)
+    deadline <- lookupDeadline request.deadlineMillis
     page <-
-        liftIO
+        runEngine
+            env
             ( Lookup.lookupWithDeadline
                 deadline
-                env.consistencyStore
-                env.tupleStore
                 env.graph
                 consistency
                 Lookup.LookupRequest
@@ -409,29 +392,27 @@ lookupHandler env request = do
                     , cursor = Lookup.LookupCursor <$> request.cursor
                     }
             )
-            >>= eitherEngine
     pure (lookupPageToWire page)
 
-lookupDeadline :: Maybe Int -> IO (Lookup.Deadline IO)
+lookupDeadline :: (IOE Effectful.:> es) => Maybe Int -> Handler (Lookup.Deadline (Eff es))
 lookupDeadline maybeDeadlineMillis = do
-    startedAt <- getMonotonicTimeNSec
+    startedAt <- liftIO getMonotonicTimeNSec
     let budgetNs :: Word64
         budgetNs = fromIntegral (max 0 (maybe 3000 id maybeDeadlineMillis)) * 1000000
     pure $
         Lookup.Deadline $ do
-            now <- getMonotonicTimeNSec
+            now <- Effectful.liftIO getMonotonicTimeNSec
             pure (now - startedAt <= budgetNs)
 
-expandHandler :: EnServer -> ExpandRequestWire -> Handler ExpandTreeWire
+expandHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es) => Env es -> ExpandRequestWire -> Handler ExpandTreeWire
 expandHandler env request = do
     consistency <- either400 (consistencyFromWire request.consistency)
     context <- either400 (contextFromWire request.context)
     object <- either400 (objectRefFromWire request.object)
     tree <-
-        liftIO
+        runEngine
+            env
             ( Expand.expand
-                env.consistencyStore
-                env.tupleStore
                 env.graph
                 consistency
                 Expand.ExpandRequest
@@ -442,7 +423,6 @@ expandHandler env request = do
                     , cursor = Expand.ExpandCursor <$> request.cursor
                     }
             )
-            >>= eitherEngine
     pure (expandTreeToWire tree)
 
 objectRefToWire :: ObjectRef -> ObjectRefWire
@@ -616,14 +596,3 @@ traverseOr400 convert values =
 either400 :: Either Text a -> Handler a
 either400 =
     either (throwError . jsonError err400) pure
-
-eitherEngine :: Either EnError a -> Handler a
-eitherEngine =
-    either (throwError . jsonError err500 . Text.pack . show) pure
-
-jsonError :: ServerError -> Text -> ServerError
-jsonError err message =
-    err
-        { errBody = encode ErrorWire{error = message}
-        , errHeaders = [("Content-Type", Text.encodeUtf8 "application/json")]
-        }

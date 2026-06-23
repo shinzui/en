@@ -71,7 +71,7 @@ This section must always reflect the actual current state of the work.
 
 - [x] **M1 — en-core effects + engine + in-memory interpreter.** Completed 2026-06-23T23:17:43Z. Added `effectful`/`effectful-core` deps; reformulated `TupleStore`/`ConsistencyStore` as `effectful` effects; migrated `Check` (incl. `checkMany`), `Lookup`, and `Expand` to `Eff`; reformulated `En.Conformance.Kikan`'s `inMemoryTupleStore`/`consistencyStore` into in-memory interpreters; ported `en-core-interface-tests`, `en-core-conformance`, and `en-core-bench`; `cabal build en-core`, `cabal test en-core`, and `cabal bench en-core` are green.
 - [x] **M2 — en-postgres interpreters.** Completed 2026-06-23T23:23:54Z. Added `En.Postgres.Database`; replaced the record constructors with `runTupleStorePostgres` / `runConsistencyStorePostgres`; migrated the PostgreSQL integration test to the interpreter stack; `cabal build en-postgres`, `cabal test en-postgres:en-postgres-revision-tests`, `cabal test en-postgres:en-postgres-integration-tests`, and `cabal build en-postgres:en-postgres-bench` are green.
-- [ ] **M3 — en-servant seam + en-example host.** Replace IO-store record fields with an `Eff`→`Handler` seam (`AppEffects`, `Env`, `runEngine`); migrate all handlers including the `/batch-check` (`checkMany`) handler; migrate the `en-example` package (`AuthorizationEnv`, `failingConsistencyStore`, the resolver-style `check` gate) and its test; `cabal build en-servant en-example` and `cabal test en-servant en-example` green.
+- [x] **M3 — en-servant seam + en-example host.** Completed 2026-06-23T23:30:52Z. Replaced IO-store record fields with an `Eff`→`Handler` seam (`AppEffects`, polymorphic `Env`, `runEngine`); migrated all handlers including `/batch-check`; migrated `en-example` from `AuthorizationEnv` and record stores to seam environments and interpreters, including the failing consistency interpreter and resolver-style gate; `cabal build en-servant en-example` and `cabal test en-servant en-example` are green.
 - [ ] **M4 — en-server assembly.** Compose `runAppIO` in `en-server/app/Main.hs`; server boots; end-to-end `check` over HTTP returns the expected decision.
 - [ ] **M5 — whole-repo build/test + en-client check + cleanup.** `cabal build all` and `cabal test all` green (including `en-core-conformance`, `en-servant-tests`, `en-example-tests`, both benchmark gates); confirm `en-client` builds unchanged; remove dead code.
 
@@ -212,6 +212,16 @@ Record every decision made while working on the plan.
   `runConsistencyStorePostgres` still requires `IOE` because it calls `getCurrentTime`.
   Date: 2026-06-23
 
+- Decision: Make `En.Servant.Seam.Env` polymorphic in its effect list (`Env es`) while keeping
+  `type AppEffects = '[ConsistencyStore, TupleStore, Error EnError, Database, IOE]` and
+  `type EnServer = Env AppEffects` for production.
+  Rationale: The plan stated that tests should be able to provide an in-memory runner with no
+  `Database` effect. A monomorphic `Env` with `runPorts :: Eff AppEffects a -> IO (Either EnError
+  a)` would force tests and examples to install a fake database interpreter even though their
+  actions never use `Database`. Parameterizing `Env` preserves the production alias and makes the
+  intended test seam type-correct.
+  Date: 2026-06-23
+
 
 ## Outcomes & Retrospective
 
@@ -253,6 +263,23 @@ Compare the result against the original purpose.
 
   The build, revision tests, ephemeral-pg integration test, and benchmark build succeeded. The
   `rg` command produced no matches in `en-postgres`.
+
+- M3 completed on 2026-06-23T23:30:52Z. en-servant now routes every handler through
+  `En.Servant.Seam.runEngine`; `writeTuples`/`deleteTuples` use tuple-store smart constructors,
+  `check` and `/batch-check` use `check`/`checkMany`, and lookup/expand run in `Eff`. en-example
+  now builds `Env ExampleEffects` from interpreters, and its Servant guard plus resolver-style gate
+  both run through the seam.
+
+  Validation:
+
+  ```text
+  cabal build en-servant en-example
+  cabal test en-servant en-example
+  rg -n 'AuthorizationEnv|:: TupleStore IO|:: ConsistencyStore IO|inMemoryTupleStore|consistencyStore|failingConsistencyStore' en-servant en-example
+  ```
+
+  The build and both test suites passed. The `rg` command produced no matches in `en-servant` or
+  `en-example`.
 
 
 ## Context and Orientation

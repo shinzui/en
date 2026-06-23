@@ -37,12 +37,16 @@ library
   exposed-modules:
     En.Servant.API
     En.Servant.Authorize
+    En.Servant.Seam
 
   build-depends:
     , aeson
     , base            >=4.19 && <5
     , containers
+    , effectful
+    , effectful-core
     , en-core
+    , en-postgres
     , servant
     , servant-server
     , text
@@ -56,6 +60,8 @@ test-suite en-servant-tests
   build-depends:
     , base
     , containers
+    , effectful
+    , effectful-core
     , en-core
     , en-servant
     , servant
