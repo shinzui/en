@@ -20,18 +20,19 @@ This plan turns a consumer-supplied schema into a checked reachability graph. Af
 
 ## Progress
 
-- [ ] Extend or consume the final schema model from EP-1, including caveat declarations and allowed subject rules.
-- [ ] Implement schema validation for unknown object types, relations, caveats, cycles, empty set operations, and invalid tuple-to-userset arrows.
-- [ ] Add schema hashing for token validation and standalone service startup.
-- [ ] Implement `En.Reachability.compile` to produce graph nodes and edges annotated as direct or conditional.
-- [ ] Add tests for union, computed userset, tuple-to-userset, intersection, exclusion, caveated rewrites, and recursion bounds.
-- [ ] Add a kikan-shaped fixture schema that exercises guest org view-only sharing and delegation caveats.
-- [ ] Run `cabal build all` and relevant tests.
+- [x] Extend or consume the final schema model from EP-1, including caveat declarations and allowed subject rules. Completed 2026-06-23T05:57:00Z.
+- [x] Implement schema validation for unknown object types, relations, caveats, cycles, empty set operations, and invalid tuple-to-userset arrows. Completed 2026-06-23T05:57:00Z.
+- [x] Add schema hashing for token validation and standalone service startup. Completed 2026-06-23T05:57:00Z.
+- [x] Implement `En.Reachability.compile` to produce graph nodes and edges annotated as direct or conditional. Completed 2026-06-23T05:57:00Z.
+- [x] Add tests for union, computed userset, tuple-to-userset, intersection, exclusion, caveated rewrites, and recursion bounds. Completed 2026-06-23T05:57:00Z.
+- [x] Add a kikan-shaped fixture schema that exercises guest org view-only sharing and delegation caveats. Completed 2026-06-23T05:57:00Z.
+- [x] Run `cabal build all` and relevant tests. Completed 2026-06-23T05:57:00Z.
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- The first reachability compiler pass incorrectly inlined `ComputedUserset` rewrites against the original target relation, so `space#view = owner + member` could not produce direct user entrypoints. The compiler now carries both the compiled target relation and the currently evaluated relation, so `This` reads allowed subjects from the inlined relation while emitted entrypoints still target the original permission.
+- Recursive schema validation needs to distinguish unproductive rewrite cycles from productive recursive traversals. The kikan-shaped `space#view` fixture is recursive through `space#parent -> space#view`, but it is valid because it also reaches direct base relations such as `owner` and `member`.
 
 
 ## Decision Log
@@ -39,11 +40,20 @@ This plan turns a consumer-supplied schema into a checked reachability graph. Af
 - Decision: Keep schema runtime-configurable as a Haskell value, not a service-side DSL.
   Rationale: The repository and kikan C13 contract choose a schema-parametric Haskell toolkit. A runtime DSL can be layered later without changing the core graph model.
   Date: 2026-06-23
+- Decision: Add `AllowedSubject` declarations to each relation.
+  Rationale: Validation needs to reject tuples and tuple-to-userset arrows that cannot be meaningful under the active schema. A relation-level allowed-subject set gives EP-4 and EP-7 enough type information to traverse direct and userset subjects safely.
+  Date: 2026-06-23
+- Decision: Treat intersection, exclusion, and caveated rewrite entrypoints as conditional in the reachability graph.
+  Rationale: The MasterPlan chose the SpiceDB-style reach-then-check approach. Direct union/computed/tuple-to-userset paths can stream lookup candidates, but set subtraction, all-branches semantics, and caveats require forward confirmation before lookup emits a final result.
+  Date: 2026-06-23
+- Decision: Use a deterministic FNV-1a text fingerprint for the initial schema hash.
+  Rationale: Tokens need a stable schema identity now, and the schema is a local Haskell value. The hash renderer orders `Map`/`Set` contents explicitly and does not rely on derived `Show`; a stronger hash can replace the private implementation later without changing the public `SchemaHash` type.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+EP-3 implemented schema validation, deterministic schema hashing, and a concrete reachability graph. The kikan-shaped fixture compiles and demonstrates direct user membership, guest-organization userset reachability, recursive parent traversal, caveated delegation, and conditional intersection/exclusion entrypoints. Invalid schema tests cover unknown references, empty set operations, invalid tuple-to-userset arrows, unknown caveats, and unproductive rewrite cycles.
 
 
 ## Context and Orientation
@@ -88,10 +98,10 @@ Run:
 cabal build all
 ```
 
-Then run the new test suite, for example:
+Then run the focused core test suite:
 
 ```bash
-cabal test en-core
+cabal test en-core-interface-tests
 ```
 
 
@@ -99,7 +109,7 @@ cabal test en-core
 
 A valid kikan-shaped fixture schema must compile. Invalid schemas must return structured `EnError` values rather than throwing exceptions. Tests must prove that direct and conditional entrypoints are annotated differently so lookup can avoid per-candidate checks for simple union paths and confirm hard cases.
 
-`cabal build all` must pass. The test command added by this plan must pass and should include at least one negative validation case for each rewrite constructor.
+`cabal build all` must pass. `cabal test en-core-interface-tests` must pass and includes negative validation cases for each rewrite constructor plus positive graph coverage for union, computed userset, tuple-to-userset, intersection, exclusion, caveated rewrites, and productive recursion.
 
 
 ## Idempotence and Recovery
@@ -115,3 +125,5 @@ This plan owns `En.Schema` validation semantics, schema hashing, and `En.Reachab
 
 
 Revision note 2026-06-23: Added `intention_01kvsbcvsfepaafp5x44ykby47` to the plan frontmatter at the user's request.
+
+Revision note 2026-06-23: Completed EP-3 by adding relation allowed-subject rules, schema validation, deterministic schema hashing, a concrete reachability graph compiler, and kikan-shaped test coverage.
