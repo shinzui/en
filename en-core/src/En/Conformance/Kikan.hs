@@ -1,10 +1,10 @@
 module En.Conformance.Kikan (
     kikanSchema,
     kikanGraph,
-    inMemoryTupleStore,
+    runTupleStoreInMemory,
     pageTuples,
     tupleRow,
-    consistencyStore,
+    runConsistencyStoreInMemory,
     fixtureTuples,
     agencyTuples,
     autonomyCaveat,
@@ -37,6 +37,8 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Time (UTCTime, defaultTimeLocale, parseTimeOrError)
+import Effectful (Eff)
+import Effectful.Dispatch.Dynamic (interpret_)
 
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
 import En.Effect.TupleStore (
@@ -131,12 +133,12 @@ kikanGraph :: ReachabilityGraph
 kikanGraph =
     either (error . show) id (compile kikanSchema)
 
-inMemoryTupleStore :: [Tuple] -> TupleStore IO
-inMemoryTupleStore tuples =
-    TupleStore
-        { readObjectRelation = \_ object relation limit cursor ->
+runTupleStoreInMemory :: [Tuple] -> Eff (TupleStore : es) a -> Eff es a
+runTupleStoreInMemory tuples =
+    interpret_ \case
+        ReadObjectRelation _ object relation limit cursor ->
             pure (pageTuples limit cursor [tuple | tuple <- tuples, tuple.object == object, tuple.relation == relation])
-        , readStartingWithUser = \_ query ->
+        ReadStartingWithUser _ query ->
             pure
                 ( pageTuples
                     query.queryLimit
@@ -148,13 +150,18 @@ inMemoryTupleStore tuples =
                     , tuple.subject `elem` query.querySubjects
                     ]
                 )
-        , writeTuples = \_ -> pure (ConsistencyToken "in-memory-write")
-        , deleteTuples = \_ -> pure (ConsistencyToken "in-memory-delete")
-        , headRevision = pure testRevision
-        , optimizedRevision = pure testRevision
-        , oldestRetainedXid = pure 0
-        , reapDeletedTuples = \_ -> pure 0
-        }
+        WriteTuples _ ->
+            pure (ConsistencyToken "in-memory-write")
+        DeleteTuples _ ->
+            pure (ConsistencyToken "in-memory-delete")
+        HeadRevision ->
+            pure testRevision
+        OptimizedRevision ->
+            pure testRevision
+        OldestRetainedXid ->
+            pure 0
+        ReapDeletedTuples _ ->
+            pure 0
 
 pageTuples :: Int -> Maybe StoreCursor -> [Tuple] -> TuplePage
 pageTuples limit cursor tuples =
@@ -192,24 +199,19 @@ decodeTestCursor (StoreCursor cursorText) =
         [(value, "")] -> value
         _ -> 0
 
-consistencyStore :: ConsistencyStore IO
-consistencyStore =
-    ConsistencyStore
-        { decodeToken = \token ->
+runConsistencyStoreInMemory :: Eff (ConsistencyStore : es) a -> Eff es a
+runConsistencyStoreInMemory =
+    interpret_ \case
+        DecodeToken token ->
+            pure (TokenMetadata token testRevision (DatastoreId "test") (SchemaHash "schema") Nothing)
+        ValidateToken _ ->
+            pure ()
+        ResolveConsistency consistency ->
             pure
-                ( Right
-                    (TokenMetadata token testRevision (DatastoreId "test") (SchemaHash "schema") Nothing)
-                )
-        , validateToken = \_ -> pure (Right ())
-        , resolveConsistency = \consistency ->
-            pure
-                ( Right
-                    ResolvedConsistency
-                        { consistency = consistency
-                        , revision = testRevision
-                        }
-                )
-        }
+                ResolvedConsistency
+                    { consistency = consistency
+                    , revision = testRevision
+                    }
 
 fixtureTuples :: [Tuple]
 fixtureTuples =

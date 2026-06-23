@@ -18,9 +18,11 @@ module En.Expand (
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Effectful (Eff, (:>))
+import Effectful.Error.Static (Error, throwError)
 
-import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..))
-import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore (..))
+import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
+import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, readObjectRelation)
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
 import En.Revision (Consistency, Revision)
@@ -67,29 +69,23 @@ data ExpandTree = ExpandTree
     deriving stock (Eq, Show)
 
 expand ::
-    (Monad m) =>
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
     ReachabilityGraph ->
     Consistency ->
     ExpandRequest ->
-    m (Either EnError ExpandTree)
-expand consistencyStore tupleStore graph consistency request = do
-    resolved <- consistencyStore.resolveConsistency consistency
-    case resolved of
-        Left err -> pure (Left err)
-        Right ResolvedConsistency{revision} ->
-            runExpand tupleStore graph revision request
+    Eff es ExpandTree
+expand graph consistency request = do
+    ResolvedConsistency{revision} <- resolveConsistency consistency
+    either throwError pure =<< runExpand graph revision request
 
 runExpand ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     Revision ->
     ExpandRequest ->
-    m (Either EnError ExpandTree)
-runExpand tupleStore graph revision request = do
-    children <- expandRelation tupleStore graph revision request.object request.permission initialState
+    Eff es (Either EnError ExpandTree)
+runExpand graph revision request = do
+    children <- expandRelation graph revision request.object request.permission initialState
     pure $
         ( \nodes ->
             let (visible, state) = pageNodes request.limit request.cursor nodes
@@ -127,15 +123,14 @@ resultCap :: Int
 resultCap = 1000
 
 expandRelation ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     Revision ->
     ObjectRef ->
     RelationName ->
     EvalState ->
-    m (Either EnError [ExpandNode])
-expandRelation tupleStore graph revision object relation state
+    Eff es (Either EnError [ExpandNode])
+expandRelation graph revision object relation state
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded)
     | subproblem `elem` state.visited =
@@ -145,7 +140,6 @@ expandRelation tupleStore graph revision object relation state
             Left err -> pure (Left err)
             Right schemaRelation ->
                 expandRewrite
-                    tupleStore
                     graph
                     revision
                     object
@@ -156,70 +150,67 @@ expandRelation tupleStore graph revision object relation state
     subproblem = Subproblem{object, relation}
 
 expandRewrite ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     Revision ->
     ObjectRef ->
     RelationName ->
     Rewrite ->
     EvalState ->
-    m (Either EnError [ExpandNode])
-expandRewrite tupleStore graph revision object currentRelation rewrite state =
+    Eff es (Either EnError [ExpandNode])
+expandRewrite graph revision object currentRelation rewrite state =
     case rewrite of
         This ->
-            expandThis tupleStore graph revision object currentRelation state
+            expandThis graph revision object currentRelation state
         ComputedUserset relation -> do
-            children <- expandRelation tupleStore graph revision object relation state
+            children <- expandRelation graph revision object relation state
             pure (fmap (pure . ExpandUserset object relation) children)
         TupleToUserset tuplesetRelation computedRelation ->
-            expandTupleToUserset tupleStore graph revision object tuplesetRelation computedRelation state
+            expandTupleToUserset graph revision object tuplesetRelation computedRelation state
         Union rewrites -> do
-            children <- traverse (\current -> expandRewrite tupleStore graph revision object currentRelation current state) rewrites
+            children <- traverse (\current -> expandRewrite graph revision object currentRelation current state) rewrites
             pure (concat <$> sequence children)
         Intersection rewrites -> do
-            children <- traverse (\current -> expandRewrite tupleStore graph revision object currentRelation current state) rewrites
+            children <- traverse (\current -> expandRewrite graph revision object currentRelation current state) rewrites
             pure (concat <$> sequence children)
         Exclusion base subtractRewrite -> do
-            baseChildren <- expandRewrite tupleStore graph revision object currentRelation base state
-            subtractChildren <- expandRewrite tupleStore graph revision object currentRelation subtractRewrite state
+            baseChildren <- expandRewrite graph revision object currentRelation base state
+            subtractChildren <- expandRewrite graph revision object currentRelation subtractRewrite state
             pure ((<>) <$> baseChildren <*> subtractChildren)
         Caveated caveat rewriteInner -> do
-            children <- expandRewrite tupleStore graph revision object currentRelation rewriteInner state
+            children <- expandRewrite graph revision object currentRelation rewriteInner state
             pure (pure . ExpandCaveated caveat <$> children)
 
 expandThis ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     Revision ->
     ObjectRef ->
     RelationName ->
     EvalState ->
-    m (Either EnError [ExpandNode])
-expandThis tupleStore graph revision object relation state = do
-    rows <- readObjectRows tupleStore revision object relation
+    Eff es (Either EnError [ExpandNode])
+expandThis graph revision object relation state = do
+    rows <- readObjectRows revision object relation
     case rows of
         Left err -> pure (Left err)
         Right tupleRows -> do
-            nodes <- traverse (nodeFromRow tupleStore graph revision state) tupleRows
+            nodes <- traverse (nodeFromRow graph revision state) tupleRows
             pure $
                 case sequence nodes of
                     Left err -> Left err
                     Right expanded -> Right (concat expanded)
 
 expandTupleToUserset ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     Revision ->
     ObjectRef ->
     RelationName ->
     RelationName ->
     EvalState ->
-    m (Either EnError [ExpandNode])
-expandTupleToUserset tupleStore graph revision object tuplesetRelation computedRelation state = do
-    rows <- readObjectRows tupleStore revision object tuplesetRelation
+    Eff es (Either EnError [ExpandNode])
+expandTupleToUserset graph revision object tuplesetRelation computedRelation state = do
+    rows <- readObjectRows revision object tuplesetRelation
     case rows of
         Left err -> pure (Left err)
         Right tupleRows -> do
@@ -238,23 +229,22 @@ expandTupleToUserset tupleStore graph revision object tuplesetRelation computedR
             SubjectWildcard subjectType ->
                 pure (Right (wrapTupleCaveat tuple.caveat [ExpandSubject (SubjectWildcard subjectType) (Just row)]))
     usersetNode TupleRow{tuple} subjectObject relation = do
-        children <- expandRelation tupleStore graph revision subjectObject relation state
+        children <- expandRelation graph revision subjectObject relation state
         pure (wrapTupleCaveat tuple.caveat . pure . ExpandUserset subjectObject relation <$> children)
 
 nodeFromRow ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     Revision ->
     EvalState ->
     TupleRow ->
-    m (Either EnError [ExpandNode])
-nodeFromRow tupleStore graph revision state row@TupleRow{tuple} =
+    Eff es (Either EnError [ExpandNode])
+nodeFromRow graph revision state row@TupleRow{tuple} =
     case tuple.subject of
         SubjectId subject ->
             pure (Right (wrapTupleCaveat tuple.caveat [ExpandSubject (SubjectId subject) (Just row)]))
         SubjectSet subject relation -> do
-            children <- expandRelation tupleStore graph revision subject relation state
+            children <- expandRelation graph revision subject relation state
             pure (wrapTupleCaveat tuple.caveat . pure . ExpandUserset subject relation <$> children)
         SubjectWildcard subjectType ->
             pure (Right (wrapTupleCaveat tuple.caveat [ExpandSubject (SubjectWildcard subjectType) (Just row)]))
@@ -264,17 +254,16 @@ wrapTupleCaveat Nothing nodes = nodes
 wrapTupleCaveat (Just TupleCaveat{name}) nodes = [ExpandCaveated name nodes]
 
 readObjectRows ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     Revision ->
     ObjectRef ->
     RelationName ->
-    m (Either EnError [TupleRow])
-readObjectRows tupleStore revision object relation =
+    Eff es (Either EnError [TupleRow])
+readObjectRows revision object relation =
     drain Nothing []
   where
     drain cursor acc = do
-        page <- tupleStore.readObjectRelation revision object relation pageLimit cursor
+        page <- readObjectRelation revision object relation pageLimit cursor
         case page.state of
             Exhausted -> pure (Right (acc <> page.rows))
             HasMore next -> drain (Just next) (acc <> page.rows)

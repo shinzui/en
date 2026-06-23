@@ -10,12 +10,14 @@ module En.Check (
 import Control.Monad (foldM)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
+import Effectful (Eff, (:>))
+import Effectful.Error.Static (Error, throwError)
 
 import En.Caveat (evaluateCaveat)
 import En.Decision (CaveatObligation (..), CheckDecision (..))
 import En.Decision qualified as Decision
-import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..))
-import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore (..))
+import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
+import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore, readObjectRelation)
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
 import En.Revision (Consistency, Revision (..))
@@ -45,22 +47,17 @@ data BatchPair = BatchPair
 reachability graph and the tuple store.
 -}
 check ::
-    (Monad m) =>
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
     ReachabilityGraph ->
     Consistency ->
     CaveatContext ->
     Subject ->
     RelationName ->
     ObjectRef ->
-    m (Either EnError CheckDecision)
-check consistencyStore tupleStore graph consistency context subject permission object = do
-    resolved <- consistencyStore.resolveConsistency consistency
-    case resolved of
-        Left err -> pure (Left err)
-        Right ResolvedConsistency{revision} ->
-            runCheck tupleStore graph context revision subject permission object
+    Eff es CheckDecision
+check graph consistency context subject permission object = do
+    ResolvedConsistency{revision} <- resolveConsistency consistency
+    either throwError pure =<< runCheck graph context revision subject permission object
 
 {- | Evaluate many checks against one resolved consistency snapshot.
 
@@ -71,29 +68,24 @@ returning 'Denied'. Transport-layer handlers remain responsible for bounding
 batch size and adding any IO-specific concurrency.
 -}
 checkMany ::
-    (Monad m) =>
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es) =>
     ReachabilityGraph ->
     Consistency ->
     CaveatContext ->
     [BatchPair] ->
-    m (Either EnError [CheckDecision])
-checkMany consistencyStore tupleStore graph consistency context pairs = do
-    resolved <- consistencyStore.resolveConsistency consistency
-    case resolved of
-        Left err -> pure (Left err)
-        Right ResolvedConsistency{revision} -> do
-            (decisionsByPair, _memo) <-
-                foldM
-                    (evaluateDistinct revision)
-                    (Map.empty, Map.empty)
-                    (dedupePairs pairs)
-            pure (Right [Map.findWithDefault Denied pair decisionsByPair | pair <- pairs])
+    Eff es [CheckDecision]
+checkMany graph consistency context pairs = do
+    ResolvedConsistency{revision} <- resolveConsistency consistency
+    (decisionsByPair, _memo) <-
+        foldM
+            (evaluateDistinct revision)
+            (Map.empty, Map.empty)
+            (dedupePairs pairs)
+    pure [Map.findWithDefault Denied pair decisionsByPair | pair <- pairs]
   where
     evaluateDistinct revision (decisionsByPair, memo) pair = do
         (result, memo') <-
-            runCheckMemo tupleStore graph context revision pair.subject pair.permission pair.object memo
+            runCheckMemo graph context revision pair.subject pair.permission pair.object memo
         let decision =
                 either (const Denied) id result
         pure (Map.insert pair decision decisionsByPair, memo')
@@ -107,17 +99,16 @@ dedupePairs =
         | otherwise = (pair : ordered, Map.insert pair () seen)
 
 runCheck ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
     Subject ->
     RelationName ->
     ObjectRef ->
-    m (Either EnError CheckDecision)
-runCheck tupleStore graph context revision subject permission object =
-    evalRelation tupleStore graph context revision subject object permission initialState
+    Eff es (Either EnError CheckDecision)
+runCheck graph context revision subject permission object =
+    evalRelation graph context revision subject object permission initialState
 
 data EvalState = EvalState
     { depth :: !Int
@@ -150,8 +141,7 @@ pageLimit :: Int
 pageLimit = 1000
 
 evalRelation ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -159,8 +149,8 @@ evalRelation ::
     ObjectRef ->
     RelationName ->
     EvalState ->
-    m (Either EnError CheckDecision)
-evalRelation tupleStore graph context revision subject object relation state
+    Eff es (Either EnError CheckDecision)
+evalRelation graph context revision subject object relation state
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded)
     | subproblem `elem` state.visited =
@@ -171,7 +161,6 @@ evalRelation tupleStore graph context revision subject object relation state
                 pure (Left (UnknownRelation (renderRef ref)))
             Just schemaRelation ->
                 evalRewrite
-                    tupleStore
                     graph
                     context
                     revision
@@ -185,8 +174,7 @@ evalRelation tupleStore graph context revision subject object relation state
     subproblem = Subproblem{subject, object, relation}
 
 runCheckMemo ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -194,13 +182,12 @@ runCheckMemo ::
     RelationName ->
     ObjectRef ->
     CheckMemo ->
-    m (Either EnError CheckDecision, CheckMemo)
-runCheckMemo tupleStore graph context revision subject permission object =
-    evalRelationMemo tupleStore graph context revision subject object permission initialState
+    Eff es (Either EnError CheckDecision, CheckMemo)
+runCheckMemo graph context revision subject permission object =
+    evalRelationMemo graph context revision subject object permission initialState
 
 evalRelationMemo ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -209,8 +196,8 @@ evalRelationMemo ::
     RelationName ->
     EvalState ->
     CheckMemo ->
-    m (Either EnError CheckDecision, CheckMemo)
-evalRelationMemo tupleStore graph context revision subject object relation state memo
+    Eff es (Either EnError CheckDecision, CheckMemo)
+evalRelationMemo graph context revision subject object relation state memo
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded, memo)
     | subproblem `elem` state.visited =
@@ -226,7 +213,6 @@ evalRelationMemo tupleStore graph context revision subject object relation state
                     Just schemaRelation -> do
                         (result, memo') <-
                             evalRewriteMemo
-                                tupleStore
                                 graph
                                 context
                                 revision
@@ -247,8 +233,7 @@ evalRelationMemo tupleStore graph context revision subject object relation state
     key = MemoKey revision.revisionEncoding subproblem
 
 evalRewriteMemo ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -258,39 +243,38 @@ evalRewriteMemo ::
     Rewrite ->
     EvalState ->
     CheckMemo ->
-    m (Either EnError CheckDecision, CheckMemo)
-evalRewriteMemo tupleStore graph context revision subject object currentRelation rewrite state memo =
+    Eff es (Either EnError CheckDecision, CheckMemo)
+evalRewriteMemo graph context revision subject object currentRelation rewrite state memo =
     case rewrite of
         This ->
-            evalThisMemo tupleStore graph context revision subject object currentRelation state memo
+            evalThisMemo graph context revision subject object currentRelation state memo
         ComputedUserset relation ->
-            evalRelationMemo tupleStore graph context revision subject object relation state memo
+            evalRelationMemo graph context revision subject object relation state memo
         TupleToUserset tuplesetRelation computedRelation ->
-            evalTupleToUsersetMemo tupleStore graph context revision subject object tuplesetRelation computedRelation state memo
+            evalTupleToUsersetMemo graph context revision subject object tuplesetRelation computedRelation state memo
         Union rewrites -> do
             (decisions, memo') <-
-                evalRewriteListMemo tupleStore graph context revision subject object currentRelation rewrites state memo
+                evalRewriteListMemo graph context revision subject object currentRelation rewrites state memo
             pure (Decision.union <$> sequence decisions, memo')
         Intersection rewrites -> do
             (decisions, memo') <-
-                evalRewriteListMemo tupleStore graph context revision subject object currentRelation rewrites state memo
+                evalRewriteListMemo graph context revision subject object currentRelation rewrites state memo
             pure (Decision.intersection <$> sequence decisions, memo')
         Exclusion base subtractRewrite -> do
-            (baseDecision, memo') <- evalRewriteMemo tupleStore graph context revision subject object currentRelation base state memo
+            (baseDecision, memo') <- evalRewriteMemo graph context revision subject object currentRelation base state memo
             case baseDecision of
                 Left err -> pure (Left err, memo')
                 Right Denied -> pure (Right Denied, memo')
                 Right (Conditional obligations) -> pure (Right (Conditional obligations), memo')
                 Right Allowed -> do
-                    (subtractDecision, memo'') <- evalRewriteMemo tupleStore graph context revision subject object currentRelation subtractRewrite state memo'
+                    (subtractDecision, memo'') <- evalRewriteMemo graph context revision subject object currentRelation subtractRewrite state memo'
                     pure (Decision.exclusion <$> subtractDecision, memo'')
         Caveated caveat rewriteInner -> do
-            (inner, memo') <- evalRewriteMemo tupleStore graph context revision subject object currentRelation rewriteInner state memo
+            (inner, memo') <- evalRewriteMemo graph context revision subject object currentRelation rewriteInner state memo
             pure (applyRewriteCaveat graph context caveat =<< inner, memo')
 
 evalRewriteListMemo ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -300,17 +284,16 @@ evalRewriteListMemo ::
     [Rewrite] ->
     EvalState ->
     CheckMemo ->
-    m ([Either EnError CheckDecision], CheckMemo)
-evalRewriteListMemo tupleStore graph context revision subject object currentRelation rewrites state memo =
+    Eff es ([Either EnError CheckDecision], CheckMemo)
+evalRewriteListMemo graph context revision subject object currentRelation rewrites state memo =
     foldM step ([], memo) rewrites
   where
     step (decisions, currentMemo) rewrite = do
-        (decision, memo') <- evalRewriteMemo tupleStore graph context revision subject object currentRelation rewrite state currentMemo
+        (decision, memo') <- evalRewriteMemo graph context revision subject object currentRelation rewrite state currentMemo
         pure (decisions <> [decision], memo')
 
 evalThisMemo ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -319,12 +302,12 @@ evalThisMemo ::
     RelationName ->
     EvalState ->
     CheckMemo ->
-    m (Either EnError CheckDecision, CheckMemo)
-evalThisMemo tupleStore graph context revision subject object relation state memo
+    Eff es (Either EnError CheckDecision, CheckMemo)
+evalThisMemo graph context revision subject object relation state memo
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded, memo)
     | otherwise = do
-        page <- tupleStore.readObjectRelation revision object relation pageLimit Nothing
+        page <- readObjectRelation revision object relation pageLimit Nothing
         case ensureExhausted page of
             Left err -> pure (Left err, memo)
             Right rows -> do
@@ -339,14 +322,13 @@ evalThisMemo tupleStore graph context revision subject object relation state mem
                 SubjectId _ ->
                     pure (decisions <> [Right Denied], memo')
                 SubjectSet subjectObject subjectRelation -> do
-                    (decision, memo'') <- evalRelationMemo tupleStore graph context revision subject subjectObject subjectRelation state memo'
+                    (decision, memo'') <- evalRelationMemo graph context revision subject subjectObject subjectRelation state memo'
                     pure (decisions <> [decision >>= applyTupleCaveat graph context tuple.caveat], memo'')
                 SubjectWildcard _ ->
                     pure (decisions <> [Right Denied], memo')
 
 evalTupleToUsersetMemo ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -356,9 +338,9 @@ evalTupleToUsersetMemo ::
     RelationName ->
     EvalState ->
     CheckMemo ->
-    m (Either EnError CheckDecision, CheckMemo)
-evalTupleToUsersetMemo tupleStore graph context revision subject object tuplesetRelation computedRelation state memo = do
-    page <- tupleStore.readObjectRelation revision object tuplesetRelation pageLimit Nothing
+    Eff es (Either EnError CheckDecision, CheckMemo)
+evalTupleToUsersetMemo graph context revision subject object tuplesetRelation computedRelation state memo = do
+    page <- readObjectRelation revision object tuplesetRelation pageLimit Nothing
     case ensureExhausted page of
         Left err -> pure (Left err, memo)
         Right rows -> do
@@ -368,10 +350,10 @@ evalTupleToUsersetMemo tupleStore graph context revision subject object tupleset
     rowDecision (decisions, memo') TupleRow{tuple} =
         case tuple.subject of
             SubjectId subjectObject -> do
-                (decision, memo'') <- evalRelationMemo tupleStore graph context revision subject subjectObject computedRelation state memo'
+                (decision, memo'') <- evalRelationMemo graph context revision subject subjectObject computedRelation state memo'
                 pure (decisions <> [applyRowGate tuple decision], memo'')
             SubjectSet subjectObject subjectRelation -> do
-                (decision, memo'') <- evalRelationMemo tupleStore graph context revision subject subjectObject subjectRelation state memo'
+                (decision, memo'') <- evalRelationMemo graph context revision subject subjectObject subjectRelation state memo'
                 pure (decisions <> [applyRowGate tuple decision], memo'')
             SubjectWildcard _ ->
                 pure (decisions <> [Right Denied], memo')
@@ -380,8 +362,7 @@ evalTupleToUsersetMemo tupleStore graph context revision subject object tupleset
         (>>= applyTupleCaveat graph context tuple.caveat)
 
 evalRewrite ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -390,37 +371,36 @@ evalRewrite ::
     RelationName ->
     Rewrite ->
     EvalState ->
-    m (Either EnError CheckDecision)
-evalRewrite tupleStore graph context revision subject object currentRelation rewrite state =
+    Eff es (Either EnError CheckDecision)
+evalRewrite graph context revision subject object currentRelation rewrite state =
     case rewrite of
         This ->
-            evalThis tupleStore graph context revision subject object currentRelation state
+            evalThis graph context revision subject object currentRelation state
         ComputedUserset relation ->
-            evalRelation tupleStore graph context revision subject object relation state
+            evalRelation graph context revision subject object relation state
         TupleToUserset tuplesetRelation computedRelation ->
-            evalTupleToUserset tupleStore graph context revision subject object tuplesetRelation computedRelation state
+            evalTupleToUserset graph context revision subject object tuplesetRelation computedRelation state
         Union rewrites -> do
-            decisions <- traverse (\current -> evalRewrite tupleStore graph context revision subject object currentRelation current state) rewrites
+            decisions <- traverse (\current -> evalRewrite graph context revision subject object currentRelation current state) rewrites
             pure (Decision.union <$> sequence decisions)
         Intersection rewrites -> do
-            decisions <- traverse (\current -> evalRewrite tupleStore graph context revision subject object currentRelation current state) rewrites
+            decisions <- traverse (\current -> evalRewrite graph context revision subject object currentRelation current state) rewrites
             pure (Decision.intersection <$> sequence decisions)
         Exclusion base subtractRewrite -> do
-            baseDecision <- evalRewrite tupleStore graph context revision subject object currentRelation base state
+            baseDecision <- evalRewrite graph context revision subject object currentRelation base state
             case baseDecision of
                 Left err -> pure (Left err)
                 Right Denied -> pure (Right Denied)
                 Right (Conditional obligations) -> pure (Right (Conditional obligations))
                 Right Allowed -> do
-                    subtractDecision <- evalRewrite tupleStore graph context revision subject object currentRelation subtractRewrite state
+                    subtractDecision <- evalRewrite graph context revision subject object currentRelation subtractRewrite state
                     pure (Decision.exclusion <$> subtractDecision)
         Caveated caveat rewriteInner -> do
-            inner <- evalRewrite tupleStore graph context revision subject object currentRelation rewriteInner state
+            inner <- evalRewrite graph context revision subject object currentRelation rewriteInner state
             pure (applyRewriteCaveat graph context caveat =<< inner)
 
 evalThis ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -428,12 +408,12 @@ evalThis ::
     ObjectRef ->
     RelationName ->
     EvalState ->
-    m (Either EnError CheckDecision)
-evalThis tupleStore graph context revision subject object relation state
+    Eff es (Either EnError CheckDecision)
+evalThis graph context revision subject object relation state
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded)
     | otherwise = do
-        page <- tupleStore.readObjectRelation revision object relation pageLimit Nothing
+        page <- readObjectRelation revision object relation pageLimit Nothing
         case ensureExhausted page of
             Left err -> pure (Left err)
             Right rows -> do
@@ -450,13 +430,12 @@ evalThis tupleStore graph context revision subject object relation state
                 SubjectSet subjectObject subjectRelation ->
                     fmap
                         (>>= applyTupleCaveat graph context tuple.caveat)
-                        (evalRelation tupleStore graph context revision subject subjectObject subjectRelation state)
+                        (evalRelation graph context revision subject subjectObject subjectRelation state)
                 SubjectWildcard _ ->
                     pure (Right Denied)
 
 evalTupleToUserset ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -465,9 +444,9 @@ evalTupleToUserset ::
     RelationName ->
     RelationName ->
     EvalState ->
-    m (Either EnError CheckDecision)
-evalTupleToUserset tupleStore graph context revision subject object tuplesetRelation computedRelation state = do
-    page <- tupleStore.readObjectRelation revision object tuplesetRelation pageLimit Nothing
+    Eff es (Either EnError CheckDecision)
+evalTupleToUserset graph context revision subject object tuplesetRelation computedRelation state = do
+    page <- readObjectRelation revision object tuplesetRelation pageLimit Nothing
     case ensureExhausted page of
         Left err -> pure (Left err)
         Right rows -> do
@@ -476,9 +455,9 @@ evalTupleToUserset tupleStore graph context revision subject object tuplesetRela
                     ( \TupleRow{tuple} ->
                         case tuple.subject of
                             SubjectId subjectObject ->
-                                applyRowGate tuple <$> evalRelation tupleStore graph context revision subject subjectObject computedRelation state
+                                applyRowGate tuple <$> evalRelation graph context revision subject subjectObject computedRelation state
                             SubjectSet subjectObject subjectRelation ->
-                                applyRowGate tuple <$> evalRelation tupleStore graph context revision subject subjectObject subjectRelation state
+                                applyRowGate tuple <$> evalRelation graph context revision subject subjectObject subjectRelation state
                             SubjectWildcard _ ->
                                 pure (Right Denied)
                     )

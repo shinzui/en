@@ -25,13 +25,15 @@ import Data.Maybe (catMaybes)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Effectful (Eff, (:>))
+import Effectful.Error.Static (Error, throwError)
 import Text.Read (readMaybe)
 
 import En.Caveat (evaluateCaveat)
 import En.Check (CheckDecision (..), check)
 import En.Decision qualified as Decision
-import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..))
-import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore (..), UsersetQuery (..))
+import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
+import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, UsersetQuery (..), readStartingWithUser)
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
 import En.Revision (Consistency, Revision (..))
@@ -104,31 +106,25 @@ entrypoints (intersection / exclusion / caveats), streamed and cursorable.
 This is the read-filter primitive (e.g. kawa filtering the activity stream).
 -}
 lookup ::
-    (Monad m) =>
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
     ReachabilityGraph ->
     Consistency ->
     LookupRequest ->
-    m (Either EnError LookupPage)
+    Eff es LookupPage
 lookup =
     lookupWithDeadline noDeadline
 
 lookupWithDeadline ::
-    (Monad m) =>
-    Deadline m ->
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
+    Deadline (Eff es) ->
     ReachabilityGraph ->
     Consistency ->
     LookupRequest ->
-    m (Either EnError LookupPage)
-lookupWithDeadline deadline consistencyStore tupleStore graph consistency request = do
+    Eff es LookupPage
+lookupWithDeadline deadline graph consistency request = do
     resolved <- resolveLookupRevision
-    case resolved of
-        Left err -> pure (Left err)
-        Right revision ->
-            runLookup deadline consistencyStore tupleStore graph revision consistency cursorState request
+    revision <- either throwError pure resolved
+    either throwError pure =<< runLookup deadline graph revision consistency cursorState request
   where
     cursorState =
         request.cursor >>= either (const Nothing) Just . decodeLookupCursor
@@ -138,22 +134,20 @@ lookupWithDeadline deadline consistencyStore tupleStore graph consistency reques
             Just cursor ->
                 pure (decodeLookupCursor cursor >>= Right . (.revision))
             Nothing -> do
-                resolved <- consistencyStore.resolveConsistency consistency
-                pure (resolved >>= Right . (.revision))
+                ResolvedConsistency{revision} <- resolveConsistency consistency
+                pure (Right revision)
 
 runLookup ::
-    (Monad m) =>
-    Deadline m ->
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
+    Deadline (Eff es) ->
     ReachabilityGraph ->
     Revision ->
     Consistency ->
     Maybe LookupCursorState ->
     LookupRequest ->
-    m (Either EnError LookupPage)
-runLookup deadline consistencyStore tupleStore graph revision consistency cursorState request = do
-    candidates <- evalRelation consistencyStore tupleStore graph request.context revision consistency request.subject request.objectType request.permission initialState
+    Eff es (Either EnError LookupPage)
+runLookup deadline graph revision consistency cursorState request = do
+    candidates <- evalRelation graph request.context revision consistency request.subject request.objectType request.permission initialState
     traverse (pageLookup deadline request.limit cursorState revision) candidates
 
 data EvalState = EvalState
@@ -189,9 +183,7 @@ resultCap :: Int
 resultCap = 1000
 
 evalRelation ::
-    (Monad m) =>
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -200,8 +192,8 @@ evalRelation ::
     ObjectType ->
     RelationName ->
     EvalState ->
-    m (Either EnError [LookupObject])
-evalRelation consistencyStore tupleStore graph context revision consistency subject objectType relation state
+    Eff es (Either EnError [LookupObject])
+evalRelation graph context revision consistency subject objectType relation state
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded)
     | subproblem `elem` state.visited && state.skipRecursive == Nothing =
@@ -212,8 +204,6 @@ evalRelation consistencyStore tupleStore graph context revision consistency subj
                 pure (Left (UnknownRelation (renderRef ref)))
             Just schemaRelation ->
                 evalRewrite
-                    consistencyStore
-                    tupleStore
                     graph
                     context
                     revision
@@ -228,9 +218,7 @@ evalRelation consistencyStore tupleStore graph context revision consistency subj
     subproblem = Subproblem{subject, objectType, relation}
 
 evalRewrite ::
-    (Monad m) =>
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -240,36 +228,34 @@ evalRewrite ::
     RelationName ->
     Rewrite ->
     EvalState ->
-    m (Either EnError [LookupObject])
-evalRewrite consistencyStore tupleStore graph context revision consistency subject objectType currentRelation rewrite state =
+    Eff es (Either EnError [LookupObject])
+evalRewrite graph context revision consistency subject objectType currentRelation rewrite state =
     case rewrite of
         This ->
-            evalThis consistencyStore tupleStore graph context revision consistency subject objectType currentRelation state
+            evalThis graph context revision consistency subject objectType currentRelation state
         ComputedUserset relation ->
-            evalRelation consistencyStore tupleStore graph context revision consistency subject objectType relation state
+            evalRelation graph context revision consistency subject objectType relation state
         TupleToUserset tuplesetRelation computedRelation ->
-            evalTupleToUserset consistencyStore tupleStore graph context revision consistency subject objectType currentRelation tuplesetRelation computedRelation state
+            evalTupleToUserset graph context revision consistency subject objectType currentRelation tuplesetRelation computedRelation state
         Union rewrites -> do
-            results <- traverse (\current -> evalRewrite consistencyStore tupleStore graph context revision consistency subject objectType currentRelation current state) rewrites
+            results <- traverse (\current -> evalRewrite graph context revision consistency subject objectType currentRelation current state) rewrites
             pure (mergeLookupObjects . concat <$> sequence results)
         Intersection rewrites ->
-            confirmCandidates consistencyStore tupleStore graph context consistency subject currentRelation
+            confirmCandidates graph context consistency subject currentRelation
                 =<< unionBranches rewrites
         Exclusion base _subtractRewrite ->
-            confirmCandidates consistencyStore tupleStore graph context consistency subject currentRelation
-                =<< evalRewrite consistencyStore tupleStore graph context revision consistency subject objectType currentRelation base state
+            confirmCandidates graph context consistency subject currentRelation
+                =<< evalRewrite graph context revision consistency subject objectType currentRelation base state
         Caveated caveat rewriteInner -> do
-            inner <- evalRewrite consistencyStore tupleStore graph context revision consistency subject objectType currentRelation rewriteInner state
+            inner <- evalRewrite graph context revision consistency subject objectType currentRelation rewriteInner state
             pure (applyRewriteCaveat graph context caveat =<< inner)
   where
     unionBranches rewrites = do
-        results <- traverse (\current -> evalRewrite consistencyStore tupleStore graph context revision consistency subject objectType currentRelation current state) rewrites
+        results <- traverse (\current -> evalRewrite graph context revision consistency subject objectType currentRelation current state) rewrites
         pure (mergeLookupObjects . concat <$> sequence results)
 
 evalThis ::
-    (Monad m) =>
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -278,9 +264,9 @@ evalThis ::
     ObjectType ->
     RelationName ->
     EvalState ->
-    m (Either EnError [LookupObject])
-evalThis consistencyStore tupleStore graph context revision consistency subject objectType relation state = do
-    direct <- readRowsForSubjects tupleStore revision objectType relation (subjectsWithWildcard subject)
+    Eff es (Either EnError [LookupObject])
+evalThis graph context revision consistency subject objectType relation state = do
+    direct <- readRowsForSubjects revision objectType relation (subjectsWithWildcard subject)
     case direct of
         Left err -> pure (Left err)
         Right directRows -> do
@@ -298,12 +284,12 @@ evalThis consistencyStore tupleStore graph context revision consistency subject 
                             case allowed.relation of
                                 Nothing -> pure (Right [])
                                 Just subjectRelation -> do
-                                    subjectObjects <- evalRelation consistencyStore tupleStore graph context revision consistency subject allowed.objectType subjectRelation state
+                                    subjectObjects <- evalRelation graph context revision consistency subject allowed.objectType subjectRelation state
                                     case subjectObjects of
                                         Left err -> pure (Left err)
                                         Right objects -> do
                                             let subjectSets = [SubjectSet object subjectRelation | LookupObject{object} <- objects]
-                                            rows <- readRowsForSubjects tupleStore revision objectType relation subjectSets
+                                            rows <- readRowsForSubjects revision objectType relation subjectSets
                                             pure (catMaybes <$> (rows >>= traverse rowLookupObject))
                         )
                         (Set.toAscList relationDefinition.allowedSubjects)
@@ -312,9 +298,7 @@ evalThis consistencyStore tupleStore graph context revision consistency subject 
         fmap (LookupObject tuple.object) <$> includeDecision graph context tuple.caveat Allowed
 
 evalTupleToUserset ::
-    (Monad m) =>
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -325,8 +309,8 @@ evalTupleToUserset ::
     RelationName ->
     RelationName ->
     EvalState ->
-    m (Either EnError [LookupObject])
-evalTupleToUserset consistencyStore tupleStore graph context revision consistency subject objectType currentRelation tuplesetRelation computedRelation state
+    Eff es (Either EnError [LookupObject])
+evalTupleToUserset graph context revision consistency subject objectType currentRelation tuplesetRelation computedRelation state
     | state.skipRecursive == Just RecursiveStep{tuplesetRelation, computedRelation} =
         pure (Right [])
     | otherwise = do
@@ -339,12 +323,12 @@ evalTupleToUserset consistencyStore tupleStore graph context revision consistenc
                             if allowed.objectType == objectType && computedRelation == currentRelation
                                 then evalRecursiveUserset allowed
                                 else do
-                                    usersetObjects <- evalRelation consistencyStore tupleStore graph context revision consistency subject allowed.objectType computedRelation state
+                                    usersetObjects <- evalRelation graph context revision consistency subject allowed.objectType computedRelation state
                                     case usersetObjects of
                                         Left err -> pure (Left err)
                                         Right objects -> do
                                             let subjects = concatMap (subjectsForAllowed allowed) objects
-                                            rows <- readRowsForSubjects tupleStore revision objectType tuplesetRelation subjects
+                                            rows <- readRowsForSubjects revision objectType tuplesetRelation subjects
                                             pure (rows >>= applyRows objects)
                         )
                         (Set.toAscList tuplesetDefinition.allowedSubjects)
@@ -354,8 +338,6 @@ evalTupleToUserset consistencyStore tupleStore graph context revision consistenc
     evalRecursiveUserset allowed = do
         seeds <-
             evalRelation
-                consistencyStore
-                tupleStore
                 graph
                 context
                 revision
@@ -377,7 +359,7 @@ evalTupleToUserset consistencyStore tupleStore graph context revision consistenc
         | depth >= maxDepth = pure (Left ResolutionLimitExceeded)
         | null frontier = pure (Right (Map.elems seen))
         | otherwise = do
-            rows <- readRowsForSubjects tupleStore revision objectType tuplesetRelation (concatMap (subjectsForAllowed allowed) frontier)
+            rows <- readRowsForSubjects revision objectType tuplesetRelation (concatMap (subjectsForAllowed allowed) frontier)
             case rows of
                 Left err -> pure (Left err)
                 Right tupleRows -> do
@@ -433,44 +415,41 @@ insertObjects objects objectMap =
         objects
 
 confirmCandidates ::
-    (Monad m) =>
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
     ReachabilityGraph ->
     CaveatContext ->
     Consistency ->
     Subject ->
     RelationName ->
     Either EnError [LookupObject] ->
-    m (Either EnError [LookupObject])
-confirmCandidates _ _ _ _ _ _ _ (Left err) =
+    Eff es (Either EnError [LookupObject])
+confirmCandidates _ _ _ _ _ (Left err) =
     pure (Left err)
-confirmCandidates consistencyStore tupleStore graph context consistency subject relation (Right candidates) = do
+confirmCandidates graph context consistency subject relation (Right candidates) = do
     confirmed <-
         traverse
             ( \LookupObject{object} -> do
-                decision <- check consistencyStore tupleStore graph consistency context subject relation object
-                pure (LookupObject object <$> decision)
+                decision <- check graph consistency context subject relation object
+                pure (LookupObject object decision)
             )
             candidates
-    pure (mergeLookupObjects . filterAllowed <$> sequence confirmed)
+    pure (Right (mergeLookupObjects (filterAllowed confirmed)))
 
 readRowsForSubjects ::
-    (Monad m) =>
-    TupleStore m ->
+    (TupleStore :> es) =>
     Revision ->
     ObjectType ->
     RelationName ->
     [Subject] ->
-    m (Either EnError [TupleRow])
-readRowsForSubjects _ _ _ _ [] =
+    Eff es (Either EnError [TupleRow])
+readRowsForSubjects _ _ _ [] =
     pure (Right [])
-readRowsForSubjects tupleStore revision objectType relation subjects =
+readRowsForSubjects revision objectType relation subjects =
     drain Nothing []
   where
     drain cursor acc = do
         page <-
-            tupleStore.readStartingWithUser
+            readStartingWithUser
                 revision
                 UsersetQuery
                     { queryType = objectType

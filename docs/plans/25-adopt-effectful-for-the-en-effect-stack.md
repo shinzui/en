@@ -69,7 +69,7 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] **M1 — en-core effects + engine + in-memory interpreter.** Add `effectful`/`effectful-core` deps; reformulate `TupleStore`/`ConsistencyStore` as `effectful` effects; migrate `Check` (incl. `checkMany`), `Lookup`, and `Expand` to `Eff es` with `Error EnError`; reformulate `En.Conformance.Kikan`'s `inMemoryTupleStore`/`consistencyStore` into in-memory *interpreters*; port the three en-core engine-consuming targets (`en-core-interface-tests`, `en-core-conformance`, `en-core-bench`); `cabal test en-core` and the `en-core-bench` gate green.
+- [x] **M1 — en-core effects + engine + in-memory interpreter.** Completed 2026-06-23T23:17:43Z. Added `effectful`/`effectful-core` deps; reformulated `TupleStore`/`ConsistencyStore` as `effectful` effects; migrated `Check` (incl. `checkMany`), `Lookup`, and `Expand` to `Eff`; reformulated `En.Conformance.Kikan`'s `inMemoryTupleStore`/`consistencyStore` into in-memory interpreters; ported `en-core-interface-tests`, `en-core-conformance`, and `en-core-bench`; `cabal build en-core`, `cabal test en-core`, and `cabal bench en-core` are green.
 - [ ] **M2 — en-postgres interpreters.** Add a `Database` effect (hasql); replace the record constructors with `runTupleStorePostgres` / `runConsistencyStorePostgres`; `cabal test en-postgres` green. (`en-postgres-bench` is pure snapshot-codec benchmarking — confirm it still builds; no engine/store changes needed there.)
 - [ ] **M3 — en-servant seam + en-example host.** Replace IO-store record fields with an `Eff`→`Handler` seam (`AppEffects`, `Env`, `runEngine`); migrate all handlers including the `/batch-check` (`checkMany`) handler; migrate the `en-example` package (`AuthorizationEnv`, `failingConsistencyStore`, the resolver-style `check` gate) and its test; `cabal build en-servant en-example` and `cabal test en-servant en-example` green.
 - [ ] **M4 — en-server assembly.** Compose `runAppIO` in `en-server/app/Main.hs`; server boots; end-to-end `check` over HTTP returns the expected decision.
@@ -81,7 +81,32 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- Discovery: The shomei reference paths in this plan use a stale `packages/...` prefix. Mori reports the project at `/Users/shinzui/Keikaku/bokuno/shomei`, and the actual reference modules are under `shomei-core/src`, `shomei-postgres/src`, `shomei-servant/src`, and `shomei-server/src`.
+  Evidence:
+
+  ```text
+  /Users/shinzui/Keikaku/bokuno/shomei/shomei-core/src/Shomei/Effect/UserStore.hs
+  /Users/shinzui/Keikaku/bokuno/shomei/shomei-postgres/src/Shomei/Postgres/Database.hs
+  /Users/shinzui/Keikaku/bokuno/shomei/shomei-servant/src/Shomei/Servant/Seam.hs
+  /Users/shinzui/Keikaku/bokuno/shomei/shomei-server/src/Shomei/Server/App.hs
+  ```
+
+- Discovery: M1's effectful conversion did not require re-recording the en-core benchmark baseline. The existing `en-core/bench/baseline.csv` gate still passed after wrapping the engine in the in-memory interpreters.
+  Evidence:
+
+  ```text
+  Benchmark en-core-bench: RUNNING...
+  All
+    check
+      shallow-owner:    OK
+      nested-parent:    OK
+    checkMany
+      overlapping:      OK
+    lookup
+      reachable-spaces: OK
+
+  All 4 tests passed
+  ```
 
 
 ## Decision Log
@@ -163,13 +188,46 @@ Record every decision made while working on the plan.
   reflect the engine surface and package set that now exist.
   Date: 2026-06-23
 
+- Decision: Preserve `checkMany`'s fail-closed per-pair semantics by keeping the internal check
+  evaluator as `Eff es (Either EnError CheckDecision)` and only throwing via `Error EnError` at the
+  public single-`check`, `lookup`, and `expand` boundaries. The public `checkMany` signature does
+  not carry a redundant `Error EnError` constraint because it resolves consistency through the
+  `ConsistencyStore` effect and converts post-resolution evaluator errors to `Denied`.
+  Rationale: The pre-migration `checkMany` documented that errors after consistency resolution
+  fail closed for only that pair. Throwing every pure evaluator `Left` through `Error EnError`
+  would abort the entire batch and change behavior. Removing the redundant constraint also keeps
+  the package clean under `-Wredundant-constraints`.
+  Date: 2026-06-23
+
+- Decision: Keep `En.Conformance.Kikan`'s pure interpreters free of an `Error EnError` constraint.
+  Rationale: The in-memory fixture reproduces the old record behavior without throwing; retaining
+  an unused error constraint produced `-Wredundant-constraints` warnings. Fault-injection behavior
+  remains in test-local interpreters where it is needed.
+  Date: 2026-06-23
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+- M1 completed on 2026-06-23T23:17:43Z. en-core now exposes `TupleStore` and `ConsistencyStore` as
+  dynamic `effectful` effects, and `check`, `checkMany`, `lookup`, and `expand` run through
+  interpreters instead of record-of-functions arguments. The Kikan fixture now exports
+  `runTupleStoreInMemory` and `runConsistencyStoreInMemory`, and the interface tests,
+  conformance suite, and benchmark target all exercise the effectful stack.
+
+  Validation:
+
+  ```text
+  cabal build en-core
+  cabal test en-core
+  cabal bench en-core
+  ```
+
+  All three commands succeeded. `cabal test en-core` reported both `en-core-conformance` and
+  `en-core-interface-tests` as `PASS`; `cabal bench en-core` reported all four benchmark checks as
+  `OK`.
 
 
 ## Context and Orientation

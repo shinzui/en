@@ -1,3 +1,7 @@
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeFamilies #-}
+
 {- | Consistency resolution boundary.
 
 Storage implementations decode tokens, validate datastore/schema identity,
@@ -9,11 +13,15 @@ module En.Effect.ConsistencyStore (
     TokenMetadata (..),
     ResolvedConsistency (..),
     ConsistencyStore (..),
+    decodeToken,
+    validateToken,
+    resolveConsistency,
 ) where
 
 import Data.Time (UTCTime)
+import Effectful (Dispatch (..), DispatchOf, Eff, Effect, (:>))
+import Effectful.Dispatch.Dynamic (send)
 
-import En.Error (EnError)
 import En.Revision (
     Consistency,
     ConsistencyToken,
@@ -39,8 +47,21 @@ data ResolvedConsistency = ResolvedConsistency
     }
     deriving stock (Eq, Show)
 
-data ConsistencyStore m = ConsistencyStore
-    { decodeToken :: ConsistencyToken -> m (Either EnError TokenMetadata)
-    , validateToken :: TokenMetadata -> m (Either EnError ())
-    , resolveConsistency :: Consistency -> m (Either EnError ResolvedConsistency)
-    }
+data ConsistencyStore :: Effect where
+    DecodeToken :: ConsistencyToken -> ConsistencyStore m TokenMetadata
+    ValidateToken :: TokenMetadata -> ConsistencyStore m ()
+    ResolveConsistency :: Consistency -> ConsistencyStore m ResolvedConsistency
+
+type instance DispatchOf ConsistencyStore = Dynamic
+
+decodeToken :: (ConsistencyStore :> es) => ConsistencyToken -> Eff es TokenMetadata
+decodeToken =
+    send . DecodeToken
+
+validateToken :: (ConsistencyStore :> es) => TokenMetadata -> Eff es ()
+validateToken =
+    send . ValidateToken
+
+resolveConsistency :: (ConsistencyStore :> es) => Consistency -> Eff es ResolvedConsistency
+resolveConsistency =
+    send . ResolveConsistency

@@ -1,17 +1,25 @@
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE RankNTypes #-}
+
 module Main (
     main,
 ) where
 
+import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.List (sort)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Effectful (Eff, IOE, liftIO, runEff)
+import Effectful.Dispatch.Dynamic (interpret_)
+import Effectful.Error.Static (Error, runErrorNoCallStack)
 
-import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..), check, checkMany)
+import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..))
+import En.Check qualified as Check
 import En.Conformance.Kikan
-import En.Effect.ConsistencyStore (ConsistencyStore (..))
+import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
 import En.Effect.TupleStore (
     PageState (..),
     StoreCursor (..),
@@ -47,7 +55,7 @@ import En.Reachability (
     compile,
  )
 import En.Reachability qualified as Reachability
-import En.Revision (Consistency (..), Revision (..))
+import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (
     AllowedSubject (..),
     CaveatCompare (..),
@@ -140,7 +148,8 @@ main = do
     assertEqual "overlapping batch returns decisions" (Right [Allowed, Allowed, Denied]) =<< checkMany consistencyStore (countingTupleStore batchReadCount tupleStore) graph MinimizeLatency requestContext overlappingBatch
     batchReads <- readIORef batchReadCount
     independentReadCount <- newIORef 0
-    let independentStore = countingTupleStore independentReadCount tupleStore
+    let independentStore :: TupleInterpreter
+        independentStore = countingTupleStore independentReadCount tupleStore
     independentResults <-
         traverse
             ( \pair ->
@@ -162,52 +171,52 @@ main = do
     assertEqual "delegation caveat is conditional with missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}])) =<< check consistencyStore tupleStore graph MinimizeLatency missingAutonomyContext (SubjectId user) (RelationName "view") intention
     assertEqual "expired delegation caveat denies access" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency expiredContext (SubjectId user) (RelationName "view") intention
     minLevelGraph <- either (fail . show) pure (compile minLevelSchema)
-    let minLevelStore = inMemoryTupleStore [minLevelTuple]
+    let minLevelStore = runTupleStoreInMemory [minLevelTuple]
     assertEqual "generic integer caveat allows sufficient clearance" (Right Allowed) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelAllowedContext (SubjectId user) (RelationName "view") minLevelDocument
     assertEqual "generic integer caveat denies insufficient clearance" (Right Denied) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelDeniedContext (SubjectId user) (RelationName "view") minLevelDocument
     assertEqual "generic integer caveat reports missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "min_level", missingContext = ["clearance"]}])) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency (CaveatContext Map.empty) (SubjectId user) (RelationName "view") minLevelDocument
     let cursorState = LookupCursorState{version = 1, revision = testRevision, lastObject = Just childSpace}
     assertEqual "lookup cursor codec round-trips" (Right cursorState) (decodeLookupCursor (encodeLookupCursor cursorState))
     publicGraph <- either (fail . show) pure (compile publicSchema)
-    let publicStore = inMemoryTupleStore [publicTuple]
+    let publicStore = runTupleStoreInMemory [publicTuple]
     assertBool "public view has a wildcard user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing True) Reachability.Direct False publicGraph)
     assertEqual "wildcard subject grants concrete users" (Right Allowed) =<< check consistencyStore publicStore publicGraph MinimizeLatency requestContext (SubjectId bob) (RelationName "view") publicSpace
     assertEqual "wildcard subject does not match userset subjects" (Right Denied) =<< check consistencyStore publicStore publicGraph MinimizeLatency requestContext (SubjectSet guestOrg (RelationName "member")) (RelationName "view") publicSpace
-    assertEqual "lookup includes public wildcard rows for concrete users" (Right (lookupPage [allowed publicSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore publicStore publicGraph MinimizeLatency (lookupRequest (SubjectId bob) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
-    publicExpansion <- Expand.expand consistencyStore publicStore publicGraph MinimizeLatency (expandRequest publicSpace (RelationName "view") requestContext (ExpandLimit 20) Nothing)
+    assertEqual "lookup includes public wildcard rows for concrete users" (Right (lookupPage [allowed publicSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore publicStore publicGraph MinimizeLatency (lookupRequest (SubjectId bob) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    publicExpansion <- expandEngine consistencyStore publicStore publicGraph MinimizeLatency (expandRequest publicSpace (RelationName "view") requestContext (ExpandLimit 20) Nothing)
     assertBool "expand renders wildcard subjects" (treeHasSubject (SubjectWildcard (ObjectType "user")) publicExpansion)
     streamingGraph <- either (fail . show) pure (compile streamingSchema)
-    let streamingStore = inMemoryTupleStore streamingTuples
+    let streamingStore = runTupleStoreInMemory streamingTuples
         expectedFolders = allowed <$> sort folders
     streamedFolders <- collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
     assertLookupObjects "streaming lookup returns every reachable folder across pages" expectedFolders streamedFolders
     assertLookupObjects "streaming lookup returns the same set with small pages" expectedFolders =<< collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 100) Nothing)
     truncatedDeadlineRef <- newIORef 0
-    truncatedPage <- Lookup.lookupWithDeadline (budgetedDeadline truncatedDeadlineRef) consistencyStore streamingStore streamingGraph MinimizeLatency (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
+    truncatedPage <- lookupEngine (budgetedDeadline truncatedDeadlineRef) consistencyStore streamingStore streamingGraph MinimizeLatency (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
     truncatedCursor <- expectLookupTruncated "deadline-bounded lookup truncates with a cursor" truncatedPage
     resumedFolders <- collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) (Just truncatedCursor))
     assertLookupObjects "deadline cursor resumes remaining lookup results" (drop 500 expectedFolders) resumedFolders
-    crowdedExpansion <- Expand.expand consistencyStore (inMemoryTupleStore expandTuples) streamingGraph MinimizeLatency (expandRequest crowdedFolder (RelationName "viewer") requestContext (ExpandLimit 1500) Nothing)
+    crowdedExpansion <- expandEngine consistencyStore (runTupleStoreInMemory expandTuples) streamingGraph MinimizeLatency (expandRequest crowdedFolder (RelationName "viewer") requestContext (ExpandLimit 1500) Nothing)
     assertEqual "expand drains multi-page object rows before applying result cap" (Right (1000, ExpandTruncated (ExpandCursor "1000"))) (fmap (\tree -> (length tree.children, tree.state)) crowdedExpansion)
     assertEqual "recursive graph respects depth limit" (Left ResolutionLimitExceeded) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
-    assertEqual "lookup returns direct and recursive view spaces" (Right (lookupPage [allowed childSpace, allowed space] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
-    assertEqual "lookup follows userset subjects" (Right (lookupPage [allowed guestSpace, allowed sharedItem, allowed usersetMemberSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId agencyUser) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
-    assertEqual "lookup confirms intersection candidates" (Right (lookupPage [allowed auditedSpace, allowed exclusionSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOwner) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
-    assertEqual "lookup omits denied intersection candidates" (Right (lookupPage [] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOnly) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
-    assertEqual "lookup confirms exclusion candidates" (Right (lookupPage [allowed exclusionSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOnly) (RelationName "member_not_owner") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
-    assertEqual "lookup preserves caveat obligations" (Right (lookupPage [conditional intention [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}]] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "intention") missingAutonomyContext (LookupLimit 10) Nothing)
+    assertEqual "lookup returns direct and recursive view spaces" (Right (lookupPage [allowed childSpace, allowed space] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    assertEqual "lookup follows userset subjects" (Right (lookupPage [allowed guestSpace, allowed sharedItem, allowed usersetMemberSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId agencyUser) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    assertEqual "lookup confirms intersection candidates" (Right (lookupPage [allowed auditedSpace, allowed exclusionSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOwner) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    assertEqual "lookup omits denied intersection candidates" (Right (lookupPage [] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOnly) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    assertEqual "lookup confirms exclusion candidates" (Right (lookupPage [allowed exclusionSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOnly) (RelationName "member_not_owner") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    assertEqual "lookup preserves caveat obligations" (Right (lookupPage [conditional intention [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}]] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "intention") missingAutonomyContext (LookupLimit 10) Nothing)
     let childCursor = encodeLookupCursor LookupCursorState{version = 1, revision = testRevision, lastObject = Just childSpace}
-    assertEqual "lookup paginates deterministically first page" (Right (lookupPage [allowed childSpace] (LookupHasMore childCursor))) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) Nothing)
-    assertEqual "lookup paginates deterministically second page" (Right (lookupPage [allowed space] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) (Just childCursor))
-    spaceExpansion <- Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest space (RelationName "view") requestContext (ExpandLimit 20) Nothing)
+    assertEqual "lookup paginates deterministically first page" (Right (lookupPage [allowed childSpace] (LookupHasMore childCursor))) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) Nothing)
+    assertEqual "lookup paginates deterministically second page" (Right (lookupPage [allowed space] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) (Just childCursor))
+    spaceExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest space (RelationName "view") requestContext (ExpandLimit 20) Nothing)
     assertBool "expand includes direct owner subject" (treeHasSubject (SubjectId user) spaceExpansion)
-    childExpansion <- Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest childSpace (RelationName "view") requestContext (ExpandLimit 20) Nothing)
+    childExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest childSpace (RelationName "view") requestContext (ExpandLimit 20) Nothing)
     assertBool "expand includes parent userset" (treeHasUserset space (RelationName "view") childExpansion)
-    usersetExpansion <- Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest usersetMemberSpace (RelationName "member") requestContext (ExpandLimit 20) Nothing)
+    usersetExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest usersetMemberSpace (RelationName "member") requestContext (ExpandLimit 20) Nothing)
     assertBool "expand expands userset subjects" (treeHasSubject (SubjectId agencyUser) usersetExpansion)
-    intentionExpansion <- Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest intention (RelationName "view") requestContext (ExpandLimit 20) Nothing)
+    intentionExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest intention (RelationName "view") requestContext (ExpandLimit 20) Nothing)
     assertBool "expand includes caveat markers" (treeHasCaveat (CaveatName "within_autonomy") intentionExpansion)
-    assertEqual "expand paginates top-level children" (Right (ExpandHasMore (ExpandCursor "1"))) =<< fmap (fmap expandState) (Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest auditedSpace (RelationName "audit") requestContext (ExpandLimit 1) Nothing))
+    assertEqual "expand paginates top-level children" (Right (ExpandHasMore (ExpandCursor "1"))) =<< fmap (fmap expandState) (expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest auditedSpace (RelationName "audit") requestContext (ExpandLimit 1) Nothing))
     pure ()
 
 sampleTuple :: Tuple
@@ -321,15 +330,72 @@ lookupPage :: [LookupObject] -> LookupState -> LookupPage
 lookupPage objects state =
     LookupPage{objects, state}
 
+type TestEffects = '[ConsistencyStore, TupleStore, Error EnError, IOE]
+
+type ConsistencyInterpreter =
+    forall a. Eff TestEffects a -> Eff '[TupleStore, Error EnError, IOE] a
+
+type TupleInterpreter =
+    forall a. Eff '[TupleStore, Error EnError, IOE] a -> Eff '[Error EnError, IOE] a
+
+runEngine :: ConsistencyInterpreter -> TupleInterpreter -> Eff TestEffects a -> IO (Either EnError a)
+runEngine cStore tStore action =
+    runEff (runErrorNoCallStack (tStore (cStore action)))
+
+check ::
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    ReachabilityGraph ->
+    Consistency ->
+    CaveatContext ->
+    Subject ->
+    RelationName ->
+    ObjectRef ->
+    IO (Either EnError CheckDecision)
+check cStore tStore graph consistency context subject relation object =
+    runEngine cStore tStore (Check.check graph consistency context subject relation object)
+
+checkMany ::
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    ReachabilityGraph ->
+    Consistency ->
+    CaveatContext ->
+    [BatchPair] ->
+    IO (Either EnError [CheckDecision])
+checkMany cStore tStore graph consistency context pairs =
+    runEngine cStore tStore (Check.checkMany graph consistency context pairs)
+
+lookupEngine ::
+    Deadline (Eff TestEffects) ->
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    ReachabilityGraph ->
+    Consistency ->
+    LookupRequest ->
+    IO (Either EnError LookupPage)
+lookupEngine deadline cStore tStore graph consistency request =
+    runEngine cStore tStore (Lookup.lookupWithDeadline deadline graph consistency request)
+
+expandEngine ::
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    ReachabilityGraph ->
+    Consistency ->
+    ExpandRequest ->
+    IO (Either EnError ExpandTree)
+expandEngine cStore tStore graph consistency request =
+    runEngine cStore tStore (Expand.expand graph consistency request)
+
 collectAllLookupPages ::
-    Deadline IO ->
-    ConsistencyStore IO ->
-    TupleStore IO ->
+    Deadline (Eff TestEffects) ->
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
     ReachabilityGraph ->
     LookupRequest ->
     IO [LookupObject]
 collectAllLookupPages deadline cStore tStore graph request = do
-    page <- Lookup.lookupWithDeadline deadline cStore tStore graph MinimizeLatency request
+    page <- lookupEngine deadline cStore tStore graph MinimizeLatency request
     case page of
         Left err -> fail ("lookup failed while collecting pages: " <> show err)
         Right LookupPage{objects, state} ->
@@ -353,15 +419,16 @@ requestWithCursor request cursor =
         , cursor = Just cursor
         }
 
-budgetedDeadline :: IORef Int -> Deadline IO
+budgetedDeadline :: IORef Int -> Deadline (Eff TestEffects)
 budgetedDeadline ref =
     Deadline $
-        atomicModifyIORef'
-            ref
-            ( \remaining ->
-                let hasBudget = remaining > 0
-                 in (remaining - 1, hasBudget)
-            )
+        liftIO $
+            atomicModifyIORef'
+                ref
+                ( \remaining ->
+                    let hasBudget = remaining > 0
+                     in (remaining - 1, hasBudget)
+                )
 
 expectLookupTruncated :: String -> Either EnError LookupPage -> IO LookupCursor
 expectLookupTruncated label =
@@ -641,13 +708,13 @@ hasEntry target source kind recursive graph =
         )
         (Map.findWithDefault [] target graph.entries)
 
-tupleStore :: TupleStore IO
+tupleStore :: TupleInterpreter
 tupleStore =
-    inMemoryTupleStore fixtureTuples
+    runTupleStoreInMemory fixtureTuples
 
-recursiveTupleStore :: TupleStore IO
+recursiveTupleStore :: TupleInterpreter
 recursiveTupleStore =
-    inMemoryTupleStore
+    runTupleStoreInMemory
         [ Tuple
             { object = recursiveSpace
             , relation = RelationName "parent"
@@ -656,33 +723,65 @@ recursiveTupleStore =
             }
         ]
 
-countingConsistencyStore :: IORef Int -> ConsistencyStore IO -> ConsistencyStore IO
-countingConsistencyStore count store =
-    store
-        { resolveConsistency = \consistency -> do
-            modifyIORef' count (+ 1)
-            store.resolveConsistency consistency
-        }
+consistencyStore :: ConsistencyInterpreter
+consistencyStore =
+    runConsistencyStoreInMemory
 
-countingTupleStore :: IORef Int -> TupleStore IO -> TupleStore IO
-countingTupleStore count store =
-    store
-        { readObjectRelation = \revision object relation limit cursor -> do
-            modifyIORef' count (+ 1)
-            store.readObjectRelation revision object relation limit cursor
-        , readStartingWithUser = \revision query -> do
-            modifyIORef' count (+ 1)
-            store.readStartingWithUser revision query
-        }
+countingConsistencyStore :: IORef Int -> ConsistencyInterpreter -> ConsistencyInterpreter
+countingConsistencyStore count _ =
+    interpret_ \case
+        DecodeToken token ->
+            pure (TokenMetadata token testRevision (DatastoreId "test") (SchemaHash "schema") Nothing)
+        ValidateToken _ ->
+            pure ()
+        ResolveConsistency consistency -> do
+            liftIO (modifyIORef' count (+ 1))
+            pure ResolvedConsistency{consistency, revision = testRevision}
 
-erroringTupleStore :: ObjectRef -> TupleStore IO -> TupleStore IO
-erroringTupleStore badObject store =
-    store
-        { readObjectRelation = \revision object relation limit cursor ->
-            if object == badObject
+countingTupleStore :: IORef Int -> TupleInterpreter -> TupleInterpreter
+countingTupleStore count _ =
+    interpretFixtureTupleStore (Just count) Nothing fixtureTuples
+
+erroringTupleStore :: ObjectRef -> TupleInterpreter -> TupleInterpreter
+erroringTupleStore badObject _ =
+    interpretFixtureTupleStore Nothing (Just badObject) fixtureTuples
+
+interpretFixtureTupleStore :: Maybe (IORef Int) -> Maybe ObjectRef -> [Tuple] -> TupleInterpreter
+interpretFixtureTupleStore countRef errorObject tuples =
+    interpret_ \case
+        ReadObjectRelation _ object relation limit cursor -> do
+            countRead
+            if Just object == errorObject
                 then pure TuplePage{rows = [], state = HasMore (StoreCursor "injected-error")}
-                else store.readObjectRelation revision object relation limit cursor
-        }
+                else pure (pageTuples limit cursor [tuple | tuple <- tuples, tuple.object == object, tuple.relation == relation])
+        ReadStartingWithUser _ query -> do
+            countRead
+            pure
+                ( pageTuples
+                    query.queryLimit
+                    query.queryCursor
+                    [ tuple
+                    | tuple <- tuples
+                    , tuple.object.objectType == query.queryType
+                    , tuple.relation == query.queryRelation
+                    , tuple.subject `elem` query.querySubjects
+                    ]
+                )
+        WriteTuples _ ->
+            pure (ConsistencyToken "in-memory-write")
+        DeleteTuples _ ->
+            pure (ConsistencyToken "in-memory-delete")
+        HeadRevision ->
+            pure testRevision
+        OptimizedRevision ->
+            pure testRevision
+        OldestRetainedXid ->
+            pure 0
+        ReapDeletedTuples _ ->
+            pure 0
+  where
+    countRead =
+        traverse_ (\ref -> liftIO (modifyIORef' ref (+ 1))) countRef
 
 minLevelSchema :: Schema
 minLevelSchema =
