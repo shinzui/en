@@ -3,20 +3,23 @@ module Main (main) where
 import Control.Exception (bracket)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
-import Data.Time (getCurrentTime)
+import Effectful (Eff, runEff)
+import Effectful.Error.Static (runErrorNoCallStack)
 import Network.Wai.Handler.Warp qualified as Warp
 import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
 
-import En.Effect.TupleStore (TupleStore (..))
+import En.Error (EnError)
 import En.Migrations (migrationsDir)
-import En.Postgres.Revision (ConsistencyConfig (..), postgresConsistencyStore)
-import En.Postgres.TupleStore (postgresTupleStoreIO)
+import En.Postgres.Database (runDatabaseConnection)
+import En.Postgres.Revision (ConsistencyConfig (..), runConsistencyStorePostgres)
+import En.Postgres.TupleStore (runTupleStorePostgres)
 import En.Reachability (compile)
 import En.Revision (DatastoreId (..))
 import En.Schema (Schema, schemaHash)
 import En.Schema.Builder qualified as Schema
-import En.Servant.API (EnServer (..), app)
+import En.Servant.API (app)
+import En.Servant.Seam (AppEffects, Env (..))
 import Hasql.Connection qualified as Connection
 import Hasql.Connection.Settings qualified as Settings
 
@@ -42,13 +45,16 @@ main = do
                 , schemaHash = schemaHash demoSchema
                 , gcWindow = gcWindow
                 }
-        tupleStore = postgresTupleStoreIO connection config
-        consistencyStore =
-            postgresConsistencyStore config getCurrentTime tupleStore.optimizedRevision tupleStore.headRevision tupleStore.oldestRetainedXid
+        runAppIO :: Eff AppEffects a -> IO (Either EnError a)
+        runAppIO =
+            runEff
+                . runDatabaseConnection connection
+                . runErrorNoCallStack
+                . runTupleStorePostgres config
+                . runConsistencyStorePostgres config
         serverEnv =
-            EnServer
-                { consistencyStore
-                , tupleStore
+            Env
+                { runPorts = runAppIO
                 , graph
                 , maxBatchSize = 1000
                 }
