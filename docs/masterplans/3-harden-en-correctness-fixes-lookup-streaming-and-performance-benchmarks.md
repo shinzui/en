@@ -80,7 +80,7 @@ each independently verifiable.
 | EP-15 | Generalize the caveat evaluator and unify the decision algebra | docs/plans/15-generalize-the-caveat-evaluator-and-unify-the-decision-algebra.md | None | None | Complete |
 | EP-16 | Make lookup streaming with resumable cursors and a deadline budget | docs/plans/16-make-lookup-streaming-with-resumable-cursors-and-a-deadline-budget.md | None | EP-15 | Complete |
 | EP-17 | Strengthen the lookup spike and add performance-regression benchmarks | docs/plans/17-strengthen-the-lookup-spike-and-add-performance-regression-benchmarks.md | None | EP-14, EP-15, EP-16 | Complete |
-| EP-18 | Conformance: a guarded route example and the kikan agency proof | docs/plans/18-conformance-a-guarded-route-example-and-the-kikan-agency-proof.md | None | EP-15, EP-16 | Not Started |
+| EP-18 | Conformance: a guarded route example and the kikan agency proof | docs/plans/18-conformance-a-guarded-route-example-and-the-kikan-agency-proof.md | None | EP-15, EP-16 | Complete |
 | EP-19 | Add BatchCheck for GraphQL field-capability and candidate filtering | docs/plans/19-add-batchcheck-for-graphql-field-capability-and-candidate-filtering.md | None | EP-15 | Not Started |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
@@ -190,9 +190,9 @@ GraphQL-field workload.
 - [x] EP-16: Prove a `lookup` that spans multiple storage pages returns complete, correctly-cursored results without erroring.
 - [x] EP-17: Fix the spike so the intersection/exclusion variant actually traverses an exclusion; run the 10,000,000-row sweep; widen percentile sampling; add a large-reachable-set subject case.
 - [x] EP-17: Add a `tasty-bench` suite for `check`/`lookup`/consistency with recorded baselines and a CI regression gate.
-- [ ] EP-18: Wire `requirePermission` into a real guarded route with a test proving fail-closed behavior (deny, conditional, and engine-error all 403/500).
-- [ ] EP-18: Encode the kikan schema and prove the agency cross-org sharing scenario (guest org sees a subset; sensitive items hidden) end to end.
-- [ ] EP-18: Add a GraphQL-resolver-style guarded example (the `en-client`-driven object gate inside a resolver) alongside the Servant `requirePermission` route, mirroring `docs/user/graphql-integration.md`.
+- [x] EP-18: Wire `requirePermission` into a real guarded route with a test proving fail-closed behavior (deny, conditional, and engine-error all 403/500).
+- [x] EP-18: Encode the kikan schema and prove the agency cross-org sharing scenario (guest org sees a subset; sensitive items hidden) end to end.
+- [x] EP-18: Add a GraphQL-resolver-style guarded example (the `en-client`-driven object gate inside a resolver) alongside the Servant `requirePermission` route, mirroring `docs/user/graphql-integration.md`.
 - [ ] EP-19: Add a `BatchCheck` engine operation (many pairs, one resolved revision, shared subproblem memo, bounded concurrency, order-preserving, fail-closed per pair) plus an `en-servant` batch endpoint with a max-batch-size and an `en-client` method.
 - [ ] EP-19: Prove a batch of overlapping checks returns correct per-pair three-valued decisions and shares subproblem work versus N single calls (and benchmark it under EP-17).
 
@@ -227,6 +227,11 @@ GraphQL-field workload.
 - EP-17 fixed the lookup spike's exclusion shape, ran the 10M sweep, and added split
   `tasty-bench` gates for `en-core` and `en-postgres`. The 10M large-reachable case was red for the
   read-path bar, confirming reachable-label smallness is a load-bearing assumption. _(2026-06-23)_
+- EP-18 extracted the private kikan fixture into `En.Conformance.Kikan`, added the
+  `en-example` host package, and proved both the Servant guarded route and GraphQL-resolver-shaped
+  object gate fail closed. The agency conformance proof uses a C13-focused tuple subset so the guest
+  `lookup` label-set is exactly `{guestSpace, sharedItem}` and excludes internal spaces.
+  _(2026-06-23)_
 
 
 ## Decision Log
@@ -274,10 +279,19 @@ GraphQL-field workload.
   comparator correction and the write-token fallback in its living sections.
   Date: 2026-06-23
 
+- Decision: Mark EP-18 complete after landing the guarded-route example and kikan conformance
+  fixture.
+  Rationale: `en-example` proves `requirePermission` maps allowed/denied/conditional/engine-error
+  outcomes to the intended fail-closed behavior, the resolver-shaped gate mirrors the GraphQL
+  integration pattern, and `en-core-conformance` proves the agency shared-vs-internal and lookup
+  read-filter behavior against the post-EP-15/EP-16 engine.
+  Date: 2026-06-23
+
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+EP-14 through EP-18 are complete. The remaining work in this MasterPlan is EP-19, the BatchCheck
+surface for GraphQL field-capability and candidate-filtering workloads.
 
 
 ---

@@ -66,20 +66,20 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Add an example host service with one route guarded by `requirePermission`, and a test
+- [x] M1: Add an example host service with one route guarded by `requirePermission`, and a test
       suite proving all four outcomes (Allowed → 200, Denied → 403, Conditional → 403,
       engine-error → 500).
-- [ ] M1: Add a GraphQL-resolver-style guarded variant — an `AuthorizationEnv`-driven object gate
+- [x] M1: Add a GraphQL-resolver-style guarded variant — an `AuthorizationEnv`-driven object gate
       inside a resolver-shaped function — alongside the Servant route, proving the same four
       fail-closed outcomes, mirroring `docs/user/graphql-integration.md`.
-- [ ] M2: Extract the kikan schema and tuple fixtures into a reusable module
+- [x] M2: Extract the kikan schema and tuple fixtures into a reusable module
       (`En.Conformance.Kikan`), extend it with shared-vs-internal visibility tiers, and add a
       `check`-based agency conformance test (guest views shared item; guest cannot view internal
       item; guest cannot act).
-- [ ] M3: Add a `lookup`-based agency conformance test proving the reachable label-set for a
+- [x] M3: Add a `lookup`-based agency conformance test proving the reachable label-set for a
       guest is exactly the shared subset (and excludes internal spaces) — the §6 read-filter
       shape.
-- [ ] Finalize against EP-15 (generic caveat evaluator) and EP-16 (streaming lookup) once those
+- [x] Finalize against EP-15 (generic caveat evaluator) and EP-16 (streaming lookup) once those
       land; record the reconciliation in the Decision Log.
 
 
@@ -104,6 +104,14 @@ implementation. Provide concise evidence.
   can call `requirePermission` directly and assert on `errHTTPCode`, with no `warp`/HTTP-client
   dependency. (A separate, optional end-to-end transcript via a real server is described for
   human demonstration, but the automated proof uses `runHandler`.) _(2026-06-23)_
+
+- **The original engine fixture includes a synthetic userset-membership space that is useful for
+  engine coverage but not part of the C13 agency grant.** `fixtureTuples` still contains
+  `usersetMemberSpace` so the existing interface test continues to prove userset subjects. The
+  new conformance suite uses `agencyTuples`, a C13-focused subset that removes that synthetic
+  membership grant, so the guest's `act` lookup is empty and the `view` lookup is exactly
+  `{guestSpace, sharedItem}`. Evidence: `cabal test en-core` passes both
+  `en-core-interface-tests` and `en-core-conformance`. _(2026-06-23)_
 
 
 ## Decision Log
@@ -162,13 +170,33 @@ Record every decision made while working on the plan.
   by EP-19 (`docs/plans/19-add-batchcheck-for-graphql-field-capability-and-candidate-filtering.md`).
   Date: 2026-06-23
 
+- Decision: Keep `fixtureTuples` broad for engine interface coverage and add `agencyTuples` for the
+  C13 agency conformance proof.
+  Rationale: The old private fixture included `usersetMemberSpace` to prove `org#member` userset
+  expansion. Because `space.act` includes direct `member`, that synthetic tuple would make an agency
+  user able to `act` on that one engine-test space, which is not part of the real
+  guest-org-only agency scenario. Splitting the tuple sets preserves both proofs without weakening
+  either.
+  Date: 2026-06-23
+
+- Decision: EP-18 finalized after EP-15 and EP-16 rather than carrying compatibility shims.
+  Rationale: The conformance fixture uses EP-15's generic caveat evaluator for
+  `within_autonomy`, and the read-filter proof asserts EP-16's final `LookupPage`/
+  `LookupExhausted` contract. No plan-specific compatibility layer was needed.
+  Date: 2026-06-23
+
 
 ## Outcomes & Retrospective
 
-Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
-Compare the result against the original purpose.
+EP-18 added the `en-example` package with a real host route guarded by
+`requirePermission`, plus a resolver-shaped gate using the same `AuthorizationEnv`. The test suite
+proves `Allowed` succeeds, `Denied` and `Conditional` return HTTP 403 for the Servant route, and an
+engine failure returns HTTP 500; the resolver shape fails closed for the same four cases.
 
-(To be filled during and after implementation.)
+The kikan-shaped schema and in-memory fixture now live in exposed module
+`En.Conformance.Kikan`. The conformance suite proves the agency user can view the shared item, cannot
+view the internal item, cannot act under the guest grant, and that `lookup` returns exactly the
+bounded shared label-set for the C13 read-filter shape.
 
 
 ## Context and Orientation

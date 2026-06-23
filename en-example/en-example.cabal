@@ -1,0 +1,68 @@
+cabal-version: 3.0
+name:          en-example
+version:       0.1.0.0
+synopsis:      Example host application using en route guards
+description:
+  A tiny host service showing how a consuming application gates its own route
+  with en-servant's fail-closed requirePermission helper.
+
+license:       MIT
+author:        Nadeem Bitar
+maintainer:    nadeem@gmail.com
+category:      Security, Authorization, Web
+
+common warnings
+  ghc-options:
+    -Wall -Wcompat -Widentities -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+
+common shared
+  default-language:   GHC2024
+  default-extensions:
+    DataKinds
+    DeriveAnyClass
+    DeriveGeneric
+    DuplicateRecordFields
+    LambdaCase
+    NoFieldSelectors
+    OverloadedRecordDot
+    OverloadedStrings
+    TypeFamilies
+
+library
+  import:          warnings, shared
+  hs-source-dirs:  src
+  exposed-modules: En.Example.Host
+  build-depends:
+    , aeson
+    , base            >=4.19 && <5
+    , containers
+    , en-core
+    , en-servant
+    , servant
+    , servant-server
+    , text
+    , time
+
+executable en-example
+  import:         warnings, shared
+  hs-source-dirs: app
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , en-core
+    , en-example
+    , text
+    , warp
+
+test-suite en-example-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , en-core
+    , en-example
+    , servant
+    , servant-server

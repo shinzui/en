@@ -41,6 +41,7 @@ library
     En.Caveat
     En.Caveat.Value
     En.Check
+    En.Conformance.Kikan
     En.Decision
     En.Effect.ConsistencyStore
     En.Effect.TupleStore
@@ -73,6 +74,15 @@ test-suite en-core-interface-tests
     , en-core
     , text
     , time
+
+test-suite en-core-conformance
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: conformance
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , en-core
 
 benchmark en-core-bench
   import:         warnings, shared

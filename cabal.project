@@ -7,6 +7,7 @@ packages:
     en-servant
     en-server
     en-client
+    en-example
     /Users/shinzui/Keikaku/bokuno/ephemeral-pg-project/ephemeral-pg
 
 -- ============================================================
