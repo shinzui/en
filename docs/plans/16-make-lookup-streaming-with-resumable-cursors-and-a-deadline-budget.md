@@ -72,28 +72,28 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M0 (orientation, no code): re-read `En.Lookup`, `En.Check`, `En.Effect.TupleStore`,
+- [x] M0 (orientation, no code): re-read `En.Lookup`, `En.Check`, `En.Effect.TupleStore`,
   `En.Postgres.TupleStore`, `En.Servant.API`; confirm the symbols and line ranges this plan
-  cites still match the tree; record any drift in Surprises & Discoveries.
-- [ ] M1: add a failing acceptance test in `en-core/test/Main.hs` — a subject that reaches
+  cites still match the tree; record any drift in Surprises & Discoveries. Completed 2026-06-23.
+- [x] M1: add a failing acceptance test in `en-core/test/Main.hs` — a subject that reaches
   more than one storage page of candidates — and confirm it fails today with
-  `Left ResolutionLimitExceeded`.
-- [ ] M2: introduce the resumable cursor codec and the `Deadline` clock seam in `En.Lookup`;
-  keep behavior identical (still eager) so all existing tests stay green.
-- [ ] M3: replace `ensureExhausted` with a paging reader that drains storage pages; remove
+  `Left ResolutionLimitExceeded`. Completed 2026-06-23 with a 1,200-folder regression test.
+- [x] M2: introduce the resumable cursor codec and the `Deadline` clock seam in `En.Lookup`;
+  keep behavior identical (still eager) so all existing tests stay green. Completed 2026-06-23.
+- [x] M3: replace `ensureExhausted` with a paging reader that drains storage pages; remove
   the multi-page hard-fail; M1's acceptance test now passes for the no-cursor (single-call)
-  case.
-- [ ] M4: make the cursor genuinely resumable (continue the walk from the token) and prove
-  page-by-page continuation returns the same complete set as a single call.
-- [ ] M5: add the deadline budget; prove a tiny deadline yields `LookupTruncated` with a
-  usable continuation cursor and that resuming past it eventually completes.
-- [ ] M6: thread the deadline default/config and the resumable cursor through
+  case. Completed 2026-06-23.
+- [x] M4: make the cursor resumable with the pinned revision and last emitted object key; prove
+  page-by-page continuation returns the same complete set as a single call. Completed 2026-06-23.
+- [x] M5: add the deadline budget; prove a tiny deadline yields `LookupTruncated` with a
+  usable continuation cursor and that resuming past it eventually completes. Completed 2026-06-23.
+- [x] M6: thread the deadline default/config and the resumable cursor through
   `en-servant` (`lookupHandler`, `LookupStateWire`); add an `en-postgres` integration test
-  that exercises real multi-page storage paging (or document why it is deferred to EP-17).
-- [ ] M7: decide Expand's scope — apply the same paging treatment to `En.Expand` or scope out
-  with a Decision Log entry; reconcile the `En.Decision` soft dependency on EP-15.
-- [ ] Final: update Outcomes & Retrospective; run `cabal build all` and `cabal test all`
-  green; note cross-plan inconsistencies.
+  that exercises real multi-page storage paging. Completed 2026-06-23.
+- [x] M7: decide Expand's scope — apply the same paging treatment to `En.Expand`; reconcile
+  the `En.Decision` soft dependency on EP-15. Completed 2026-06-23.
+- [x] Final: update Outcomes & Retrospective; run `cabal build all` and `cabal test all`
+  green; note cross-plan inconsistencies. Completed 2026-06-23.
 
 
 ## Surprises & Discoveries
@@ -121,10 +121,15 @@ implementation. Provide concise evidence.
   it here. _(2026-06-23)_
 
 - EP-15 (`docs/plans/15-generalize-the-caveat-evaluator-and-unify-the-decision-algebra.md`)
-  is, at the time of writing this plan, **still a skeleton** — the `En.Decision` module it is
-  meant to extract does not exist yet. So `lookup`'s reach-then-check confirmation will
-  continue to call `En.Check.check` directly during this plan. See Decision Log
-  "En.Decision dependency". _(2026-06-23)_
+  landed before this plan ran. `En.Decision` exists, and `En.Lookup` already delegates
+  decision combination through it where it computes lookup decisions. `confirmCandidates`
+  still calls `En.Check.check` because reach-then-check needs the full forward evaluator,
+  not only the algebra helpers. _(2026-06-23)_
+
+- The in-memory test store's `StoreCursor` semantics were off by one for multi-page reads: it
+  returned the next row index while resume used `drop cursor`, skipping that row. PostgreSQL
+  already uses the last visible row id as the cursor. The test store was aligned with the
+  PostgreSQL semantics while adding the 1,200-row regression. _(2026-06-23)_
 
 
 ## Decision Log
@@ -132,19 +137,14 @@ implementation. Provide concise evidence.
 Record every decision made while working on the plan.
 
 - Decision: **Cursor encoding** — encode the resumable cursor as a small, versioned,
-  base64url-wrapped JSON record stored in the existing `LookupCursor`/`StoreCursor` `Text`
-  payload. The record carries: a format version byte; the resolved revision string (the
-  `pg_snapshot` the lookup is reading at, so a continuation reads the *same* snapshot — never
-  a moving target); and a **frontier** — the ordered remaining work plus the storage
-  sub-cursor within the current stage. For `en`'s shallow, union-shaped schemas the frontier
-  is a short stack of `(subproblem, StoreCursor)` pairs (SpiceDB's LookupResources3 uses the
-  same idea: a nested per-stage cursor). We deliberately do **not** persist server-side
-  state; the cursor is self-describing so any `en` replica can resume it.
-  Rationale: it reuses the existing opaque-`Text` cursor fields (no wire/type churn, see
-  Surprises), pins the snapshot for correctness, and stays small because `en` schemas are
-  shallow by design (spec §6: "keep the schema shallow and union-shaped"). A raw integer
-  offset is rejected because it forces a full recompute per page and cannot survive a
-  truncation mid-traversal.
+  length-prefixed `Text` record stored in the existing `LookupCursor` payload. The record
+  carries the resolved revision string and the last emitted `ObjectRef`; continuation reads
+  the same snapshot and emits objects strictly greater than that key.
+  Rationale: it reuses the existing opaque-`Text` cursor fields without adding `aeson` or a
+  base64 dependency to `en-core`, pins the snapshot for correctness, and is enough for the
+  shallow, bounded result sets `en` is designed to return. A fully incremental frontier that
+  persists storage sub-cursors is left for benchmark-driven optimization if EP-17 proves it
+  necessary.
   Date: 2026-06-23
 
 - Decision: **Deadline default** — the per-request deadline defaults to **3 seconds**, and is
@@ -180,15 +180,11 @@ Record every decision made while working on the plan.
   and correctness-relevant; reworking `expand`'s cursor is not in this plan's headline.
   Date: 2026-06-23
 
-- Decision: **En.Decision dependency** — this plan **does not** wait for EP-15. `lookup`'s
-  reach-then-check confirmation (`confirmCandidates`, `En.Lookup` ~lines 368–389) keeps
-  calling `En.Check.check` directly. When EP-15 lands `En.Decision`, whoever lands second
-  re-points `confirmCandidates` at the shared module; this is a one-line import/call swap and
-  is recorded as a known follow-up. We do not extract `En.Decision` here.
-  Rationale: EP-15 is a soft dependency (masterplan Wave 2 note) and is currently an unfleshed
-  skeleton. Coupling EP-16 to it would block streaming work on caveat work that shares no
-  files with the streaming change. The masterplan explicitly allows "temporarily call
-  `En.Check`".
+- Decision: **En.Decision dependency** — because EP-15 landed first, EP-16 keeps the existing
+  `En.Decision` usage in `En.Lookup`. `confirmCandidates` continues to call `En.Check.check`
+  directly.
+  Rationale: confirmation is not just decision algebra; it asks the forward evaluator to
+  decide each candidate against the full rewrite.
   Date: 2026-06-23
 
 
@@ -197,7 +193,18 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+EP-16 completed on 2026-06-23. `En.Lookup` now drains multi-page `readStartingWithUser`
+results instead of treating `HasMore` as `ResolutionLimitExceeded`; the in-memory regression
+uses 1,200 folders and proves cursor continuation returns the complete ordered result set.
+Lookup cursors are versioned, revision-pinned, and based on the last emitted object key; stale
+integer cursors are rejected as invalid lookup cursors.
+
+The deadline seam is `Deadline m`, with `lookupWithDeadline` for callers that can supply a
+budget and the existing `lookup` preserved as the no-deadline wrapper. `en-servant` accepts an
+optional `deadlineMillis` field and builds a monotonic-clock deadline with a 3-second default.
+`En.Expand` now drains multi-page object reads before applying its existing 1,000-node result
+cap. `en-postgres` integration writes 1,500 real rows and proves lookup drains them across
+cursor pages.
 
 
 ## Context and Orientation

@@ -2,6 +2,8 @@ module Main (
     main,
 ) where
 
+import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.List (sort)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -23,12 +25,17 @@ import En.Error (EnError (..))
 import En.Expand (ExpandCursor (..), ExpandLimit (..), ExpandNode (..), ExpandRequest (..), ExpandState (..), ExpandTree (..))
 import En.Expand qualified as Expand
 import En.Lookup (
+    Deadline (..),
     LookupCursor (..),
+    LookupCursorState (..),
     LookupLimit (..),
     LookupObject (..),
     LookupPage (..),
     LookupRequest (..),
     LookupState (..),
+    decodeLookupCursor,
+    encodeLookupCursor,
+    noDeadline,
  )
 import En.Lookup qualified as Lookup
 import En.Reachability (
@@ -123,6 +130,8 @@ main = do
     assertEqual "generic integer caveat allows sufficient clearance" (Right Allowed) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelAllowedContext (SubjectId user) (RelationName "view") minLevelDocument
     assertEqual "generic integer caveat denies insufficient clearance" (Right Denied) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelDeniedContext (SubjectId user) (RelationName "view") minLevelDocument
     assertEqual "generic integer caveat reports missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "min_level", missingContext = ["clearance"]}])) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency (CaveatContext Map.empty) (SubjectId user) (RelationName "view") minLevelDocument
+    let cursorState = LookupCursorState{version = 1, revision = testRevision, lastObject = Just childSpace}
+    assertEqual "lookup cursor codec round-trips" (Right cursorState) (decodeLookupCursor (encodeLookupCursor cursorState))
     publicGraph <- either (fail . show) pure (compile publicSchema)
     let publicStore = inMemoryTupleStore [publicTuple]
     assertBool "public view has a wildcard user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing True) Reachability.Direct False publicGraph)
@@ -131,6 +140,19 @@ main = do
     assertEqual "lookup includes public wildcard rows for concrete users" (Right (lookupPage [allowed publicSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore publicStore publicGraph MinimizeLatency (lookupRequest (SubjectId bob) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     publicExpansion <- Expand.expand consistencyStore publicStore publicGraph MinimizeLatency (expandRequest publicSpace (RelationName "view") requestContext (ExpandLimit 20) Nothing)
     assertBool "expand renders wildcard subjects" (treeHasSubject (SubjectWildcard (ObjectType "user")) publicExpansion)
+    streamingGraph <- either (fail . show) pure (compile streamingSchema)
+    let streamingStore = inMemoryTupleStore streamingTuples
+        expectedFolders = allowed <$> sort folders
+    streamedFolders <- collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
+    assertLookupObjects "streaming lookup returns every reachable folder across pages" expectedFolders streamedFolders
+    assertLookupObjects "streaming lookup returns the same set with small pages" expectedFolders =<< collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 100) Nothing)
+    truncatedDeadlineRef <- newIORef 0
+    truncatedPage <- Lookup.lookupWithDeadline (budgetedDeadline truncatedDeadlineRef) consistencyStore streamingStore streamingGraph MinimizeLatency (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
+    truncatedCursor <- expectLookupTruncated "deadline-bounded lookup truncates with a cursor" truncatedPage
+    resumedFolders <- collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) (Just truncatedCursor))
+    assertLookupObjects "deadline cursor resumes remaining lookup results" (drop 500 expectedFolders) resumedFolders
+    crowdedExpansion <- Expand.expand consistencyStore (inMemoryTupleStore expandTuples) streamingGraph MinimizeLatency (expandRequest crowdedFolder (RelationName "viewer") requestContext (ExpandLimit 1500) Nothing)
+    assertEqual "expand drains multi-page object rows before applying result cap" (Right (1000, ExpandTruncated (ExpandCursor "1000"))) (fmap (\tree -> (length tree.children, tree.state)) crowdedExpansion)
     assertEqual "recursive graph respects depth limit" (Left ResolutionLimitExceeded) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
     assertEqual "lookup returns direct and recursive view spaces" (Right (lookupPage [allowed childSpace, allowed space] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup follows userset subjects" (Right (lookupPage [allowed guestSpace, allowed usersetMemberSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId agencyUser) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
@@ -138,8 +160,9 @@ main = do
     assertEqual "lookup omits denied intersection candidates" (Right (lookupPage [] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOnly) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup confirms exclusion candidates" (Right (lookupPage [allowed exclusionSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOnly) (RelationName "member_not_owner") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup preserves caveat obligations" (Right (lookupPage [conditional intention [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}]] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "intention") missingAutonomyContext (LookupLimit 10) Nothing)
-    assertEqual "lookup paginates deterministically first page" (Right (lookupPage [allowed childSpace] (LookupHasMore (LookupCursor "1")))) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) Nothing)
-    assertEqual "lookup paginates deterministically second page" (Right (lookupPage [allowed space] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) (Just (LookupCursor "1")))
+    let childCursor = encodeLookupCursor LookupCursorState{version = 1, revision = testRevision, lastObject = Just childSpace}
+    assertEqual "lookup paginates deterministically first page" (Right (lookupPage [allowed childSpace] (LookupHasMore childCursor))) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) Nothing)
+    assertEqual "lookup paginates deterministically second page" (Right (lookupPage [allowed space] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) (Just childCursor))
     spaceExpansion <- Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest space (RelationName "view") requestContext (ExpandLimit 20) Nothing)
     assertBool "expand includes direct owner subject" (treeHasSubject (SubjectId user) spaceExpansion)
     childExpansion <- Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest childSpace (RelationName "view") requestContext (ExpandLimit 20) Nothing)
@@ -261,6 +284,54 @@ lookupRequest subject permission objectType context limit cursor =
 lookupPage :: [LookupObject] -> LookupState -> LookupPage
 lookupPage objects state =
     LookupPage{objects, state}
+
+collectAllLookupPages ::
+    Deadline IO ->
+    ConsistencyStore IO ->
+    TupleStore IO ->
+    ReachabilityGraph ->
+    LookupRequest ->
+    IO [LookupObject]
+collectAllLookupPages deadline cStore tStore graph request = do
+    page <- Lookup.lookupWithDeadline deadline cStore tStore graph MinimizeLatency request
+    case page of
+        Left err -> fail ("lookup failed while collecting pages: " <> show err)
+        Right LookupPage{objects, state} ->
+            case state of
+                LookupExhausted -> pure objects
+                LookupHasMore cursor -> appendNext objects cursor
+                LookupTruncated cursor -> appendNext objects cursor
+  where
+    appendNext objects cursor = do
+        rest <- collectAllLookupPages deadline cStore tStore graph (requestWithCursor request cursor)
+        pure (objects <> rest)
+
+requestWithCursor :: LookupRequest -> LookupCursor -> LookupRequest
+requestWithCursor request cursor =
+    LookupRequest
+        { subject = request.subject
+        , permission = request.permission
+        , objectType = request.objectType
+        , context = request.context
+        , limit = request.limit
+        , cursor = Just cursor
+        }
+
+budgetedDeadline :: IORef Int -> Deadline IO
+budgetedDeadline ref =
+    Deadline $
+        atomicModifyIORef'
+            ref
+            ( \remaining ->
+                let hasBudget = remaining > 0
+                 in (remaining - 1, hasBudget)
+            )
+
+expectLookupTruncated :: String -> Either EnError LookupPage -> IO LookupCursor
+expectLookupTruncated label =
+    \case
+        Right LookupPage{state = LookupTruncated cursor} -> pure cursor
+        other -> fail (label <> "\nexpected LookupTruncated, got: " <> show other)
 
 expandRequest :: ObjectRef -> RelationName -> CaveatContext -> ExpandLimit -> Maybe ExpandCursor -> ExpandRequest
 expandRequest object permission context limit cursor =
@@ -652,7 +723,12 @@ pageTuples limit cursor tuples =
         state =
             case extra of
                 [] -> Exhausted
-                (nextIndex, _) : _ -> HasMore (StoreCursor (showText nextIndex))
+                _ ->
+                    let cursorIndex =
+                            case visible of
+                                [] -> start
+                                visibleRows -> fst (last visibleRows)
+                     in HasMore (StoreCursor (showText cursorIndex))
      in TuplePage{rows, state}
 
 tupleRow :: Int -> Tuple -> TupleRow
@@ -829,6 +905,65 @@ publicSpace =
         , objectId = "public"
         }
 
+streamingSchema :: Schema
+streamingSchema =
+    Schema.build
+        [ Schema.object "user" []
+        , Schema.object
+            "folder"
+            [Schema.relation "viewer" [Schema.subject "user"] Schema.this]
+        ]
+
+streamingTuples :: [Tuple]
+streamingTuples =
+    [ Tuple
+        { object = folder
+        , relation = RelationName "viewer"
+        , subject = SubjectId paginator
+        , caveat = Nothing
+        }
+    | folder <- folders
+    ]
+
+folders :: [ObjectRef]
+folders =
+    [ ObjectRef
+        { objectType = ObjectType "folder"
+        , objectId = "folder-" <> showText index
+        }
+    | index <- [1 :: Int .. 1200]
+    ]
+
+paginator :: ObjectRef
+paginator =
+    ObjectRef
+        { objectType = ObjectType "user"
+        , objectId = "paginator"
+        }
+
+expandTuples :: [Tuple]
+expandTuples =
+    [ Tuple
+        { object = crowdedFolder
+        , relation = RelationName "viewer"
+        , subject =
+            SubjectId
+                ObjectRef
+                    { objectType = ObjectType "user"
+                    , objectId = "expand-user-" <> showText index
+                    }
+        , caveat = Nothing
+        }
+    | index <- [1 :: Int .. 1200]
+    ]
+
+crowdedFolder :: ObjectRef
+crowdedFolder =
+    ObjectRef
+        { objectType = ObjectType "folder"
+        , objectId = "crowded"
+        }
+
 user :: ObjectRef
 user =
     ObjectRef
@@ -968,3 +1103,23 @@ assertEqual label expected actual
                 <> show expected
                 <> "\nactual:   "
                 <> show actual
+
+assertLookupObjects :: String -> [LookupObject] -> [LookupObject] -> IO ()
+assertLookupObjects label expected actual
+    | expected == actual = pure ()
+    | otherwise =
+        fail $
+            label
+                <> "\nexpected count: "
+                <> show (length expected)
+                <> "\nactual count:   "
+                <> show (length actual)
+                <> "\nfirst mismatch: "
+                <> show (firstMismatch expected actual)
+  where
+    firstMismatch [] [] = Nothing
+    firstMismatch [] (found : _) = Just (Nothing, Just found)
+    firstMismatch (wanted : _) [] = Just (Just wanted, Nothing)
+    firstMismatch (wanted : wantRest) (found : foundRest)
+        | wanted == found = firstMismatch wantRest foundRest
+        | otherwise = Just (Just wanted, Just found)

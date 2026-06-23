@@ -3,12 +3,18 @@
 -- | Reverse expansion: list the objects a subject can reach with a permission.
 module En.Lookup (
     LookupCursor (..),
+    LookupCursorState (..),
     LookupLimit (..),
     LookupRequest (..),
     LookupObject (..),
     LookupState (..),
     LookupPage (..),
+    Deadline (..),
+    noDeadline,
+    encodeLookupCursor,
+    decodeLookupCursor,
     lookup,
+    lookupWithDeadline,
 ) where
 
 import Prelude hiding (lookup)
@@ -19,15 +25,16 @@ import Data.Maybe (catMaybes)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Text.Read (readMaybe)
 
 import En.Caveat (evaluateCaveat)
 import En.Check (CheckDecision (..), check)
 import En.Decision qualified as Decision
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..))
-import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore (..), UsersetQuery (..))
+import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore (..), UsersetQuery (..))
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
-import En.Revision (Consistency, Revision)
+import En.Revision (Consistency, Revision (..))
 import En.Schema (AllowedSubject (..), CaveatName (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..))
 import En.Tuple (
     CaveatContext (..),
@@ -43,10 +50,25 @@ newtype LookupCursor = LookupCursor
     }
     deriving stock (Eq, Ord, Show)
 
+data LookupCursorState = LookupCursorState
+    { version :: !Int
+    , revision :: !Revision
+    , lastObject :: !(Maybe ObjectRef)
+    }
+    deriving stock (Eq, Show)
+
 newtype LookupLimit = LookupLimit
     { unLookupLimit :: Int
     }
     deriving stock (Eq, Ord, Show)
+
+newtype Deadline m = Deadline
+    { remainingBudget :: m Bool
+    }
+
+noDeadline :: (Applicative m) => Deadline m
+noDeadline =
+    Deadline (pure True)
 
 data LookupRequest = LookupRequest
     { subject :: !Subject
@@ -89,25 +111,50 @@ lookup ::
     Consistency ->
     LookupRequest ->
     m (Either EnError LookupPage)
-lookup consistencyStore tupleStore graph consistency request = do
-    resolved <- consistencyStore.resolveConsistency consistency
+lookup =
+    lookupWithDeadline noDeadline
+
+lookupWithDeadline ::
+    (Monad m) =>
+    Deadline m ->
+    ConsistencyStore m ->
+    TupleStore m ->
+    ReachabilityGraph ->
+    Consistency ->
+    LookupRequest ->
+    m (Either EnError LookupPage)
+lookupWithDeadline deadline consistencyStore tupleStore graph consistency request = do
+    resolved <- resolveLookupRevision
     case resolved of
         Left err -> pure (Left err)
-        Right ResolvedConsistency{revision} ->
-            runLookup consistencyStore tupleStore graph revision consistency request
+        Right revision ->
+            runLookup deadline consistencyStore tupleStore graph revision consistency cursorState request
+  where
+    cursorState =
+        request.cursor >>= either (const Nothing) Just . decodeLookupCursor
+
+    resolveLookupRevision =
+        case request.cursor of
+            Just cursor ->
+                pure (decodeLookupCursor cursor >>= Right . (.revision))
+            Nothing -> do
+                resolved <- consistencyStore.resolveConsistency consistency
+                pure (resolved >>= Right . (.revision))
 
 runLookup ::
     (Monad m) =>
+    Deadline m ->
     ConsistencyStore m ->
     TupleStore m ->
     ReachabilityGraph ->
     Revision ->
     Consistency ->
+    Maybe LookupCursorState ->
     LookupRequest ->
     m (Either EnError LookupPage)
-runLookup consistencyStore tupleStore graph revision consistency request = do
+runLookup deadline consistencyStore tupleStore graph revision consistency cursorState request = do
     candidates <- evalRelation consistencyStore tupleStore graph request.context revision consistency request.subject request.objectType request.permission initialState
-    pure (pageLookup request.limit request.cursor <$> candidates)
+    traverse (pageLookup deadline request.limit cursorState revision) candidates
 
 data EvalState = EvalState
     { depth :: !Int
@@ -418,25 +465,24 @@ readRowsForSubjects ::
     m (Either EnError [TupleRow])
 readRowsForSubjects _ _ _ _ [] =
     pure (Right [])
-readRowsForSubjects tupleStore revision objectType relation subjects = do
-    page <-
-        tupleStore.readStartingWithUser
-            revision
-            UsersetQuery
-                { queryType = objectType
-                , queryRelation = relation
-                , querySubjects = subjects
-                , queryLimit = pageLimit
-                , queryCursor = Nothing
-                }
-    pure (ensureExhausted page)
-
-ensureExhausted :: TuplePage -> Either EnError [TupleRow]
-ensureExhausted TuplePage{rows, state} =
-    case state of
-        Exhausted -> Right rows
-        HasMore (_ :: StoreCursor) -> Left ResolutionLimitExceeded
-        Truncated (_ :: StoreCursor) -> Left ResolutionLimitExceeded
+readRowsForSubjects tupleStore revision objectType relation subjects =
+    drain Nothing []
+  where
+    drain cursor acc = do
+        page <-
+            tupleStore.readStartingWithUser
+                revision
+                UsersetQuery
+                    { queryType = objectType
+                    , queryRelation = relation
+                    , querySubjects = subjects
+                    , queryLimit = pageLimit
+                    , queryCursor = cursor
+                    }
+        case page.state of
+            Exhausted -> pure (Right (acc <> page.rows))
+            HasMore next -> drain (Just next) (acc <> page.rows)
+            Truncated next -> drain (Just next) (acc <> page.rows)
 
 lookupRelation :: ReachabilityGraph -> ObjectType -> RelationName -> Either EnError Relation
 lookupRelation graph objectType relation =
@@ -514,24 +560,83 @@ caveatText :: CaveatName -> Text
 caveatText (CaveatName text) =
     text
 
-pageLookup :: LookupLimit -> Maybe LookupCursor -> [LookupObject] -> LookupPage
-pageLookup (LookupLimit rawLimit) cursor objects =
+pageLookup :: (Monad m) => Deadline m -> LookupLimit -> Maybe LookupCursorState -> Revision -> [LookupObject] -> m LookupPage
+pageLookup deadline (LookupLimit rawLimit) cursorState revision objects = do
+    hasBudget <- deadline.remainingBudget
     let limit = max 0 rawLimit
-        start = maybe 0 decodeCursor cursor
-        capped = take resultCap objects
-        visible = take limit (drop start capped)
-        next = start + length visible
+        startAfter = cursorState >>= (.lastObject)
+        remainingObjects =
+            case startAfter of
+                Nothing -> objects
+                Just lastSeen -> filter (\LookupObject{object} -> object > lastSeen) objects
+        visible = take (min resultCap limit) remainingObjects
+        hasMore = length visible < length remainingObjects
+        nextCursor =
+            LookupCursorState
+                { version = 1
+                , revision
+                , lastObject = (.object) <$> lastMaybe visible
+                }
         state
-            | next < length capped = LookupHasMore (LookupCursor (showText next))
-            | length objects > resultCap = LookupTruncated (LookupCursor (showText resultCap))
+            | hasMore && hasBudget = LookupHasMore (encodeLookupCursor nextCursor)
+            | hasMore = LookupTruncated (encodeLookupCursor nextCursor)
             | otherwise = LookupExhausted
-     in LookupPage{objects = visible, state}
+    pure LookupPage{objects = visible, state}
 
-decodeCursor :: LookupCursor -> Int
-decodeCursor (LookupCursor cursorText) =
-    case reads (Text.unpack cursorText) of
-        [(value, "")] -> max 0 value
-        _ -> 0
+lastMaybe :: [a] -> Maybe a
+lastMaybe =
+    \case
+        [] -> Nothing
+        values -> Just (last values)
+
+encodeLookupCursor :: LookupCursorState -> LookupCursor
+encodeLookupCursor LookupCursorState{revision, lastObject} =
+    LookupCursor $
+        Text.intercalate
+            ""
+            ( ("lookup-v1" :)
+                [ encodeField revision.revisionEncoding
+                , encodeField (maybe "" (objectText . (.objectType)) lastObject)
+                , encodeField (maybe "" (.objectId) lastObject)
+                ]
+            )
+
+decodeLookupCursor :: LookupCursor -> Either EnError LookupCursorState
+decodeLookupCursor (LookupCursor cursorText) =
+    case Text.stripPrefix "lookup-v1" cursorText >>= parseFields 3 of
+        Just [revisionText, objectTypeText, objectId] ->
+            Right
+                LookupCursorState
+                    { version = 1
+                    , revision = Revision revisionText
+                    , lastObject =
+                        if Text.null objectTypeText && Text.null objectId
+                            then Nothing
+                            else Just ObjectRef{objectType = ObjectType objectTypeText, objectId}
+                    }
+        _ -> Left (InvalidConsistencyToken "lookup cursor")
+
+encodeField :: Text -> Text
+encodeField value =
+    "|" <> showText (Text.length value) <> ":" <> value
+
+parseFields :: Int -> Text -> Maybe [Text]
+parseFields expected text = do
+    (fields, rest) <- go expected text
+    if Text.null rest then Just fields else Nothing
+  where
+    go 0 rest = Just ([], rest)
+    go remaining rest = do
+        afterPipe <- Text.stripPrefix "|" rest
+        let (lengthText, afterLength) = Text.breakOn ":" afterPipe
+        afterColon <- Text.stripPrefix ":" afterLength
+        fieldLength <- readMaybe (Text.unpack lengthText)
+        let (field, next) = Text.splitAt fieldLength afterColon
+        if Text.length field == fieldLength
+            then do
+                (fields, finalRest) <- go (remaining - 1) next
+                Just (field : fields, finalRest)
+            else Nothing
 
 showText :: (Show a) => a -> Text
 showText =
@@ -540,3 +645,7 @@ showText =
 renderRef :: RelationRef -> Text
 renderRef RelationRef{objectType = ObjectType objectType, relation = RelationName relation} =
     objectType <> "#" <> relation
+
+objectText :: ObjectType -> Text
+objectText (ObjectType text) =
+    text

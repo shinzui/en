@@ -78,7 +78,7 @@ each independently verifiable.
 |---|-------|------|-----------|-----------|--------|
 | EP-14 | Harden consistency: faithful snapshot visibility, GC window, and token reconciliation | docs/plans/14-harden-consistency-faithful-snapshot-visibility-gc-window-and-token-reconciliation.md | None | None | Complete |
 | EP-15 | Generalize the caveat evaluator and unify the decision algebra | docs/plans/15-generalize-the-caveat-evaluator-and-unify-the-decision-algebra.md | None | None | Complete |
-| EP-16 | Make lookup streaming with resumable cursors and a deadline budget | docs/plans/16-make-lookup-streaming-with-resumable-cursors-and-a-deadline-budget.md | None | EP-15 | Not Started |
+| EP-16 | Make lookup streaming with resumable cursors and a deadline budget | docs/plans/16-make-lookup-streaming-with-resumable-cursors-and-a-deadline-budget.md | None | EP-15 | Complete |
 | EP-17 | Strengthen the lookup spike and add performance-regression benchmarks | docs/plans/17-strengthen-the-lookup-spike-and-add-performance-regression-benchmarks.md | None | EP-14, EP-15, EP-16 | Not Started |
 | EP-18 | Conformance: a guarded route example and the kikan agency proof | docs/plans/18-conformance-a-guarded-route-example-and-the-kikan-agency-proof.md | None | EP-15, EP-16 | Not Started |
 | EP-19 | Add BatchCheck for GraphQL field-capability and candidate filtering | docs/plans/19-add-batchcheck-for-graphql-field-capability-and-candidate-filtering.md | None | EP-15 | Not Started |
@@ -186,8 +186,8 @@ GraphQL-field workload.
 - [x] EP-14: Reconcile the `deleted_xid` sentinel (NULL vs max-xid) and add an index that serves point-in-time reads of since-deleted rows; reconcile the token format (base64-proto + ISO-8601 expiry) and remove the `En.Revision.compareRevision` error stub.
 - [x] EP-15: Replace the hardcoded `within_autonomy`/`requested_autonomy` caveat logic with a generic typed evaluator over `CaveatDefinition`/`CaveatParameterType`.
 - [x] EP-15: Extract the three-valued decision algebra into `En.Decision` and use it from `En.Check` and `En.Lookup` (audit `En.Expand`, which computes no decision); remove the `evalThis` error partial; model wildcard/public subjects.
-- [ ] EP-16: Replace eager-compute-then-cap `lookup` with a resumable cursor and a deadline budget; remove the `ensureExhausted` hard-fail on multi-page intermediate reads.
-- [ ] EP-16: Prove a `lookup` that spans multiple storage pages returns complete, correctly-cursored results without erroring.
+- [x] EP-16: Replace eager-compute-then-cap `lookup` with a resumable cursor and a deadline budget; remove the `ensureExhausted` hard-fail on multi-page intermediate reads.
+- [x] EP-16: Prove a `lookup` that spans multiple storage pages returns complete, correctly-cursored results without erroring.
 - [ ] EP-17: Fix the spike so the intersection/exclusion variant actually traverses an exclusion; run the 10,000,000-row sweep; widen percentile sampling; add a large-reachable-set subject case.
 - [ ] EP-17: Add a `tasty-bench` suite for `check`/`lookup`/consistency with recorded baselines and a CI regression gate.
 - [ ] EP-18: Wire `requirePermission` into a real guarded route with a test proving fail-closed behavior (deny, conditional, and engine-error all 403/500).
@@ -221,6 +221,9 @@ GraphQL-field workload.
 - EP-15 landed the generic caveat evaluator, shared decision algebra, and explicit wildcard subject
   model. Wildcard tuples match concrete `SubjectId` values of the same type only; userset subjects are
   intentionally not matched by `type:*`. _(2026-06-23)_
+- EP-16 landed drained multi-page lookup reads, revision-pinned object-key cursors, the deadline seam
+  and Servant `deadlineMillis` field, plus a PostgreSQL integration proof over 1,500 rows.
+  _(2026-06-23)_
 
 
 ## Decision Log

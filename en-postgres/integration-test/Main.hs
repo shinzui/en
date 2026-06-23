@@ -6,6 +6,7 @@ module Main (main) where
 import Data.Foldable (traverse_)
 import Data.Functor.Contravariant ((>$<))
 import Data.Int (Int64)
+import Data.List (sort)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -22,7 +23,7 @@ import En.Lookup (LookupCursor (..), LookupLimit (..), LookupObject (..), Lookup
 import En.Lookup qualified as Lookup
 import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgSnapshot, parsePgSnapshot, postgresConsistencyStore, renderPgSnapshot, tokenMetadataFromPayload, transactionVisible)
 import En.Postgres.TupleStore (postgresTupleStoreIO)
-import En.Reachability (compile)
+import En.Reachability (ReachabilityGraph, compile)
 import En.Revision (Consistency (..), DatastoreId (..), Revision (..), RevisionOrder (..))
 import En.Schema (AllowedSubject (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..), Schema (..))
 import En.Schema qualified as Schema
@@ -117,16 +118,8 @@ runTupleStoreScenario connection = do
     checkDecision <- check consistencyStore store graph (AtLeastAsFresh writeToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX
     assertEqual "postgres-backed check sees written tuple" (Right Allowed) checkDecision
     lookupFirstPage <- Lookup.lookup consistencyStore store graph (AtLeastAsFresh writeToken) (lookupRequest Nothing)
-    assertEqual
-        "postgres-backed lookup returns first cursor page"
-        ( Right
-            LookupPage
-                { objects = [LookupObject{object = projectX, decision = Allowed}]
-                , state = LookupHasMore (LookupCursor "1")
-                }
-        )
-        lookupFirstPage
-    lookupSecondPage <- Lookup.lookup consistencyStore store graph (AtLeastAsFresh writeToken) (lookupRequest (Just (LookupCursor "1")))
+    projectXCursor <- expectLookupHasMore "postgres-backed lookup returns first cursor page" [LookupObject{object = projectX, decision = Allowed}] lookupFirstPage
+    lookupSecondPage <- Lookup.lookup consistencyStore store graph (AtLeastAsFresh writeToken) (lookupRequest (Just projectXCursor))
     assertEqual
         "postgres-backed lookup resumes from cursor"
         ( Right
@@ -178,6 +171,34 @@ runTupleStoreScenario connection = do
     TuplePage{rows = publicRows, state = publicState} <- store.readStartingWithUser publicRevision publicQuery
     assertEqual "postgres tuple store round-trips wildcard rows" [publicTuple] ((.tuple) <$> publicRows)
     assertEqual "postgres wildcard read is exhausted" Exhausted publicState
+    let pgFolders =
+            [ ObjectRef
+                { objectType = ObjectType "folder"
+                , objectId = "pg-folder-" <> showText index
+                }
+            | index <- [1 :: Int .. 1500]
+            ]
+        pgFolderTuples =
+            [ Tuple
+                { object = folder
+                , relation = RelationName "viewer"
+                , subject = SubjectId (ObjectRef (ObjectType "user") "paginator")
+                , caveat = Nothing
+                }
+            | folder <- pgFolders
+            ]
+        pgLookupRequest cursor =
+            LookupRequest
+                { subject = SubjectId (ObjectRef (ObjectType "user") "paginator")
+                , permission = RelationName "viewer"
+                , objectType = ObjectType "folder"
+                , context = CaveatContext Map.empty
+                , limit = LookupLimit 400
+                , cursor = cursor
+                }
+    pgToken <- store.writeTuples pgFolderTuples
+    pgObjects <- collectLookupObjects consistencyStore store graph (AtLeastAsFresh pgToken) pgLookupRequest Nothing
+    assertEqual "postgres-backed lookup drains multi-page storage reads" (sort pgFolders) pgObjects
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
 assertEqual label expected actual
@@ -189,6 +210,32 @@ assertEqual label expected actual
                 <> show expected
                 <> "\nactual:   "
                 <> show actual
+
+expectLookupHasMore :: String -> [LookupObject] -> Either EnError LookupPage -> IO LookupCursor
+expectLookupHasMore label expectedObjects =
+    \case
+        Right LookupPage{objects, state = LookupHasMore cursor}
+            | objects == expectedObjects -> pure cursor
+        other -> fail (label <> "\nexpected objects with LookupHasMore, got: " <> show other)
+
+collectLookupObjects ::
+    ConsistencyStore IO ->
+    TupleStore IO ->
+    ReachabilityGraph ->
+    Consistency ->
+    (Maybe LookupCursor -> LookupRequest) ->
+    Maybe LookupCursor ->
+    IO [ObjectRef]
+collectLookupObjects consistencyStore tupleStore graph consistency mkRequest cursor = do
+    page <- Lookup.lookup consistencyStore tupleStore graph consistency (mkRequest cursor)
+    case page of
+        Left err -> fail ("lookup failed while collecting postgres pages: " <> show err)
+        Right LookupPage{objects, state} -> do
+            let current = (.object) <$> objects
+            case state of
+                LookupExhausted -> pure current
+                LookupHasMore next -> (current <>) <$> collectLookupObjects consistencyStore tupleStore graph consistency mkRequest (Just next)
+                LookupTruncated next -> (current <>) <$> collectLookupObjects consistencyStore tupleStore graph consistency mkRequest (Just next)
 
 runSnapshotOracleScenario :: Connection.Connection -> IO ()
 runSnapshotOracleScenario connection =
@@ -296,6 +343,10 @@ parseWord64 text =
         [(value, "")] -> Just value
         _ -> Nothing
 
+showText :: (Show a) => a -> Text
+showText =
+    Text.pack . show
+
 checkSchema :: Schema
 checkSchema =
     Schema
@@ -307,6 +358,12 @@ checkSchema =
                     , Map.fromList
                         [ relationEntry "viewer" (userSubject <> wildcardUserSubject) This
                         , relationEntry "view" Set.empty (ComputedUserset (RelationName "viewer"))
+                        ]
+                    )
+                ,
+                    ( ObjectType "folder"
+                    , Map.fromList
+                        [ relationEntry "viewer" userSubject This
                         ]
                     )
                 ]

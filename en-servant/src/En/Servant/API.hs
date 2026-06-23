@@ -43,6 +43,8 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Time (UTCTime)
+import Data.Word (Word64)
+import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
 import Servant (
     Application,
@@ -206,6 +208,7 @@ data LookupRequestWire = LookupRequestWire
     , context :: !CaveatContextWire
     , limit :: !Int
     , cursor :: !(Maybe Text)
+    , deadlineMillis :: !(Maybe Int)
     }
     deriving stock (Eq, Show, Generic)
     deriving anyclass (FromJSON, ToJSON)
@@ -327,9 +330,11 @@ lookupHandler env request = do
     consistency <- either400 (consistencyFromWire request.consistency)
     context <- either400 (contextFromWire request.context)
     subject <- either400 (subjectFromWire request.subject)
+    deadline <- liftIO (lookupDeadline request.deadlineMillis)
     page <-
         liftIO
-            ( Lookup.lookup
+            ( Lookup.lookupWithDeadline
+                deadline
                 env.consistencyStore
                 env.tupleStore
                 env.graph
@@ -345,6 +350,16 @@ lookupHandler env request = do
             )
             >>= eitherEngine
     pure (lookupPageToWire page)
+
+lookupDeadline :: Maybe Int -> IO (Lookup.Deadline IO)
+lookupDeadline maybeDeadlineMillis = do
+    startedAt <- getMonotonicTimeNSec
+    let budgetNs :: Word64
+        budgetNs = fromIntegral (max 0 (maybe 3000 id maybeDeadlineMillis)) * 1000000
+    pure $
+        Lookup.Deadline $ do
+            now <- getMonotonicTimeNSec
+            pure (now - startedAt <= budgetNs)
 
 expandHandler :: EnServer -> ExpandRequestWire -> Handler ExpandTreeWire
 expandHandler env request = do

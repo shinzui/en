@@ -20,7 +20,7 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..))
-import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore (..))
+import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore (..))
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
 import En.Revision (Consistency, Revision)
@@ -270,16 +270,15 @@ readObjectRows ::
     ObjectRef ->
     RelationName ->
     m (Either EnError [TupleRow])
-readObjectRows tupleStore revision object relation = do
-    page <- tupleStore.readObjectRelation revision object relation pageLimit Nothing
-    pure (ensureExhausted page)
-
-ensureExhausted :: TuplePage -> Either EnError [TupleRow]
-ensureExhausted TuplePage{rows, state} =
-    case state of
-        Exhausted -> Right rows
-        HasMore (_ :: StoreCursor) -> Left ResolutionLimitExceeded
-        Truncated (_ :: StoreCursor) -> Left ResolutionLimitExceeded
+readObjectRows tupleStore revision object relation =
+    drain Nothing []
+  where
+    drain cursor acc = do
+        page <- tupleStore.readObjectRelation revision object relation pageLimit cursor
+        case page.state of
+            Exhausted -> pure (Right (acc <> page.rows))
+            HasMore next -> drain (Just next) (acc <> page.rows)
+            Truncated next -> drain (Just next) (acc <> page.rows)
 
 lookupRelation :: ReachabilityGraph -> ObjectType -> RelationName -> Either EnError Relation
 lookupRelation graph objectType relation =
