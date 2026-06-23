@@ -156,7 +156,56 @@ minimal intersection/exclusion → few conditional entrypoints → little check-
 
 ---
 
-## 6. Consistency design (`en-postgres`)
+## 6. Performance: the `en` / consumer boundary (load-bearing)
+
+`en`'s performance health rests on **one rule about what becomes a relationship tuple**, plus the
+read-filter pattern that follows from it. This is the single most important performance decision in
+the architecture; get it wrong and `en` has a scaling problem on day one.
+
+**The rule.** `en` stores the **low-cardinality, slow-changing relationship graph** — who belongs to
+which space/org, memberships, delegations, participations (thousands of tuples, changing on
+human/agent actions). **High-cardinality, high-churn per-object facts stay as attributes in the
+owning service** — an activity's visibility-class is a column on the kawa Activity Envelope (kikan
+C1), **not** an `en` tuple.
+
+**Why it is load-bearing.** If per-object facts ("activity X is in class *restricted*") were `en`
+tuples, then (a) `en`'s `relation_tuple` table would grow to **the size of the activity stream**
+(millions of rows), and (b) `en` would take a **write on every kawa ingest**, coupling its write
+path to ingest throughput. Both are disqualifying at scale.
+
+**The read-filter pattern (how a consumer uses `en` without enumerating its own data).** A consumer
+never asks `en` to list its objects. Instead:
+
+1. `en.lookup` answers the *small* question — "which spaces / visibility-classes can this subject
+   reach?" — a bounded traversal over the relationship graph (tens of results).
+2. The consumer applies that **reachable label-set** as a predicate over its **own** indexed store:
+   kawa runs `… WHERE space IN (:spaces) AND class IN (:classes)`.
+
+This keeps `lookup` bounded (it never returns activity-scale sets), avoids per-item `check` fan-out
+(no N+1), and keeps `en` decoupled from ingest volume. It is the standard "protect a list endpoint"
+pattern (SpiceDB documents it explicitly), and it is the reason the deferred materialized (Leopard)
+index can **stay** deferred: as long as consumers filter their own data by a small reachable set,
+`en` never has to enumerate a large one.
+
+**Corollaries — the perf rules that follow:**
+
+- **Default reads to `AtLeastAsFresh` / `MinimizeLatency`, not `FullyConsistent`.** The quantized
+  "optimized revision" (§7) lets many requests share a snapshot so decision caches hit;
+  `FullyConsistent` reads head every time and defeats caching. Reserve it for the rare must-be-live check.
+- **Keep the schema shallow and union-shaped.** `check` is pointer-chasing — one datastore hop per
+  nesting level (depth capped, ~25). Every `Intersection`/`Exclusion` is a non-streaming cliff for
+  `lookup` (§5). Prefer `Union` / `ComputedUserset` / container relations.
+- **Cache decisions keyed by `(revision, subproblem)`** and batch checks; expect a **read replica**
+  under `en`'s Postgres (the consistency design's follower-read-delay already accounts for replica lag).
+- **`en` is now a read-path dependency** of kawa/kizashi/danwa — monitor its latency/availability as
+  such; degradation there degrades those surfaces.
+
+The `lookup` spike (§10, and `docs/spec/0002-lookup-spike.md`) must validate **this** shape — a
+relationship graph + "reachable label-set → SQL filter" — not "enumerate N objects."
+
+---
+
+## 7. Consistency design (`en-postgres`)
 
 The standalone, multi-writer topology requires a real consistency token. Following SpiceDB's
 PostgreSQL datastore, this is **mostly Postgres MVCC + a codec**, not a consistency protocol:
@@ -186,7 +235,7 @@ silently breaks read-your-writes. This is the one place to be most careful.
 
 ---
 
-## 7. Package architecture (mirrors `shomei`)
+## 8. Package architecture (mirrors `shomei`)
 
 | Package | Role |
 | --- | --- |
@@ -202,7 +251,7 @@ Postgres); implementations live in `en-postgres` — the shomei pattern.
 
 ---
 
-## 8. First consumer: kikan (contract C13)
+## 9. First consumer: kikan (contract C13)
 
 kikan supplies the first `Schema`. Its load-bearing requirements (from C13,
 `shinzui/kikan → docs/architecture/evolution/contracts.md`):
@@ -225,7 +274,7 @@ agency case, the model is right.
 
 ---
 
-## 9. Staged build plan
+## 10. Staged build plan
 
 1. **Schema + reachability compiler** (`En.Reachability.compile`) over a fixed kikan-shaped
    schema; property-test the rewrite rules (QuickCheck).
@@ -233,14 +282,15 @@ agency case, the model is right.
    `pg_snapshot` revision partial order, the token codec, the four modes. In-memory store first.
 3. **`check`** (forward) — the smaller algorithm.
 4. **`lookup`** (reverse, cursored streaming, reach-then-check) — **the risk to retire first**;
-   spike it over a synthetic kikan graph at target tuple counts with a pass/fail latency bar
-   *before* committing the full build.
+   spike it **in the §6 read-path shape** (relationship graph + reachable-label-set → SQL filter,
+   *not* enumerate-N-objects) over a synthetic kikan graph at target tuple counts with a pass/fail
+   latency bar, *before* committing the full build. Full task: `docs/spec/0002-lookup-spike.md`.
 5. **`en-servant` + `en-server`** + the `RequirePermission` combinator.
 6. **kikan schema + agency conformance proof.**
 
 ---
 
-## 10. References (read at source level)
+## 11. References (read at source level)
 
 - Google Zanzibar (Pang et al., USENIX ATC 2019) — the model, Zookies, the new-enemy problem,
   Leopard.
