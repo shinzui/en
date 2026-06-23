@@ -21,6 +21,7 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 
 import En.Check (CaveatObligation (..), CheckDecision (..), check)
+import En.Decision qualified as Decision
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..))
 import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore (..), UsersetQuery (..))
 import En.Error (EnError (..))
@@ -430,7 +431,7 @@ objectFromRowWithDecision TupleRow{tuple} decision =
 
 includeDecision :: CaveatContext -> Maybe TupleCaveat -> CheckDecision -> Maybe CheckDecision
 includeDecision context caveat decision =
-    case applyDecisionGate (evaluateTupleCaveat context caveat) decision of
+    case Decision.applyGate (evaluateTupleCaveat context caveat) decision of
         Denied -> Nothing
         allowed -> Just allowed
 
@@ -465,44 +466,12 @@ applyGateToObjects gate =
     filterAllowed
         . fmap
             ( \current@LookupObject{decision} ->
-                current{decision = applyDecisionGate gate decision}
+                current{decision = Decision.applyGate gate decision}
             )
 
 combineDecisions :: CheckDecision -> CheckDecision -> CheckDecision
 combineDecisions left right =
-    unionDecisions [left, right]
-
-unionDecisions :: [CheckDecision] -> CheckDecision
-unionDecisions decisions
-    | Allowed `elem` decisions = Allowed
-    | null obligations = Denied
-    | otherwise = Conditional (dedupeObligations obligations)
-  where
-    obligations =
-        concatMap
-            ( \case
-                Conditional current -> current
-                _ -> []
-            )
-            decisions
-
-intersectionDecisions :: [CheckDecision] -> CheckDecision
-intersectionDecisions decisions
-    | Denied `elem` decisions = Denied
-    | all (== Allowed) decisions = Allowed
-    | otherwise = Conditional (dedupeObligations obligations)
-  where
-    obligations =
-        concatMap
-            ( \case
-                Conditional current -> current
-                _ -> []
-            )
-            decisions
-
-applyDecisionGate :: CheckDecision -> CheckDecision -> CheckDecision
-applyDecisionGate gate decision =
-    intersectionDecisions [gate, decision]
+    Decision.union [left, right]
 
 evaluateRewriteCaveat :: CaveatName -> CaveatContext -> CheckDecision
 evaluateRewriteCaveat caveat (CaveatContext context)
@@ -554,14 +523,6 @@ autonomyRank value =
         "act" -> 1
         "admin" -> 2
         _ -> maxBound
-
-dedupeObligations :: [CaveatObligation] -> [CaveatObligation]
-dedupeObligations =
-    foldl'
-        ( \acc obligation ->
-            if obligation `elem` acc then acc else acc <> [obligation]
-        )
-        []
 
 pageLookup :: LookupLimit -> Maybe LookupCursor -> [LookupObject] -> LookupPage
 pageLookup (LookupLimit rawLimit) cursor objects =

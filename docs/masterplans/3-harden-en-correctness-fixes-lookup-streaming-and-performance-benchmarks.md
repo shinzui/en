@@ -77,7 +77,7 @@ each independently verifiable.
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | EP-14 | Harden consistency: faithful snapshot visibility, GC window, and token reconciliation | docs/plans/14-harden-consistency-faithful-snapshot-visibility-gc-window-and-token-reconciliation.md | None | None | Complete |
-| EP-15 | Generalize the caveat evaluator and unify the decision algebra | docs/plans/15-generalize-the-caveat-evaluator-and-unify-the-decision-algebra.md | None | None | Not Started |
+| EP-15 | Generalize the caveat evaluator and unify the decision algebra | docs/plans/15-generalize-the-caveat-evaluator-and-unify-the-decision-algebra.md | None | None | In Progress |
 | EP-16 | Make lookup streaming with resumable cursors and a deadline budget | docs/plans/16-make-lookup-streaming-with-resumable-cursors-and-a-deadline-budget.md | None | EP-15 | Not Started |
 | EP-17 | Strengthen the lookup spike and add performance-regression benchmarks | docs/plans/17-strengthen-the-lookup-spike-and-add-performance-regression-benchmarks.md | None | EP-14, EP-15, EP-16 | Not Started |
 | EP-18 | Conformance: a guarded route example and the kikan agency proof | docs/plans/18-conformance-a-guarded-route-example-and-the-kikan-agency-proof.md | None | EP-15, EP-16 | Not Started |

@@ -8,6 +8,8 @@ module En.Check (
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 
+import En.Decision (CaveatObligation (..), CheckDecision (..))
+import En.Decision qualified as Decision
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..))
 import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore (..))
 import En.Error (EnError (..))
@@ -23,23 +25,6 @@ import En.Tuple (
     Tuple (..),
     TupleCaveat (..),
  )
-
--- | A caveat that could not be reduced to an unconditional answer.
-data CaveatObligation = CaveatObligation
-    { caveat :: !CaveatName
-    , missingContext :: ![Text]
-    }
-    deriving stock (Eq, Show)
-
-{- | Three-valued authorization result. 'Conditional' means the graph path exists
-but one or more caveats need request context before the caller may treat it as
-allowed.
--}
-data CheckDecision
-    = Allowed
-    | Denied
-    | Conditional ![CaveatObligation]
-    deriving stock (Eq, Show)
 
 {- | Does @subject@ have @permission@ on @object@? Forward evaluation over the
 reachability graph and the tuple store.
@@ -125,6 +110,7 @@ evalRelation tupleStore graph context revision subject object relation state
                     revision
                     subject
                     object
+                    relation
                     schemaRelation.rewrite
                     EvalState{depth = state.depth + 1, visited = subproblem : state.visited}
   where
@@ -139,35 +125,36 @@ evalRewrite ::
     Revision ->
     Subject ->
     ObjectRef ->
+    RelationName ->
     Rewrite ->
     EvalState ->
     m (Either EnError CheckDecision)
-evalRewrite tupleStore graph context revision subject object rewrite state =
+evalRewrite tupleStore graph context revision subject object currentRelation rewrite state =
     case rewrite of
         This ->
-            evalThis tupleStore graph context revision subject object state
+            evalThis tupleStore graph context revision subject object currentRelation state
         ComputedUserset relation ->
             evalRelation tupleStore graph context revision subject object relation state
         TupleToUserset tuplesetRelation computedRelation ->
             evalTupleToUserset tupleStore graph context revision subject object tuplesetRelation computedRelation state
         Union rewrites -> do
-            decisions <- traverse (\current -> evalRewrite tupleStore graph context revision subject object current state) rewrites
-            pure (unionDecisions <$> sequence decisions)
+            decisions <- traverse (\current -> evalRewrite tupleStore graph context revision subject object currentRelation current state) rewrites
+            pure (Decision.union <$> sequence decisions)
         Intersection rewrites -> do
-            decisions <- traverse (\current -> evalRewrite tupleStore graph context revision subject object current state) rewrites
-            pure (intersectionDecisions <$> sequence decisions)
+            decisions <- traverse (\current -> evalRewrite tupleStore graph context revision subject object currentRelation current state) rewrites
+            pure (Decision.intersection <$> sequence decisions)
         Exclusion base subtractRewrite -> do
-            baseDecision <- evalRewrite tupleStore graph context revision subject object base state
+            baseDecision <- evalRewrite tupleStore graph context revision subject object currentRelation base state
             case baseDecision of
                 Left err -> pure (Left err)
                 Right Denied -> pure (Right Denied)
                 Right (Conditional obligations) -> pure (Right (Conditional obligations))
                 Right Allowed -> do
-                    subtractDecision <- evalRewrite tupleStore graph context revision subject object subtractRewrite state
-                    pure (exclusionDecision <$> subtractDecision)
+                    subtractDecision <- evalRewrite tupleStore graph context revision subject object currentRelation subtractRewrite state
+                    pure (Decision.exclusion <$> subtractDecision)
         Caveated caveat rewriteInner -> do
-            inner <- evalRewrite tupleStore graph context revision subject object rewriteInner state
-            pure (applyDecisionGate (evaluateRewriteCaveat caveat context) <$> inner)
+            inner <- evalRewrite tupleStore graph context revision subject object currentRelation rewriteInner state
+            pure (Decision.applyGate (evaluateRewriteCaveat caveat context) <$> inner)
 
 evalThis ::
     (Monad m) =>
@@ -177,33 +164,30 @@ evalThis ::
     Revision ->
     Subject ->
     ObjectRef ->
+    RelationName ->
     EvalState ->
     m (Either EnError CheckDecision)
-evalThis tupleStore graph context revision subject object state
+evalThis tupleStore graph context revision subject object relation state
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded)
     | otherwise = do
-        page <- tupleStore.readObjectRelation revision object stateRelation pageLimit Nothing
+        page <- tupleStore.readObjectRelation revision object relation pageLimit Nothing
         case ensureExhausted page of
             Left err -> pure (Left err)
             Right rows -> do
                 decisions <- traverse rowDecision rows
-                pure (unionDecisions <$> sequence decisions)
+                pure (Decision.union <$> sequence decisions)
   where
-    stateRelation =
-        case state.visited of
-            Subproblem{relation} : _ -> relation
-            [] -> error "internal error: evalThis requires a current relation"
     rowDecision TupleRow{tuple}
         | tuple.subject == subject =
-            pure (Right (applyDecisionGate (evaluateTupleCaveat context tuple.caveat) Allowed))
+            pure (Right (Decision.applyGate (evaluateTupleCaveat context tuple.caveat) Allowed))
         | otherwise =
             case tuple.subject of
                 SubjectId _ ->
                     pure (Right Denied)
                 SubjectSet subjectObject subjectRelation ->
                     fmap
-                        (fmap (applyDecisionGate (evaluateTupleCaveat context tuple.caveat)))
+                        (fmap (Decision.applyGate (evaluateTupleCaveat context tuple.caveat)))
                         (evalRelation tupleStore graph context revision subject subjectObject subjectRelation state)
 
 evalTupleToUserset ::
@@ -233,10 +217,10 @@ evalTupleToUserset tupleStore graph context revision subject object tuplesetRela
                                 applyRowGate tuple <$> evalRelation tupleStore graph context revision subject subjectObject subjectRelation state
                     )
                     rows
-            pure (unionDecisions <$> sequence decisions)
+            pure (Decision.union <$> sequence decisions)
   where
     applyRowGate tuple =
-        fmap (applyDecisionGate (evaluateTupleCaveat context tuple.caveat))
+        fmap (Decision.applyGate (evaluateTupleCaveat context tuple.caveat))
 
 ensureExhausted :: TuplePage -> Either EnError [TupleRow]
 ensureExhausted TuplePage{rows, state} =
@@ -244,45 +228,6 @@ ensureExhausted TuplePage{rows, state} =
         Exhausted -> Right rows
         HasMore (_ :: StoreCursor) -> Left ResolutionLimitExceeded
         Truncated (_ :: StoreCursor) -> Left ResolutionLimitExceeded
-
-unionDecisions :: [CheckDecision] -> CheckDecision
-unionDecisions decisions
-    | Allowed `elem` decisions = Allowed
-    | null obligations = Denied
-    | otherwise = Conditional (dedupeObligations obligations)
-  where
-    obligations =
-        concatMap
-            ( \case
-                Conditional current -> current
-                _ -> []
-            )
-            decisions
-
-intersectionDecisions :: [CheckDecision] -> CheckDecision
-intersectionDecisions decisions
-    | Denied `elem` decisions = Denied
-    | all (== Allowed) decisions = Allowed
-    | otherwise = Conditional (dedupeObligations obligations)
-  where
-    obligations =
-        concatMap
-            ( \case
-                Conditional current -> current
-                _ -> []
-            )
-            decisions
-
-exclusionDecision :: CheckDecision -> CheckDecision
-exclusionDecision =
-    \case
-        Allowed -> Denied
-        Denied -> Allowed
-        Conditional obligations -> Conditional obligations
-
-applyDecisionGate :: CheckDecision -> CheckDecision -> CheckDecision
-applyDecisionGate gate decision =
-    intersectionDecisions [gate, decision]
 
 evaluateRewriteCaveat :: CaveatName -> CaveatContext -> CheckDecision
 evaluateRewriteCaveat caveat (CaveatContext context)
@@ -334,14 +279,6 @@ autonomyRank value =
         "act" -> 1
         "admin" -> 2
         _ -> maxBound
-
-dedupeObligations :: [CaveatObligation] -> [CaveatObligation]
-dedupeObligations =
-    foldl'
-        ( \acc obligation ->
-            if obligation `elem` acc then acc else acc <> [obligation]
-        )
-        []
 
 renderRef :: RelationRef -> Text
 renderRef RelationRef{objectType = ObjectType objectType, relation = RelationName relation} =

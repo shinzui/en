@@ -66,18 +66,21 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] **M1.1** Create `en-core/src/En/Decision.hs` exporting `CheckDecision`, `CaveatObligation`,
+- [x] **M1.1** Create `en-core/src/En/Decision.hs` exporting `CheckDecision`, `CaveatObligation`,
   and the combinators (`unionDecisions`, `intersectionDecisions`, `exclusionDecision`,
   `applyDecisionGate`, `dedupeObligations`). Add it to `exposed-modules` in `en-core.cabal`.
-- [ ] **M1.2** Re-export `CheckDecision`/`CaveatObligation` from `En.Check` (so the public API is
-  unchanged) and delete the copy-pasted combinators from `En.Check`.
-- [ ] **M1.3** Delete the copy-pasted combinators from `En.Lookup`; import them from `En.Decision`.
-- [ ] **M1.4** Audit `En.Expand`; it builds trees, not decisions, so it has no algebra to remove —
-  record that finding and move on (do not invent code to delete).
-- [ ] **M1.5** Remove the `error "internal error: evalThis requires a current relation"` partial in
-  `En.Check.evalThis` by passing the current relation explicitly.
-- [ ] **M1.6** `cabal build all` and `cabal test all` green; the existing test assertions still pass
-  unchanged.
+  Completed 2026-06-23.
+- [x] **M1.2** Re-export `CheckDecision`/`CaveatObligation` from `En.Check` (so the public API is
+  unchanged) and delete the copy-pasted combinators from `En.Check`. Completed 2026-06-23.
+- [x] **M1.3** Delete the copy-pasted combinators from `En.Lookup`; import them from `En.Decision`.
+  Completed 2026-06-23.
+- [x] **M1.4** Audit `En.Expand`; it builds trees, not decisions, so it has no algebra to remove —
+  record that finding and move on (do not invent code to delete). Completed 2026-06-23; the seeded
+  Surprises & Discoveries entry remains accurate.
+- [x] **M1.5** Remove the `error "internal error: evalThis requires a current relation"` partial in
+  `En.Check.evalThis` by passing the current relation explicitly. Completed 2026-06-23.
+- [x] **M1.6** `cabal build all` and `cabal test all` green; the existing test assertions still pass
+  unchanged. Completed 2026-06-23.
 - [ ] **M2.1** Add a typed predicate AST (`CaveatPredicate`) and a `predicate` field to
   `En.Schema.CaveatDefinition`; extend `schemaHash`, `validate`, and `En.Schema.Builder`.
 - [ ] **M2.2** Write `En.Caveat.evaluateCaveat :: CaveatDefinition -> CaveatPayload -> CaveatContext

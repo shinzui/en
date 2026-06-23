@@ -39,6 +39,7 @@ library
   hs-source-dirs:  src
   exposed-modules:
     En.Check
+    En.Decision
     En.Effect.ConsistencyStore
     En.Effect.TupleStore
     En.Error
