@@ -3,16 +3,22 @@
 
 module Main (main) where
 
+import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Data.Time (UTCTime, defaultTimeLocale, parseTimeOrError)
 
+import En.Check (CheckDecision (..), check)
 import En.Effect.ConsistencyStore (TokenMetadata (..))
 import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleStore (..), UsersetQuery (..))
-import En.Postgres.Revision (ConsistencyConfig (..), tokenMetadataFromPayload)
+import En.Postgres.Revision (ConsistencyConfig (..), postgresConsistencyStore, tokenMetadataFromPayload)
 import En.Postgres.TupleStore (postgresTupleStoreIO)
-import En.Revision (DatastoreId (..), SchemaHash (..))
-import En.Schema (ObjectType (..), RelationName (..))
-import En.Tuple (ObjectRef (..), Subject (..), Tuple (..))
+import En.Reachability (compile)
+import En.Revision (Consistency (..), DatastoreId (..))
+import En.Schema (AllowedSubject (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..), Schema (..))
+import En.Schema qualified as Schema
+import En.Tuple (CaveatContext (..), ObjectRef (..), Subject (..), Tuple (..))
 import EphemeralPg qualified as Pg
 import Hasql.Connection qualified as Connection
 import Hasql.Session qualified as Session
@@ -45,9 +51,11 @@ runTupleStoreScenario connection = do
     let config =
             ConsistencyConfig
                 { datastoreId = DatastoreId "test-datastore"
-                , schemaHash = SchemaHash "test-schema"
+                , schemaHash = Schema.schemaHash checkSchema
                 }
         store = postgresTupleStoreIO connection config
+        consistencyStore =
+            postgresConsistencyStore config (pure testTime) store.optimizedRevision store.headRevision
         tuple =
             Tuple
                 { object = ObjectRef (ObjectType "space") "project-x"
@@ -68,6 +76,9 @@ runTupleStoreScenario connection = do
     TuplePage{rows = rowsAtWrite, state = stateAtWrite} <- store.readStartingWithUser writeRevision query
     assertEqual "write token read sees tuple count" 1 (length rowsAtWrite)
     assertEqual "write token read is exhausted" Exhausted stateAtWrite
+    graph <- either (fail . show) pure (compile checkSchema)
+    checkDecision <- check consistencyStore store graph (AtLeastAsFresh writeToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") tuple.object
+    assertEqual "postgres-backed check sees written tuple" (Right Allowed) checkDecision
     deleteToken <- store.deleteTuples [tuple]
     TokenMetadata{revision = deleteRevision} <- either (fail . show) pure (tokenMetadataFromPayload deleteToken)
     TuplePage{rows = rowsAtOldRevision} <- store.readStartingWithUser writeRevision query
@@ -85,6 +96,41 @@ assertEqual label expected actual
                 <> show expected
                 <> "\nactual:   "
                 <> show actual
+
+checkSchema :: Schema
+checkSchema =
+    Schema
+        { objectTypes =
+            Map.fromList
+                [ (ObjectType "user", Map.empty)
+                ,
+                    ( ObjectType "space"
+                    , Map.fromList
+                        [ relationEntry "viewer" userSubject This
+                        , relationEntry "view" Set.empty (ComputedUserset (RelationName "viewer"))
+                        ]
+                    )
+                ]
+        , caveats = Map.empty
+        }
+
+relationEntry :: Text -> Set.Set AllowedSubject -> Rewrite -> (RelationName, Relation)
+relationEntry name allowedSubjects rewrite =
+    ( RelationName name
+    , Relation
+        { relationName = RelationName name
+        , allowedSubjects = allowedSubjects
+        , rewrite = rewrite
+        }
+    )
+
+userSubject :: Set.Set AllowedSubject
+userSubject =
+    Set.singleton AllowedSubject{objectType = ObjectType "user", relation = Nothing}
+
+testTime :: UTCTime
+testTime =
+    parseTimeOrError True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" "2026-06-23T00:00:00Z"
 
 schemaSql :: Text
 schemaSql =

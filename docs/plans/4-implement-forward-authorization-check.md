@@ -20,19 +20,20 @@ This plan implements the core yes/no object gate: given a subject, permission, o
 
 ## Progress
 
-- [ ] Resolve the requested consistency mode to a revision before reading store rows.
-- [ ] Implement forward traversal for `This`, `ComputedUserset`, `TupleToUserset`, and `Union`.
-- [ ] Implement bounded handling for `Intersection` and `Exclusion`.
-- [ ] Evaluate tuple and rewrite caveats using request context and return conditional decisions when context is missing.
-- [ ] Enforce recursion, breadth, and deadline limits with `ResolutionLimitExceeded`.
-- [ ] Add an in-memory tuple store for deterministic tests if EP-1 has not already added one.
-- [ ] Test kikan C13 cases: owner, member, guest org view-only, delegation autonomy, time-bounded delegation, and denied internal-only access.
-- [ ] Run `cabal build all` and relevant tests.
+- [x] Resolve the requested consistency mode to a revision before reading store rows. Completed 2026-06-23T06:24:00Z.
+- [x] Implement forward traversal for `This`, `ComputedUserset`, `TupleToUserset`, and `Union`. Completed 2026-06-23T06:24:00Z.
+- [x] Implement bounded handling for `Intersection` and `Exclusion`. Completed 2026-06-23T06:24:00Z.
+- [x] Evaluate tuple and rewrite caveats using request context and return conditional decisions when context is missing. Completed 2026-06-23T06:24:00Z.
+- [x] Enforce recursion and breadth limits with `ResolutionLimitExceeded`; leave wall-clock deadlines to the service/runtime layer. Completed 2026-06-23T06:24:00Z.
+- [x] Add an in-memory tuple store for deterministic tests if EP-1 has not already added one. Completed 2026-06-23T06:24:00Z.
+- [x] Test kikan C13 cases: owner, member, guest org view-only, delegation autonomy, time-bounded delegation, and denied internal-only access. Completed 2026-06-23T06:24:00Z.
+- [x] Run `cabal build all` and relevant tests. Completed 2026-06-23T06:24:00Z.
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- The EP-1 `TupleStore` interface still lacked an object-side relation read, which made real forward tuple-to-userset checks impossible: `space#view = guest_org->member` must first read `space:project-x#guest_org` tuples. The interface now includes `readObjectRelation`, implemented by both the deterministic in-memory test store and the Hasql Postgres store.
+- The public `check` signature needed the consistency resolver explicitly. It now accepts `ConsistencyStore m` and returns `m (Either EnError CheckDecision)` so token resolution failures, store traversal limit failures, and unknown schema references are observable rather than hidden inside `m CheckDecision`.
 
 
 ## Decision Log
@@ -40,11 +41,20 @@ This plan implements the core yes/no object gate: given a subject, permission, o
 - Decision: Implement `check` before production `lookup`.
   Rationale: Lookup needs reach-then-check confirmation for conditional entrypoints, so forward check is a prerequisite for correct reverse expansion.
   Date: 2026-06-23
+- Decision: Add `readObjectRelation` to `TupleStore`.
+  Rationale: Forward check needs to inspect tuples attached to a specific object relation. The existing `readStartingWithUser` remains the reverse lookup primitive, but it cannot discover tuple-to-userset arrows without already knowing the intermediate subject objects.
+  Date: 2026-06-23
+- Decision: Make `check` return `Either EnError CheckDecision` and take `ConsistencyStore m`.
+  Rationale: EP-4 must resolve the requested consistency mode before reading and must report `ResolutionLimitExceeded`. The old signature had neither a consistency resolver nor a way to return structured engine errors.
+  Date: 2026-06-23
+- Decision: Keep wall-clock deadline enforcement outside the pure core `check` function for now.
+  Rationale: The current core interface is polymorphic in `m` and has no clock or cancellation primitive. The core checker enforces deterministic recursion and page-size limits; Servant/server integration can apply request deadlines around the effect when EP-6 wires runtime handlers.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+EP-4 implemented forward authorization checks over the compiled schema and tuple store. The checker resolves consistency, evaluates direct tuples, computed usersets, tuple-to-userset arrows, unions, intersections, exclusions, userset subjects, and bounded caveats, and reports traversal limits as `EnError`. Tests cover the kikan-shaped owner/member/guest/delegation cases, conditional missing caveat context, expired time-bound grants, exclusion/intersection semantics, recursion limits, and a Postgres-backed write-token-check path.
 
 
 ## Context and Orientation
@@ -89,7 +99,8 @@ Run:
 
 ```bash
 cabal build all
-cabal test en-core
+cabal test en-core-interface-tests
+cabal test en-postgres-integration-tests
 ```
 
 
@@ -97,7 +108,7 @@ cabal test en-core
 
 Tests must demonstrate that a direct owner is allowed, a non-member is denied, a user in an agency org granted `guest_org` receives `view` but not `act`, a delegate with autonomy below the requested action is denied or conditional according to caveat semantics, and an expired `until` caveat denies access. Tests must also cover recursion limits and at least one userset subject.
 
-If EP-2 is complete, add at least one integration test that exercises Postgres-backed check through the same core function. If EP-2 is not complete, record that integration as remaining work.
+EP-2 is complete, so acceptance also includes an ephemeral PostgreSQL integration test that writes a tuple through `postgresTupleStoreIO`, resolves `AtLeastAsFresh` through `postgresConsistencyStore`, and calls the same `En.Check.check` core function.
 
 
 ## Idempotence and Recovery
@@ -115,3 +126,5 @@ This plan owns `en-core/src/En/Check.hs` and any in-memory test store helpers ne
 
 
 Revision note 2026-06-23: Added `intention_01kvsbcvsfepaafp5x44ykby47` to the plan frontmatter at the user's request.
+
+Revision note 2026-06-23: Completed EP-4 by implementing consistency-aware forward check, adding object-side tuple reads, covering kikan authorization cases with an in-memory store, and extending the Postgres integration test through the same core check path.

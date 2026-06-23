@@ -34,6 +34,7 @@ traversal-ordering optimization.
 -}
 data ReachabilityGraph = ReachabilityGraph
     { entries :: !(Map RelationRef [EntryPoint])
+    , relations :: !(Map RelationRef Relation)
     , hash :: !SchemaHash
     }
     deriving stock (Eq, Show)
@@ -94,6 +95,12 @@ compile schema = do
                     | (objectType, relations) <- Map.toAscList schema.objectTypes
                     , (relationName, relation) <- Map.toAscList relations
                     , let target = RelationRef{objectType, relation = relationName}
+                    ]
+            , relations =
+                Map.fromList
+                    [ (RelationRef{objectType, relation = relationName}, relation)
+                    | (objectType, objectRelations) <- Map.toAscList schema.objectTypes
+                    , (relationName, relation) <- Map.toAscList objectRelations
                     ]
             , hash = schemaHash schema
             }

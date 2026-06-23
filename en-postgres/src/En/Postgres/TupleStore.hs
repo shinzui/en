@@ -77,7 +77,9 @@ hasqlConnectionRunner connection =
 postgresTupleStore :: PostgresSessionRunner m -> ConsistencyConfig -> TupleStore m
 postgresTupleStore (PostgresSessionRunner run) config =
     TupleStore
-        { readStartingWithUser = \revision query ->
+        { readObjectRelation = \revision object relation limit cursor ->
+            run (readObjectRelationSession revision object relation limit cursor)
+        , readStartingWithUser = \revision query ->
             run (readStartingWithUserSession revision query)
         , writeTuples = \tuples ->
             run (writeTuplesSession config tuples)
@@ -131,7 +133,18 @@ readStartingWithUserSession revision query = do
     let limitPlusOne = fromIntegral (max 0 query.queryLimit + 1)
         cursorId = maybe 0 decodeCursor query.queryCursor
     rows <- Session.statement (readParams revision query limitPlusOne cursorId) readStartingWithUserStatement
-    let (visibleRows, extraRows) = splitAt (max 0 query.queryLimit) rows
+    pure (pageFromRows query.queryLimit rows)
+
+readObjectRelationSession :: Revision -> ObjectRef -> RelationName -> Int -> Maybe StoreCursor -> Session TuplePage
+readObjectRelationSession revision object relation limit maybeCursor = do
+    let limitPlusOne = fromIntegral (max 0 limit + 1)
+        cursorId = maybe 0 decodeCursor maybeCursor
+    rows <- Session.statement (objectReadParams revision object relation limitPlusOne cursorId) readObjectRelationStatement
+    pure (pageFromRows limit rows)
+
+pageFromRows :: Int -> [TupleRow] -> TuplePage
+pageFromRows limit rows =
+    let (visibleRows, extraRows) = splitAt (max 0 limit) rows
         pageState =
             case extraRows of
                 [] -> Exhausted
@@ -140,7 +153,7 @@ readStartingWithUserSession revision query = do
                         case visibleRows of
                             [] -> nextRow
                             _ -> last visibleRows
-    pure TuplePage{rows = visibleRows, state = pageState}
+     in TuplePage{rows = visibleRows, state = pageState}
 
 data Anchor = Anchor
     { xid :: !Text
@@ -324,6 +337,54 @@ readParams revision query limitPlusOne cursorId =
             , limit = limitPlusOne
             , cursor = cursorId
             }
+
+data ObjectReadParams = ObjectReadParams
+    { revision :: !Text
+    , objectType :: !Text
+    , objectId :: !Text
+    , relation :: !Text
+    , limit :: !Int64
+    , cursor :: !Int64
+    }
+
+objectReadParams :: Revision -> ObjectRef -> RelationName -> Int64 -> Int64 -> ObjectReadParams
+objectReadParams revision object relation limitPlusOne cursorId =
+    ObjectReadParams
+        { revision = revision.revisionEncoding
+        , objectType = unObjectType object.objectType
+        , objectId = object.objectId
+        , relation = unRelationName relation
+        , limit = limitPlusOne
+        , cursor = cursorId
+        }
+
+readObjectRelationStatement :: Statement ObjectReadParams [TupleRow]
+readObjectRelationStatement =
+    Statement.preparable
+        """
+        SELECT id, object_type, object_id, relation, subject_type, subject_id, subject_relation,
+               caveat_name, caveat_payload, created_xid::text, deleted_xid::text
+        FROM relation_tuple
+        WHERE object_type = $2
+          AND object_id = $3
+          AND relation = $4
+          AND id > $6
+          AND pg_visible_in_snapshot(created_xid, $1::pg_snapshot)
+          AND (deleted_xid IS NULL OR NOT pg_visible_in_snapshot(deleted_xid, $1::pg_snapshot))
+        ORDER BY id ASC
+        LIMIT $5
+        """
+        readObjectRelationEncoder
+        (Decoders.rowList tupleRowDecoder)
+
+readObjectRelationEncoder :: Encoders.Params ObjectReadParams
+readObjectRelationEncoder =
+    ((\params -> params.revision) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.objectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.objectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.relation) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.limit) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+        <> ((\params -> params.cursor) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
 
 readStartingWithUserStatement :: Statement ReadParams [TupleRow]
 readStartingWithUserStatement =

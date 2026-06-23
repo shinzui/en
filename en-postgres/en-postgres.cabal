@@ -65,8 +65,10 @@ test-suite en-postgres-integration-tests
   main-is:        Main.hs
   build-depends:
     , base
+    , containers
     , en-core
     , en-postgres
     , ephemeral-pg
     , hasql
     , text
+    , time

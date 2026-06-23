@@ -5,17 +5,21 @@ module Main (
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
+import Data.Text qualified as Text
 import Data.Time (UTCTime, defaultTimeLocale, parseTimeOrError)
 
-import En.Check (CaveatObligation (..), CheckDecision (..))
+import En.Check (CaveatObligation (..), CheckDecision (..), check)
+import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
 import En.Effect.TupleStore (
     PageState (..),
     StoreCursor (..),
     TuplePage (..),
     TupleRow (..),
     TupleRowId (..),
+    TupleStore (..),
     UsersetQuery (..),
  )
+import En.Error (EnError (..))
 import En.Expand (ExpandLimit (..), ExpandRequest (..), ExpandState (..), ExpandTree (..))
 import En.Lookup (
     LookupCursor (..),
@@ -33,7 +37,7 @@ import En.Reachability (
     compile,
  )
 import En.Reachability qualified as Reachability
-import En.Revision (Revision (..))
+import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (
     AllowedSubject (..),
     CaveatDefinition (..),
@@ -87,6 +91,21 @@ main = do
     assertValidationFails "Exclusion validates both branches" (schemaWithRelation "space" "viewer" userSubject (Exclusion This (ComputedUserset (RelationName "missing"))))
     assertValidationFails "Caveated rejects unknown caveat" (schemaWithRelation "space" "viewer" userSubject (Caveated (CaveatName "missing") This))
     assertValidationFails "unproductive rewrite cycles are rejected" unproductiveCycleSchema
+    assertEqual "owner can view a space" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
+    assertEqual "non-member cannot view a space" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId bob) (RelationName "view") space
+    assertEqual "agency org member can view guest space" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId agencyUser) (RelationName "view") guestSpace
+    assertEqual "guest org view does not grant act" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId agencyUser) (RelationName "act") guestSpace
+    assertEqual "userset subject grants member relation" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId agencyUser) (RelationName "member") usersetMemberSpace
+    assertEqual "parent recursion grants view" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") childSpace
+    assertEqual "intersection requires every branch" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "audit") space
+    assertEqual "intersection allows owner plus member" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId memberOwner) (RelationName "audit") auditedSpace
+    assertEqual "exclusion allows member who is not owner" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId memberOnly) (RelationName "member_not_owner") exclusionSpace
+    assertEqual "exclusion rejects owner" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId memberOwner) (RelationName "member_not_owner") exclusionSpace
+    assertEqual "delegation caveat allows matching autonomy and time" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") intention
+    assertEqual "delegation caveat denies higher autonomy" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency adminContext (SubjectId user) (RelationName "view") intention
+    assertEqual "delegation caveat is conditional with missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}])) =<< check consistencyStore tupleStore graph MinimizeLatency missingAutonomyContext (SubjectId user) (RelationName "view") intention
+    assertEqual "expired delegation caveat denies access" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency expiredContext (SubjectId user) (RelationName "view") intention
+    assertEqual "recursive graph respects depth limit" (Left ResolutionLimitExceeded) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
     pure ()
 
 sampleTuple :: Tuple
@@ -201,7 +220,7 @@ kikanSchema =
                     ( ObjectType "space"
                     , Map.fromList
                         [ relationEntry "owner" userSubject This
-                        , relationEntry "member" userSubject This
+                        , relationEntry "member" (userSubject <> orgMemberSubject) This
                         , relationEntry "guest_org" orgSubject This
                         , relationEntry "parent" spaceSubject This
                         , relationEntry "visibility_class" visibilityClassSubject This
@@ -329,6 +348,10 @@ orgSubject :: Set.Set AllowedSubject
 orgSubject =
     Set.singleton AllowedSubject{objectType = ObjectType "org", relation = Nothing}
 
+orgMemberSubject :: Set.Set AllowedSubject
+orgMemberSubject =
+    Set.singleton AllowedSubject{objectType = ObjectType "org", relation = Just (RelationName "member")}
+
 spaceSubject :: Set.Set AllowedSubject
 spaceSubject =
     Set.singleton AllowedSubject{objectType = ObjectType "space", relation = Nothing}
@@ -360,6 +383,109 @@ hasCaveatedEntry target caveat graph =
         )
         (Map.findWithDefault [] target graph.entries)
 
+tupleStore :: TupleStore IO
+tupleStore =
+    inMemoryTupleStore fixtureTuples
+
+recursiveTupleStore :: TupleStore IO
+recursiveTupleStore =
+    inMemoryTupleStore
+        [ Tuple
+            { object = recursiveSpace
+            , relation = RelationName "parent"
+            , subject = SubjectId recursiveSpace
+            , caveat = Nothing
+            }
+        ]
+
+inMemoryTupleStore :: [Tuple] -> TupleStore IO
+inMemoryTupleStore tuples =
+    TupleStore
+        { readObjectRelation = \_ object relation limit cursor ->
+            pure (pageTuples limit cursor [tuple | tuple <- tuples, tuple.object == object, tuple.relation == relation])
+        , readStartingWithUser = \_ query ->
+            pure
+                ( pageTuples
+                    query.queryLimit
+                    query.queryCursor
+                    [ tuple
+                    | tuple <- tuples
+                    , tuple.object.objectType == query.queryType
+                    , tuple.relation == query.queryRelation
+                    , tuple.subject `elem` query.querySubjects
+                    ]
+                )
+        , writeTuples = \_ -> pure (ConsistencyToken "in-memory-write")
+        , deleteTuples = \_ -> pure (ConsistencyToken "in-memory-delete")
+        , headRevision = pure testRevision
+        , optimizedRevision = pure testRevision
+        }
+
+pageTuples :: Int -> Maybe StoreCursor -> [Tuple] -> TuplePage
+pageTuples limit cursor tuples =
+    let start =
+            maybe 0 decodeTestCursor cursor
+        indexed =
+            drop start (zip [start + 1 ..] tuples)
+        (visible, extra) =
+            splitAt limit indexed
+        rows =
+            uncurry tupleRow <$> visible
+        state =
+            case extra of
+                [] -> Exhausted
+                (nextIndex, _) : _ -> HasMore (StoreCursor (showText nextIndex))
+     in TuplePage{rows, state}
+
+tupleRow :: Int -> Tuple -> TupleRow
+tupleRow index tuple =
+    TupleRow
+        { rowId = TupleRowId (showText index)
+        , tuple = tuple
+        , createdAt = testRevision
+        , deletedAt = Nothing
+        }
+
+decodeTestCursor :: StoreCursor -> Int
+decodeTestCursor (StoreCursor cursorText) =
+    case reads (Text.unpack cursorText) of
+        [(value, "")] -> value
+        _ -> 0
+
+consistencyStore :: ConsistencyStore IO
+consistencyStore =
+    ConsistencyStore
+        { decodeToken = \token ->
+            pure
+                ( Right
+                    (TokenMetadata token testRevision (DatastoreId "test") (SchemaHash "schema") Nothing)
+                )
+        , validateToken = \_ -> pure (Right ())
+        , resolveConsistency = \consistency ->
+            pure
+                ( Right
+                    ResolvedConsistency
+                        { consistency = consistency
+                        , revision = testRevision
+                        }
+                )
+        }
+
+fixtureTuples :: [Tuple]
+fixtureTuples =
+    [ Tuple{object = space, relation = RelationName "owner", subject = SubjectId user, caveat = Nothing}
+    , Tuple{object = guestOrg, relation = RelationName "member", subject = SubjectId agencyUser, caveat = Nothing}
+    , Tuple{object = guestSpace, relation = RelationName "guest_org", subject = SubjectId guestOrg, caveat = Nothing}
+    , Tuple{object = usersetMemberSpace, relation = RelationName "member", subject = SubjectSet guestOrg (RelationName "member"), caveat = Nothing}
+    , Tuple{object = childSpace, relation = RelationName "parent", subject = SubjectId space, caveat = Nothing}
+    , Tuple{object = auditedSpace, relation = RelationName "owner", subject = SubjectId memberOwner, caveat = Nothing}
+    , Tuple{object = auditedSpace, relation = RelationName "member", subject = SubjectId memberOwner, caveat = Nothing}
+    , Tuple{object = exclusionSpace, relation = RelationName "member", subject = SubjectId memberOnly, caveat = Nothing}
+    , Tuple{object = exclusionSpace, relation = RelationName "member", subject = SubjectId memberOwner, caveat = Nothing}
+    , Tuple{object = exclusionSpace, relation = RelationName "owner", subject = SubjectId memberOwner, caveat = Nothing}
+    , Tuple{object = intention, relation = RelationName "delegate", subject = SubjectId user, caveat = Just autonomyCaveat}
+    ]
+
 autonomyCaveat :: TupleCaveat
 autonomyCaveat =
     TupleCaveat
@@ -382,11 +508,65 @@ requestContext =
             ]
         )
 
+adminContext :: CaveatContext
+adminContext =
+    CaveatContext
+        ( Map.fromList
+            [ ("requested_autonomy", ValueEnum "admin")
+            , ("current_time", ValueTimestamp currentTime)
+            ]
+        )
+
+missingAutonomyContext :: CaveatContext
+missingAutonomyContext =
+    CaveatContext
+        ( Map.fromList
+            [ ("current_time", ValueTimestamp currentTime)
+            ]
+        )
+
+expiredContext :: CaveatContext
+expiredContext =
+    CaveatContext
+        ( Map.fromList
+            [ ("requested_autonomy", ValueEnum "act")
+            , ("current_time", ValueTimestamp (parseUtc "2026-08-01T00:00:00Z"))
+            ]
+        )
+
 user :: ObjectRef
 user =
     ObjectRef
         { objectType = ObjectType "user"
         , objectId = "alice"
+        }
+
+bob :: ObjectRef
+bob =
+    ObjectRef
+        { objectType = ObjectType "user"
+        , objectId = "bob"
+        }
+
+agencyUser :: ObjectRef
+agencyUser =
+    ObjectRef
+        { objectType = ObjectType "user"
+        , objectId = "agency-alice"
+        }
+
+memberOnly :: ObjectRef
+memberOnly =
+    ObjectRef
+        { objectType = ObjectType "user"
+        , objectId = "member-only"
+        }
+
+memberOwner :: ObjectRef
+memberOwner =
+    ObjectRef
+        { objectType = ObjectType "user"
+        , objectId = "member-owner"
         }
 
 space :: ObjectRef
@@ -396,12 +576,65 @@ space =
         , objectId = "project-x"
         }
 
+guestSpace :: ObjectRef
+guestSpace =
+    ObjectRef
+        { objectType = ObjectType "space"
+        , objectId = "guest-space"
+        }
+
+usersetMemberSpace :: ObjectRef
+usersetMemberSpace =
+    ObjectRef
+        { objectType = ObjectType "space"
+        , objectId = "userset-member-space"
+        }
+
+childSpace :: ObjectRef
+childSpace =
+    ObjectRef
+        { objectType = ObjectType "space"
+        , objectId = "child-space"
+        }
+
+auditedSpace :: ObjectRef
+auditedSpace =
+    ObjectRef
+        { objectType = ObjectType "space"
+        , objectId = "audited-space"
+        }
+
+exclusionSpace :: ObjectRef
+exclusionSpace =
+    ObjectRef
+        { objectType = ObjectType "space"
+        , objectId = "exclusion-space"
+        }
+
+recursiveSpace :: ObjectRef
+recursiveSpace =
+    ObjectRef
+        { objectType = ObjectType "space"
+        , objectId = "recursive-space"
+        }
+
+guestOrg :: ObjectRef
+guestOrg =
+    ObjectRef
+        { objectType = ObjectType "org"
+        , objectId = "acme"
+        }
+
 intention :: ObjectRef
 intention =
     ObjectRef
         { objectType = ObjectType "intention"
         , objectId = "42"
         }
+
+testRevision :: Revision
+testRevision =
+    Revision "test-revision"
 
 currentTime :: UTCTime
 currentTime =
@@ -414,6 +647,10 @@ expiry =
 parseUtc :: String -> UTCTime
 parseUtc =
     parseTimeOrError True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
+
+showText :: (Show a) => a -> Text
+showText =
+    Text.pack . show
 
 assertValidationFails :: String -> Schema -> IO ()
 assertValidationFails label schema =

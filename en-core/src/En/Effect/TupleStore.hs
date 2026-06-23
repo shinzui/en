@@ -18,7 +18,7 @@ import Data.Text (Text)
 
 import En.Revision (ConsistencyToken, Revision)
 import En.Schema (ObjectType, RelationName)
-import En.Tuple (Subject, Tuple)
+import En.Tuple (ObjectRef, Subject, Tuple)
 
 newtype StoreCursor = StoreCursor
     { cursorEncoding :: Text
@@ -68,7 +68,8 @@ data UsersetQuery = UsersetQuery
 writes return a 'ConsistencyToken' for read-your-writes.
 -}
 data TupleStore m = TupleStore
-    { readStartingWithUser :: Revision -> UsersetQuery -> m TuplePage
+    { readObjectRelation :: Revision -> ObjectRef -> RelationName -> Int -> Maybe StoreCursor -> m TuplePage
+    , readStartingWithUser :: Revision -> UsersetQuery -> m TuplePage
     , writeTuples :: [Tuple] -> m ConsistencyToken
     , deleteTuples :: [Tuple] -> m ConsistencyToken
     , headRevision :: m Revision

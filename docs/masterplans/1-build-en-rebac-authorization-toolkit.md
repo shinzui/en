@@ -37,7 +37,7 @@ An alternative decomposition by package was rejected. Planning by files such as 
 | EP-1 | Stabilize core authorization interfaces | docs/plans/1-stabilize-core-authorization-interfaces.md | None | None | Complete |
 | EP-2 | Implement PostgreSQL tuple store and consistency tokens | docs/plans/2-implement-postgresql-tuple-store-and-consistency-tokens.md | EP-1 | EP-3 | Complete |
 | EP-3 | Implement schema validation and reachability compilation | docs/plans/3-implement-schema-validation-and-reachability-compilation.md | EP-1 | None | Complete |
-| EP-4 | Implement forward authorization check | docs/plans/4-implement-forward-authorization-check.md | EP-1, EP-3 | EP-2 | Not Started |
+| EP-4 | Implement forward authorization check | docs/plans/4-implement-forward-authorization-check.md | EP-1, EP-3 | EP-2 | Complete |
 | EP-5 | Validate bounded lookup with the kikan read-filter spike | docs/plans/5-validate-bounded-lookup-with-the-kikan-read-filter-spike.md | None | EP-1, EP-3 | Not Started |
 | EP-6 | Expose en through Servant server and client APIs | docs/plans/6-expose-en-through-servant-server-and-client-apis.md | EP-1, EP-2, EP-3, EP-4, EP-7 | EP-5 | Not Started |
 | EP-7 | Implement cursored reverse lookup and expand | docs/plans/7-implement-cursored-reverse-lookup-and-expand.md | EP-1, EP-3, EP-4 | EP-2, EP-5 | Not Started |
@@ -85,8 +85,8 @@ The Servant API is owned by EP-6 but must not invent new semantics. It serialize
 - [x] EP-2: Implement and test the hasql-backed tuple store with MVCC snapshot reads and write tokens.
 - [x] EP-3: Validate schema definitions, caveat declarations, allowed subject shapes, and rewrite references.
 - [x] EP-3: Compile valid schemas into a reachability graph annotated for direct and conditional entrypoints.
-- [ ] EP-4: Implement forward `check` over the compiled graph and store rows.
-- [ ] EP-4: Prove caveated, userset, tuple-to-userset, intersection, exclusion, and recursion-limit behavior with tests.
+- [x] EP-4: Implement forward `check` over the compiled graph and store rows.
+- [x] EP-4: Prove caveated, userset, tuple-to-userset, intersection, exclusion, and recursion-limit behavior with tests.
 - [ ] EP-5: Build and run the kikan read-filter lookup spike over synthetic relationship and activity data.
 - [ ] EP-5: Append p95 results and a green/red decision to `docs/spec/0002-lookup-spike.md`.
 - [ ] EP-7: Implement production cursored reverse lookup with caps, truncation, and reach-then-check confirmation.
@@ -105,6 +105,7 @@ The Servant API is owned by EP-6 but must not invent new semantics. It serialize
 - EP-2 now exposes a real `ConsistencyStore IO` constructor over supplied head/optimized revision readers. The remaining storage work can wire those readers to Hasql statements without changing `en-core`.
 - EP-2 found that write tokens must be minted from a post-commit snapshot. Capturing `pg_current_snapshot()` inside the write transaction did not make that transaction's `xid` visible to `pg_visible_in_snapshot`, and the new `en-postgres-integration-tests` caught the issue.
 - EP-3 found that productive recursive schemas need a base path check rather than a blanket cycle rejection. The kikan-shaped `space#view` recursion through `space#parent` is valid because it can also reach direct `owner`/`member` bases; pure computed-userset cycles without a base are rejected.
+- EP-4 found that forward check requires object-side tuple reads in addition to Zanzibar's reverse `ReadStartingWithUser` primitive. `TupleStore` now exposes `readObjectRelation` for check and keeps `readStartingWithUser` for lookup.
 
 
 ## Decision Log
@@ -133,6 +134,9 @@ The Servant API is owned by EP-6 but must not invent new semantics. It serialize
 - Decision: Treat EP-3 as complete after the kikan-shaped schema fixture validates and compiles into direct, conditional, caveated, and recursive reachability entrypoints.
   Rationale: EP-4 and EP-7 now have concrete schema validation and graph artifacts to consume rather than placeholders.
   Date: 2026-06-23
+- Decision: Treat EP-4 as complete after in-memory kikan checks and the Postgres-backed write-token-check integration test pass.
+  Rationale: The forward authorization gate now resolves consistency, traverses the compiled schema over tuple-store rows, evaluates bounded caveats, and reports traversal limits through the core error model.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
@@ -147,3 +151,5 @@ Revision note 2026-06-23: Completed EP-1 and updated the registry, aggregate pro
 Revision note 2026-06-23: Completed EP-2 and updated aggregate progress after adding the Hasql tuple store and `ephemeral-pg` integration coverage.
 
 Revision note 2026-06-23: Completed EP-3 and updated aggregate progress after adding schema validation, deterministic schema hashing, and reachability compilation.
+
+Revision note 2026-06-23: Completed EP-4 and updated aggregate progress after adding consistency-aware forward checks and Postgres-backed check coverage.
