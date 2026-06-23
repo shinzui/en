@@ -1,17 +1,19 @@
-cabal-version:      3.0
-name:               en-postgres
-version:            0.1.0.0
-synopsis:           PostgreSQL implementations of en's store effects + revisions
+cabal-version: 3.0
+name:          en-postgres
+version:       0.1.0.0
+synopsis:
+  PostgreSQL implementations of en's store effects + revisions
+
 description:
   PostgreSQL (hasql) implementations of en-core's TupleStore effect and the
   pg_snapshot-based revision / consistency-token machinery: MVCC point-in-time
   reads via pg_visible_in_snapshot, the revision partial order, and the
   quantized "optimized revision".
 
-license:            MIT
-author:             Nadeem Bitar
-maintainer:         nadeem@gmail.com
-category:           Security, Authorization, Database
+license:       MIT
+author:        Nadeem Bitar
+maintainer:    nadeem@gmail.com
+category:      Security, Authorization, Database
 
 common warnings
   ghc-options:
@@ -29,12 +31,25 @@ library
   import:          warnings, shared
   hs-source-dirs:  src
   exposed-modules:
-    En.Postgres.TupleStore
     En.Postgres.Revision
+    En.Postgres.TupleStore
+
   build-depends:
     , base           >=4.19 && <5
     , bytestring
     , en-core
     , en-migrations
     , text
-    -- , hasql        -- added when the implementation lands
+    , time
+
+-- , hasql        -- added when the implementation lands
+
+test-suite en-postgres-revision-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , en-core
+    , en-postgres

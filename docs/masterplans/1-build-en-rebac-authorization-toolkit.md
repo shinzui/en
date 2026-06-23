@@ -35,7 +35,7 @@ An alternative decomposition by package was rejected. Planning by files such as 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | EP-1 | Stabilize core authorization interfaces | docs/plans/1-stabilize-core-authorization-interfaces.md | None | None | Complete |
-| EP-2 | Implement PostgreSQL tuple store and consistency tokens | docs/plans/2-implement-postgresql-tuple-store-and-consistency-tokens.md | EP-1 | EP-3 | Not Started |
+| EP-2 | Implement PostgreSQL tuple store and consistency tokens | docs/plans/2-implement-postgresql-tuple-store-and-consistency-tokens.md | EP-1 | EP-3 | In Progress |
 | EP-3 | Implement schema validation and reachability compilation | docs/plans/3-implement-schema-validation-and-reachability-compilation.md | EP-1 | None | Not Started |
 | EP-4 | Implement forward authorization check | docs/plans/4-implement-forward-authorization-check.md | EP-1, EP-3 | EP-2 | Not Started |
 | EP-5 | Validate bounded lookup with the kikan read-filter spike | docs/plans/5-validate-bounded-lookup-with-the-kikan-read-filter-spike.md | None | EP-1, EP-3 | Not Started |
@@ -79,7 +79,9 @@ The Servant API is owned by EP-6 but must not invent new semantics. It serialize
 
 - [x] EP-1: Define final core result, caveat, tuple-store, consistency, lookup cursor, and expand interfaces.
 - [x] EP-1: Add focused compile and interface tests proving the skeleton no longer exposes unbounded or information-losing APIs.
-- [ ] EP-2: Add codd migrations and Postgres revision/token machinery.
+- [x] EP-2: Add codd migration schema for `relation_tuple` and `en_transaction`.
+- [x] EP-2: Add Postgres `pg_snapshot` parsing, rendering, partial-order comparison, and token codec tests.
+- [ ] EP-2: Implement revision resolution for `MinimizeLatency`, `FullyConsistent`, `AtLeastAsFresh`, and `AtExactSnapshot`.
 - [ ] EP-2: Implement and test the hasql-backed tuple store with MVCC snapshot reads and write tokens.
 - [ ] EP-3: Validate schema definitions, caveat declarations, allowed subject shapes, and rewrite references.
 - [ ] EP-3: Compile valid schemas into a reachability graph annotated for direct and conditional entrypoints.
@@ -99,6 +101,7 @@ The Servant API is owned by EP-6 but must not invent new semantics. It serialize
 - The lookup spike from `docs/spec/0002-lookup-spike.md` is not a substitute for production lookup. It validates the performance shape and informs EP-7, but EP-7 still must implement the real cursored algorithm.
 - The generated child plan numbering reflects creation time. EP-6 is the final integration plan even though EP-7 must complete before it; the registry and dependency graph, not file number order alone, define implementation order.
 - EP-1 discovered that caveat schema declaration constructors and runtime caveat value constructors must be distinct for normal client imports. The final interface uses `Parameter*` constructors for schema parameter kinds and `Value*` constructors for tuple/request values.
+- EP-2 found that the Postgres snapshot order must compare only the required snapshot's known transaction horizon. Comparing future transaction visibility symmetrically made a newer snapshot appear older; `en-postgres-revision-tests` now covers this case and the concurrent case.
 
 
 ## Decision Log

@@ -21,6 +21,9 @@ cabal-dev
 .direnv
 .pre-commit-config.yaml
 db/
+!en-migrations/db/
+!en-migrations/db/migrations/
+!en-migrations/db/migrations/*.sql
 .claude/
 .agents/
 CLAUDE.local.md

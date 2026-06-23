@@ -20,25 +20,33 @@ This plan gives `en` durable relationship storage and the read-your-writes guara
 
 ## Progress
 
-- [ ] Add codd-managed SQL migrations for `relation_tuple` and `en_transaction`.
-- [ ] Define indexes for forward reads, reverse `readStartingWithUser` reads, deletion, and cursor pagination.
-- [ ] Implement `PgSnapshot` parsing, rendering, partial-order comparison, and tests.
-- [ ] Implement consistency-token encoding and decoding with datastore id, schema hash, revision payload, and validation errors.
+- [x] Add codd-managed SQL migrations for `relation_tuple` and `en_transaction`. Completed 2026-06-23T04:44:44Z.
+- [x] Define indexes for forward reads, reverse `readStartingWithUser` reads, deletion, and cursor pagination. Completed 2026-06-23T04:44:44Z.
+- [x] Implement `PgSnapshot` parsing, rendering, partial-order comparison, and tests. Completed 2026-06-23T04:44:44Z.
+- [x] Implement consistency-token encoding and decoding with datastore id, schema hash, revision payload, and validation errors. Completed 2026-06-23T04:44:44Z.
 - [ ] Implement `MinimizeLatency`, `FullyConsistent`, `AtLeastAsFresh`, and `AtExactSnapshot` revision resolution.
 - [ ] Implement hasql-backed write, delete, and read operations for the final EP-1 store interface.
 - [ ] Add integration tests against a temporary PostgreSQL database or the repository's established Postgres test harness.
-- [ ] Run `cabal build all` and the relevant test command.
+- [x] Run `cabal build all` and the relevant test command for the completed revision slice. Completed 2026-06-23T04:44:44Z.
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- The first snapshot comparison implementation treated future transaction visibility symmetrically. That made `10:30:` compare before `10:20:` because transaction 21 is visible in the newer snapshot but outside the older snapshot's horizon. The fixed rule requires the candidate snapshot to have at least the required `xmax` and preserve visibility for transactions visible within the required snapshot's horizon. Evidence:
+
+```text
+cabal test en-postgres-revision-tests
+1 of 1 test suites (1 of 1 test cases) passed.
+```
 
 
 ## Decision Log
 
 - Decision: Use PostgreSQL `pg_snapshot` as the concrete revision, not a monotonically increasing sequence number.
   Rationale: `docs/spec/0001-en-overview.md` makes the new-enemy guarantee depend on Postgres MVCC snapshot visibility and a partial revision order.
+  Date: 2026-06-23
+- Decision: Keep the first token codec as a versioned opaque text envelope owned by `En.Postgres.Revision`.
+  Rationale: The core interface only exposes `ConsistencyToken` as opaque text. This lets token validation and revision resolution proceed without committing the wire encoding to later Servant/API work; if a base64 protobuf payload is still required for compatibility, it can replace this private codec without changing `en-core`.
   Date: 2026-06-23
 
 
@@ -112,6 +120,12 @@ If a Postgres test harness is added, document and run the exact command here dur
 cabal test en-postgres
 ```
 
+The revision/token slice added a database-free test suite that must pass while the full database harness is still pending:
+
+```bash
+cabal test en-postgres-revision-tests
+```
+
 
 ## Validation and Acceptance
 
@@ -135,3 +149,5 @@ This plan owns `en-migrations/src/En/Migrations.hs`, migration SQL under `en-mig
 
 
 Revision note 2026-06-23: Added `intention_01kvsbcvsfepaafp5x44ykby47` to the plan frontmatter at the user's request.
+
+Revision note 2026-06-23: Marked the migration and revision/token codec slice complete, recorded the Postgres snapshot partial-order correction, and added the `en-postgres-revision-tests` validation command.
