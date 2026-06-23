@@ -8,7 +8,7 @@ import Data.Text qualified as Text
 
 import Test.Tasty.Bench (bench, bgroup, defaultMain, whnfAppIO)
 
-import En.Check (check)
+import En.Check (BatchPair (..), check, checkMany)
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (..))
 import En.Effect.TupleStore (PageState (..), StoreCursor (..), TuplePage (..), TupleRow (..), TupleRowId (..), TupleStore (..), UsersetQuery (..))
 import En.Lookup (LookupLimit (..), LookupRequest (..))
@@ -36,6 +36,15 @@ main = do
                 whnfAppIO
                     ( \() ->
                         check consistencyStore store graph MinimizeLatency emptyContext (SubjectId user) (RelationName "view") childSpace
+                    )
+                    ()
+            ]
+        , bgroup
+            "checkMany"
+            [ bench "overlapping" $
+                whnfAppIO
+                    ( \() ->
+                        checkMany consistencyStore store graph MinimizeLatency emptyContext overlappingPairs
                     )
                     ()
             ]
@@ -76,6 +85,13 @@ viewSpacesRequest =
         , limit = LookupLimit 50
         , cursor = Nothing
         }
+
+overlappingPairs :: [BatchPair]
+overlappingPairs =
+    [ BatchPair (SubjectId user) (RelationName "view") space
+    , BatchPair (SubjectId user) (RelationName "owner") space
+    , BatchPair (SubjectId user) (RelationName "view") childSpace
+    ]
 
 emptyContext :: CaveatContext
 emptyContext =

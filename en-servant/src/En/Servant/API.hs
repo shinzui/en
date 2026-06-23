@@ -15,7 +15,12 @@ module En.Servant.API (
     ConsistencyWire (..),
     CaveatContextWire (..),
     CheckRequestWire (..),
+    CheckDecisionWire (..),
+    CaveatObligationWire (..),
     CheckResponseWire (..),
+    BatchCheckPairWire (..),
+    BatchCheckRequestWire (..),
+    BatchCheckResponseWire (..),
     LookupRequestWire (..),
     LookupObjectWire (..),
     LookupPageWire (..),
@@ -64,7 +69,7 @@ import Servant (
     type (:>),
  )
 
-import En.Check (CaveatObligation (..), CheckDecision (..), check)
+import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..), check, checkMany)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore (..))
 import En.Error (EnError)
@@ -87,6 +92,7 @@ type EnAPI =
     "tuples" :> ReqBody '[JSON] WriteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
         :<|> "tuples" :> ReqBody '[JSON] DeleteTuplesRequestWire :> Delete '[JSON] WriteTuplesResponseWire
         :<|> "check" :> ReqBody '[JSON] CheckRequestWire :> Post '[JSON] CheckResponseWire
+        :<|> "batch-check" :> ReqBody '[JSON] BatchCheckRequestWire :> Post '[JSON] BatchCheckResponseWire
         :<|> "lookup" :> ReqBody '[JSON] LookupRequestWire :> Post '[JSON] LookupPageWire
         :<|> "expand" :> ReqBody '[JSON] ExpandRequestWire :> Post '[JSON] ExpandTreeWire
 
@@ -97,6 +103,7 @@ data EnServer = EnServer
     { consistencyStore :: !(ConsistencyStore IO)
     , tupleStore :: !(TupleStore IO)
     , graph :: !ReachabilityGraph
+    , maxBatchSize :: !Int
     }
 
 server :: EnServer -> Server EnAPI
@@ -104,6 +111,7 @@ server env =
     writeTuplesHandler env
         :<|> deleteTuplesHandler env
         :<|> checkHandler env
+        :<|> batchCheckHandler env
         :<|> lookupHandler env
         :<|> expandHandler env
 
@@ -196,6 +204,28 @@ data CaveatObligationWire = CaveatObligationWire
 
 newtype CheckResponseWire = CheckResponseWire
     { decision :: CheckDecisionWire
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (FromJSON, ToJSON)
+
+data BatchCheckPairWire = BatchCheckPairWire
+    { subject :: !SubjectWire
+    , permission :: !Text
+    , object :: !ObjectRefWire
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (FromJSON, ToJSON)
+
+data BatchCheckRequestWire = BatchCheckRequestWire
+    { consistency :: !ConsistencyWire
+    , context :: !CaveatContextWire
+    , pairs :: ![BatchCheckPairWire]
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (FromJSON, ToJSON)
+
+newtype BatchCheckResponseWire = BatchCheckResponseWire
+    { decisions :: [CheckDecisionWire]
     }
     deriving stock (Eq, Show, Generic)
     deriving anyclass (FromJSON, ToJSON)
@@ -324,6 +354,37 @@ checkHandler env request = do
             )
             >>= eitherEngine
     pure CheckResponseWire{decision = decisionToWire decision}
+
+batchCheckHandler :: EnServer -> BatchCheckRequestWire -> Handler BatchCheckResponseWire
+batchCheckHandler env request = do
+    if length request.pairs > env.maxBatchSize
+        then throwError (jsonError err400 "batch exceeds maximum batch size")
+        else pure ()
+    consistency <- either400 (consistencyFromWire request.consistency)
+    context <- either400 (contextFromWire request.context)
+    pairs <- traverseOr400 pairFromWire request.pairs
+    decisions <-
+        liftIO
+            ( checkMany
+                env.consistencyStore
+                env.tupleStore
+                env.graph
+                consistency
+                context
+                pairs
+            )
+            >>= eitherEngine
+    pure BatchCheckResponseWire{decisions = decisionToWire <$> decisions}
+  where
+    pairFromWire :: BatchCheckPairWire -> Either Text BatchPair
+    pairFromWire wire =
+        BatchPair
+            <$> subjectFromWire wire.subject
+            <*> ( if Text.null wire.permission
+                    then Left "permission must not be empty"
+                    else Right (RelationName wire.permission)
+                )
+            <*> objectRefFromWire wire.object
 
 lookupHandler :: EnServer -> LookupRequestWire -> Handler LookupPageWire
 lookupHandler env request = do

@@ -47,3 +47,17 @@ library
     , servant-server
     , text
     , time
+
+test-suite en-servant-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , containers
+    , en-core
+    , en-servant
+    , servant
+    , servant-server
+    , text

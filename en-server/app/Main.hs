@@ -50,6 +50,7 @@ main = do
                 { consistencyStore
                 , tupleStore
                 , graph
+                , maxBatchSize = 1000
                 }
     Text.putStrLn ("en-server listening on :" <> Text.pack (show port))
     Text.putStrLn ("Using built-in demo schema; run migrations from " <> Text.pack migrationsDir <> " before writes.")

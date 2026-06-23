@@ -2,16 +2,16 @@ module Main (
     main,
 ) where
 
-import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.List (sort)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 
-import En.Check (CaveatObligation (..), CheckDecision (..), check)
+import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..), check, checkMany)
 import En.Conformance.Kikan
-import En.Effect.ConsistencyStore (ConsistencyStore)
+import En.Effect.ConsistencyStore (ConsistencyStore (..))
 import En.Effect.TupleStore (
     PageState (..),
     StoreCursor (..),
@@ -121,6 +121,42 @@ main = do
     assertEqual "intersection allows owner plus member" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId memberOwner) (RelationName "audit") auditedSpace
     assertEqual "exclusion allows member who is not owner" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId memberOnly) (RelationName "member_not_owner") exclusionSpace
     assertEqual "exclusion rejects owner" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId memberOwner) (RelationName "member_not_owner") exclusionSpace
+    let mixedBatch =
+            [ BatchPair (SubjectId user) (RelationName "view") space
+            , BatchPair (SubjectId bob) (RelationName "view") space
+            , BatchPair (SubjectId user) (RelationName "audit") space
+            , BatchPair (SubjectId memberOwner) (RelationName "member_not_owner") exclusionSpace
+            ]
+    assertEqual "batch agrees with single checks in input order" (Right [Allowed, Denied, Denied, Denied]) =<< checkMany consistencyStore tupleStore graph MinimizeLatency requestContext mixedBatch
+    resolveCount <- newIORef 0
+    assertEqual "batch with counted consistency still returns decisions" (Right [Allowed, Denied, Denied, Denied]) =<< checkMany (countingConsistencyStore resolveCount consistencyStore) tupleStore graph MinimizeLatency requestContext mixedBatch
+    assertEqual "batch resolves consistency once" 1 =<< readIORef resolveCount
+    let overlappingBatch =
+            [ BatchPair (SubjectId user) (RelationName "view") space
+            , BatchPair (SubjectId user) (RelationName "owner") space
+            , BatchPair (SubjectId user) (RelationName "member") space
+            ]
+    batchReadCount <- newIORef 0
+    assertEqual "overlapping batch returns decisions" (Right [Allowed, Allowed, Denied]) =<< checkMany consistencyStore (countingTupleStore batchReadCount tupleStore) graph MinimizeLatency requestContext overlappingBatch
+    batchReads <- readIORef batchReadCount
+    independentReadCount <- newIORef 0
+    let independentStore = countingTupleStore independentReadCount tupleStore
+    independentResults <-
+        traverse
+            ( \pair ->
+                check consistencyStore independentStore graph MinimizeLatency requestContext pair.subject pair.permission pair.object
+            )
+            overlappingBatch
+    assertEqual "independent overlapping checks return decisions" [Right Allowed, Right Allowed, Right Denied] independentResults
+    independentReads <- readIORef independentReadCount
+    assertBool "batch shares subproblem reads" (batchReads < independentReads)
+    let badReadSpace = ObjectRef{objectType = ObjectType "space", objectId = "bad-read"}
+        badReadBatch =
+            [ BatchPair (SubjectId user) (RelationName "view") space
+            , BatchPair (SubjectId user) (RelationName "view") badReadSpace
+            , BatchPair (SubjectId bob) (RelationName "view") space
+            ]
+    assertEqual "batch fails closed per pair" (Right [Allowed, Denied, Denied]) =<< checkMany consistencyStore (erroringTupleStore badReadSpace tupleStore) graph MinimizeLatency requestContext badReadBatch
     assertEqual "delegation caveat allows matching autonomy and time" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") intention
     assertEqual "delegation caveat denies higher autonomy" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency adminContext (SubjectId user) (RelationName "view") intention
     assertEqual "delegation caveat is conditional with missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}])) =<< check consistencyStore tupleStore graph MinimizeLatency missingAutonomyContext (SubjectId user) (RelationName "view") intention
@@ -619,6 +655,34 @@ recursiveTupleStore =
             , caveat = Nothing
             }
         ]
+
+countingConsistencyStore :: IORef Int -> ConsistencyStore IO -> ConsistencyStore IO
+countingConsistencyStore count store =
+    store
+        { resolveConsistency = \consistency -> do
+            modifyIORef' count (+ 1)
+            store.resolveConsistency consistency
+        }
+
+countingTupleStore :: IORef Int -> TupleStore IO -> TupleStore IO
+countingTupleStore count store =
+    store
+        { readObjectRelation = \revision object relation limit cursor -> do
+            modifyIORef' count (+ 1)
+            store.readObjectRelation revision object relation limit cursor
+        , readStartingWithUser = \revision query -> do
+            modifyIORef' count (+ 1)
+            store.readStartingWithUser revision query
+        }
+
+erroringTupleStore :: ObjectRef -> TupleStore IO -> TupleStore IO
+erroringTupleStore badObject store =
+    store
+        { readObjectRelation = \revision object relation limit cursor ->
+            if object == badObject
+                then pure TuplePage{rows = [], state = HasMore (StoreCursor "injected-error")}
+                else store.readObjectRelation revision object relation limit cursor
+        }
 
 minLevelSchema :: Schema
 minLevelSchema =

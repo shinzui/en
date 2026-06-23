@@ -81,7 +81,7 @@ each independently verifiable.
 | EP-16 | Make lookup streaming with resumable cursors and a deadline budget | docs/plans/16-make-lookup-streaming-with-resumable-cursors-and-a-deadline-budget.md | None | EP-15 | Complete |
 | EP-17 | Strengthen the lookup spike and add performance-regression benchmarks | docs/plans/17-strengthen-the-lookup-spike-and-add-performance-regression-benchmarks.md | None | EP-14, EP-15, EP-16 | Complete |
 | EP-18 | Conformance: a guarded route example and the kikan agency proof | docs/plans/18-conformance-a-guarded-route-example-and-the-kikan-agency-proof.md | None | EP-15, EP-16 | Complete |
-| EP-19 | Add BatchCheck for GraphQL field-capability and candidate filtering | docs/plans/19-add-batchcheck-for-graphql-field-capability-and-candidate-filtering.md | None | EP-15 | Not Started |
+| EP-19 | Add BatchCheck for GraphQL field-capability and candidate filtering | docs/plans/19-add-batchcheck-for-graphql-field-capability-and-candidate-filtering.md | None | EP-15 | Complete |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
 
@@ -193,8 +193,8 @@ GraphQL-field workload.
 - [x] EP-18: Wire `requirePermission` into a real guarded route with a test proving fail-closed behavior (deny, conditional, and engine-error all 403/500).
 - [x] EP-18: Encode the kikan schema and prove the agency cross-org sharing scenario (guest org sees a subset; sensitive items hidden) end to end.
 - [x] EP-18: Add a GraphQL-resolver-style guarded example (the `en-client`-driven object gate inside a resolver) alongside the Servant `requirePermission` route, mirroring `docs/user/graphql-integration.md`.
-- [ ] EP-19: Add a `BatchCheck` engine operation (many pairs, one resolved revision, shared subproblem memo, bounded concurrency, order-preserving, fail-closed per pair) plus an `en-servant` batch endpoint with a max-batch-size and an `en-client` method.
-- [ ] EP-19: Prove a batch of overlapping checks returns correct per-pair three-valued decisions and shares subproblem work versus N single calls (and benchmark it under EP-17).
+- [x] EP-19: Add a `BatchCheck` engine operation (many pairs, one resolved revision, shared subproblem memo, bounded concurrency, order-preserving, fail-closed per pair) plus an `en-servant` batch endpoint with a max-batch-size and an `en-client` method.
+- [x] EP-19: Prove a batch of overlapping checks returns correct per-pair three-valued decisions and shares subproblem work versus N single calls (and benchmark it under EP-17).
 
 
 ## Surprises & Discoveries
@@ -231,6 +231,11 @@ GraphQL-field workload.
   `en-example` host package, and proved both the Servant guarded route and GraphQL-resolver-shaped
   object gate fail closed. The agency conformance proof uses a C13-focused tuple subset so the guest
   `lookup` label-set is exactly `{guestSpace, sharedItem}` and excludes internal spaces.
+  _(2026-06-23)_
+- EP-19 added `checkMany`, `/batch-check`, and the typed client method. The core test proves one
+  consistency resolution, input-order decisions, strict read-sharing versus independent checks, and
+  per-pair fail-closed behavior; the Servant test proves ordered wire decisions and HTTP 400 for an
+  oversized batch. The `en-core-bench` regression gate now includes `checkMany/overlapping`.
   _(2026-06-23)_
 
 
@@ -287,11 +292,19 @@ GraphQL-field workload.
   read-filter behavior against the post-EP-15/EP-16 engine.
   Date: 2026-06-23
 
+- Decision: Mark EP-19 complete after landing BatchCheck across engine, HTTP, and client surfaces.
+  Rationale: `En.Check.checkMany` now resolves consistency once, deduplicates inputs, memoizes
+  completed subproblems within a call, preserves input order, and fails closed per pair. The
+  `en-servant` endpoint enforces `maxBatchSize`, and `En.Client` exposes the matching typed method.
+  `cabal build all`, `cabal test all`, and the `en-core` benchmark gate passed.
+  Date: 2026-06-23
+
 
 ## Outcomes & Retrospective
 
-EP-14 through EP-18 are complete. The remaining work in this MasterPlan is EP-19, the BatchCheck
-surface for GraphQL field-capability and candidate-filtering workloads.
+MasterPlan 3 is complete. EP-14 through EP-19 landed the consistency hardening, generic caveat
+evaluator, streaming lookup, lookup spike/benchmark gates, guarded-route and kikan conformance
+proofs, and BatchCheck for GraphQL fan-out workloads.
 
 
 ---

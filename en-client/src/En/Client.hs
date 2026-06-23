@@ -16,6 +16,7 @@ data EnClient = EnClient
     { writeTuples :: WriteTuplesRequestWire -> ClientM WriteTuplesResponseWire
     , deleteTuples :: DeleteTuplesRequestWire -> ClientM WriteTuplesResponseWire
     , check :: CheckRequestWire -> ClientM CheckResponseWire
+    , batchCheck :: BatchCheckRequestWire -> ClientM BatchCheckResponseWire
     , lookup :: LookupRequestWire -> ClientM LookupPageWire
     , expand :: ExpandRequestWire -> ClientM ExpandTreeWire
     }
@@ -26,6 +27,7 @@ enClient =
         { writeTuples
         , deleteTuples
         , check
+        , batchCheck
         , lookup
         , expand
         }
@@ -33,5 +35,6 @@ enClient =
     writeTuples
         :<|> deleteTuples
         :<|> check
+        :<|> batchCheck
         :<|> lookup
         :<|> expand = client apiProxy

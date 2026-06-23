@@ -82,20 +82,20 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Milestone 1 (engine): add `En.Check.checkMany` (a new exported function in
+- [x] Milestone 1 (engine): add `En.Check.checkMany` (a new exported function in
       `en-core/src/En/Check.hs`) that resolves consistency once, deduplicates pairs, memoizes
       shared subproblems within the call, and returns per-pair decisions in input order with
       fail-closed per-pair error handling.
-- [ ] Milestone 1: add `en-core/test` cases proving order preservation, single consistency
+- [x] Milestone 1: add `en-core/test` cases proving order preservation, single consistency
       resolution, fewer storage reads than N `check` calls, and fail-closed-per-pair.
-- [ ] Milestone 2 (HTTP): add `BatchCheckRequestWire`/`BatchCheckResponseWire` and a
+- [x] Milestone 2 (HTTP): add `BatchCheckRequestWire`/`BatchCheckResponseWire` and a
       `POST /batch-check` endpoint to `en-servant/src/En/Servant/API.hs`, with a configurable
       maximum batch size enforced as HTTP 400 on oversized batches.
-- [ ] Milestone 2: add an `en-servant` test suite proving ordered decisions and the oversize
+- [x] Milestone 2: add an `en-servant` test suite proving ordered decisions and the oversize
       rejection (the package has no `test/` directory today; create one and register it).
-- [ ] Milestone 3 (client): add the `batchCheck` method to `En.Client.EnClient` in
+- [x] Milestone 3 (client): add the `batchCheck` method to `En.Client.EnClient` in
       `en-client/src/En/Client.hs` so HTTP consumers get it typed.
-- [ ] Run `cabal build all` and `cabal test all` green after each milestone.
+- [x] Run `cabal build all` and `cabal test all` green after each milestone.
 
 
 ## Surprises & Discoveries
@@ -103,7 +103,21 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- **The within-call memo can be tested without exposing internals.** A counting `TupleStore`
+  wrapped around the existing kikan fixture showed that one overlapping batch performs fewer
+  tuple reads than the same pairs executed as independent `check` calls. This proves the memo is
+  load-bearing while keeping `Subproblem` private to `En.Check`. _(2026-06-23)_
+
+- **Core BatchCheck stays sequential to preserve sharing.** The final `checkMany` implementation
+  evaluates distinct pairs in input-first order through one memo. This matches the plan's
+  bounded-concurrency note: parallelism can be added later with a thread-safe memo, but a naive
+  parallel implementation would race on an empty memo and lose the read-sharing property.
+  _(2026-06-23)_
+
+- **The existing `en-core-bench` gate could absorb BatchCheck directly.** Although EP-17 landed
+  before EP-19, the benchmark target was easy to extend with `checkMany/overlapping`; refreshing
+  `en-core/bench/baseline.csv` and running the `--fail-if-slower 25` gate passed with four
+  benchmarks. _(2026-06-23)_
 
 
 ## Decision Log
@@ -179,13 +193,28 @@ Record every decision made while working on the plan.
   contract, which also returns `Conditional` verbatim.
   Date: 2026-06-23
 
+- Decision: Export `CheckDecisionWire` and `CaveatObligationWire` from `En.Servant.API`.
+  Rationale: BatchCheck returns a list of wire decisions directly. These constructors were already
+  part of the JSON response shape through `CheckResponseWire`, but not explicitly exported. The
+  new `en-servant` test and downstream clients need to construct/compare the decision values
+  without relying on opaque JSON.
+  Date: 2026-06-23
+
 
 ## Outcomes & Retrospective
 
-Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
-Compare the result against the original purpose.
+EP-19 added `BatchPair` and `checkMany` to `En.Check`. The batch path resolves consistency once,
+deduplicates identical pairs, shares completed subproblems through a within-call memo, preserves
+input order, and maps per-pair engine errors to `Denied` while leaving the outer `Left` for
+batch-wide consistency resolution failures.
 
-(To be filled during and after implementation.)
+The HTTP layer now exposes `POST /batch-check` with `BatchCheck*Wire` DTOs, a configurable
+`maxBatchSize` on `EnServer`, and an `en-servant` test proving ordered decisions and HTTP 400 for an
+oversized request. `En.Client` exposes the matching typed `batchCheck` method. The `en-core-bench`
+target now includes `checkMany/overlapping` with a recorded baseline.
+
+Validation completed with `cabal build all`, `cabal test all`, and the `en-core` benchmark gate
+passing.
 
 
 ## Context and Orientation
