@@ -233,7 +233,7 @@ evalThis ::
     EvalState ->
     m (Either EnError [LookupObject])
 evalThis consistencyStore tupleStore graph context revision consistency subject objectType relation state = do
-    direct <- readRowsForSubjects tupleStore revision objectType relation [subject]
+    direct <- readRowsForSubjects tupleStore revision objectType relation (subjectsWithWildcard subject)
     case direct of
         Left err -> pure (Left err)
         Right directRows -> do
@@ -350,14 +350,27 @@ evalTupleToUserset consistencyStore tupleStore graph context revision consistenc
                         let usersetDecision =
                                 case tuple.subject of
                                     SubjectId subjectObject ->
-                                        Map.findWithDefault Allowed subjectObject objectDecisionMap
+                                        Just (Map.findWithDefault Allowed subjectObject objectDecisionMap)
                                     SubjectSet subjectObject _ ->
-                                        Map.findWithDefault Allowed subjectObject objectDecisionMap
-                        includeDecision graph context tuple.caveat usersetDecision >>= \case
+                                        Just (Map.findWithDefault Allowed subjectObject objectDecisionMap)
+                                    SubjectWildcard _ ->
+                                        Nothing
+                        case usersetDecision of
                             Nothing -> Right []
-                            Just decision -> Right [objectFromRowWithDecision row decision]
+                            Just decision ->
+                                includeDecision graph context tuple.caveat decision >>= \case
+                                    Nothing -> Right []
+                                    Just included -> Right [objectFromRowWithDecision row included]
                     )
                     rows
+
+subjectsWithWildcard :: Subject -> [Subject]
+subjectsWithWildcard subject =
+    subject
+        : case subject of
+            SubjectId object -> [SubjectWildcard object.objectType]
+            SubjectSet _ _ -> []
+            SubjectWildcard _ -> []
 
 insertObjects :: [LookupObject] -> Map.Map ObjectRef LookupObject -> Map.Map ObjectRef LookupObject
 insertObjects objects objectMap =

@@ -93,12 +93,15 @@ This section must always reflect the actual current state of the work.
   test fixture and confirm every existing caveat assertion still passes. Completed 2026-06-23.
 - [x] **M2.5** Add a test declaring a brand-new caveat (`min_level`, Integer `>=`) and prove the
   engine evaluates it with no engine code naming it. Completed 2026-06-23.
-- [ ] **M3.1** Add a public/wildcard subject form to `En.Tuple.Subject` and `En.Schema.AllowedSubject`.
-- [ ] **M3.2** Handle it in `En.Check` (a `user:*` tuple grants every concrete subject of that type).
-- [ ] **M3.3** Handle it in `En.Lookup` and the `En.Reachability` compiler.
-- [ ] **M3.4** Add tests proving `check` admits an arbitrary user via a public grant and `lookup`
-  returns the publicly-granted object.
-- [ ] Final: `cabal build all && cabal test all` green; grep checks from Purpose hold.
+- [x] **M3.1** Add a public/wildcard subject form to `En.Tuple.Subject` and `En.Schema.AllowedSubject`.
+  Completed 2026-06-23.
+- [x] **M3.2** Handle it in `En.Check` (a `user:*` tuple grants every concrete subject of that type).
+  Completed 2026-06-23.
+- [x] **M3.3** Handle it in `En.Lookup` and the `En.Reachability` compiler. Completed 2026-06-23.
+- [x] **M3.4** Add tests proving `check` admits an arbitrary user via a public grant and `lookup`
+  returns the publicly-granted object. Completed 2026-06-23.
+- [x] Final: `cabal build all && cabal test all` green; grep checks from Purpose hold.
+  Completed 2026-06-23.
 
 
 ## Surprises & Discoveries
@@ -184,13 +187,28 @@ Record every decision made while working on the plan.
   a byproduct of the hard-coded evaluator's context-presence shortcut, not the semantic grant.
   Date: 2026-06-23
 
+- Decision: A wildcard tuple (`type:*`) matches only concrete `SubjectId` values of that object type,
+  not userset subjects.
+  Rationale: A userset subject represents "members of object#relation", not a concrete subject object,
+  so matching it against `type:*` would grant through a set identity rather than an actual member.
+  Date: 2026-06-23
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+EP-15 completed on 2026-06-23. The decision algebra now lives in `En.Decision` and both `En.Check`
+and `En.Lookup` use it; `En.Check.evalThis` no longer has a partial `error` path. Caveats are
+schema-driven through `CaveatPredicate` and `En.Caveat.evaluateCaveat`, including the existing
+`within_autonomy` fixture and a new generic `min_level` integer proof that names no engine code.
+
+Wildcard/public subjects are first-class as `SubjectWildcard ObjectType`, authorable through
+`Schema.wildcardSubject`, compiled into reachability entrypoints, matched in `check`, included in
+direct `lookup`, rendered by `expand`, and round-tripped by the PostgreSQL tuple store. The matching
+rule is intentionally narrow: `user:*` matches concrete `user:<id>` subjects only, and does not match
+`SubjectSet` userset subjects. `cabal test all` and `cabal build all` passed after the implementation.
 
 
 ## Context and Orientation

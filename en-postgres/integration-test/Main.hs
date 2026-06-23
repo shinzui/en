@@ -71,6 +71,7 @@ runTupleStoreScenario connection = do
             postgresConsistencyStore config (pure testTime) store.optimizedRevision store.headRevision store.oldestRetainedXid
         projectX = ObjectRef (ObjectType "space") "project-x"
         projectY = ObjectRef (ObjectType "space") "project-y"
+        projectPublic = ObjectRef (ObjectType "space") "public"
         tuple =
             Tuple
                 { object = projectX
@@ -157,6 +158,26 @@ runTupleStoreScenario connection = do
         "stale snapshot token is rejected after GC horizon advances"
         (Left (InvalidConsistencyToken "token is older than the garbage-collection window"))
         staleResult
+    let publicTuple =
+            Tuple
+                { object = projectPublic
+                , relation = RelationName "viewer"
+                , subject = SubjectWildcard (ObjectType "user")
+                , caveat = Nothing
+                }
+        publicQuery =
+            UsersetQuery
+                { queryType = ObjectType "space"
+                , queryRelation = RelationName "viewer"
+                , querySubjects = [SubjectWildcard (ObjectType "user")]
+                , queryLimit = 10
+                , queryCursor = Nothing
+                }
+    publicToken <- store.writeTuples [publicTuple]
+    TokenMetadata{revision = publicRevision} <- either (fail . show) pure (tokenMetadataFromPayload publicToken)
+    TuplePage{rows = publicRows, state = publicState} <- store.readStartingWithUser publicRevision publicQuery
+    assertEqual "postgres tuple store round-trips wildcard rows" [publicTuple] ((.tuple) <$> publicRows)
+    assertEqual "postgres wildcard read is exhausted" Exhausted publicState
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
 assertEqual label expected actual
@@ -284,7 +305,7 @@ checkSchema =
                 ,
                     ( ObjectType "space"
                     , Map.fromList
-                        [ relationEntry "viewer" userSubject This
+                        [ relationEntry "viewer" (userSubject <> wildcardUserSubject) This
                         , relationEntry "view" Set.empty (ComputedUserset (RelationName "viewer"))
                         ]
                     )
@@ -304,7 +325,11 @@ relationEntry name allowedSubjects rewrite =
 
 userSubject :: Set.Set AllowedSubject
 userSubject =
-    Set.singleton AllowedSubject{objectType = ObjectType "user", relation = Nothing}
+    Set.singleton AllowedSubject{objectType = ObjectType "user", relation = Nothing, wildcard = False}
+
+wildcardUserSubject :: Set.Set AllowedSubject
+wildcardUserSubject =
+    Set.singleton AllowedSubject{objectType = ObjectType "user", relation = Nothing, wildcard = True}
 
 testTime :: UTCTime
 testTime =

@@ -32,6 +32,7 @@ data ObjectRef = ObjectRef
 data Subject
     = SubjectId ObjectRef
     | SubjectSet ObjectRef RelationName
+    | SubjectWildcard ObjectType
     deriving stock (Eq, Ord, Show)
 
 -- | A named caveat plus the tuple-local arguments supplied at write time.

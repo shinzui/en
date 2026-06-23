@@ -235,6 +235,8 @@ expandTupleToUserset tupleStore graph revision object tuplesetRelation computedR
                 usersetNode row subjectObject computedRelation
             SubjectSet subjectObject subjectRelation ->
                 usersetNode row subjectObject subjectRelation
+            SubjectWildcard subjectType ->
+                pure (Right (wrapTupleCaveat tuple.caveat [ExpandSubject (SubjectWildcard subjectType) (Just row)]))
     usersetNode TupleRow{tuple} subjectObject relation = do
         children <- expandRelation tupleStore graph revision subjectObject relation state
         pure (wrapTupleCaveat tuple.caveat . pure . ExpandUserset subjectObject relation <$> children)
@@ -254,6 +256,8 @@ nodeFromRow tupleStore graph revision state row@TupleRow{tuple} =
         SubjectSet subject relation -> do
             children <- expandRelation tupleStore graph revision subject relation state
             pure (wrapTupleCaveat tuple.caveat . pure . ExpandUserset subject relation <$> children)
+        SubjectWildcard subjectType ->
+            pure (Right (wrapTupleCaveat tuple.caveat [ExpandSubject (SubjectWildcard subjectType) (Just row)]))
 
 wrapTupleCaveat :: Maybe TupleCaveat -> [ExpandNode] -> [ExpandNode]
 wrapTupleCaveat Nothing nodes = nodes

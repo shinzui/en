@@ -179,7 +179,7 @@ evalThis tupleStore graph context revision subject object relation state
                 pure (Decision.union <$> sequence decisions)
   where
     rowDecision TupleRow{tuple}
-        | tuple.subject == subject =
+        | tuple.subject == subject || wildcardMatches tuple.subject subject =
             pure (applyTupleCaveat graph context tuple.caveat Allowed)
         | otherwise =
             case tuple.subject of
@@ -189,6 +189,8 @@ evalThis tupleStore graph context revision subject object relation state
                     fmap
                         (>>= applyTupleCaveat graph context tuple.caveat)
                         (evalRelation tupleStore graph context revision subject subjectObject subjectRelation state)
+                SubjectWildcard _ ->
+                    pure (Right Denied)
 
 evalTupleToUserset ::
     (Monad m) =>
@@ -215,12 +217,21 @@ evalTupleToUserset tupleStore graph context revision subject object tuplesetRela
                                 applyRowGate tuple <$> evalRelation tupleStore graph context revision subject subjectObject computedRelation state
                             SubjectSet subjectObject subjectRelation ->
                                 applyRowGate tuple <$> evalRelation tupleStore graph context revision subject subjectObject subjectRelation state
+                            SubjectWildcard _ ->
+                                pure (Right Denied)
                     )
                     rows
             pure (Decision.union <$> sequence decisions)
   where
     applyRowGate tuple =
         (>>= applyTupleCaveat graph context tuple.caveat)
+
+wildcardMatches :: Subject -> Subject -> Bool
+wildcardMatches tupleSubject checkedSubject =
+    case (tupleSubject, checkedSubject) of
+        (SubjectWildcard wildcardType, SubjectId ObjectRef{objectType}) ->
+            wildcardType == objectType
+        _ -> False
 
 ensureExhausted :: TuplePage -> Either EnError [TupleRow]
 ensureExhausted TuplePage{rows, state} =

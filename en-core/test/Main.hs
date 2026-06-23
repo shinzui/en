@@ -89,18 +89,20 @@ main = do
     graph <- either (fail . show) pure (compile kikanSchema)
     assertEqual "graph stores schema hash" (schemaHash kikanSchema) graph.hash
     assertEqual "schema hash is stable across map insertion order" (schemaHash kikanSchema) (schemaHash kikanSchemaReordered)
-    assertBool "space view has a direct user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing) Reachability.Direct False graph)
-    assertBool "space view has a guest-org userset entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "org") (Just (RelationName "member"))) Reachability.Direct False graph)
-    assertBool "space view has a recursive parent entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "space") (Just (RelationName "view"))) Reachability.Direct True graph)
-    assertBool "space audit relation is conditional" (hasEntry (relationRef "space" "audit") (SubjectSelector (ObjectType "user") Nothing) Reachability.Conditional False graph)
-    assertBool "space member-minus-owner relation is conditional" (hasEntry (relationRef "space" "member_not_owner") (SubjectSelector (ObjectType "user") Nothing) Reachability.Conditional False graph)
+    assertBool "space view has a direct user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Direct False graph)
+    assertBool "space view has a guest-org userset entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "org") (Just (RelationName "member")) False) Reachability.Direct False graph)
+    assertBool "space view has a recursive parent entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "space") (Just (RelationName "view")) False) Reachability.Direct True graph)
+    assertBool "space audit relation is conditional" (hasEntry (relationRef "space" "audit") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Conditional False graph)
+    assertBool "space member-minus-owner relation is conditional" (hasEntry (relationRef "space" "member_not_owner") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Conditional False graph)
     assertValidationFails "This requires allowed subjects" (schemaWithRelation "space" "viewer" Set.empty This)
     assertValidationFails "ComputedUserset rejects unknown relation" (schemaWithRelation "space" "viewer" userSubject (ComputedUserset (RelationName "missing")))
     assertValidationFails "TupleToUserset rejects incompatible arrows" invalidTupleToUsersetSchema
+    assertValidationFails "TupleToUserset rejects wildcard-only arrows" invalidWildcardTupleToUsersetSchema
     assertValidationFails "Union rejects empty branches" (schemaWithRelation "space" "viewer" userSubject (Union []))
     assertValidationFails "Intersection rejects empty branches" (schemaWithRelation "space" "viewer" userSubject (Intersection []))
     assertValidationFails "Exclusion validates both branches" (schemaWithRelation "space" "viewer" userSubject (Exclusion This (ComputedUserset (RelationName "missing"))))
     assertValidationFails "Caveated rejects unknown caveat" (schemaWithRelation "space" "viewer" userSubject (Caveated (CaveatName "missing") This))
+    assertValidationFails "wildcard allowed subjects cannot be usersets" invalidWildcardUsersetSchema
     assertValidationFails "unproductive rewrite cycles are rejected" unproductiveCycleSchema
     assertEqual "owner can view a space" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
     assertEqual "non-member cannot view a space" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId bob) (RelationName "view") space
@@ -121,6 +123,14 @@ main = do
     assertEqual "generic integer caveat allows sufficient clearance" (Right Allowed) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelAllowedContext (SubjectId user) (RelationName "view") minLevelDocument
     assertEqual "generic integer caveat denies insufficient clearance" (Right Denied) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelDeniedContext (SubjectId user) (RelationName "view") minLevelDocument
     assertEqual "generic integer caveat reports missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "min_level", missingContext = ["clearance"]}])) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency (CaveatContext Map.empty) (SubjectId user) (RelationName "view") minLevelDocument
+    publicGraph <- either (fail . show) pure (compile publicSchema)
+    let publicStore = inMemoryTupleStore [publicTuple]
+    assertBool "public view has a wildcard user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing True) Reachability.Direct False publicGraph)
+    assertEqual "wildcard subject grants concrete users" (Right Allowed) =<< check consistencyStore publicStore publicGraph MinimizeLatency requestContext (SubjectId bob) (RelationName "view") publicSpace
+    assertEqual "wildcard subject does not match userset subjects" (Right Denied) =<< check consistencyStore publicStore publicGraph MinimizeLatency requestContext (SubjectSet guestOrg (RelationName "member")) (RelationName "view") publicSpace
+    assertEqual "lookup includes public wildcard rows for concrete users" (Right (lookupPage [allowed publicSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore publicStore publicGraph MinimizeLatency (lookupRequest (SubjectId bob) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    publicExpansion <- Expand.expand consistencyStore publicStore publicGraph MinimizeLatency (expandRequest publicSpace (RelationName "view") requestContext (ExpandLimit 20) Nothing)
+    assertBool "expand renders wildcard subjects" (treeHasSubject (SubjectWildcard (ObjectType "user")) publicExpansion)
     assertEqual "recursive graph respects depth limit" (Left ResolutionLimitExceeded) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
     assertEqual "lookup returns direct and recursive view spaces" (Right (lookupPage [allowed childSpace, allowed space] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup follows userset subjects" (Right (lookupPage [allowed guestSpace, allowed usersetMemberSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId agencyUser) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
@@ -469,6 +479,50 @@ invalidTupleToUsersetSchema =
         , caveats = Map.empty
         }
 
+invalidWildcardUsersetSchema :: Schema
+invalidWildcardUsersetSchema =
+    Schema
+        { objectTypes =
+            Map.fromList
+                [ (ObjectType "user", Map.empty)
+                ,
+                    ( ObjectType "space"
+                    , Map.fromList
+                        [ relationEntry
+                            "viewer"
+                            (Set.singleton AllowedSubject{objectType = ObjectType "user", relation = Just (RelationName "member"), wildcard = True})
+                            This
+                        ]
+                    )
+                ]
+        , caveats = Map.empty
+        }
+
+invalidWildcardTupleToUsersetSchema :: Schema
+invalidWildcardTupleToUsersetSchema =
+    Schema
+        { objectTypes =
+            Map.fromList
+                [
+                    ( ObjectType "user"
+                    , Map.fromList
+                        [ relationEntry "member" userSubject This
+                        ]
+                    )
+                ,
+                    ( ObjectType "space"
+                    , Map.fromList
+                        [ relationEntry
+                            "viewer"
+                            (Set.singleton AllowedSubject{objectType = ObjectType "user", relation = Nothing, wildcard = True})
+                            This
+                        , relationEntry "bad" Set.empty (TupleToUserset (RelationName "viewer") (RelationName "member"))
+                        ]
+                    )
+                ]
+        , caveats = Map.empty
+        }
+
 unproductiveCycleSchema :: Schema
 unproductiveCycleSchema =
     Schema
@@ -513,23 +567,23 @@ relationEntry name allowedSubjects rewrite =
 
 userSubject :: Set.Set AllowedSubject
 userSubject =
-    Set.singleton AllowedSubject{objectType = ObjectType "user", relation = Nothing}
+    Set.singleton AllowedSubject{objectType = ObjectType "user", relation = Nothing, wildcard = False}
 
 orgSubject :: Set.Set AllowedSubject
 orgSubject =
-    Set.singleton AllowedSubject{objectType = ObjectType "org", relation = Nothing}
+    Set.singleton AllowedSubject{objectType = ObjectType "org", relation = Nothing, wildcard = False}
 
 orgMemberSubject :: Set.Set AllowedSubject
 orgMemberSubject =
-    Set.singleton AllowedSubject{objectType = ObjectType "org", relation = Just (RelationName "member")}
+    Set.singleton AllowedSubject{objectType = ObjectType "org", relation = Just (RelationName "member"), wildcard = False}
 
 spaceSubject :: Set.Set AllowedSubject
 spaceSubject =
-    Set.singleton AllowedSubject{objectType = ObjectType "space", relation = Nothing}
+    Set.singleton AllowedSubject{objectType = ObjectType "space", relation = Nothing, wildcard = False}
 
 visibilityClassSubject :: Set.Set AllowedSubject
 visibilityClassSubject =
-    Set.singleton AllowedSubject{objectType = ObjectType "visibility_class", relation = Nothing}
+    Set.singleton AllowedSubject{objectType = ObjectType "visibility_class", relation = Nothing, wildcard = False}
 
 relationRef :: Text -> Text -> RelationRef
 relationRef objectType relation =
@@ -743,6 +797,36 @@ minLevelDocument =
     ObjectRef
         { objectType = ObjectType "document"
         , objectId = "classified"
+        }
+
+publicSchema :: Schema
+publicSchema =
+    Schema.build
+        [ Schema.object "user" []
+        , Schema.object
+            "org"
+            [Schema.relation "member" [Schema.subject "user"] Schema.this]
+        , Schema.object
+            "space"
+            [ Schema.relation "viewer" [Schema.wildcardSubject "user"] Schema.this
+            , Schema.permission "view" (Schema.computed "viewer")
+            ]
+        ]
+
+publicTuple :: Tuple
+publicTuple =
+    Tuple
+        { object = publicSpace
+        , relation = RelationName "viewer"
+        , subject = SubjectWildcard (ObjectType "user")
+        , caveat = Nothing
+        }
+
+publicSpace :: ObjectRef
+publicSpace =
+    ObjectRef
+        { objectType = ObjectType "space"
+        , objectId = "public"
         }
 
 user :: ObjectRef

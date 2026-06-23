@@ -119,6 +119,7 @@ data ObjectRefWire = ObjectRefWire
 data SubjectWire
     = SubjectIdWire !ObjectRefWire
     | SubjectSetWire !ObjectRefWire !Text
+    | SubjectWildcardWire !Text
     deriving stock (Eq, Show, Generic)
     deriving anyclass (FromJSON, ToJSON)
 
@@ -383,6 +384,7 @@ subjectToWire =
     \case
         SubjectId object -> SubjectIdWire (objectRefToWire object)
         SubjectSet object (RelationName relation) -> SubjectSetWire (objectRefToWire object) relation
+        SubjectWildcard (ObjectType objectType) -> SubjectWildcardWire objectType
 
 subjectFromWire :: SubjectWire -> Either Text Subject
 subjectFromWire =
@@ -391,6 +393,9 @@ subjectFromWire =
         SubjectSetWire object relation
             | Text.null relation -> Left "subject relation must not be empty"
             | otherwise -> SubjectSet <$> objectRefFromWire object <*> Right (RelationName relation)
+        SubjectWildcardWire objectType
+            | Text.null objectType -> Left "wildcard subject objectType must not be empty"
+            | otherwise -> Right (SubjectWildcard (ObjectType objectType))
 
 tupleToWire :: Tuple -> TupleWire
 tupleToWire Tuple{object, relation = RelationName relation, subject, caveat} =

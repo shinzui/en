@@ -130,6 +130,7 @@ as @user:alice@. @AllowedSubject t (Just r)@ accepts userset subjects of shape
 data AllowedSubject = AllowedSubject
     { objectType :: !ObjectType
     , relation :: !(Maybe RelationName)
+    , wildcard :: !Bool
     }
     deriving stock (Eq, Ord, Show)
 
@@ -211,9 +212,11 @@ validate schema = do
             Nothing ->
                 Left (UnknownRelation ("unknown allowed subject object type: " <> objectText allowed.objectType))
             Just subjectRelations ->
-                case allowed.relation of
-                    Nothing -> Right ()
-                    Just relationName ->
+                case (allowed.wildcard, allowed.relation) of
+                    (True, Just _) ->
+                        Left (SchemaViolation ("wildcard allowed subject cannot name a userset relation: " <> objectText allowed.objectType))
+                    (_, Nothing) -> Right ()
+                    (_, Just relationName) ->
                         if Map.member relationName subjectRelations
                             then Right ()
                             else Left (UnknownRelation ("unknown allowed subject relation: " <> relationText allowed.objectType relationName))
@@ -229,6 +232,7 @@ validate schema = do
                 let compatibleTargets =
                         [ allowed.objectType
                         | allowed <- Set.toList tupleset.allowedSubjects
+                        , not allowed.wildcard
                         , hasRelation allowed.objectType computedRelation
                         ]
                 if null compatibleTargets
@@ -323,6 +327,7 @@ validateProductiveCycles schema =
                         Set.fromList
                             [ RelationRef{objectType = allowed.objectType, relation = computedRelation}
                             | allowed <- Set.toList tupleset.allowedSubjects
+                            , not allowed.wildcard
                             , hasRelation allowed.objectType computedRelation
                             ]
             Union rewrites -> foldMap (dependencies objectType) rewrites
@@ -393,6 +398,7 @@ renderSchema schema =
             [ "subject"
             , renderText (objectText allowed.objectType)
             , maybe "_" (renderText . relationNameText) allowed.relation
+            , if allowed.wildcard then "wildcard" else "concrete"
             ]
 
     renderCaveatDefinition (caveatName, definition) =

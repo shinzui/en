@@ -517,9 +517,10 @@ rowFromColumns idValue objectType objectId relation subjectType subjectId subjec
                 { object = ObjectRef{objectType = ObjectType objectType, objectId = objectId}
                 , relation = RelationName relation
                 , subject =
-                    case subjectRelation of
-                        Nothing -> SubjectId subjectObject
-                        Just relationName -> SubjectSet subjectObject (RelationName relationName)
+                    case (subjectRelation, subjectId) of
+                        (Nothing, "*") -> SubjectWildcard (ObjectType subjectType)
+                        (Nothing, _) -> SubjectId subjectObject
+                        (Just relationName, _) -> SubjectSet subjectObject (RelationName relationName)
                 , caveat = decodeTupleCaveat caveatName caveatPayload
                 }
         , createdAt = Revision createdXid
@@ -546,6 +547,7 @@ flattenSubject =
     \case
         SubjectId objectRef -> (objectRef, Nothing)
         SubjectSet objectRef relationName -> (objectRef, Just relationName)
+        SubjectWildcard objectType -> (ObjectRef{objectType, objectId = "*"}, Nothing)
 
 flattenCaveat :: Maybe TupleCaveat -> (Maybe CaveatName, Maybe CaveatPayload)
 flattenCaveat =

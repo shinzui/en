@@ -17,6 +17,7 @@ module En.Schema.Builder (
     permission,
     subject,
     userset,
+    wildcardSubject,
     caveat,
     caveatWith,
     parameter,
@@ -106,11 +107,15 @@ permission name =
 
 subject :: Text -> SubjectSpec
 subject name =
-    SubjectSpec (Raw.AllowedSubject (Raw.ObjectType name) Nothing)
+    SubjectSpec (Raw.AllowedSubject (Raw.ObjectType name) Nothing False)
 
 userset :: Text -> Text -> SubjectSpec
 userset objectType relationName =
-    SubjectSpec (Raw.AllowedSubject (Raw.ObjectType objectType) (Just (Raw.RelationName relationName)))
+    SubjectSpec (Raw.AllowedSubject (Raw.ObjectType objectType) (Just (Raw.RelationName relationName)) False)
+
+wildcardSubject :: Text -> SubjectSpec
+wildcardSubject name =
+    SubjectSpec (Raw.AllowedSubject (Raw.ObjectType name) Nothing True)
 
 caveat :: Text -> [ParameterSpec] -> CaveatSpec
 caveat name parameterSpecs =

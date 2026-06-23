@@ -54,6 +54,7 @@ data RelationRef = RelationRef
 data SubjectSelector = SubjectSelector
     { objectType :: !ObjectType
     , relation :: !(Maybe RelationName)
+    , wildcard :: !Bool
     }
     deriving stock (Eq, Ord, Show)
 
@@ -126,7 +127,7 @@ compileRewrite schema target current visited kind path caveats =
     \case
         This ->
             [ EntryPoint
-                { source = SubjectSelector{objectType = allowed.objectType, relation = allowed.relation}
+                { source = SubjectSelector{objectType = allowed.objectType, relation = allowed.relation, wildcard = allowed.wildcard}
                 , target = target
                 , kind = kind
                 , path = reverse (StepThis : path)
@@ -156,7 +157,7 @@ compileRewrite schema target current visited kind path caveats =
                             (lookupRelation schema computed)
         TupleToUserset tuplesetRelation computedRelation ->
             [ EntryPoint
-                { source = SubjectSelector{objectType = allowed.objectType, relation = Just computedRelation}
+                { source = SubjectSelector{objectType = allowed.objectType, relation = Just computedRelation, wildcard = False}
                 , target = target
                 , kind = kind
                 , path = reverse (StepTupleToUserset tuplesetRelation computedRelation : path)
@@ -164,6 +165,7 @@ compileRewrite schema target current visited kind path caveats =
                 , recursive = RelationRef{objectType = allowed.objectType, relation = computedRelation} == target
                 }
             | allowed <- maybe [] (Set.toAscList . (.allowedSubjects)) (lookupRelation schema RelationRef{objectType = current.objectType, relation = tuplesetRelation})
+            , not allowed.wildcard
             , hasRelation schema allowed.objectType computedRelation
             ]
         Union rewrites ->
