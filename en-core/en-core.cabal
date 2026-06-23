@@ -1,7 +1,9 @@
-cabal-version:      3.0
-name:               en-core
-version:            0.1.0.0
-synopsis:           Schema-parametric ReBAC engine: model, reachability, check/lookup, revisions
+cabal-version: 3.0
+name:          en-core
+version:       0.1.0.0
+synopsis:
+  Schema-parametric ReBAC engine: model, reachability, check/lookup, revisions
+
 description:
   en-core is the transport- and database-agnostic heart of en. It defines the
   authorization model (relation tuples, userset-rewrite rules, caveats), the
@@ -10,10 +12,10 @@ description:
   types. It depends on no Servant, WAI, PostgreSQL, or HTTP library; concrete
   implementations live in en-postgres, en-servant, and en-server.
 
-license:            MIT
-author:             Nadeem Bitar
-maintainer:         nadeem@gmail.com
-category:           Security, Authorization
+license:       MIT
+author:        Nadeem Bitar
+maintainer:    nadeem@gmail.com
+category:      Security, Authorization
 
 common warnings
   ghc-options:
@@ -24,9 +26,11 @@ common shared
   default-language:   GHC2024
   default-extensions:
     BlockArguments
+    DeriveAnyClass
     DerivingStrategies
     DuplicateRecordFields
     LambdaCase
+    OverloadedLabels
     OverloadedRecordDot
     OverloadedStrings
 
@@ -34,18 +38,34 @@ library
   import:          warnings, shared
   hs-source-dirs:  src
   exposed-modules:
-    En.Prelude
+    En.Check
+    En.Effect.ConsistencyStore
+    En.Effect.TupleStore
     En.Error
+    En.Expand
+    En.Lookup
+    En.Prelude
+    En.Reachability
+    En.Revision
     En.Schema
     En.Tuple
-    En.Revision
-    En.Reachability
-    En.Check
-    En.Lookup
-    En.Effect.TupleStore
+
   build-depends:
-    , base              >=4.19 && <5
+    , base                  >=4.19 && <5
     , bytestring
     , containers
     , text
+    , time
     , unordered-containers
+
+test-suite en-core-interface-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , containers
+    , en-core
+    , text
+    , time
