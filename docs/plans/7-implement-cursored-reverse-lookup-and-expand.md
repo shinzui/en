@@ -26,14 +26,15 @@ This plan implements the production reverse-query surface. After it is complete,
 - [x] Propagate caveat obligations or missing context through lookup results. Completed 2026-06-23.
 - [x] Enforce result caps, recursion/depth limits, deadlines if configured, and deterministic cursor resume. Completed 2026-06-23 except no deadline option exists yet in the core request type.
 - [x] Add tests for direct union lookup, userset lookup, tuple-to-userset lookup, caveated lookup, intersection/exclusion confirmation, cycles, and pagination. Completed 2026-06-23 for core lookup behavior.
-- [ ] Implement `expand` result construction for audit/review use.
-- [ ] Run `cabal build all` and relevant tests.
+- [x] Implement `expand` result construction for audit/review use. Completed 2026-06-23.
+- [x] Run `cabal build all` and relevant tests. Completed 2026-06-23.
 
 
 ## Surprises & Discoveries
 
 - The EP-1 `LookupPage` shape carried only `[ObjectRef]`, which could not preserve conditional caveat obligations. Lookup now returns `LookupObject` values with the object and its `CheckDecision`, so EP-6 can expose conditional lookup results without losing information.
 - Recursive tuple-to-userset lookup needs a bounded transitive walk. Treating a repeated relation as an immediate error prevents valid parent/container schemas from returning descendants, so the implementation skips the currently-recursive branch while computing base objects and then expands descendants with a depth cap.
+- `expand` can stay explanatory rather than authorization-filtering. It resolves consistency and walks the rewrite tree from an object relation to direct subjects and usersets, preserving caveat markers so audit/review UIs can display why a subject path is conditional.
 
 
 ## Decision Log
@@ -47,11 +48,31 @@ This plan implements the production reverse-query surface. After it is complete,
 - Decision: Carry per-object `CheckDecision` in lookup results.
   Rationale: Conditional caveated paths are valid lookup results but cannot be represented by a bare object id. The result page now preserves `Allowed` versus `Conditional` for each object.
   Date: 2026-06-23
+- Decision: Keep `expand` as a structural explanation tree.
+  Rationale: `expand` is for review and audit UIs, so it should show direct subjects, usersets, tuple-to-userset hops, caveat markers, and boolean rewrite branches instead of collapsing the graph into a yes/no authorization result.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+EP-7 implemented the production core reverse-query surface. `En.Lookup.lookup` now resolves
+consistency through `ConsistencyStore`, returns bounded cursor pages of `LookupObject` values, carries
+per-object `CheckDecision` values for conditional caveated results, recursively expands tuple-to-userset
+container paths, and confirms intersection/exclusion candidates with forward `check`. `En.Expand.expand`
+now builds bounded explanatory trees containing direct subjects, usersets, tuple-to-userset branches,
+and caveat markers. The core tests cover direct lookup, userset subjects, tuple-to-userset recursion,
+caveated lookup, intersection/exclusion confirmation, deterministic pagination, and expand trees. The
+Postgres integration test also verifies lookup cursor paging over the Hasql-backed tuple store.
+
+Validation completed 2026-06-23:
+
+```text
+cabal build all
+Up to date
+
+cabal test all
+... all test suites passed ...
+```
 
 
 ## Context and Orientation

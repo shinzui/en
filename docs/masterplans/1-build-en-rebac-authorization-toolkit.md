@@ -40,7 +40,7 @@ An alternative decomposition by package was rejected. Planning by files such as 
 | EP-4 | Implement forward authorization check | docs/plans/4-implement-forward-authorization-check.md | EP-1, EP-3 | EP-2 | Complete |
 | EP-5 | Validate bounded lookup with the kikan read-filter spike | docs/plans/5-validate-bounded-lookup-with-the-kikan-read-filter-spike.md | None | EP-1, EP-3 | Complete |
 | EP-6 | Expose en through Servant server and client APIs | docs/plans/6-expose-en-through-servant-server-and-client-apis.md | EP-1, EP-2, EP-3, EP-4, EP-7 | EP-5 | Not Started |
-| EP-7 | Implement cursored reverse lookup and expand | docs/plans/7-implement-cursored-reverse-lookup-and-expand.md | EP-1, EP-3, EP-4 | EP-2, EP-5 | In Progress |
+| EP-7 | Implement cursored reverse lookup and expand | docs/plans/7-implement-cursored-reverse-lookup-and-expand.md | EP-1, EP-3, EP-4 | EP-2, EP-5 | Complete |
 
 
 ## Dependency Graph
@@ -89,8 +89,8 @@ The Servant API is owned by EP-6 but must not invent new semantics. It serialize
 - [x] EP-4: Prove caveated, userset, tuple-to-userset, intersection, exclusion, and recursion-limit behavior with tests.
 - [x] EP-5: Build and run the kikan read-filter lookup spike over synthetic relationship and activity data.
 - [x] EP-5: Append p95 results and a green/red decision to `docs/spec/0002-lookup-spike.md`.
-- [ ] EP-7: Implement production cursored reverse lookup with caps, truncation, and reach-then-check confirmation.
-- [ ] EP-7: Implement `expand` for review and audit UIs.
+- [x] EP-7: Implement production cursored reverse lookup with caps, truncation, and reach-then-check confirmation.
+- [x] EP-7: Implement `expand` for review and audit UIs.
 - [ ] EP-6: Define Servant API, handlers, client functions, and server wiring over the completed libraries.
 - [ ] EP-6: Validate the standalone service with an end-to-end write-token-check-lookup scenario.
 
@@ -107,6 +107,7 @@ The Servant API is owned by EP-6 but must not invent new semantics. It serialize
 - EP-3 found that productive recursive schemas need a base path check rather than a blanket cycle rejection. The kikan-shaped `space#view` recursion through `space#parent` is valid because it can also reach direct `owner`/`member` bases; pure computed-userset cycles without a base are rejected.
 - EP-4 found that forward check requires object-side tuple reads in addition to Zanzibar's reverse `ReadStartingWithUser` primitive. `TupleStore` now exposes `readObjectRelation` for check and keeps `readStartingWithUser` for lookup.
 - EP-5 found that the intended kikan read-filter shape remains bounded in the spike: the reachable label set stayed at 24 spaces and 4 visibility classes across 1k, 10k, and 100k relationship tuples, while the anti-pattern hit the 1001-result cap in every scenario.
+- EP-7 found that bare lookup object ids are insufficient for caveated reverse results. `LookupPage` now carries `LookupObject` entries with per-object `CheckDecision` values so conditional caveat obligations can reach EP-6's HTTP surface.
 
 
 ## Decision Log
@@ -141,6 +142,9 @@ The Servant API is owned by EP-6 but must not invent new semantics. It serialize
 - Decision: Treat EP-5 as complete after the `ephemeral-pg` spike produced a green 1M-row read-filter result and documented the skipped 10M-row case.
   Rationale: The measured lookup p95 is far below the target at 100k relationship tuples/depth 6, the indexed consumer read path is below the target at the required 1M-row scale, and the remaining 10M check is explicitly recorded as optional/where-feasible evidence.
   Date: 2026-06-23
+- Decision: Treat EP-7 as complete after core lookup/expand tests and Postgres-backed lookup paging passed.
+  Rationale: The core algorithms now resolve consistency, preserve conditional lookup decisions, confirm conditional candidates with forward check, return deterministic cursors, build expand trees, and exercise the Hasql tuple-store path through the integration suite.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
@@ -159,3 +163,5 @@ Revision note 2026-06-23: Completed EP-3 and updated aggregate progress after ad
 Revision note 2026-06-23: Completed EP-4 and updated aggregate progress after adding consistency-aware forward checks and Postgres-backed check coverage.
 
 Revision note 2026-06-23: Completed EP-5 after adding and running the `ephemeral-pg` lookup spike, recording p95 timings, and marking the kikan read-filter shape green at 1M activity rows.
+
+Revision note 2026-06-23: Completed EP-7 after implementing bounded reverse lookup, explanatory expand trees, core traversal tests, and Postgres-backed lookup paging coverage.

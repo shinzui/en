@@ -12,6 +12,8 @@ import Data.Time (UTCTime, defaultTimeLocale, parseTimeOrError)
 import En.Check (CheckDecision (..), check)
 import En.Effect.ConsistencyStore (TokenMetadata (..))
 import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleStore (..), UsersetQuery (..))
+import En.Lookup (LookupCursor (..), LookupLimit (..), LookupObject (..), LookupPage (..), LookupRequest (..), LookupState (..))
+import En.Lookup qualified as Lookup
 import En.Postgres.Revision (ConsistencyConfig (..), postgresConsistencyStore, tokenMetadataFromPayload)
 import En.Postgres.TupleStore (postgresTupleStoreIO)
 import En.Reachability (compile)
@@ -56,11 +58,20 @@ runTupleStoreScenario connection = do
         store = postgresTupleStoreIO connection config
         consistencyStore =
             postgresConsistencyStore config (pure testTime) store.optimizedRevision store.headRevision
+        projectX = ObjectRef (ObjectType "space") "project-x"
+        projectY = ObjectRef (ObjectType "space") "project-y"
         tuple =
             Tuple
-                { object = ObjectRef (ObjectType "space") "project-x"
+                { object = projectX
                 , relation = RelationName "viewer"
                 , subject = SubjectId (ObjectRef (ObjectType "user") "alice")
+                , caveat = Nothing
+                }
+        tuple2 =
+            Tuple
+                { object = projectY
+                , relation = RelationName "viewer"
+                , subject = tuple.subject
                 , caveat = Nothing
                 }
         query =
@@ -71,19 +82,48 @@ runTupleStoreScenario connection = do
                 , queryLimit = 10
                 , queryCursor = Nothing
                 }
-    writeToken <- store.writeTuples [tuple]
+        lookupRequest cursor =
+            LookupRequest
+                { subject = tuple.subject
+                , permission = RelationName "view"
+                , objectType = ObjectType "space"
+                , context = CaveatContext Map.empty
+                , limit = LookupLimit 1
+                , cursor = cursor
+                }
+    writeToken <- store.writeTuples [tuple, tuple2]
     TokenMetadata{revision = writeRevision} <- either (fail . show) pure (tokenMetadataFromPayload writeToken)
     TuplePage{rows = rowsAtWrite, state = stateAtWrite} <- store.readStartingWithUser writeRevision query
-    assertEqual "write token read sees tuple count" 1 (length rowsAtWrite)
+    assertEqual "write token read sees tuple count" 2 (length rowsAtWrite)
     assertEqual "write token read is exhausted" Exhausted stateAtWrite
     graph <- either (fail . show) pure (compile checkSchema)
-    checkDecision <- check consistencyStore store graph (AtLeastAsFresh writeToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") tuple.object
+    checkDecision <- check consistencyStore store graph (AtLeastAsFresh writeToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX
     assertEqual "postgres-backed check sees written tuple" (Right Allowed) checkDecision
-    deleteToken <- store.deleteTuples [tuple]
+    lookupFirstPage <- Lookup.lookup consistencyStore store graph (AtLeastAsFresh writeToken) (lookupRequest Nothing)
+    assertEqual
+        "postgres-backed lookup returns first cursor page"
+        ( Right
+            LookupPage
+                { objects = [LookupObject{object = projectX, decision = Allowed}]
+                , state = LookupHasMore (LookupCursor "1")
+                }
+        )
+        lookupFirstPage
+    lookupSecondPage <- Lookup.lookup consistencyStore store graph (AtLeastAsFresh writeToken) (lookupRequest (Just (LookupCursor "1")))
+    assertEqual
+        "postgres-backed lookup resumes from cursor"
+        ( Right
+            LookupPage
+                { objects = [LookupObject{object = projectY, decision = Allowed}]
+                , state = LookupExhausted
+                }
+        )
+        lookupSecondPage
+    deleteToken <- store.deleteTuples [tuple, tuple2]
     TokenMetadata{revision = deleteRevision} <- either (fail . show) pure (tokenMetadataFromPayload deleteToken)
     TuplePage{rows = rowsAtOldRevision} <- store.readStartingWithUser writeRevision query
     TuplePage{rows = rowsAtDelete} <- store.readStartingWithUser deleteRevision query
-    assertEqual "old revision still sees deleted tuple" 1 (length rowsAtOldRevision)
+    assertEqual "old revision still sees deleted tuple" 2 (length rowsAtOldRevision)
     assertEqual "delete revision hides tuple" 0 (length rowsAtDelete)
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()

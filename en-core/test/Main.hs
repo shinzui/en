@@ -20,7 +20,8 @@ import En.Effect.TupleStore (
     UsersetQuery (..),
  )
 import En.Error (EnError (..))
-import En.Expand (ExpandLimit (..), ExpandRequest (..), ExpandState (..), ExpandTree (..))
+import En.Expand (ExpandCursor (..), ExpandLimit (..), ExpandNode (..), ExpandRequest (..), ExpandState (..), ExpandTree (..))
+import En.Expand qualified as Expand
 import En.Lookup (
     LookupCursor (..),
     LookupLimit (..),
@@ -116,6 +117,15 @@ main = do
     assertEqual "lookup preserves caveat obligations" (Right (lookupPage [conditional intention [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}]] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "intention") missingAutonomyContext (LookupLimit 10) Nothing)
     assertEqual "lookup paginates deterministically first page" (Right (lookupPage [allowed childSpace] (LookupHasMore (LookupCursor "1")))) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) Nothing)
     assertEqual "lookup paginates deterministically second page" (Right (lookupPage [allowed space] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) (Just (LookupCursor "1")))
+    spaceExpansion <- Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest space (RelationName "view") requestContext (ExpandLimit 20) Nothing)
+    assertBool "expand includes direct owner subject" (treeHasSubject (SubjectId user) spaceExpansion)
+    childExpansion <- Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest childSpace (RelationName "view") requestContext (ExpandLimit 20) Nothing)
+    assertBool "expand includes parent userset" (treeHasUserset space (RelationName "view") childExpansion)
+    usersetExpansion <- Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest usersetMemberSpace (RelationName "member") requestContext (ExpandLimit 20) Nothing)
+    assertBool "expand expands userset subjects" (treeHasSubject (SubjectId agencyUser) usersetExpansion)
+    intentionExpansion <- Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest intention (RelationName "view") requestContext (ExpandLimit 20) Nothing)
+    assertBool "expand includes caveat markers" (treeHasCaveat (CaveatName "within_autonomy") intentionExpansion)
+    assertEqual "expand paginates top-level children" (Right (ExpandHasMore (ExpandCursor "1"))) =<< fmap (fmap expandState) (Expand.expand consistencyStore tupleStore graph MinimizeLatency (expandRequest auditedSpace (RelationName "audit") requestContext (ExpandLimit 1) Nothing))
     pure ()
 
 sampleTuple :: Tuple
@@ -216,6 +226,14 @@ lookupPage :: [LookupObject] -> LookupState -> LookupPage
 lookupPage objects state =
     LookupPage{objects, state}
 
+expandRequest :: ObjectRef -> RelationName -> CaveatContext -> ExpandLimit -> Maybe ExpandCursor -> ExpandRequest
+expandRequest object permission context limit cursor =
+    ExpandRequest{object, permission, context, limit, cursor}
+
+expandState :: ExpandTree -> ExpandState
+expandState ExpandTree{state} =
+    state
+
 allowed :: ObjectRef -> LookupObject
 allowed object =
     LookupObject{object, decision = Allowed}
@@ -223,6 +241,42 @@ allowed object =
 conditional :: ObjectRef -> [CaveatObligation] -> LookupObject
 conditional object obligations =
     LookupObject{object, decision = Conditional obligations}
+
+treeHasSubject :: Subject -> Either EnError ExpandTree -> Bool
+treeHasSubject subject =
+    either (const False) (any (nodeHasSubject subject) . (.children))
+
+nodeHasSubject :: Subject -> ExpandNode -> Bool
+nodeHasSubject subject =
+    \case
+        ExpandSubject found _ -> found == subject
+        ExpandUserset _ _ children -> any (nodeHasSubject subject) children
+        ExpandCaveated _ children -> any (nodeHasSubject subject) children
+
+treeHasUserset :: ObjectRef -> RelationName -> Either EnError ExpandTree -> Bool
+treeHasUserset object relation =
+    either (const False) (any (nodeHasUserset object relation) . (.children))
+
+nodeHasUserset :: ObjectRef -> RelationName -> ExpandNode -> Bool
+nodeHasUserset object relation =
+    \case
+        ExpandSubject _ _ -> False
+        ExpandUserset foundObject foundRelation children ->
+            (foundObject == object && foundRelation == relation)
+                || any (nodeHasUserset object relation) children
+        ExpandCaveated _ children -> any (nodeHasUserset object relation) children
+
+treeHasCaveat :: CaveatName -> Either EnError ExpandTree -> Bool
+treeHasCaveat caveat =
+    either (const False) (any (nodeHasCaveat caveat) . (.children))
+
+nodeHasCaveat :: CaveatName -> ExpandNode -> Bool
+nodeHasCaveat caveat =
+    \case
+        ExpandSubject _ _ -> False
+        ExpandUserset _ _ children -> any (nodeHasCaveat caveat) children
+        ExpandCaveated found children ->
+            found == caveat || any (nodeHasCaveat caveat) children
 
 kikanSchema :: Schema
 kikanSchema =
