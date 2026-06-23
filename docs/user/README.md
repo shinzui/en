@@ -14,10 +14,18 @@ and implementation plans live under [`docs/spec`](../spec) and [`docs/plans`](..
   and call `check`.
 - [Modeling authorization](modeling.md): choose object types, relations,
   permissions, usersets, caveats, and lookup-friendly schemas.
+- [Space, page, and invitation modeling](space-page-sharing.md): model spaces,
+  groups, page hierarchies, documents, activities, and subtree invitations with
+  the schema builder DSL.
 - [Queries and writes](queries-and-writes.md): use `check`, `lookup`, `expand`,
   consistency modes, tuples, and cursors.
+- [GraphQL integration](graphql-integration.md): place `en` behind GraphQL
+  gateways and resolvers without creating authorization fan-out.
 - [Service and operations](service-and-operations.md): run the standalone server,
   use PostgreSQL, call the Servant API, and understand operational constraints.
+- [Production deployment and performance](production-deployment-and-performance.md):
+  choose embedded vs service deployment, place enforcement boundaries, tune
+  consistency, and avoid list-endpoint fan-out.
 
 ## Mental model
 

@@ -4,6 +4,10 @@
 service. The embedded path gives the host application direct control over the
 schema and stores; the service path exposes the same operations over HTTP.
 
+For production deployment topology, enforcement boundaries, caching, batching,
+and list-endpoint performance guidance, see
+[Production deployment and performance](production-deployment-and-performance.md).
+
 ## PostgreSQL store
 
 Use `en-postgres` when storing real tuples:
