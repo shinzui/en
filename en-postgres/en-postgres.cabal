@@ -35,14 +35,16 @@ library
     En.Postgres.TupleStore
 
   build-depends:
+    , aeson
     , base           >=4.19 && <5
     , bytestring
+    , containers
     , en-core
     , en-migrations
+    , hasql
+    , scientific
     , text
     , time
-
--- , hasql        -- added when the implementation lands
 
 test-suite en-postgres-revision-tests
   import:         warnings, shared
@@ -55,3 +57,16 @@ test-suite en-postgres-revision-tests
     , en-postgres
     , text
     , time
+
+test-suite en-postgres-integration-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: integration-test
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , en-core
+    , en-postgres
+    , ephemeral-pg
+    , hasql
+    , text

@@ -67,47 +67,50 @@ main = do
         )
     let payload =
             TokenPayload
-                { tokenDatastoreId = DatastoreId "primary"
-                , tokenSchemaHash = SchemaHash "schema:hash"
-                , tokenRevision = revisionFromPgSnapshot PgSnapshot{xmin = 10, xmax = 20, xip = [12]}
-                , tokenExpiresAt = Nothing
+                { datastoreId = DatastoreId "primary"
+                , schemaHash = SchemaHash "schema:hash"
+                , revision = revisionFromPgSnapshot PgSnapshot{xmin = 10, xmax = 20, xip = [12]}
+                , expiresAt = Nothing
                 }
     assertEqual "token codec round-trips payload" (Right payload) (decodeToken (encodeToken payload))
     assertEqual "token decoder rejects bad snapshots" True (isLeft (decodeToken (ConsistencyToken "en1.primary.schema.bad")))
     assertEqual
         "exact snapshot resolves to token revision"
-        (Right ResolvedConsistency{consistency = AtExactSnapshot (encodeToken payload), revision = tokenRevision payload})
+        (Right ResolvedConsistency{consistency = AtExactSnapshot (encodeToken payload), revision = payload.revision})
         (resolveConsistencyRequest optimizedRevision headRevision metadataFromToken validateMetadata (AtExactSnapshot (encodeToken payload)))
     assertEqual
         "at least as fresh uses optimized revision when it is after the token"
         (Right ResolvedConsistency{consistency = AtLeastAsFresh (encodeToken payload), revision = optimizedRevision})
         (resolveConsistencyRequest optimizedRevision headRevision metadataFromToken validateMetadata (AtLeastAsFresh (encodeToken payload)))
     let concurrentPayload =
-            payload
-                { tokenRevision = Revision "10:20:11"
+            TokenPayload
+                { datastoreId = payload.datastoreId
+                , schemaHash = payload.schemaHash
+                , revision = Revision "10:20:11"
+                , expiresAt = payload.expiresAt
                 }
         concurrentOptimized = Revision "10:20:12"
     assertEqual
         "at least as fresh honors token revision when optimized is concurrent"
-        (Right ResolvedConsistency{consistency = AtLeastAsFresh (encodeToken concurrentPayload), revision = tokenRevision concurrentPayload})
+        (Right ResolvedConsistency{consistency = AtLeastAsFresh (encodeToken concurrentPayload), revision = concurrentPayload.revision})
         (resolveConsistencyRequest concurrentOptimized headRevision metadataFromToken validateMetadata (AtLeastAsFresh (encodeToken concurrentPayload)))
     assertEqual
         "wrong datastore is rejected"
         (Left (InvalidConsistencyToken "token datastore does not match this en datastore"))
-        (validateTokenMetadata config now metadata{datastoreId = DatastoreId "other"})
+        (validateTokenMetadata config now metadataWithWrongDatastore)
     assertEqual
         "wrong schema hash is rejected"
         (Left (InvalidConsistencyToken "token schema hash does not match the active schema"))
-        (validateTokenMetadata config now metadata{schemaHash = SchemaHash "other"})
+        (validateTokenMetadata config now metadataWithWrongSchema)
     assertEqual
         "expired token is rejected"
         (Left (InvalidConsistencyToken "token is expired"))
-        (validateTokenMetadata config now metadata{expiresAt = Just now})
+        (validateTokenMetadata config now expiredMetadata)
   where
     config =
         ConsistencyConfig
-            { expectedDatastoreId = DatastoreId "primary"
-            , expectedSchemaHash = SchemaHash "schema:hash"
+            { datastoreId = DatastoreId "primary"
+            , schemaHash = SchemaHash "schema:hash"
             }
     now = parseUtc "2026-06-23T00:00:00Z"
     optimizedRevision = Revision "10:30:"
@@ -120,16 +123,40 @@ main = do
             , schemaHash = SchemaHash "schema:hash"
             , expiresAt = Nothing
             }
+    metadataWithWrongDatastore =
+        TokenMetadata
+            { token = metadata.token
+            , revision = metadata.revision
+            , datastoreId = DatastoreId "other"
+            , schemaHash = metadata.schemaHash
+            , expiresAt = metadata.expiresAt
+            }
+    metadataWithWrongSchema =
+        TokenMetadata
+            { token = metadata.token
+            , revision = metadata.revision
+            , datastoreId = metadata.datastoreId
+            , schemaHash = SchemaHash "other"
+            , expiresAt = metadata.expiresAt
+            }
+    expiredMetadata =
+        TokenMetadata
+            { token = metadata.token
+            , revision = metadata.revision
+            , datastoreId = metadata.datastoreId
+            , schemaHash = metadata.schemaHash
+            , expiresAt = Just now
+            }
     metadataFromToken token =
         case decodeToken token of
             Right tokenPayload ->
                 Right
                     TokenMetadata
                         { token = token
-                        , revision = tokenPayload.tokenRevision
-                        , datastoreId = tokenPayload.tokenDatastoreId
-                        , schemaHash = tokenPayload.tokenSchemaHash
-                        , expiresAt = tokenPayload.tokenExpiresAt
+                        , revision = tokenPayload.revision
+                        , datastoreId = tokenPayload.datastoreId
+                        , schemaHash = tokenPayload.schemaHash
+                        , expiresAt = tokenPayload.expiresAt
                         }
             Left err -> Left (InvalidConsistencyToken (showText err))
     validateMetadata =

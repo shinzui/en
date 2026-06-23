@@ -25,9 +25,10 @@ This plan gives `en` durable relationship storage and the read-your-writes guara
 - [x] Implement `PgSnapshot` parsing, rendering, partial-order comparison, and tests. Completed 2026-06-23T04:44:44Z.
 - [x] Implement consistency-token encoding and decoding with datastore id, schema hash, revision payload, and validation errors. Completed 2026-06-23T04:44:44Z.
 - [x] Implement `MinimizeLatency`, `FullyConsistent`, `AtLeastAsFresh`, and `AtExactSnapshot` revision resolution. Completed 2026-06-23T04:51:22Z.
-- [ ] Implement hasql-backed write, delete, and read operations for the final EP-1 store interface.
-- [ ] Add integration tests against a temporary PostgreSQL database or the repository's established Postgres test harness.
+- [x] Implement hasql-backed write, delete, and read operations for the final EP-1 store interface. Completed 2026-06-23T05:33:00Z.
+- [x] Add integration tests against a temporary PostgreSQL database or the repository's established Postgres test harness. Completed 2026-06-23T05:33:00Z.
 - [x] Run `cabal build all` and the relevant test command for the completed revision slice. Completed 2026-06-23T04:44:44Z.
+- [x] Run `cabal build all`, `cabal test en-postgres-revision-tests`, and `cabal test en-postgres-integration-tests` for the completed tuple-store slice. Completed 2026-06-23T05:33:00Z.
 
 
 ## Surprises & Discoveries
@@ -39,6 +40,8 @@ cabal test en-postgres-revision-tests
 1 of 1 test suites (1 of 1 test cases) passed.
 ```
 - Revision resolution is now implemented without database effects: `postgresConsistencyStore` accepts IO actions for optimized and head revisions, validates token metadata against the configured datastore and schema hash, rejects expired tokens, and uses the partial snapshot order so concurrent optimized revisions do not satisfy `AtLeastAsFresh`.
+- The Hasql tuple store cannot mint a write token from `pg_current_snapshot()` inside the same transaction that creates the tuple. `pg_visible_in_snapshot(created_xid, snapshot)` does not treat that transaction as visible, so the integration test read zero rows at the write token. The store now records the mutation xid inside the transaction, commits, and then mints the token from a fresh post-commit snapshot.
+- `ephemeral-pg` is available as a local Mori-registered project and can run the tuple-store tests without relying on a developer-managed PostgreSQL service.
 
 
 ## Decision Log
@@ -49,11 +52,20 @@ cabal test en-postgres-revision-tests
 - Decision: Keep the first token codec as a versioned opaque text envelope owned by `En.Postgres.Revision`.
   Rationale: The core interface only exposes `ConsistencyToken` as opaque text. This lets token validation and revision resolution proceed without committing the wire encoding to later Servant/API work; if a base64 protobuf payload is still required for compatibility, it can replace this private codec without changing `en-core`.
   Date: 2026-06-23
+- Decision: Parameterize the tuple store over `PostgresSessionRunner m` and provide `postgresTupleStoreIO` as the direct Hasql `Connection` convenience constructor.
+  Rationale: The store can be lifted into a later effect stack without changing the storage implementation, while the IO constructor keeps tests and early callers straightforward.
+  Date: 2026-06-23
+- Decision: Use `MultilineStrings` for SQL snippets and keep newly introduced record fields unprefixed.
+  Rationale: Multiline SQL is easier to read and edit, and unprefixed fields match the style requested for new records while `DuplicateRecordFields` and explicit construction handle ambiguity.
+  Date: 2026-06-23
+- Decision: Use `ephemeral-pg` for the Postgres integration test harness.
+  Rationale: The test can start a temporary database, run schema setup, and prove write-token/read/delete visibility without requiring a preconfigured local service.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+EP-2 now provides a working PostgreSQL persistence slice: codd migrations define the tuple tables and indexes, `En.Postgres.Revision` owns snapshot/token semantics, and `En.Postgres.TupleStore` implements write, delete, head/optimized revision, and reverse userset reads over Hasql. Validation covers the pure revision/token behavior and an ephemeral PostgreSQL write-token-delete scenario.
 
 
 ## Context and Orientation
@@ -115,16 +127,16 @@ After implementing migrations and Haskell modules, run:
 cabal build all
 ```
 
-If a Postgres test harness is added, document and run the exact command here during implementation. A likely shape is:
-
-```bash
-cabal test en-postgres
-```
-
 The revision/token slice added a database-free test suite that must pass while the full database harness is still pending:
 
 ```bash
 cabal test en-postgres-revision-tests
+```
+
+The tuple-store slice added an ephemeral PostgreSQL integration suite:
+
+```bash
+cabal test en-postgres-integration-tests
 ```
 
 
@@ -132,7 +144,7 @@ cabal test en-postgres-revision-tests
 
 Acceptance requires tests or a reproducible harness that demonstrates these behaviors: writing a tuple returns a token; reading at that token can see the tuple; deleting the tuple returns a later token; reading at the old token still sees the tuple while reading at the new token does not; invalid datastore ids, schema hashes, expired tokens, and concurrent snapshots are handled according to the core error model.
 
-`cabal build all` must pass. If database tests require a local PostgreSQL binary or service, record the exact prerequisite and skip reason if unavailable.
+`cabal build all`, `cabal test en-postgres-revision-tests`, and `cabal test en-postgres-integration-tests` must pass. The integration test uses `ephemeral-pg`, which requires PostgreSQL binaries discoverable by that package at runtime.
 
 
 ## Idempotence and Recovery
@@ -154,3 +166,5 @@ Revision note 2026-06-23: Added `intention_01kvsbcvsfepaafp5x44ykby47` to the pl
 Revision note 2026-06-23: Marked the migration and revision/token codec slice complete, recorded the Postgres snapshot partial-order correction, and added the `en-postgres-revision-tests` validation command.
 
 Revision note 2026-06-23: Marked revision resolution complete and documented the `postgresConsistencyStore` constructor shape over supplied optimized/head revision readers.
+
+Revision note 2026-06-23: Completed the Hasql tuple store, added the `PostgresSessionRunner` parameterization for later effect stacks, switched SQL literals to `MultilineStrings`, and validated write/delete snapshot behavior with `ephemeral-pg`.

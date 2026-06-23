@@ -1,3 +1,6 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE NoFieldSelectors #-}
+
 -- | PostgreSQL @pg_snapshot@ revisions and consistency-token codec.
 module En.Postgres.Revision (
     PgSnapshot (..),
@@ -53,16 +56,16 @@ data PgSnapshot = PgSnapshot
     deriving stock (Eq, Show)
 
 data TokenPayload = TokenPayload
-    { tokenDatastoreId :: !DatastoreId
-    , tokenSchemaHash :: !SchemaHash
-    , tokenRevision :: !Revision
-    , tokenExpiresAt :: !(Maybe UTCTime)
+    { datastoreId :: !DatastoreId
+    , schemaHash :: !SchemaHash
+    , revision :: !Revision
+    , expiresAt :: !(Maybe UTCTime)
     }
     deriving stock (Eq, Show)
 
 data ConsistencyConfig = ConsistencyConfig
-    { expectedDatastoreId :: !DatastoreId
-    , expectedSchemaHash :: !SchemaHash
+    { datastoreId :: !DatastoreId
+    , schemaHash :: !SchemaHash
     }
     deriving stock (Eq, Show)
 
@@ -126,20 +129,20 @@ comparePostgresRevision left right =
     comparePgSnapshot <$> revisionToPgSnapshot left <*> revisionToPgSnapshot right
 
 encodeToken :: TokenPayload -> ConsistencyToken
-encodeToken TokenPayload{tokenDatastoreId, tokenSchemaHash, tokenRevision, tokenExpiresAt} =
+encodeToken TokenPayload{datastoreId, schemaHash, revision, expiresAt} =
     ConsistencyToken $
         Text.intercalate
             "."
             [ "en1"
-            , escapeText datastore
-            , escapeText schemaHash
-            , escapeText revision
-            , maybe "" (escapeText . Text.pack . show) tokenExpiresAt
+            , escapeText datastoreText
+            , escapeText schemaHashText
+            , escapeText revisionText
+            , maybe "" (escapeText . Text.pack . show) expiresAt
             ]
   where
-    DatastoreId datastore = tokenDatastoreId
-    SchemaHash schemaHash = tokenSchemaHash
-    revision = revisionEncoding tokenRevision
+    DatastoreId datastoreText = datastoreId
+    SchemaHash schemaHashText = schemaHash
+    revisionText = revisionEncoding revision
 
 decodeToken :: ConsistencyToken -> Either TokenDecodeError TokenPayload
 decodeToken (ConsistencyToken tokenText) =
@@ -154,10 +157,10 @@ decodeToken (ConsistencyToken tokenText) =
                 Right _ ->
                     Right
                         TokenPayload
-                            { tokenDatastoreId = DatastoreId datastore
-                            , tokenSchemaHash = SchemaHash schema
-                            , tokenRevision = Revision revision
-                            , tokenExpiresAt = expires
+                            { datastoreId = DatastoreId datastore
+                            , schemaHash = SchemaHash schema
+                            , revision = Revision revision
+                            , expiresAt = expires
                             }
         prefix : _ | prefix /= "en1" -> Left TokenBadPrefix
         _ -> Left TokenBadFieldCount
@@ -170,17 +173,17 @@ tokenMetadataFromPayload token =
             Right
                 TokenMetadata
                     { token = token
-                    , revision = payload.tokenRevision
-                    , datastoreId = payload.tokenDatastoreId
-                    , schemaHash = payload.tokenSchemaHash
-                    , expiresAt = payload.tokenExpiresAt
+                    , revision = payload.revision
+                    , datastoreId = payload.datastoreId
+                    , schemaHash = payload.schemaHash
+                    , expiresAt = payload.expiresAt
                     }
 
 validateTokenMetadata :: ConsistencyConfig -> UTCTime -> TokenMetadata -> Either EnError ()
 validateTokenMetadata config now metadata
-    | metadata.datastoreId /= config.expectedDatastoreId =
+    | metadata.datastoreId /= config.datastoreId =
         Left (InvalidConsistencyToken "token datastore does not match this en datastore")
-    | metadata.schemaHash /= config.expectedSchemaHash =
+    | metadata.schemaHash /= config.schemaHash =
         Left (InvalidConsistencyToken "token schema hash does not match the active schema")
     | maybe False (<= now) metadata.expiresAt =
         Left (InvalidConsistencyToken "token is expired")

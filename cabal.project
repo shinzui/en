@@ -7,9 +7,9 @@ packages:
     en-servant
     en-server
     en-client
+    /Users/shinzui/Keikaku/bokuno/ephemeral-pg-project/ephemeral-pg
 
 -- ============================================================
 -- DEPENDENCY OVERRIDES — each milestone appends its own block; none rewrites another's.
--- (None required yet. The persistence stack — codd + ephemeral-pg — will be pinned
---  here when en-migrations/en-postgres land, mirroring shomei's cabal.project.)
+-- ephemeral-pg is a local Mori-registered package used by en-postgres integration tests.
 -- ============================================================
