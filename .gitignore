@@ -26,6 +26,7 @@ db/
 !en-migrations/db/migrations/*.sql
 .claude/
 .agents/
+.codex/
 .mina/
 CLAUDE.local.md
 .seihou/manifest.json.tmp
