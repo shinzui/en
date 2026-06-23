@@ -19,7 +19,14 @@ module En.Schema (
     CaveatName (..),
     CaveatParameterName (..),
     CaveatParameterType (..),
+    CaveatSource (..),
+    CaveatOperand (..),
+    CaveatCompare (..),
+    CaveatPredicate (..),
     CaveatDefinition (..),
+    CaveatValue (..),
+    CaveatPayload (..),
+    CaveatContext (..),
     validate,
     schemaHash,
 ) where
@@ -35,6 +42,7 @@ import Data.Text qualified as Text
 import Data.Word (Word64)
 import Numeric (showHex)
 
+import En.Caveat.Value (CaveatContext (..), CaveatPayload (..), CaveatValue (..))
 import En.Error (EnError (..))
 import En.Revision (SchemaHash (..))
 
@@ -62,10 +70,39 @@ data CaveatParameterType
     | ParameterEnum [Text]
     deriving stock (Eq, Ord, Show)
 
+data CaveatSource
+    = FromContext
+    | FromPayload
+    deriving stock (Eq, Ord, Show)
+
+data CaveatOperand
+    = OperandParam !CaveatSource !CaveatParameterName
+    | OperandLiteral !CaveatValue
+    deriving stock (Eq, Ord, Show)
+
+data CaveatCompare
+    = CmpEq
+    | CmpNe
+    | CmpLt
+    | CmpLe
+    | CmpGt
+    | CmpGe
+    deriving stock (Eq, Ord, Show)
+
+data CaveatPredicate
+    = PredTrue
+    | PredCompare !CaveatCompare !CaveatOperand !CaveatOperand
+    | PredAnd ![CaveatPredicate]
+    | PredOr ![CaveatPredicate]
+    | PredNot !CaveatPredicate
+    | PredMember !CaveatOperand ![CaveatValue]
+    deriving stock (Eq, Ord, Show)
+
 -- | Declares the request or tuple arguments a named caveat expects.
 data CaveatDefinition = CaveatDefinition
     { name :: !CaveatName
     , parameters :: !(Map CaveatParameterName CaveatParameterType)
+    , predicate :: !CaveatPredicate
     }
     deriving stock (Eq, Show)
 
@@ -125,8 +162,9 @@ validate schema = do
     validateCaveatDefinition (name, definition)
         | name /= definition.name =
             Left (SchemaViolation ("caveat map key does not match definition name: " <> caveatText name))
-        | otherwise =
+        | otherwise = do
             traverse_ validateParameterType (Map.toAscList definition.parameters)
+            validatePredicate definition.parameters definition.predicate
 
     validateParameterType (parameterName, parameterType) =
         case parameterType of
@@ -136,6 +174,23 @@ validate schema = do
                 | length values /= Set.size (Set.fromList values) ->
                     Left (SchemaViolation ("enum caveat parameter has duplicate values: " <> parameterText parameterName))
             _ -> Right ()
+
+    validatePredicate parameters =
+        \case
+            PredTrue -> Right ()
+            PredCompare _ left right -> validateOperand parameters left *> validateOperand parameters right
+            PredAnd predicates -> traverse_ (validatePredicate parameters) predicates
+            PredOr predicates -> traverse_ (validatePredicate parameters) predicates
+            PredNot predicate -> validatePredicate parameters predicate
+            PredMember operand _ -> validateOperand parameters operand
+
+    validateOperand parameters =
+        \case
+            OperandParam _ parameterName ->
+                if Map.member parameterName parameters
+                    then Right ()
+                    else Left (SchemaViolation ("caveat predicate references undeclared parameter: " <> parameterText parameterName))
+            OperandLiteral _ -> Right ()
 
     validateObjectType :: (ObjectType, Map RelationName Relation) -> Either EnError ()
     validateObjectType (objectType, relations) =
@@ -346,6 +401,7 @@ renderSchema schema =
             [ "caveat"
             , renderText (caveatText caveatName)
             , renderList renderParameter (Map.toAscList definition.parameters)
+            , renderPredicate definition.predicate
             ]
 
     renderParameter (parameterName, parameterType) =
@@ -363,6 +419,43 @@ renderSchema schema =
             ParameterInteger -> "integer"
             ParameterTimestamp -> "timestamp"
             ParameterEnum values -> "enum:" <> renderList renderText (Set.toAscList (Set.fromList values))
+
+    renderPredicate =
+        \case
+            PredTrue -> "true"
+            PredCompare comparator left right ->
+                Text.intercalate ":" ["compare", renderCompare comparator, renderOperand left, renderOperand right]
+            PredAnd predicates -> "and:" <> renderList renderPredicate predicates
+            PredOr predicates -> "or:" <> renderList renderPredicate predicates
+            PredNot predicate -> "not:" <> renderPredicate predicate
+            PredMember operand values -> "member:" <> renderOperand operand <> ":" <> renderList renderCaveatValue values
+
+    renderCompare =
+        \case
+            CmpEq -> "eq"
+            CmpNe -> "ne"
+            CmpLt -> "lt"
+            CmpLe -> "le"
+            CmpGt -> "gt"
+            CmpGe -> "ge"
+
+    renderOperand =
+        \case
+            OperandParam source name -> "param:" <> renderSource source <> ":" <> renderText (parameterText name)
+            OperandLiteral value -> "literal:" <> renderCaveatValue value
+
+    renderSource =
+        \case
+            FromContext -> "context"
+            FromPayload -> "payload"
+
+    renderCaveatValue =
+        \case
+            ValueText value -> "text:" <> renderText value
+            ValueBool value -> "bool:" <> Text.pack (show value)
+            ValueInteger value -> "integer:" <> Text.pack (show value)
+            ValueTimestamp value -> "timestamp:" <> Text.pack (show value)
+            ValueEnum value -> "enum:" <> renderText value
 
     renderRewrite =
         \case

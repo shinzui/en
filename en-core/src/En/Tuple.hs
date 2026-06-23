@@ -14,10 +14,9 @@ module En.Tuple (
     TupleCaveat (..),
 ) where
 
-import Data.Map.Strict (Map)
 import Data.Text (Text)
-import Data.Time (UTCTime)
 
+import En.Caveat.Value (CaveatContext (..), CaveatPayload (..), CaveatValue (..))
 import En.Schema (CaveatName, ObjectType, RelationName)
 
 -- | A concrete object, e.g. @intention:42@.
@@ -33,25 +32,6 @@ data ObjectRef = ObjectRef
 data Subject
     = SubjectId ObjectRef
     | SubjectSet ObjectRef RelationName
-    deriving stock (Eq, Ord, Show)
-
--- | Concrete values accepted by the bounded caveat evaluator.
-data CaveatValue
-    = ValueText !Text
-    | ValueBool !Bool
-    | ValueInteger !Integer
-    | ValueTimestamp !UTCTime
-    | ValueEnum !Text
-    deriving stock (Eq, Ord, Show)
-
--- | Arguments stored on a tuple with a named caveat.
-newtype CaveatPayload = CaveatPayload (Map Text CaveatValue)
-    deriving stock (Eq, Ord, Show)
-
-{- | Request-time facts evaluated by caveats, e.g. current time or requested
-autonomy level.
--}
-newtype CaveatContext = CaveatContext (Map Text CaveatValue)
     deriving stock (Eq, Ord, Show)
 
 -- | A named caveat plus the tuple-local arguments supplied at write time.

@@ -43,10 +43,14 @@ import En.Reachability qualified as Reachability
 import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (
     AllowedSubject (..),
+    CaveatCompare (..),
     CaveatDefinition (..),
     CaveatName (..),
+    CaveatOperand (..),
     CaveatParameterName (..),
     CaveatParameterType (..),
+    CaveatPredicate (..),
+    CaveatSource (..),
     ObjectType (..),
     Relation (..),
     RelationName (..),
@@ -90,7 +94,6 @@ main = do
     assertBool "space view has a recursive parent entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "space") (Just (RelationName "view"))) Reachability.Direct True graph)
     assertBool "space audit relation is conditional" (hasEntry (relationRef "space" "audit") (SubjectSelector (ObjectType "user") Nothing) Reachability.Conditional False graph)
     assertBool "space member-minus-owner relation is conditional" (hasEntry (relationRef "space" "member_not_owner") (SubjectSelector (ObjectType "user") Nothing) Reachability.Conditional False graph)
-    assertBool "intention delegate relation is caveated" (hasCaveatedEntry (relationRef "intention" "delegate") (CaveatName "within_autonomy") graph)
     assertValidationFails "This requires allowed subjects" (schemaWithRelation "space" "viewer" Set.empty This)
     assertValidationFails "ComputedUserset rejects unknown relation" (schemaWithRelation "space" "viewer" userSubject (ComputedUserset (RelationName "missing")))
     assertValidationFails "TupleToUserset rejects incompatible arrows" invalidTupleToUsersetSchema
@@ -113,6 +116,11 @@ main = do
     assertEqual "delegation caveat denies higher autonomy" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency adminContext (SubjectId user) (RelationName "view") intention
     assertEqual "delegation caveat is conditional with missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}])) =<< check consistencyStore tupleStore graph MinimizeLatency missingAutonomyContext (SubjectId user) (RelationName "view") intention
     assertEqual "expired delegation caveat denies access" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency expiredContext (SubjectId user) (RelationName "view") intention
+    minLevelGraph <- either (fail . show) pure (compile minLevelSchema)
+    let minLevelStore = inMemoryTupleStore [minLevelTuple]
+    assertEqual "generic integer caveat allows sufficient clearance" (Right Allowed) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelAllowedContext (SubjectId user) (RelationName "view") minLevelDocument
+    assertEqual "generic integer caveat denies insufficient clearance" (Right Denied) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelDeniedContext (SubjectId user) (RelationName "view") minLevelDocument
+    assertEqual "generic integer caveat reports missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "min_level", missingContext = ["clearance"]}])) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency (CaveatContext Map.empty) (SubjectId user) (RelationName "view") minLevelDocument
     assertEqual "recursive graph respects depth limit" (Left ResolutionLimitExceeded) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
     assertEqual "lookup returns direct and recursive view spaces" (Right (lookupPage [allowed childSpace, allowed space] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup follows userset subjects" (Right (lookupPage [allowed guestSpace, allowed usersetMemberSpace] LookupExhausted)) =<< Lookup.lookup consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId agencyUser) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
@@ -219,7 +227,20 @@ sampleCaveatDefinition =
         , parameters =
             Map.fromList
                 [ (CaveatParameterName "requested_autonomy", ParameterEnum ["read", "act"])
+                , (CaveatParameterName "autonomy", ParameterEnum ["read", "act", "admin"])
+                , (CaveatParameterName "current_time", ParameterTimestamp)
                 , (CaveatParameterName "until", ParameterTimestamp)
+                ]
+        , predicate =
+            PredAnd
+                [ PredCompare
+                    CmpLe
+                    (OperandParam FromContext (CaveatParameterName "requested_autonomy"))
+                    (OperandParam FromPayload (CaveatParameterName "autonomy"))
+                , PredCompare
+                    CmpLe
+                    (OperandParam FromContext (CaveatParameterName "current_time"))
+                    (OperandParam FromPayload (CaveatParameterName "until"))
                 ]
         }
 
@@ -286,11 +307,18 @@ nodeHasCaveat caveat =
 kikanSchema :: Schema
 kikanSchema =
     Schema.buildWithCaveats
-        [ Schema.caveat
+        [ Schema.caveatWith
             "within_autonomy"
             [ Schema.parameter "requested_autonomy" (ParameterEnum ["read", "act"])
+            , Schema.parameter "autonomy" (ParameterEnum ["read", "act", "admin"])
+            , Schema.parameter "current_time" ParameterTimestamp
             , Schema.parameter "until" ParameterTimestamp
             ]
+            ( Schema.predAnd
+                [ Schema.cmpLe (Schema.ctxParam "requested_autonomy") (Schema.payloadParam "autonomy")
+                , Schema.cmpLe (Schema.ctxParam "current_time") (Schema.payloadParam "until")
+                ]
+            )
         ]
         [ Schema.object "user" []
         , Schema.object
@@ -336,7 +364,7 @@ kikanSchema =
             ]
         , Schema.object
             "intention"
-            [ Schema.relation "delegate" [Schema.subject "user"] (Schema.caveated "within_autonomy" Schema.this)
+            [ Schema.relation "delegate" [Schema.subject "user"] Schema.this
             , Schema.permission "view" (Schema.computed "delegate")
             ]
         ]
@@ -406,7 +434,7 @@ kikanSchemaManual =
                 ,
                     ( ObjectType "intention"
                     , Map.fromList
-                        [ relationEntry "delegate" userSubject (Caveated (CaveatName "within_autonomy") This)
+                        [ relationEntry "delegate" userSubject This
                         , relationEntry "view" Set.empty (ComputedUserset (RelationName "delegate"))
                         ]
                     )
@@ -514,15 +542,6 @@ hasEntry target source kind recursive graph =
             entry.source == source
                 && entry.kind == kind
                 && entry.recursive == recursive
-        )
-        (Map.findWithDefault [] target graph.entries)
-
-hasCaveatedEntry :: RelationRef -> CaveatName -> ReachabilityGraph -> Bool
-hasCaveatedEntry target caveat graph =
-    any
-        ( \entry ->
-            entry.kind == Reachability.Conditional
-                && caveat `elem` entry.caveats
         )
         (Map.findWithDefault [] target graph.entries)
 
@@ -678,6 +697,53 @@ expiredContext =
             , ("current_time", ValueTimestamp (parseUtc "2026-08-01T00:00:00Z"))
             ]
         )
+
+minLevelSchema :: Schema
+minLevelSchema =
+    Schema.buildWithCaveats
+        [ Schema.caveatWith
+            "min_level"
+            [ Schema.parameter "clearance" ParameterInteger
+            , Schema.parameter "level" ParameterInteger
+            ]
+            (Schema.cmpGe (Schema.ctxParam "clearance") (Schema.payloadParam "level"))
+        ]
+        [ Schema.object "user" []
+        , Schema.object
+            "document"
+            [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
+            , Schema.permission "view" (Schema.computed "viewer")
+            ]
+        ]
+
+minLevelTuple :: Tuple
+minLevelTuple =
+    Tuple
+        { object = minLevelDocument
+        , relation = RelationName "viewer"
+        , subject = SubjectId user
+        , caveat =
+            Just
+                TupleCaveat
+                    { name = CaveatName "min_level"
+                    , payload = CaveatPayload (Map.fromList [("level", ValueInteger 3)])
+                    }
+        }
+
+minLevelAllowedContext :: CaveatContext
+minLevelAllowedContext =
+    CaveatContext (Map.fromList [("clearance", ValueInteger 5)])
+
+minLevelDeniedContext :: CaveatContext
+minLevelDeniedContext =
+    CaveatContext (Map.fromList [("clearance", ValueInteger 2)])
+
+minLevelDocument :: ObjectRef
+minLevelDocument =
+    ObjectRef
+        { objectType = ObjectType "document"
+        , objectId = "classified"
+        }
 
 user :: ObjectRef
 user =

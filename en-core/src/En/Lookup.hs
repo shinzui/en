@@ -15,12 +15,13 @@ import Prelude hiding (lookup)
 
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (catMaybes)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 
-import En.Check (CaveatObligation (..), CheckDecision (..), check)
+import En.Caveat (evaluateCaveat)
+import En.Check (CheckDecision (..), check)
 import En.Decision qualified as Decision
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..))
 import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore (..), UsersetQuery (..))
@@ -31,7 +32,6 @@ import En.Schema (AllowedSubject (..), CaveatName (..), ObjectType (..), Relatio
 import En.Tuple (
     CaveatContext (..),
     CaveatPayload (..),
-    CaveatValue (..),
     ObjectRef (..),
     Subject (..),
     Tuple (..),
@@ -213,7 +213,7 @@ evalRewrite consistencyStore tupleStore graph context revision consistency subje
                 =<< evalRewrite consistencyStore tupleStore graph context revision consistency subject objectType currentRelation base state
         Caveated caveat rewriteInner -> do
             inner <- evalRewrite consistencyStore tupleStore graph context revision consistency subject objectType currentRelation rewriteInner state
-            pure (applyGateToObjects (evaluateRewriteCaveat caveat context) <$> inner)
+            pure (applyRewriteCaveat graph context caveat =<< inner)
   where
     unionBranches rewrites = do
         results <- traverse (\current -> evalRewrite consistencyStore tupleStore graph context revision consistency subject objectType currentRelation current state) rewrites
@@ -238,8 +238,8 @@ evalThis consistencyStore tupleStore graph context revision consistency subject 
         Left err -> pure (Left err)
         Right directRows -> do
             usersetRows <- rowsForAllowedUsersets
-            let directObjects = mapMaybe rowLookupObject directRows
-            pure (mergeLookupObjects . (directObjects <>) <$> usersetRows)
+            let directObjects = catMaybes <$> traverse rowLookupObject directRows
+            pure (mergeLookupObjects <$> ((<>) <$> directObjects <*> usersetRows))
   where
     rowsForAllowedUsersets = do
         case lookupRelation graph objectType relation of
@@ -257,12 +257,12 @@ evalThis consistencyStore tupleStore graph context revision consistency subject 
                                         Right objects -> do
                                             let subjectSets = [SubjectSet object subjectRelation | LookupObject{object} <- objects]
                                             rows <- readRowsForSubjects tupleStore revision objectType relation subjectSets
-                                            pure (mapMaybe rowLookupObject <$> rows)
+                                            pure (catMaybes <$> (rows >>= traverse rowLookupObject))
                         )
                         (Set.toAscList relationDefinition.allowedSubjects)
                 pure (mergeLookupObjects . concat <$> sequence collected)
     rowLookupObject TupleRow{tuple} =
-        LookupObject tuple.object <$> includeDecision context tuple.caveat Allowed
+        fmap (LookupObject tuple.object) <$> includeDecision graph context tuple.caveat Allowed
 
 evalTupleToUserset ::
     (Monad m) =>
@@ -298,7 +298,7 @@ evalTupleToUserset consistencyStore tupleStore graph context revision consistenc
                                         Right objects -> do
                                             let subjects = concatMap (subjectsForAllowed allowed) objects
                                             rows <- readRowsForSubjects tupleStore revision objectType tuplesetRelation subjects
-                                            pure (applyRows objects <$> rows)
+                                            pure (rows >>= applyRows objects)
                         )
                         (Set.toAscList tuplesetDefinition.allowedSubjects)
                 pure (mergeLookupObjects . concat <$> sequence collected)
@@ -334,24 +334,30 @@ evalTupleToUserset consistencyStore tupleStore graph context revision consistenc
             case rows of
                 Left err -> pure (Left err)
                 Right tupleRows -> do
-                    let found = mergeLookupObjects (applyRows frontier tupleRows)
-                        seenWithFrontier = insertObjects frontier seen
-                        newObjects = filter (\LookupObject{object} -> Map.notMember object seenWithFrontier) found
-                    expandRecursive allowed newObjects (insertObjects newObjects seenWithFrontier) (depth + 1)
+                    case applyRows frontier tupleRows of
+                        Left err -> pure (Left err)
+                        Right appliedRows -> do
+                            let found = mergeLookupObjects appliedRows
+                                seenWithFrontier = insertObjects frontier seen
+                                newObjects = filter (\LookupObject{object} -> Map.notMember object seenWithFrontier) found
+                            expandRecursive allowed newObjects (insertObjects newObjects seenWithFrontier) (depth + 1)
     applyRows usersetObjects rows =
         let objectDecisionMap =
                 Map.fromListWith combineDecisions [(object, decision) | LookupObject{object, decision} <- usersetObjects]
-         in do
-                row@TupleRow{tuple} <- rows
-                let usersetDecision =
-                        case tuple.subject of
-                            SubjectId subjectObject ->
-                                Map.findWithDefault Allowed subjectObject objectDecisionMap
-                            SubjectSet subjectObject _ ->
-                                Map.findWithDefault Allowed subjectObject objectDecisionMap
-                case includeDecision context tuple.caveat usersetDecision of
-                    Nothing -> []
-                    Just decision -> [objectFromRowWithDecision row decision]
+         in fmap concat $
+                traverse
+                    ( \row@TupleRow{tuple} -> do
+                        let usersetDecision =
+                                case tuple.subject of
+                                    SubjectId subjectObject ->
+                                        Map.findWithDefault Allowed subjectObject objectDecisionMap
+                                    SubjectSet subjectObject _ ->
+                                        Map.findWithDefault Allowed subjectObject objectDecisionMap
+                        includeDecision graph context tuple.caveat usersetDecision >>= \case
+                            Nothing -> Right []
+                            Just decision -> Right [objectFromRowWithDecision row decision]
+                    )
+                    rows
 
 insertObjects :: [LookupObject] -> Map.Map ObjectRef LookupObject -> Map.Map ObjectRef LookupObject
 insertObjects objects objectMap =
@@ -429,11 +435,12 @@ objectFromRowWithDecision :: TupleRow -> CheckDecision -> LookupObject
 objectFromRowWithDecision TupleRow{tuple} decision =
     LookupObject{object = tuple.object, decision}
 
-includeDecision :: CaveatContext -> Maybe TupleCaveat -> CheckDecision -> Maybe CheckDecision
-includeDecision context caveat decision =
-    case Decision.applyGate (evaluateTupleCaveat context caveat) decision of
-        Denied -> Nothing
-        allowed -> Just allowed
+includeDecision :: ReachabilityGraph -> CaveatContext -> Maybe TupleCaveat -> CheckDecision -> Either EnError (Maybe CheckDecision)
+includeDecision graph context caveat decision = do
+    gate <- evaluateTupleCaveat graph context caveat
+    case Decision.applyGate gate decision of
+        Denied -> Right Nothing
+        allowed -> Right (Just allowed)
 
 filterAllowed :: [LookupObject] -> [LookupObject]
 filterAllowed =
@@ -473,56 +480,26 @@ combineDecisions :: CheckDecision -> CheckDecision -> CheckDecision
 combineDecisions left right =
     Decision.union [left, right]
 
-evaluateRewriteCaveat :: CaveatName -> CaveatContext -> CheckDecision
-evaluateRewriteCaveat caveat (CaveatContext context)
-    | Map.member "requested_autonomy" context = Allowed
-    | otherwise = Conditional [CaveatObligation{caveat, missingContext = ["requested_autonomy"]}]
+applyRewriteCaveat :: ReachabilityGraph -> CaveatContext -> CaveatName -> [LookupObject] -> Either EnError [LookupObject]
+applyRewriteCaveat graph context caveat objects = do
+    gate <- evaluateNamedCaveat graph context caveat (CaveatPayload Map.empty)
+    pure (applyGateToObjects gate objects)
 
-evaluateTupleCaveat :: CaveatContext -> Maybe TupleCaveat -> CheckDecision
-evaluateTupleCaveat _ Nothing = Allowed
-evaluateTupleCaveat context (Just TupleCaveat{name = caveat@(CaveatName "within_autonomy"), payload}) =
-    evaluateWithinAutonomy caveat payload context
-evaluateTupleCaveat _ (Just TupleCaveat{name}) =
-    Conditional [CaveatObligation{caveat = name, missingContext = []}]
+evaluateTupleCaveat :: ReachabilityGraph -> CaveatContext -> Maybe TupleCaveat -> Either EnError CheckDecision
+evaluateTupleCaveat _ _ Nothing =
+    Right Allowed
+evaluateTupleCaveat graph context (Just TupleCaveat{name, payload}) =
+    evaluateNamedCaveat graph context name payload
 
-evaluateWithinAutonomy :: CaveatName -> CaveatPayload -> CaveatContext -> CheckDecision
-evaluateWithinAutonomy caveat (CaveatPayload payload) (CaveatContext context) =
-    case missing of
-        [] ->
-            if autonomyAllowed && timeAllowed
-                then Allowed
-                else Denied
-        _ -> Conditional [CaveatObligation{caveat, missingContext = missing}]
-  where
-    requested = Map.lookup "requested_autonomy" context
-    granted = Map.lookup "autonomy" payload
-    now = Map.lookup "current_time" context
-    untilValue = Map.lookup "until" payload
-    missing =
-        ["requested_autonomy" | requested == Nothing]
-            <> ["current_time" | untilValue /= Nothing && now == Nothing]
-    autonomyAllowed =
-        case (requested, granted) of
-            (Just (ValueEnum requestedAutonomy), Just (ValueEnum grantedAutonomy)) ->
-                autonomyRank requestedAutonomy <= autonomyRank grantedAutonomy
-            (Just (ValueText requestedAutonomy), Just (ValueText grantedAutonomy)) ->
-                autonomyRank requestedAutonomy <= autonomyRank grantedAutonomy
-            _ -> False
-    timeAllowed =
-        case (now, untilValue) of
-            (_, Nothing) -> True
-            (Just (ValueTimestamp currentTime), Just (ValueTimestamp expiryTime)) ->
-                currentTime <= expiryTime
-            _ -> False
+evaluateNamedCaveat :: ReachabilityGraph -> CaveatContext -> CaveatName -> CaveatPayload -> Either EnError CheckDecision
+evaluateNamedCaveat graph context caveat payload =
+    case Map.lookup caveat graph.caveats of
+        Nothing -> Left (UnknownRelation ("unknown caveat: " <> caveatText caveat))
+        Just definition -> Right (evaluateCaveat definition payload context)
 
-autonomyRank :: Text -> Int
-autonomyRank value =
-    case value of
-        "read" -> 0
-        "view" -> 0
-        "act" -> 1
-        "admin" -> 2
-        _ -> maxBound
+caveatText :: CaveatName -> Text
+caveatText (CaveatName text) =
+    text
 
 pageLookup :: LookupLimit -> Maybe LookupCursor -> [LookupObject] -> LookupPage
 pageLookup (LookupLimit rawLimit) cursor objects =

@@ -18,7 +18,26 @@ module En.Schema.Builder (
     subject,
     userset,
     caveat,
+    caveatWith,
     parameter,
+    ctxParam,
+    payloadParam,
+    litText,
+    litBool,
+    litInteger,
+    litTimestamp,
+    litEnum,
+    cmpEq,
+    cmpNe,
+    cmpLt,
+    cmpLe,
+    cmpGt,
+    cmpGe,
+    predTrue,
+    predAnd,
+    predOr,
+    predNot,
+    predMember,
     this,
     computed,
     arrow,
@@ -31,8 +50,9 @@ module En.Schema.Builder (
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
+import Data.Time (UTCTime)
 
-import En.Schema (CaveatParameterType, Rewrite, Schema)
+import En.Schema (CaveatCompare (..), CaveatOperand (..), CaveatParameterType, CaveatPredicate (..), CaveatSource (..), CaveatValue (..), Rewrite, Schema)
 import En.Schema qualified as Raw
 
 data SchemaObject = SchemaObject Raw.ObjectType (Map.Map Raw.RelationName Raw.Relation)
@@ -94,9 +114,13 @@ userset objectType relationName =
 
 caveat :: Text -> [ParameterSpec] -> CaveatSpec
 caveat name parameterSpecs =
+    caveatWith name parameterSpecs PredTrue
+
+caveatWith :: Text -> [ParameterSpec] -> CaveatPredicate -> CaveatSpec
+caveatWith name parameterSpecs predicate =
     CaveatSpec
         caveatName
-        (Raw.CaveatDefinition caveatName (Map.fromList (parameterEntry <$> parameterSpecs)))
+        (Raw.CaveatDefinition caveatName (Map.fromList (parameterEntry <$> parameterSpecs)) predicate)
   where
     caveatName =
         Raw.CaveatName name
@@ -107,6 +131,78 @@ caveat name parameterSpecs =
 parameter :: Text -> CaveatParameterType -> ParameterSpec
 parameter name =
     ParameterSpec (Raw.CaveatParameterName name)
+
+ctxParam :: Text -> CaveatOperand
+ctxParam =
+    OperandParam FromContext . Raw.CaveatParameterName
+
+payloadParam :: Text -> CaveatOperand
+payloadParam =
+    OperandParam FromPayload . Raw.CaveatParameterName
+
+litText :: Text -> CaveatOperand
+litText =
+    OperandLiteral . ValueText
+
+litBool :: Bool -> CaveatOperand
+litBool =
+    OperandLiteral . ValueBool
+
+litInteger :: Integer -> CaveatOperand
+litInteger =
+    OperandLiteral . ValueInteger
+
+litTimestamp :: UTCTime -> CaveatOperand
+litTimestamp =
+    OperandLiteral . ValueTimestamp
+
+litEnum :: Text -> CaveatOperand
+litEnum =
+    OperandLiteral . ValueEnum
+
+cmpEq :: CaveatOperand -> CaveatOperand -> CaveatPredicate
+cmpEq =
+    PredCompare CmpEq
+
+cmpNe :: CaveatOperand -> CaveatOperand -> CaveatPredicate
+cmpNe =
+    PredCompare CmpNe
+
+cmpLt :: CaveatOperand -> CaveatOperand -> CaveatPredicate
+cmpLt =
+    PredCompare CmpLt
+
+cmpLe :: CaveatOperand -> CaveatOperand -> CaveatPredicate
+cmpLe =
+    PredCompare CmpLe
+
+cmpGt :: CaveatOperand -> CaveatOperand -> CaveatPredicate
+cmpGt =
+    PredCompare CmpGt
+
+cmpGe :: CaveatOperand -> CaveatOperand -> CaveatPredicate
+cmpGe =
+    PredCompare CmpGe
+
+predTrue :: CaveatPredicate
+predTrue =
+    PredTrue
+
+predAnd :: [CaveatPredicate] -> CaveatPredicate
+predAnd =
+    PredAnd
+
+predOr :: [CaveatPredicate] -> CaveatPredicate
+predOr =
+    PredOr
+
+predNot :: CaveatPredicate -> CaveatPredicate
+predNot =
+    PredNot
+
+predMember :: CaveatOperand -> [CaveatValue] -> CaveatPredicate
+predMember =
+    PredMember
 
 this :: Rewrite
 this =

@@ -8,6 +8,7 @@ module En.Check (
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 
+import En.Caveat (evaluateCaveat)
 import En.Decision (CaveatObligation (..), CheckDecision (..))
 import En.Decision qualified as Decision
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..))
@@ -19,7 +20,6 @@ import En.Schema (CaveatName (..), ObjectType (..), Relation (..), RelationName 
 import En.Tuple (
     CaveatContext (..),
     CaveatPayload (..),
-    CaveatValue (..),
     ObjectRef (..),
     Subject (..),
     Tuple (..),
@@ -154,7 +154,7 @@ evalRewrite tupleStore graph context revision subject object currentRelation rew
                     pure (Decision.exclusion <$> subtractDecision)
         Caveated caveat rewriteInner -> do
             inner <- evalRewrite tupleStore graph context revision subject object currentRelation rewriteInner state
-            pure (Decision.applyGate (evaluateRewriteCaveat caveat context) <$> inner)
+            pure (applyRewriteCaveat graph context caveat =<< inner)
 
 evalThis ::
     (Monad m) =>
@@ -180,14 +180,14 @@ evalThis tupleStore graph context revision subject object relation state
   where
     rowDecision TupleRow{tuple}
         | tuple.subject == subject =
-            pure (Right (Decision.applyGate (evaluateTupleCaveat context tuple.caveat) Allowed))
+            pure (applyTupleCaveat graph context tuple.caveat Allowed)
         | otherwise =
             case tuple.subject of
                 SubjectId _ ->
                     pure (Right Denied)
                 SubjectSet subjectObject subjectRelation ->
                     fmap
-                        (fmap (Decision.applyGate (evaluateTupleCaveat context tuple.caveat)))
+                        (>>= applyTupleCaveat graph context tuple.caveat)
                         (evalRelation tupleStore graph context revision subject subjectObject subjectRelation state)
 
 evalTupleToUserset ::
@@ -220,7 +220,7 @@ evalTupleToUserset tupleStore graph context revision subject object tuplesetRela
             pure (Decision.union <$> sequence decisions)
   where
     applyRowGate tuple =
-        fmap (Decision.applyGate (evaluateTupleCaveat context tuple.caveat))
+        (>>= applyTupleCaveat graph context tuple.caveat)
 
 ensureExhausted :: TuplePage -> Either EnError [TupleRow]
 ensureExhausted TuplePage{rows, state} =
@@ -229,57 +229,28 @@ ensureExhausted TuplePage{rows, state} =
         HasMore (_ :: StoreCursor) -> Left ResolutionLimitExceeded
         Truncated (_ :: StoreCursor) -> Left ResolutionLimitExceeded
 
-evaluateRewriteCaveat :: CaveatName -> CaveatContext -> CheckDecision
-evaluateRewriteCaveat caveat (CaveatContext context)
-    | Map.member "requested_autonomy" context = Allowed
-    | otherwise = Conditional [CaveatObligation{caveat, missingContext = ["requested_autonomy"]}]
+applyRewriteCaveat :: ReachabilityGraph -> CaveatContext -> CaveatName -> CheckDecision -> Either EnError CheckDecision
+applyRewriteCaveat graph context caveat decision = do
+    gate <- evaluateNamedCaveat graph context caveat (CaveatPayload Map.empty)
+    pure (Decision.applyGate gate decision)
 
-evaluateTupleCaveat :: CaveatContext -> Maybe TupleCaveat -> CheckDecision
-evaluateTupleCaveat _ Nothing = Allowed
-evaluateTupleCaveat context (Just TupleCaveat{name = caveat@(CaveatName "within_autonomy"), payload}) =
-    evaluateWithinAutonomy caveat payload context
-evaluateTupleCaveat _ (Just TupleCaveat{name}) =
-    Conditional [CaveatObligation{caveat = name, missingContext = []}]
+applyTupleCaveat :: ReachabilityGraph -> CaveatContext -> Maybe TupleCaveat -> CheckDecision -> Either EnError CheckDecision
+applyTupleCaveat _ _ Nothing decision =
+    Right decision
+applyTupleCaveat graph context (Just TupleCaveat{name, payload}) decision = do
+    gate <- evaluateNamedCaveat graph context name payload
+    pure (Decision.applyGate gate decision)
 
-evaluateWithinAutonomy :: CaveatName -> CaveatPayload -> CaveatContext -> CheckDecision
-evaluateWithinAutonomy caveat (CaveatPayload payload) (CaveatContext context) =
-    case missing of
-        [] ->
-            if autonomyAllowed && timeAllowed
-                then Allowed
-                else Denied
-        _ -> Conditional [CaveatObligation{caveat, missingContext = missing}]
-  where
-    requested = Map.lookup "requested_autonomy" context
-    granted = Map.lookup "autonomy" payload
-    now = Map.lookup "current_time" context
-    untilValue = Map.lookup "until" payload
-    missing =
-        ["requested_autonomy" | requested == Nothing]
-            <> ["current_time" | untilValue /= Nothing && now == Nothing]
-    autonomyAllowed =
-        case (requested, granted) of
-            (Just (ValueEnum requestedAutonomy), Just (ValueEnum grantedAutonomy)) ->
-                autonomyRank requestedAutonomy <= autonomyRank grantedAutonomy
-            (Just (ValueText requestedAutonomy), Just (ValueText grantedAutonomy)) ->
-                autonomyRank requestedAutonomy <= autonomyRank grantedAutonomy
-            _ -> False
-    timeAllowed =
-        case (now, untilValue) of
-            (_, Nothing) -> True
-            (Just (ValueTimestamp currentTime), Just (ValueTimestamp expiryTime)) ->
-                currentTime <= expiryTime
-            _ -> False
-
-autonomyRank :: Text -> Int
-autonomyRank value =
-    case value of
-        "read" -> 0
-        "view" -> 0
-        "act" -> 1
-        "admin" -> 2
-        _ -> maxBound
+evaluateNamedCaveat :: ReachabilityGraph -> CaveatContext -> CaveatName -> CaveatPayload -> Either EnError CheckDecision
+evaluateNamedCaveat graph context caveat payload =
+    case Map.lookup caveat graph.caveats of
+        Nothing -> Left (UnknownRelation ("unknown caveat: " <> caveatText caveat))
+        Just definition -> Right (evaluateCaveat definition payload context)
 
 renderRef :: RelationRef -> Text
 renderRef RelationRef{objectType = ObjectType objectType, relation = RelationName relation} =
     objectType <> "#" <> relation
+
+caveatText :: CaveatName -> Text
+caveatText (CaveatName text) =
+    text

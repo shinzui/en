@@ -13,6 +13,7 @@ import En.Error (EnError)
 import En.Revision (SchemaHash)
 import En.Schema (
     AllowedSubject (..),
+    CaveatDefinition,
     CaveatName,
     ObjectType,
     Relation (..),
@@ -35,6 +36,7 @@ traversal-ordering optimization.
 data ReachabilityGraph = ReachabilityGraph
     { entries :: !(Map RelationRef [EntryPoint])
     , relations :: !(Map RelationRef Relation)
+    , caveats :: !(Map CaveatName CaveatDefinition)
     , hash :: !SchemaHash
     }
     deriving stock (Eq, Show)
@@ -102,6 +104,7 @@ compile schema = do
                     | (objectType, objectRelations) <- Map.toAscList schema.objectTypes
                     , (relationName, relation) <- Map.toAscList objectRelations
                     ]
+            , caveats = schema.caveats
             , hash = schemaHash schema
             }
 

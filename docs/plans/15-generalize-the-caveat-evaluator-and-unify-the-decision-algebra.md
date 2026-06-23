@@ -81,17 +81,18 @@ This section must always reflect the actual current state of the work.
   `En.Check.evalThis` by passing the current relation explicitly. Completed 2026-06-23.
 - [x] **M1.6** `cabal build all` and `cabal test all` green; the existing test assertions still pass
   unchanged. Completed 2026-06-23.
-- [ ] **M2.1** Add a typed predicate AST (`CaveatPredicate`) and a `predicate` field to
+- [x] **M2.1** Add a typed predicate AST (`CaveatPredicate`) and a `predicate` field to
   `En.Schema.CaveatDefinition`; extend `schemaHash`, `validate`, and `En.Schema.Builder`.
-- [ ] **M2.2** Write `En.Caveat.evaluateCaveat :: CaveatDefinition -> CaveatPayload -> CaveatContext
-  -> CheckDecision` — the generic, total, schema-driven evaluator.
-- [ ] **M2.3** Rewrite `En.Check` and `En.Lookup` to look the caveat up in the schema and call the
+  Completed 2026-06-23.
+- [x] **M2.2** Write `En.Caveat.evaluateCaveat :: CaveatDefinition -> CaveatPayload -> CaveatContext
+  -> CheckDecision` — the generic, total, schema-driven evaluator. Completed 2026-06-23.
+- [x] **M2.3** Rewrite `En.Check` and `En.Lookup` to look the caveat up in the schema and call the
   generic evaluator; delete `evaluateRewriteCaveat`, `evaluateTupleCaveat`,
-  `evaluateWithinAutonomy`, `autonomyRank`.
-- [ ] **M2.4** Re-express kikan's `within_autonomy` as a schema caveat with a predicate; update the
-  test fixture and confirm every existing caveat assertion still passes.
-- [ ] **M2.5** Add a test declaring a brand-new caveat (`min_level`, Integer `>=`) and prove the
-  engine evaluates it with no engine code naming it.
+  `evaluateWithinAutonomy`, `autonomyRank`. Completed 2026-06-23.
+- [x] **M2.4** Re-express kikan's `within_autonomy` as a schema caveat with a predicate; update the
+  test fixture and confirm every existing caveat assertion still passes. Completed 2026-06-23.
+- [x] **M2.5** Add a test declaring a brand-new caveat (`min_level`, Integer `>=`) and prove the
+  engine evaluates it with no engine code naming it. Completed 2026-06-23.
 - [ ] **M3.1** Add a public/wildcard subject form to `En.Tuple.Subject` and `En.Schema.AllowedSubject`.
 - [ ] **M3.2** Handle it in `En.Check` (a `user:*` tuple grants every concrete subject of that type).
 - [ ] **M3.3** Handle it in `En.Lookup` and the `En.Reachability` compiler.
@@ -117,6 +118,13 @@ implementation. Provide concise evidence.
   values* a caveat takes but not *how to decide*. The hard-coded evaluator embeds the decision
   logic in Haskell. Generalizing requires adding the decision logic to the schema as data; see
   Milestone 2. _(2026-06-23.)_
+
+- **The old kikan fixture used the same caveat as both a rewrite caveat and a tuple caveat.** Once
+  `within_autonomy` became a real predicate over tuple payload keys (`autonomy`, `until`) and context
+  keys (`requested_autonomy`, `current_time`), evaluating it as a rewrite gate with an empty payload
+  correctly denied the path. The fixture now represents autonomy as the tuple caveat that carries
+  those payload values; the behavioral check/lookup/expand caveat assertions still pass.
+  _(2026-06-23.)_
 
 
 ## Decision Log
@@ -160,6 +168,20 @@ Record every decision made while working on the plan.
   Rationale: An explicit constructor cannot be confused with a real object whose id happens to be
   `"*"`, is exhaustively matched by the compiler (so we cannot forget a case), and matches how
   OpenFGA/SpiceDB model `type:*` as a first-class wildcard.
+  Date: 2026-06-23
+
+- Decision: Put `CaveatValue`, `CaveatPayload`, and `CaveatContext` in `En.Caveat.Value`, re-exported
+  from `En.Tuple`, instead of moving them directly into `En.Schema`.
+  Rationale: `En.Schema` needs to mention `CaveatValue` in `CaveatPredicate`, while `En.Tuple`
+  already imports `En.Schema` for object/relation/caveat names. A tiny shared module avoids an import
+  cycle and preserves existing `En.Tuple` imports.
+  Date: 2026-06-23
+
+- Decision: Migrate the existing `within_autonomy` fixture to a tuple caveat rather than a rewrite
+  caveat.
+  Rationale: Its predicate reads tuple payload fields (`autonomy`, `until`), so the schema-driven
+  evaluator should only apply it where that payload exists. The previous rewrite caveat wrapper was
+  a byproduct of the hard-coded evaluator's context-presence shortcut, not the semantic grant.
   Date: 2026-06-23
 
 

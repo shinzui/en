@@ -38,6 +38,8 @@ library
   import:          warnings, shared
   hs-source-dirs:  src
   exposed-modules:
+    En.Caveat
+    En.Caveat.Value
     En.Check
     En.Decision
     En.Effect.ConsistencyStore
