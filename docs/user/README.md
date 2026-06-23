@@ -23,7 +23,8 @@ and implementation plans live under [`docs/spec`](../spec) and [`docs/plans`](..
 
 An `en` authorization model has three pieces:
 
-1. A `Schema` supplied by the consuming application.
+1. A `Schema` supplied by the consuming application, usually authored with
+   `En.Schema.Builder`.
 2. Relationship `Tuple`s stored in a `TupleStore`.
 3. Read queries over a compiled `ReachabilityGraph`.
 

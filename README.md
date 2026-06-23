@@ -18,9 +18,10 @@ autonomy-leveled grants).
 ## Schema-parametric
 
 `en` does **not** hard-code an authorization model. Each consuming project supplies its own
-**schema** — object types, relations, rewrite rules, caveats — as a Haskell value. The engine
-(tuple store, `check`, `lookup`, consistency tokens) is generic over that schema. This is the
-same posture as `shomei`: a toolkit, not a single-app service.
+**schema** — object types, relations, rewrite rules, caveats — as a Haskell value, normally
+authored with `En.Schema.Builder`. The engine (tuple store, `check`, `lookup`, consistency
+tokens) is generic over that schema. This is the same posture as `shomei`: a toolkit, not a
+single-app service.
 
 ## Query surface
 

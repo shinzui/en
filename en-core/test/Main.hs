@@ -55,6 +55,7 @@ import En.Schema (
     schemaHash,
     validate,
  )
+import En.Schema.Builder qualified as Schema
 import En.Tuple (
     CaveatContext (..),
     CaveatPayload (..),
@@ -77,6 +78,10 @@ main = do
         _ = sampleExpandTree
         _ = sampleCaveatDefinition
     assertEqual "kikan-shaped fixture validates" (Right ()) (validate kikanSchema)
+    assertEqual "builder schema equals manual schema" kikanSchemaManual kikanSchema
+    assertEqual "builder schema hash matches manual schema hash" (schemaHash kikanSchemaManual) (schemaHash kikanSchema)
+    assertEqual "builder anyOf constructs a non-empty union" (Union [This, ComputedUserset (RelationName "owner")]) (Schema.anyOf Schema.this [Schema.computed "owner"])
+    assertEqual "builder allOf constructs a non-empty intersection" (Intersection [This, ComputedUserset (RelationName "owner")]) (Schema.allOf Schema.this [Schema.computed "owner"])
     graph <- either (fail . show) pure (compile kikanSchema)
     assertEqual "graph stores schema hash" (schemaHash kikanSchema) graph.hash
     assertEqual "schema hash is stable across map insertion order" (schemaHash kikanSchema) (schemaHash kikanSchemaReordered)
@@ -280,6 +285,64 @@ nodeHasCaveat caveat =
 
 kikanSchema :: Schema
 kikanSchema =
+    Schema.buildWithCaveats
+        [ Schema.caveat
+            "within_autonomy"
+            [ Schema.parameter "requested_autonomy" (ParameterEnum ["read", "act"])
+            , Schema.parameter "until" ParameterTimestamp
+            ]
+        ]
+        [ Schema.object "user" []
+        , Schema.object
+            "org"
+            [ Schema.relation "member" [Schema.subject "user"] Schema.this
+            ]
+        , Schema.object
+            "visibility_class"
+            [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
+            ]
+        , Schema.object
+            "space"
+            [ Schema.relation "owner" [Schema.subject "user"] Schema.this
+            , Schema.relation "member" [Schema.subject "user", Schema.userset "org" "member"] Schema.this
+            , Schema.relation "guest_org" [Schema.subject "org"] Schema.this
+            , Schema.relation "parent" [Schema.subject "space"] Schema.this
+            , Schema.relation "visibility_class" [Schema.subject "visibility_class"] Schema.this
+            , Schema.permission
+                "view"
+                ( Schema.anyOf
+                    (Schema.computed "owner")
+                    [ Schema.computed "member"
+                    , Schema.arrow "guest_org" "member"
+                    , Schema.arrow "parent" "view"
+                    , Schema.arrow "visibility_class" "viewer"
+                    ]
+                )
+            , Schema.permission
+                "act"
+                ( Schema.anyOf
+                    (Schema.computed "owner")
+                    [Schema.computed "member"]
+                )
+            , Schema.permission
+                "audit"
+                ( Schema.allOf
+                    (Schema.computed "owner")
+                    [Schema.computed "member"]
+                )
+            , Schema.permission
+                "member_not_owner"
+                (Schema.minus (Schema.computed "member") (Schema.computed "owner"))
+            ]
+        , Schema.object
+            "intention"
+            [ Schema.relation "delegate" [Schema.subject "user"] (Schema.caveated "within_autonomy" Schema.this)
+            , Schema.permission "view" (Schema.computed "delegate")
+            ]
+        ]
+
+kikanSchemaManual :: Schema
+kikanSchemaManual =
     Schema
         { objectTypes =
             Map.fromList

@@ -1,9 +1,6 @@
 module Main (main) where
 
 import Control.Exception (bracket)
-import Data.Map.Strict qualified as Map
-import Data.Set qualified as Set
-import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Data.Time (getCurrentTime)
@@ -17,8 +14,8 @@ import En.Postgres.Revision (ConsistencyConfig (..), postgresConsistencyStore)
 import En.Postgres.TupleStore (postgresTupleStoreIO)
 import En.Reachability (compile)
 import En.Revision (DatastoreId (..))
-import En.Schema (AllowedSubject (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..), Schema (..))
-import En.Schema qualified as Schema
+import En.Schema (Schema, schemaHash)
+import En.Schema.Builder qualified as Schema
 import En.Servant.API (EnServer (..), app)
 import Hasql.Connection qualified as Connection
 import Hasql.Connection.Settings qualified as Settings
@@ -41,7 +38,7 @@ main = do
     let config =
             ConsistencyConfig
                 { datastoreId = DatastoreId "en-server"
-                , schemaHash = Schema.schemaHash demoSchema
+                , schemaHash = schemaHash demoSchema
                 }
         tupleStore = postgresTupleStoreIO connection config
         consistencyStore =
@@ -77,31 +74,11 @@ parsePort value =
 
 demoSchema :: Schema
 demoSchema =
-    Schema
-        { objectTypes =
-            Map.fromList
-                [ (ObjectType "user", Map.empty)
-                ,
-                    ( ObjectType "space"
-                    , Map.fromList
-                        [ relationEntry "viewer" userSubject This
-                        , relationEntry "view" Set.empty (ComputedUserset (RelationName "viewer"))
-                        ]
-                    )
-                ]
-        , caveats = Map.empty
-        }
-
-relationEntry :: Text -> Set.Set AllowedSubject -> Rewrite -> (RelationName, Relation)
-relationEntry name allowedSubjects rewrite =
-    ( RelationName name
-    , Relation
-        { relationName = RelationName name
-        , allowedSubjects = allowedSubjects
-        , rewrite = rewrite
-        }
-    )
-
-userSubject :: Set.Set AllowedSubject
-userSubject =
-    Set.singleton AllowedSubject{objectType = ObjectType "user", relation = Nothing}
+    Schema.build
+        [ Schema.object "user" []
+        , Schema.object
+            "space"
+            [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
+            , Schema.permission "view" (Schema.computed "viewer")
+            ]
+        ]

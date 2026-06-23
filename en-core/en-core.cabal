@@ -48,6 +48,7 @@ library
     En.Reachability
     En.Revision
     En.Schema
+    En.Schema.Builder
     En.Tuple
 
   build-depends:

@@ -40,14 +40,15 @@ not write direct tuples to them. Instead, the permission rewrites over stored
 relations.
 
 ```haskell
-relationEntry
+import En.Schema.Builder qualified as Schema
+
+Schema.permission
     "view"
-    Set.empty
-    ( Union
-        [ ComputedUserset (RelationName "owner")
-        , ComputedUserset (RelationName "member")
-        , TupleToUserset (RelationName "guest_org") (RelationName "member")
-        , TupleToUserset (RelationName "parent") (RelationName "view")
+    ( Schema.anyOf
+        (Schema.computed "owner")
+        [ Schema.computed "member"
+        , Schema.arrow "guest_org" "member"
+        , Schema.arrow "parent" "view"
         ]
     )
 ```
@@ -60,12 +61,13 @@ a guest org attached to the space, or can view a parent space.
 `AllowedSubject` controls what shapes may appear in direct tuples:
 
 ```haskell
-AllowedSubject{objectType = ObjectType "user", relation = Nothing}
-AllowedSubject{objectType = ObjectType "org", relation = Just (RelationName "member")}
+Schema.relation "owner" [Schema.subject "user"] Schema.this
+Schema.relation "member" [Schema.subject "user", Schema.userset "org" "member"] Schema.this
 ```
 
-The first accepts concrete subjects such as `user:alice`. The second accepts
-userset subjects such as `org:acme#member`.
+`Schema.subject "user"` accepts concrete subjects such as `user:alice`.
+`Schema.userset "org" "member"` accepts userset subjects such as
+`org:acme#member`.
 
 Use userset subjects when membership in another object should grant access:
 
@@ -116,6 +118,22 @@ Autonomy levels rank as `read < act < admin`; unknown enum values are treated as
 the lowest rank.
 
 ```haskell
+schema :: Schema
+schema =
+    Schema.buildWithCaveats
+        [ Schema.caveat
+            "within_autonomy"
+            [ Schema.parameter "requested_autonomy" (ParameterEnum ["read", "act", "admin"])
+            , Schema.parameter "until" ParameterTimestamp
+            ]
+        ]
+        [ Schema.object
+            "intention"
+            [ Schema.relation "delegate" [Schema.subject "user"] (Schema.caveated "within_autonomy" Schema.this)
+            , Schema.permission "view" (Schema.computed "delegate")
+            ]
+        ]
+
 TupleCaveat
     { name = CaveatName "within_autonomy"
     , payload =
@@ -131,6 +149,11 @@ TupleCaveat
 When required context is missing, `check` and `lookup` return `Conditional`
 with the missing keys. Callers should fail closed or retry with complete
 context.
+
+The raw constructors in `En.Schema` remain available for advanced callers and
+tests that intentionally construct invalid schemas. Application schemas should
+prefer `En.Schema.Builder` so relation map keys, relation records, and allowed
+subject sets are assembled consistently.
 
 ## Lookup-friendly modeling
 

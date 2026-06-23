@@ -11,10 +11,9 @@ object types and relations as values.
 
 ```haskell
 import Data.Map.Strict qualified as Map
-import Data.Set qualified as Set
-import Data.Text (Text)
 
-import En.Schema
+import En.Schema (ObjectType (..), RelationName (..), Schema)
+import En.Schema.Builder qualified as Schema
 import En.Tuple
 import En.Reachability (compile)
 import En.Revision (Consistency (MinimizeLatency))
@@ -27,44 +26,24 @@ spaceType = ObjectType "space"
 viewer, view :: RelationName
 viewer = RelationName "viewer"
 view = RelationName "view"
-
-userSubject :: Set.Set AllowedSubject
-userSubject =
-    Set.singleton AllowedSubject{objectType = userType, relation = Nothing}
 ```
 
 ## 2. Build a schema
 
-A direct relation uses `This`; a permission usually computes over one or more
-relations.
+A direct relation uses `Schema.this`; a permission usually computes over one or
+more relations.
 
 ```haskell
 schema :: Schema
 schema =
-    Schema
-        { objectTypes =
-            Map.fromList
-                [ (userType, Map.empty)
-                ,
-                    ( spaceType
-                    , Map.fromList
-                        [ relationEntry "viewer" userSubject This
-                        , relationEntry "view" Set.empty (ComputedUserset viewer)
-                        ]
-                    )
-                ]
-        , caveats = Map.empty
-        }
-
-relationEntry :: Text -> Set.Set AllowedSubject -> Rewrite -> (RelationName, Relation)
-relationEntry name allowedSubjects rewrite =
-    ( RelationName name
-    , Relation
-        { relationName = RelationName name
-        , allowedSubjects = allowedSubjects
-        , rewrite = rewrite
-        }
-    )
+    Schema.build
+        [ Schema.object "user" []
+        , Schema.object
+            "space"
+            [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
+            , Schema.permission "view" (Schema.computed "viewer")
+            ]
+        ]
 ```
 
 `viewer` accepts direct `user` subjects. `view` accepts no direct tuples; it is
@@ -136,7 +115,7 @@ can supply the missing caveat context and retry.
 
 ## 6. Next steps
 
-- Add parent or container relations with `TupleToUserset`.
+- Add parent or container relations with `Schema.arrow`.
 - Use `lookup` to protect list endpoints without doing one `check` per row.
 - Use `expand` to build review and audit views that explain who can access an
   object.
