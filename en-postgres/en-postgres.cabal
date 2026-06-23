@@ -31,14 +31,17 @@ library
   import:          warnings, shared
   hs-source-dirs:  src
   exposed-modules:
+    En.Postgres.Database
     En.Postgres.Revision
     En.Postgres.TupleStore
 
   build-depends:
     , aeson
-    , base           >=4.19 && <5
+    , base            >=4.19 && <5
     , bytestring
     , containers
+    , effectful
+    , effectful-core
     , en-core
     , en-migrations
     , hasql
@@ -53,6 +56,8 @@ test-suite en-postgres-revision-tests
   main-is:        Main.hs
   build-depends:
     , base
+    , effectful
+    , effectful-core
     , en-core
     , en-postgres
     , text
@@ -66,6 +71,8 @@ test-suite en-postgres-integration-tests
   build-depends:
     , base
     , containers
+    , effectful
+    , effectful-core
     , en-core
     , en-postgres
     , ephemeral-pg

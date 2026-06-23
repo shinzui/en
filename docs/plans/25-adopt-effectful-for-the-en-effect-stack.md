@@ -70,7 +70,7 @@ even if it requires splitting a partially completed task into two ("done" vs. "r
 This section must always reflect the actual current state of the work.
 
 - [x] **M1 — en-core effects + engine + in-memory interpreter.** Completed 2026-06-23T23:17:43Z. Added `effectful`/`effectful-core` deps; reformulated `TupleStore`/`ConsistencyStore` as `effectful` effects; migrated `Check` (incl. `checkMany`), `Lookup`, and `Expand` to `Eff`; reformulated `En.Conformance.Kikan`'s `inMemoryTupleStore`/`consistencyStore` into in-memory interpreters; ported `en-core-interface-tests`, `en-core-conformance`, and `en-core-bench`; `cabal build en-core`, `cabal test en-core`, and `cabal bench en-core` are green.
-- [ ] **M2 — en-postgres interpreters.** Add a `Database` effect (hasql); replace the record constructors with `runTupleStorePostgres` / `runConsistencyStorePostgres`; `cabal test en-postgres` green. (`en-postgres-bench` is pure snapshot-codec benchmarking — confirm it still builds; no engine/store changes needed there.)
+- [x] **M2 — en-postgres interpreters.** Completed 2026-06-23T23:23:54Z. Added `En.Postgres.Database`; replaced the record constructors with `runTupleStorePostgres` / `runConsistencyStorePostgres`; migrated the PostgreSQL integration test to the interpreter stack; `cabal build en-postgres`, `cabal test en-postgres:en-postgres-revision-tests`, `cabal test en-postgres:en-postgres-integration-tests`, and `cabal build en-postgres:en-postgres-bench` are green.
 - [ ] **M3 — en-servant seam + en-example host.** Replace IO-store record fields with an `Eff`→`Handler` seam (`AppEffects`, `Env`, `runEngine`); migrate all handlers including the `/batch-check` (`checkMany`) handler; migrate the `en-example` package (`AuthorizationEnv`, `failingConsistencyStore`, the resolver-style `check` gate) and its test; `cabal build en-servant en-example` and `cabal test en-servant en-example` green.
 - [ ] **M4 — en-server assembly.** Compose `runAppIO` in `en-server/app/Main.hs`; server boots; end-to-end `check` over HTTP returns the expected decision.
 - [ ] **M5 — whole-repo build/test + en-client check + cleanup.** `cabal build all` and `cabal test all` green (including `en-core-conformance`, `en-servant-tests`, `en-example-tests`, both benchmark gates); confirm `en-client` builds unchanged; remove dead code.
@@ -205,6 +205,13 @@ Record every decision made while working on the plan.
   remains in test-local interpreters where it is needed.
   Date: 2026-06-23
 
+- Decision: Keep `runTupleStorePostgres` free of an `IOE` constraint.
+  Rationale: The tuple-store PostgreSQL interpreter does not perform `IO` directly; it delegates
+  all SQL execution to the `Database` effect. Carrying `IOE` here would be redundant under
+  `-Wredundant-constraints`. The `Database` interpreter still requires `IOE`, and
+  `runConsistencyStorePostgres` still requires `IOE` because it calls `getCurrentTime`.
+  Date: 2026-06-23
+
 
 ## Outcomes & Retrospective
 
@@ -228,6 +235,24 @@ Compare the result against the original purpose.
   All three commands succeeded. `cabal test en-core` reported both `en-core-conformance` and
   `en-core-interface-tests` as `PASS`; `cabal bench en-core` reported all four benchmark checks as
   `OK`.
+
+- M2 completed on 2026-06-23T23:23:54Z. en-postgres now has a `Database` effect interpreted by
+  `runDatabaseConnection`; the tuple and consistency stores are PostgreSQL interpreters rather
+  than record constructors. The integration suite runs `check`, `lookup`, and direct tuple-store
+  operations through the real interpreter composition.
+
+  Validation:
+
+  ```text
+  cabal build en-postgres
+  cabal test en-postgres:en-postgres-revision-tests
+  cabal test en-postgres:en-postgres-integration-tests
+  cabal build en-postgres:en-postgres-bench
+  rg -n 'PostgresSessionRunner|postgresTupleStore|postgresTupleStoreIO|postgresConsistencyStore|:: TupleStore IO|:: ConsistencyStore IO' en-postgres
+  ```
+
+  The build, revision tests, ephemeral-pg integration test, and benchmark build succeeded. The
+  `rg` command produced no matches in `en-postgres`.
 
 
 ## Context and Orientation

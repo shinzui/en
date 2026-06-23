@@ -1,18 +1,14 @@
+{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE MultilineStrings #-}
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
 -- | PostgreSQL-backed 'TupleStore'.
 module En.Postgres.TupleStore (
-    PostgresSessionRunner (..),
-    hasqlConnectionRunner,
-    postgresTupleStore,
-    postgresTupleStoreIO,
-    reapDeletedTuples,
+    runTupleStorePostgres,
+    reapDeletedTuplesSession,
 ) where
 
-import Control.Exception (throwIO)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as AesonKey
 import Data.Aeson.KeyMap qualified as AesonKeyMap
@@ -27,6 +23,9 @@ import Data.Scientific (floatingOrInteger)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Word (Word64)
+import Effectful (Eff, (:>))
+import Effectful.Dispatch.Dynamic (interpret_)
+import Effectful.Error.Static (Error, throwError)
 
 import En.Effect.TupleStore (
     PageState (..),
@@ -37,6 +36,8 @@ import En.Effect.TupleStore (
     TupleStore (..),
     UsersetQuery (..),
  )
+import En.Error (EnError (..))
+import En.Postgres.Database (Database, runSession)
 import En.Postgres.Revision (
     ConsistencyConfig (..),
     PgSnapshot (..),
@@ -59,8 +60,6 @@ import En.Tuple (
     Tuple (..),
     TupleCaveat (..),
  )
-import Hasql.Connection (Connection)
-import Hasql.Connection qualified as Connection
 import Hasql.Decoders qualified as Decoders
 import Hasql.Encoders qualified as Encoders
 import Hasql.Errors qualified as Hasql
@@ -70,47 +69,32 @@ import Hasql.Statement (Statement)
 import Hasql.Statement qualified as Statement
 import Numeric (readDec)
 
--- | An effect-polymorphic runner for Hasql sessions.
-newtype PostgresSessionRunner m = PostgresSessionRunner
-    { run :: forall a. Session a -> m a
-    }
-
-hasqlConnectionRunner :: Connection -> PostgresSessionRunner IO
-hasqlConnectionRunner connection =
-    PostgresSessionRunner (runStoreSession connection)
-
--- | Construct a tuple store from any effect that can run Hasql sessions.
-postgresTupleStore :: PostgresSessionRunner m -> ConsistencyConfig -> TupleStore m
-postgresTupleStore (PostgresSessionRunner run) config =
-    TupleStore
-        { readObjectRelation = \revision object relation limit cursor ->
-            run (readObjectRelationSession revision object relation limit cursor)
-        , readStartingWithUser = \revision query ->
-            run (readStartingWithUserSession revision query)
-        , writeTuples = \tuples ->
-            run (writeTuplesSession config tuples)
-        , deleteTuples = \tuples ->
-            run (deleteTuplesSession config tuples)
-        , headRevision =
-            run headRevisionSession
-        , optimizedRevision =
-            run headRevisionSession
-        , oldestRetainedXid =
-            run (oldestRetainedXidSession config.gcWindow)
-        , reapDeletedTuples = \horizon ->
-            run (reapDeletedTuples horizon)
-        }
-
--- | Convenience constructor for the common direct-connection IO case.
-postgresTupleStoreIO :: Connection -> ConsistencyConfig -> TupleStore IO
-postgresTupleStoreIO connection =
-    postgresTupleStore (hasqlConnectionRunner connection)
-
-runStoreSession :: Connection -> Session a -> IO a
-runStoreSession connection session =
-    Connection.use connection session >>= \case
-        Right value -> pure value
-        Left err -> throwIO (userError (Text.unpack (Hasql.toDetailedText err)))
+runTupleStorePostgres ::
+    (Database :> es, Error EnError :> es) =>
+    ConsistencyConfig ->
+    Eff (TupleStore : es) a ->
+    Eff es a
+runTupleStorePostgres config =
+    interpret_ \case
+        ReadObjectRelation revision object relation limit cursor ->
+            orThrow =<< runSession (readObjectRelationSession revision object relation limit cursor)
+        ReadStartingWithUser revision query ->
+            orThrow =<< runSession (readStartingWithUserSession revision query)
+        WriteTuples tuples ->
+            orThrow =<< runSession (writeTuplesSession config tuples)
+        DeleteTuples tuples ->
+            orThrow =<< runSession (deleteTuplesSession config tuples)
+        HeadRevision ->
+            orThrow =<< runSession headRevisionSession
+        OptimizedRevision ->
+            orThrow =<< runSession headRevisionSession
+        OldestRetainedXid ->
+            orThrow =<< runSession (oldestRetainedXidSession config.gcWindow)
+        ReapDeletedTuples horizon ->
+            orThrow =<< runSession (reapDeletedTuplesSession horizon)
+  where
+    orThrow =
+        either (throwError . StoreError . Hasql.toDetailedText) pure
 
 writeTuplesSession :: ConsistencyConfig -> [Tuple] -> Session ConsistencyToken
 writeTuplesSession config tuples = do
@@ -140,8 +124,8 @@ oldestRetainedXidSession :: Text -> Session Word64
 oldestRetainedXidSession window =
     fromIntegral <$> Session.statement window oldestRetainedXidStatement
 
-reapDeletedTuples :: Word64 -> Session Int64
-reapDeletedTuples horizon =
+reapDeletedTuplesSession :: Word64 -> Session Int64
+reapDeletedTuplesSession horizon =
     Session.statement (Text.pack (show horizon)) reapDeletedTuplesStatement
 
 readStartingWithUserSession :: Revision -> UsersetQuery -> Session TuplePage

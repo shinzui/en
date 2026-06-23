@@ -1,3 +1,4 @@
+{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
@@ -20,24 +21,28 @@ module En.Postgres.Revision (
     tokenMetadataFromPayload,
     validateTokenMetadata,
     resolveConsistencyRequest,
-    postgresConsistencyStore,
+    runConsistencyStorePostgres,
 ) where
 
 import Data.Char (digitToInt, isDigit, ord)
 import Data.List (nub, sort)
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Time (UTCTime)
+import Data.Time (UTCTime, getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
 import Data.Word (Word64)
+import Effectful (Eff, IOE, liftIO, (:>))
+import Effectful.Dispatch.Dynamic (interpret_)
+import Effectful.Error.Static (Error, throwError)
 import Numeric (readDec, showHex)
 
 import En.Effect.ConsistencyStore (
-    ConsistencyStore,
+    ConsistencyStore (..),
     ResolvedConsistency (..),
     TokenMetadata (..),
  )
-import En.Effect.ConsistencyStore qualified as ConsistencyStore
+import En.Effect.TupleStore (TupleStore)
+import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError (..))
 import En.Revision (
     Consistency (..),
@@ -230,33 +235,31 @@ resolveConsistencyRequest optimized headRevision decode validate request =
                         RConcurrent -> metadata.revision
             Right ResolvedConsistency{consistency = request, revision = selectedRevision}
 
-postgresConsistencyStore ::
+runConsistencyStorePostgres ::
+    (TupleStore :> es, IOE :> es, Error EnError :> es) =>
     ConsistencyConfig ->
-    IO UTCTime ->
-    IO Revision ->
-    IO Revision ->
-    IO Word64 ->
-    ConsistencyStore IO
-postgresConsistencyStore config currentTime readOptimizedRevision readHeadRevision readOldestRetainedXid =
-    ConsistencyStore.ConsistencyStore
-        { ConsistencyStore.decodeToken = pure . tokenMetadataFromPayload
-        , ConsistencyStore.validateToken = \metadata -> do
-            now <- currentTime
-            oldestXid <- readOldestRetainedXid
-            pure (validateTokenMetadata config now oldestXid metadata)
-        , ConsistencyStore.resolveConsistency = \request -> do
-            now <- currentTime
-            optimized <- readOptimizedRevision
-            currentHead <- readHeadRevision
-            oldestXid <- readOldestRetainedXid
-            pure $
+    Eff (ConsistencyStore : es) a ->
+    Eff es a
+runConsistencyStorePostgres config =
+    interpret_ \case
+        DecodeToken token ->
+            either throwError pure (tokenMetadataFromPayload token)
+        ValidateToken metadata -> do
+            now <- liftIO getCurrentTime
+            oldestXid <- TupleStore.oldestRetainedXid
+            either throwError pure (validateTokenMetadata config now oldestXid metadata)
+        ResolveConsistency request -> do
+            now <- liftIO getCurrentTime
+            optimized <- TupleStore.optimizedRevision
+            currentHead <- TupleStore.headRevision
+            oldestXid <- TupleStore.oldestRetainedXid
+            either throwError pure $
                 resolveConsistencyRequest
                     optimized
                     currentHead
                     tokenMetadataFromPayload
                     (validateTokenMetadata config now oldestXid)
                     request
-        }
 
 snapshotIncludes :: PgSnapshot -> PgSnapshot -> Bool
 snapshotIncludes candidate required =
