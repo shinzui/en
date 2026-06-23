@@ -159,3 +159,34 @@ activity rows, well below the 50 ms bar for the measured stream size. The return
 bounded at 24 spaces and 4 visibility classes across all sweeps, independent of stream size. The
 anti-pattern hit the 1001-result cap in every scenario, which is the expected evidence that consumer
 objects must not be modeled as relationship tuples for read feeds.
+
+## 8. Result Note — 2026-06-23 (10M scale, fixed spike)
+
+Harness: `cabal run en-lookup-spike -- 10000000`, after fixing the spike so
+`intersection-exclusion` subtracts `blocked` spaces for the measured subject, widening the p95 sample
+to 50 measured runs after a warm-up, and adding a large-reachable-set scenario. The harness loaded
+10,000,000 `spike_activity` rows and 10,000,000 activity-as-object rows.
+
+The ordinary bounded-label shape remains green at 10M rows: lookup p95 stays below 1 ms and the
+indexed read path stays below 5 ms in the representative 100k-relationship rows below. The
+large-reachable scenario is red for the original read-path bar: when the measured subject reaches
+~1000 spaces, lookup itself remains below the 25 ms lookup bar, but the downstream activity read path
+is hundreds of milliseconds. That confirms the architectural claim: lookup performance depends on
+keeping the reachable label set small, and consumers should treat large label sets as a schema/data
+discipline problem rather than assuming the read path is invariant.
+
+| relationships | depth | guest | shape | large reachable | actual tuples | spaces | classes | lookup p95 ms | read p95 ms | anti p95 ms | anti capped |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100000 | 1 | false | union | false | 100000 | 24 | 4 | 0.21 | 3.8 | 0.36 | true |
+| 100000 | 1 | false | intersection-exclusion | false | 100000 | 12 | 4 | 0.16 | 2.2 | 0.34 | true |
+| 100000 | 3 | true | union | false | 100000 | 24 | 4 | 0.18 | 3.69 | 0.28 | true |
+| 100000 | 3 | true | intersection-exclusion | false | 100000 | 12 | 4 | 0.16 | 2.08 | 0.38 | true |
+| 100000 | 6 | true | union | false | 100000 | 24 | 4 | 0.18 | 3.76 | 0.31 | true |
+| 100000 | 6 | true | intersection-exclusion | false | 100000 | 12 | 4 | 0.21 | 2.08 | 0.33 | true |
+| 100000 | 3 | true | union | true | 100000 | 1000 | 4 | 18.02 | 906.22 | 5.61 | true |
+| 100000 | 3 | true | intersection-exclusion | true | 100000 | 988 | 4 | 14.17 | 876.53 | 8.13 | true |
+
+Decision: green for the bounded kikan read-filter shape at 10M rows; red for deliberately-large
+reachable sets against the 50 ms read-path bar. The spike now measures a real exclusion difference:
+the exclusion rows remove blocked spaces (24 → 12 in the ordinary shape, 1000 → 988 in the
+large-reachable shape) and execute a distinct query rather than the previous no-op variant.

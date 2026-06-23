@@ -73,3 +73,17 @@ test-suite en-core-interface-tests
     , en-core
     , text
     , time
+
+benchmark en-core-bench
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: bench
+  main-is:        Main.hs
+  ghc-options:    -fproc-alignment=64
+  build-depends:
+    , base
+    , containers
+    , en-core
+    , tasty-bench
+    , text
+    , time

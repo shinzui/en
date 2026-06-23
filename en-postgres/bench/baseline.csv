@@ -1,0 +1,4 @@
+Name,Mean (ps),2*Stdev (ps)
+All.consistency.encodeToken,946405,224698
+All.consistency.decodeToken,1366122,439706
+All.consistency.comparePgSnapshot,80352,29112

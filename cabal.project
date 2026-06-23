@@ -13,3 +13,6 @@ packages:
 -- DEPENDENCY OVERRIDES — each milestone appends its own block; none rewrites another's.
 -- ephemeral-pg is a local Mori-registered package used by en-postgres integration tests.
 -- ============================================================
+
+-- EP-17: tasty-bench for the en-core regression benchmark suite.
+packages: /Users/shinzui/Keikaku/hub/haskell/tasty-bench-project/tasty-bench

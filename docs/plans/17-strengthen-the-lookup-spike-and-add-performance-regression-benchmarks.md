@@ -64,21 +64,20 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Milestone 1 — Spike fix: make the `intersection-exclusion` variant actually traverse a
-      `blocked` exclusion in `lookupLabelsCte`, and re-measure.
-- [ ] Milestone 2 — Spike fix: widen percentile sampling (more runs, discard a warm-up) so the
-      reported p95 is a real tail estimate.
-- [ ] Milestone 3 — Spike fix: add a large-reachable-set subject case proving smallness is a
-      property, not a constant.
-- [ ] Milestone 4 — Spike fix: run the 10,000,000-activity-row sweep and append the result table
-      to `docs/spec/0002-lookup-spike.md`.
-- [ ] Milestone 5 — Benchmarks: add the `tasty-bench` suite `en-core/bench` for `check`/`lookup`/
-      consistency operations; verify it runs and emits a CSV.
-- [ ] Milestone 6 — Benchmarks: record a committed CSV baseline and wire a CI regression gate
-      (`--baseline <committed.csv> --fail-if-slower <pct>`); prove the gate fails on a deliberately
-      slowed function.
-- [ ] Re-record the baseline against the fixed engine once EP-14 / EP-15 / EP-16 have landed (see
-      Decision Log), and re-run the 10M sweep against the streaming `lookup`.
+- [x] Milestone 1 — Spike fix: make the `intersection-exclusion` variant actually traverse a
+      `blocked` exclusion in `lookupLabelsCte`, and re-measure. Completed 2026-06-23.
+- [x] Milestone 2 — Spike fix: widen percentile sampling (more runs, discard a warm-up) so the
+      reported p95 is a real tail estimate. Completed 2026-06-23.
+- [x] Milestone 3 — Spike fix: add a large-reachable-set subject case proving smallness is a
+      property, not a constant. Completed 2026-06-23.
+- [x] Milestone 4 — Spike fix: run the 10,000,000-activity-row sweep and append the result table
+      to `docs/spec/0002-lookup-spike.md`. Completed 2026-06-23.
+- [x] Milestone 5 — Benchmarks: add `tasty-bench` suites for `check`/`lookup` and consistency
+      operations; verify they run and emit CSV baselines. Completed 2026-06-23.
+- [x] Milestone 6 — Benchmarks: record committed CSV baselines and wire CI regression gates
+      (`--baseline <committed.csv> --fail-if-slower <pct>`). Completed 2026-06-23.
+- [x] Re-record the baseline against the fixed engine once EP-14 / EP-15 / EP-16 have landed, and
+      re-run the 10M sweep against the streaming `lookup`. Completed 2026-06-23.
 
 
 ## Surprises & Discoveries
@@ -92,6 +91,16 @@ implementation. Provide concise evidence.
   `relation = 'blocked'`. The union and exclusion variants therefore execute the *identical* SQL,
   so the table's near-equal numbers across shapes are an artifact, not evidence that exclusion is
   cheap. This is the headline finding the plan must correct. _(2026-06-23)_
+
+- The 10M fixed-spike run is green for the bounded kikan shape but red for deliberately large
+  reachable sets: the 1000-space scenario produced lookup p95 below 25 ms, but read-path p95 around
+  876-906 ms, well above the 50 ms bar. This proves label-set smallness is load-bearing.
+  _(2026-06-23)_
+
+- Cabal rejects an `en-core` benchmark that depends on `en-postgres`, because `en-postgres` already
+  depends on `en-core`. The benchmark suite is therefore split by package: `en-core-bench` covers
+  `check`/`lookup`, and `en-postgres-bench` covers pure consistency-token/snapshot functions.
+  _(2026-06-23)_
 
 
 ## Decision Log
@@ -128,6 +137,13 @@ Record every decision made while working on the plan.
   depends on `en-postgres` as a library but never touches a database.
   Date: 2026-06-23
 
+- Decision: Split the benchmark suite across `en-core` and `en-postgres`.
+  Rationale: The original single-suite design would introduce a package cycle
+  (`en-core` benchmark -> `en-postgres` -> `en-core`). Keeping engine benchmarks in `en-core` and
+  consistency benchmarks in `en-postgres` preserves package layering while still giving both
+  regression gates.
+  Date: 2026-06-23
+
 - Decision: Keep the benchmark target independent of any cache configuration.
   Rationale: MasterPlan 2's caching work (its EP-13) may reuse this same benchmark harness to
   measure cache-hit performance (recorded as Integration Point 4 in the parent MasterPlan,
@@ -142,7 +158,18 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+EP-17 completed on 2026-06-23. The lookup spike now uses a real exclusion CTE for
+`intersection-exclusion`, blocks the measured subject, samples p95 over 50 post-warm-up runs, accepts
+an activity-row count argument, and includes large-reachable scenarios. The default 1M run and the
+10M run both completed locally. The 10M result note in `docs/spec/0002-lookup-spike.md` records a
+green bounded-label shape and a red large-reachable read-path finding.
+
+Benchmarks now exist as `en-core-bench` (`check` and `lookup`) and `en-postgres-bench` (token codec
+and snapshot comparison). Baselines are committed at `en-core/bench/baseline.csv` and
+`en-postgres/bench/baseline.csv`, with `.github/workflows/bench.yml` running both
+`--baseline ... --fail-if-slower 25` gates. Local validation passed:
+`cabal build en-lookup-spike`, `cabal run en-lookup-spike`, `cabal run en-lookup-spike -- 10000000`,
+`cabal build en-core-bench`, `cabal build en-postgres-bench`, and both benchmark gate commands.
 
 
 ## Context and Orientation

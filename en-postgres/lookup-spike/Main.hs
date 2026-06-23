@@ -23,12 +23,15 @@ import Hasql.Errors qualified as Hasql
 import Hasql.Session qualified as Session
 import Hasql.Statement (Statement)
 import Hasql.Statement qualified as Statement
+import System.Environment (getArgs)
+import Text.Read (readMaybe)
 
 data Scenario = Scenario
     { relationships :: !Int64
     , depth :: !Int64
     , guestSharing :: !Bool
     , shape :: !Text
+    , largeReachable :: !Bool
     }
     deriving stock (Eq, Show)
 
@@ -72,12 +75,13 @@ data Percentiles = Percentiles
 
 main :: IO ()
 main = do
+    activityRows <- activityRowsFromArgs
     result <- Pg.with \database ->
         bracket (acquire database) Connection.release \connection -> do
             runScript connection resetSql
-            run connection populateActivitiesStatement (1000000, maxSpaceId)
+            run connection populateActivitiesStatement (activityRows, maxSpaceId)
             measurements <- for scenarios (measureScenario connection)
-            Text.putStrLn (renderResults measurements)
+            Text.putStrLn (renderResults activityRows measurements)
     case result of
         Left err -> fail ("ephemeral-pg failed to start: " <> Text.unpack (Pg.renderStartError err))
         Right () -> pure ()
@@ -85,22 +89,42 @@ main = do
 maxSpaceId :: Int64
 maxSpaceId = 20000
 
+sampleRuns :: Int
+sampleRuns = 50
+
+antiSampleRuns :: Int
+antiSampleRuns = 30
+
+largeReachableSpaces :: Int64
+largeReachableSpaces = 1000
+
 scenarios :: [Scenario]
 scenarios =
-    [ Scenario relationships depth guestSharing shape
+    [ Scenario relationships depth guestSharing shape False
     | relationships <- [1000, 10000, 100000]
     , depth <- [1, 3, 6]
     , guestSharing <- [False, True]
     , shape <- ["union", "intersection-exclusion"]
     ]
+        <> [ Scenario 100000 3 True "union" True
+           , Scenario 100000 3 True "intersection-exclusion" True
+           ]
+
+activityRowsFromArgs :: IO Int64
+activityRowsFromArgs = do
+    args <- getArgs
+    pure $
+        case args of
+            raw : _ -> maybe 1000000 (max 1) (readMaybe raw)
+            [] -> 1000000
 
 measureScenario :: Connection.Connection -> Scenario -> IO Measurement
 measureScenario connection scenario = do
     actualRelationships <- run connection populateRelationshipsStatement scenario
     runScript connection analyzeSql
-    lookupRuns <- timedRuns 7 \_ -> run connection lookupLabelsStatement ()
-    readRuns <- timedRuns 7 \_ -> run connection readPathStatement ()
-    antiRuns <- timedRuns 3 \_ -> run connection antiPatternStatement ()
+    lookupRuns <- measuredRuns sampleRuns \_ -> run connection (lookupLabelsStatement scenario.shape) ()
+    readRuns <- measuredRuns sampleRuns \_ -> run connection (readPathStatement scenario.shape) ()
+    antiRuns <- measuredRuns antiSampleRuns \_ -> run connection (antiPatternStatement scenario.shape) ()
     let labelStats = (last lookupRuns).value
         antiPatternStats = (last antiRuns).value
         Percentiles{p50 = lookupP50Ms, p95 = lookupP95Ms} = percentiles ((.elapsedMs) <$> lookupRuns)
@@ -127,6 +151,10 @@ timedRuns count action =
         result <- action index
         end <- getMonotonicTimeNSec
         pure Timed{elapsedMs = fromIntegral (end - start) / 1000000, value = result}
+
+measuredRuns :: Int -> (Int -> IO a) -> IO [Timed a]
+measuredRuns count action =
+    drop 1 <$> timedRuns (count + 1) action
 
 percentiles :: [Double] -> Percentiles
 percentiles values =
@@ -237,17 +265,20 @@ populateRelationshipsStatement =
               $1::bigint AS target_relationships,
               greatest(1, $2::bigint) AS requested_depth,
               $3::boolean AS guest_sharing,
-              $4::text AS shape
+              $4::text AS shape,
+              $5::boolean AS large_reachable
         ),
         sizes AS (
           SELECT
               target_relationships,
-              least($5::bigint, greatest(24::bigint, target_relationships / 5)) AS generated_spaces,
+              least($6::bigint, greatest(24::bigint, target_relationships / 5)) AS generated_spaces,
               24::bigint AS hot_spaces,
+              least($6::bigint, $7::bigint) AS large_spaces,
               requested_depth,
               greatest(1::bigint, (24 + requested_depth - 1) / requested_depth) AS roots,
               guest_sharing,
-              shape
+              shape,
+              large_reachable
           FROM params
         ),
         direct_members AS (
@@ -292,9 +323,18 @@ populateRelationshipsStatement =
         blocked_edges AS (
           INSERT INTO spike_relation_tuple
             (object_type, object_id, relation, subject_type, subject_id, subject_relation)
-          SELECT 'space', space_id, 'blocked', 'user', 999999, NULL
+          SELECT 'space', space_id, 'blocked', 'user', 1, NULL
           FROM sizes, generate_series(1, hot_spaces) AS space_id
           WHERE shape = 'intersection-exclusion'
+            AND space_id % 2 = 0
+          RETURNING 1
+        ),
+        large_reachable_edges AS (
+          INSERT INTO spike_relation_tuple
+            (object_type, object_id, relation, subject_type, subject_id, subject_relation)
+          SELECT 'space', space_id, 'member', 'user', 1, NULL
+          FROM sizes, generate_series(1, large_spaces) AS space_id
+          WHERE large_reachable
           RETURNING 1
         ),
         inserted_count AS (
@@ -304,6 +344,7 @@ populateRelationshipsStatement =
           UNION ALL SELECT count(*)::bigint FROM parent_edges
           UNION ALL SELECT count(*)::bigint FROM class_edges
           UNION ALL SELECT count(*)::bigint FROM blocked_edges
+          UNION ALL SELECT count(*)::bigint FROM large_reachable_edges
         ),
         filler_budget AS (
           SELECT greatest(0::bigint, target_relationships - sum(n)) AS filler_rows
@@ -331,7 +372,9 @@ populateRelationshipsStatement =
             <> ((\params -> params.depth) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
             <> ((\params -> params.guestSharing) >$< Encoders.param (Encoders.nonNullable Encoders.bool))
             <> ((\params -> params.shape) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+            <> ((\params -> params.largeReachable) >$< Encoders.param (Encoders.nonNullable Encoders.bool))
             <> ((\_ -> maxSpaceId) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+            <> ((\_ -> largeReachableSpaces) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
         )
         (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
 
@@ -343,10 +386,10 @@ analyzeSql =
     ANALYZE spike_activity_relation_tuple;
     """
 
-lookupLabelsStatement :: Statement () LabelStats
-lookupLabelsStatement =
+lookupLabelsStatement :: Text -> Statement () LabelStats
+lookupLabelsStatement shape =
     Statement.preparable
-        lookupLabelsSql
+        (lookupLabelsSql shape)
         Encoders.noParams
         ( Decoders.singleRow
             ( LabelStats
@@ -355,10 +398,10 @@ lookupLabelsStatement =
             )
         )
 
-readPathStatement :: Statement () Int64
-readPathStatement =
+readPathStatement :: Text -> Statement () Int64
+readPathStatement shape =
     Statement.preparable
-        ( lookupLabelsCte
+        ( lookupLabelsCteFor shape
             <> """
                SELECT count(*)::bigint
                FROM (
@@ -374,10 +417,10 @@ readPathStatement =
         Encoders.noParams
         (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
 
-antiPatternStatement :: Statement () AntiPatternStats
-antiPatternStatement =
+antiPatternStatement :: Text -> Statement () AntiPatternStats
+antiPatternStatement shape =
     Statement.preparable
-        ( lookupLabelsCte
+        ( lookupLabelsCteFor shape
             <> """
                SELECT count(*)::bigint, count(*) = 1001
                FROM (
@@ -399,17 +442,21 @@ antiPatternStatement =
             )
         )
 
-lookupLabelsSql :: Text
-lookupLabelsSql =
-    lookupLabelsCte
+lookupLabelsSql :: Text -> Text
+lookupLabelsSql shape =
+    lookupLabelsCteFor shape
         <> """
            SELECT
                (SELECT count(*)::bigint FROM reachable_spaces),
                (SELECT count(*)::bigint FROM reachable_classes)
            """
 
-lookupLabelsCte :: Text
-lookupLabelsCte =
+lookupLabelsCteFor :: Text -> Text
+lookupLabelsCteFor shape =
+    lookupLabelsCte (shape == "intersection-exclusion")
+
+lookupLabelsCte :: Bool -> Text
+lookupLabelsCte excludeBlocked =
     """
     WITH RECURSIVE
     direct_spaces(space_id) AS (
@@ -433,44 +480,68 @@ lookupLabelsCte =
         AND relation_tuple.relation = 'guest_org'
         AND relation_tuple.subject_type = 'org'
     ),
-    reachable_spaces(space_id) AS (
+    reachable_spaces_raw(space_id) AS (
       SELECT space_id FROM direct_spaces
       UNION
       SELECT child.object_id
       FROM spike_relation_tuple child
-      JOIN reachable_spaces parent
+      JOIN reachable_spaces_raw parent
         ON parent.space_id = child.subject_id
       WHERE child.object_type = 'space'
         AND child.relation = 'parent'
         AND child.subject_type = 'space'
         AND child.subject_relation = 'view'
     ),
-    reachable_classes(visibility_class) AS (
-      SELECT DISTINCT class_edge.subject_id
-      FROM spike_relation_tuple class_edge
-      JOIN reachable_spaces
-        ON reachable_spaces.space_id = class_edge.object_id
-      WHERE class_edge.object_type = 'space'
-        AND class_edge.relation = 'visibility_class'
-        AND class_edge.subject_type = 'visibility_class'
-    )
+    reachable_spaces(space_id) AS (
+      SELECT raw.space_id
+      FROM reachable_spaces_raw raw
     """
+        <> blockedFilter
+        <> """
+           ),
+           reachable_classes(visibility_class) AS (
+             SELECT DISTINCT class_edge.subject_id
+             FROM spike_relation_tuple class_edge
+             JOIN reachable_spaces
+               ON reachable_spaces.space_id = class_edge.object_id
+             WHERE class_edge.object_type = 'space'
+               AND class_edge.relation = 'visibility_class'
+               AND class_edge.subject_type = 'visibility_class'
+           )
+           """
+  where
+    blockedFilter
+        | excludeBlocked =
+            """
 
-renderResults :: [Measurement] -> Text
-renderResults measurements =
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM spike_relation_tuple blocked
+              WHERE blocked.object_type = 'space'
+                AND blocked.object_id = raw.space_id
+                AND blocked.relation = 'blocked'
+                AND blocked.subject_type = 'user'
+                AND blocked.subject_id = 1
+                AND blocked.subject_relation IS NULL
+            )
+            """
+        | otherwise = ""
+
+renderResults :: Int64 -> [Measurement] -> Text
+renderResults activityRows measurements =
     Text.unlines $
         [ "# en lookup spike results"
         , ""
-        , "Activity rows: 1,000,000. Activity relation rows for the anti-pattern: 1,000,000. The 10,000,000-row case was not run by this default harness command."
+        , "Activity rows: " <> showText activityRows <> ". Activity relation rows for the anti-pattern: " <> showText activityRows <> "."
         , ""
-        , "| relationships | depth | guest | shape | actual tuples | spaces | classes | lookup p50 ms | lookup p95 ms | read p50 ms | read p95 ms | anti p50 ms | anti p95 ms | anti capped |"
-        , "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        , "| relationships | depth | guest | shape | large reachable | actual tuples | spaces | classes | lookup p50 ms | lookup p95 ms | read p50 ms | read p95 ms | anti p50 ms | anti p95 ms | anti capped |"
+        , "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
         ]
             <> fmap renderMeasurement measurements
 
 renderMeasurement :: Measurement -> Text
 renderMeasurement measurement =
-    let Scenario{relationships, depth, guestSharing, shape} = measurement.scenario
+    let Scenario{relationships, depth, guestSharing, shape, largeReachable} = measurement.scenario
         LabelStats{spaces, classes} = measurement.labelStats
         AntiPatternStats{capped} = measurement.antiPatternStats
      in Text.intercalate
@@ -479,6 +550,7 @@ renderMeasurement measurement =
             , showText depth
             , boolText guestSharing
             , shape
+            , boolText largeReachable
             , showText measurement.actualRelationships
             , showText spaces
             , showText classes

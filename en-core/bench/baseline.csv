@@ -1,0 +1,4 @@
+Name,Mean (ps),2*Stdev (ps)
+All.check.shallow-owner,653721,214618
+All.check.nested-parent,1366549,415194
+All.lookup.reachable-spaces,2625402,820564

@@ -82,3 +82,15 @@ executable en-lookup-spike
     , ephemeral-pg
     , hasql
     , text
+
+benchmark en-postgres-bench
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: bench
+  main-is:        Main.hs
+  ghc-options:    -fproc-alignment=64
+  build-depends:
+    , base
+    , en-core
+    , en-postgres
+    , tasty-bench

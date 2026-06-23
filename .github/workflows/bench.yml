@@ -1,0 +1,24 @@
+name: Benchmarks
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  regression-gate:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.12.4"
+          cabal-version: "3.14.2.0"
+      - name: Build benchmarks
+        run: |
+          cabal update
+          cabal build en-core-bench en-postgres-bench
+      - name: en-core benchmark gate
+        run: cabal bench en-core --benchmark-options='--baseline bench/baseline.csv --fail-if-slower 25 --hide-successes'
+      - name: en-postgres benchmark gate
+        run: cabal bench en-postgres --benchmark-options='--baseline bench/baseline.csv --fail-if-slower 25 --hide-successes'
