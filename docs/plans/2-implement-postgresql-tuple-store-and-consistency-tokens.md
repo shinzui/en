@@ -24,7 +24,7 @@ This plan gives `en` durable relationship storage and the read-your-writes guara
 - [x] Define indexes for forward reads, reverse `readStartingWithUser` reads, deletion, and cursor pagination. Completed 2026-06-23T04:44:44Z.
 - [x] Implement `PgSnapshot` parsing, rendering, partial-order comparison, and tests. Completed 2026-06-23T04:44:44Z.
 - [x] Implement consistency-token encoding and decoding with datastore id, schema hash, revision payload, and validation errors. Completed 2026-06-23T04:44:44Z.
-- [ ] Implement `MinimizeLatency`, `FullyConsistent`, `AtLeastAsFresh`, and `AtExactSnapshot` revision resolution.
+- [x] Implement `MinimizeLatency`, `FullyConsistent`, `AtLeastAsFresh`, and `AtExactSnapshot` revision resolution. Completed 2026-06-23T04:51:22Z.
 - [ ] Implement hasql-backed write, delete, and read operations for the final EP-1 store interface.
 - [ ] Add integration tests against a temporary PostgreSQL database or the repository's established Postgres test harness.
 - [x] Run `cabal build all` and the relevant test command for the completed revision slice. Completed 2026-06-23T04:44:44Z.
@@ -38,6 +38,7 @@ This plan gives `en` durable relationship storage and the read-your-writes guara
 cabal test en-postgres-revision-tests
 1 of 1 test suites (1 of 1 test cases) passed.
 ```
+- Revision resolution is now implemented without database effects: `postgresConsistencyStore` accepts IO actions for optimized and head revisions, validates token metadata against the configured datastore and schema hash, rejects expired tokens, and uses the partial snapshot order so concurrent optimized revisions do not satisfy `AtLeastAsFresh`.
 
 
 ## Decision Log
@@ -151,3 +152,5 @@ This plan owns `en-migrations/src/En/Migrations.hs`, migration SQL under `en-mig
 Revision note 2026-06-23: Added `intention_01kvsbcvsfepaafp5x44ykby47` to the plan frontmatter at the user's request.
 
 Revision note 2026-06-23: Marked the migration and revision/token codec slice complete, recorded the Postgres snapshot partial-order correction, and added the `en-postgres-revision-tests` validation command.
+
+Revision note 2026-06-23: Marked revision resolution complete and documented the `postgresConsistencyStore` constructor shape over supplied optimized/head revision readers.

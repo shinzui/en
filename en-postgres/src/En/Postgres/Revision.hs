@@ -3,6 +3,7 @@ module En.Postgres.Revision (
     PgSnapshot (..),
     TokenPayload (..),
     TokenDecodeError (..),
+    ConsistencyConfig (..),
     parsePgSnapshot,
     renderPgSnapshot,
     revisionFromPgSnapshot,
@@ -12,6 +13,10 @@ module En.Postgres.Revision (
     comparePostgresRevision,
     encodeToken,
     decodeToken,
+    tokenMetadataFromPayload,
+    validateTokenMetadata,
+    resolveConsistencyRequest,
+    postgresConsistencyStore,
 ) where
 
 import Data.Char (digitToInt, isDigit, ord)
@@ -23,7 +28,15 @@ import Data.Word (Word64)
 import Numeric (readDec, showHex)
 import Text.Read (readMaybe)
 
+import En.Effect.ConsistencyStore (
+    ConsistencyStore,
+    ResolvedConsistency (..),
+    TokenMetadata (..),
+ )
+import En.Effect.ConsistencyStore qualified as ConsistencyStore
+import En.Error (EnError (..))
 import En.Revision (
+    Consistency (..),
     ConsistencyToken (..),
     DatastoreId (..),
     Revision (..),
@@ -44,6 +57,12 @@ data TokenPayload = TokenPayload
     , tokenSchemaHash :: !SchemaHash
     , tokenRevision :: !Revision
     , tokenExpiresAt :: !(Maybe UTCTime)
+    }
+    deriving stock (Eq, Show)
+
+data ConsistencyConfig = ConsistencyConfig
+    { expectedDatastoreId :: !DatastoreId
+    , expectedSchemaHash :: !SchemaHash
     }
     deriving stock (Eq, Show)
 
@@ -143,6 +162,87 @@ decodeToken (ConsistencyToken tokenText) =
         prefix : _ | prefix /= "en1" -> Left TokenBadPrefix
         _ -> Left TokenBadFieldCount
 
+tokenMetadataFromPayload :: ConsistencyToken -> Either EnError TokenMetadata
+tokenMetadataFromPayload token =
+    case decodeToken token of
+        Left err -> Left (InvalidConsistencyToken (Text.pack (show err)))
+        Right payload ->
+            Right
+                TokenMetadata
+                    { token = token
+                    , revision = payload.tokenRevision
+                    , datastoreId = payload.tokenDatastoreId
+                    , schemaHash = payload.tokenSchemaHash
+                    , expiresAt = payload.tokenExpiresAt
+                    }
+
+validateTokenMetadata :: ConsistencyConfig -> UTCTime -> TokenMetadata -> Either EnError ()
+validateTokenMetadata config now metadata
+    | metadata.datastoreId /= config.expectedDatastoreId =
+        Left (InvalidConsistencyToken "token datastore does not match this en datastore")
+    | metadata.schemaHash /= config.expectedSchemaHash =
+        Left (InvalidConsistencyToken "token schema hash does not match the active schema")
+    | maybe False (<= now) metadata.expiresAt =
+        Left (InvalidConsistencyToken "token is expired")
+    | otherwise = Right ()
+
+resolveConsistencyRequest ::
+    Revision ->
+    Revision ->
+    (ConsistencyToken -> Either EnError TokenMetadata) ->
+    (TokenMetadata -> Either EnError ()) ->
+    Consistency ->
+    Either EnError ResolvedConsistency
+resolveConsistencyRequest optimized headRevision decode validate request =
+    case request of
+        MinimizeLatency ->
+            Right ResolvedConsistency{consistency = request, revision = optimized}
+        FullyConsistent ->
+            Right ResolvedConsistency{consistency = request, revision = headRevision}
+        AtExactSnapshot token -> do
+            metadata <- decode token
+            validate metadata
+            Right ResolvedConsistency{consistency = request, revision = metadata.revision}
+        AtLeastAsFresh token -> do
+            metadata <- decode token
+            validate metadata
+            order <-
+                mapLeft
+                    (InvalidConsistencyToken . ("could not compare token revision: " <>))
+                    (comparePostgresRevision optimized metadata.revision)
+            let selectedRevision =
+                    case order of
+                        RAfter -> optimized
+                        REqual -> optimized
+                        RBefore -> metadata.revision
+                        RConcurrent -> metadata.revision
+            Right ResolvedConsistency{consistency = request, revision = selectedRevision}
+
+postgresConsistencyStore ::
+    ConsistencyConfig ->
+    IO UTCTime ->
+    IO Revision ->
+    IO Revision ->
+    ConsistencyStore IO
+postgresConsistencyStore config currentTime readOptimizedRevision readHeadRevision =
+    ConsistencyStore.ConsistencyStore
+        { ConsistencyStore.decodeToken = pure . tokenMetadataFromPayload
+        , ConsistencyStore.validateToken = \metadata -> do
+            now <- currentTime
+            pure (validateTokenMetadata config now metadata)
+        , ConsistencyStore.resolveConsistency = \request -> do
+            now <- currentTime
+            optimized <- readOptimizedRevision
+            currentHead <- readHeadRevision
+            pure $
+                resolveConsistencyRequest
+                    optimized
+                    currentHead
+                    tokenMetadataFromPayload
+                    (validateTokenMetadata config now)
+                    request
+        }
+
 snapshotIncludes :: PgSnapshot -> PgSnapshot -> Bool
 snapshotIncludes candidate required =
     candidate.xmax >= required.xmax
@@ -218,3 +318,7 @@ nonEmptyText :: Text -> Maybe Text
 nonEmptyText text
     | Text.null text = Nothing
     | otherwise = Just text
+
+mapLeft :: (left -> left') -> Either left right -> Either left' right
+mapLeft f =
+    either (Left . f) Right

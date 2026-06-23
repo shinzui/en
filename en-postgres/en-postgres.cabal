@@ -53,3 +53,5 @@ test-suite en-postgres-revision-tests
     , base
     , en-core
     , en-postgres
+    , text
+    , time
