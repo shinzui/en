@@ -72,3 +72,13 @@ test-suite en-postgres-integration-tests
     , hasql
     , text
     , time
+
+executable en-lookup-spike
+  import:         warnings, shared
+  hs-source-dirs: lookup-spike
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , ephemeral-pg
+    , hasql
+    , text

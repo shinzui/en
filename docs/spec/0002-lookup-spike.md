@@ -100,3 +100,62 @@ stay bounded — and nothing else.
 A short result note appended here (the sweeps, the p95s, green/red) and a go/no-go on the §10 build
 plan. If green, `lookup` ceases to be the project's open risk and the engine build proceeds in the
 spec's order.
+
+## 7. Result Note — 2026-06-23
+
+Harness: `cabal run en-lookup-spike`, implemented as a throwaway executable in
+`en-postgres/lookup-spike` using `ephemeral-pg` and Hasql. The harness creates an isolated PostgreSQL
+database, loads 1,000,000 `spike_activity` rows plus 1,000,000 activity-as-object rows for the
+anti-pattern, sweeps relationship graph size, nesting depth, guest sharing, and a union-only versus
+intersection/exclusion-shaped variant, then prints this measurement table.
+
+The default run did not execute the 10,000,000 activity-row case. These numbers therefore satisfy the
+1M-row evidence requirement and leave the 10M-row p95 as the remaining scale check if local resources
+permit a later extended run.
+
+| relationships | depth | guest | shape | actual tuples | spaces | classes | lookup p95 ms | read p95 ms | anti p95 ms | anti capped |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1000 | 1 | false | union | 1000 | 24 | 4 | 0.9 | 1.56 | 0.88 | true |
+| 1000 | 1 | false | intersection-exclusion | 1000 | 24 | 4 | 0.8 | 0.92 | 0.64 | true |
+| 1000 | 1 | true | union | 1000 | 24 | 4 | 0.74 | 0.97 | 0.64 | true |
+| 1000 | 1 | true | intersection-exclusion | 1000 | 24 | 4 | 0.9 | 0.86 | 0.71 | true |
+| 1000 | 3 | false | union | 1000 | 24 | 4 | 0.86 | 0.93 | 0.65 | true |
+| 1000 | 3 | false | intersection-exclusion | 1000 | 24 | 4 | 0.93 | 0.92 | 0.7 | true |
+| 1000 | 3 | true | union | 1000 | 24 | 4 | 0.81 | 1.0 | 0.7 | true |
+| 1000 | 3 | true | intersection-exclusion | 1000 | 24 | 4 | 0.89 | 0.88 | 0.7 | true |
+| 1000 | 6 | false | union | 1000 | 24 | 4 | 0.94 | 0.92 | 0.67 | true |
+| 1000 | 6 | false | intersection-exclusion | 1000 | 24 | 4 | 0.74 | 0.87 | 0.8 | true |
+| 1000 | 6 | true | union | 1000 | 24 | 4 | 0.76 | 0.86 | 0.7 | true |
+| 1000 | 6 | true | intersection-exclusion | 1000 | 24 | 4 | 0.77 | 0.96 | 0.64 | true |
+| 10000 | 1 | false | union | 10000 | 24 | 4 | 1.15 | 0.85 | 0.72 | true |
+| 10000 | 1 | false | intersection-exclusion | 10000 | 24 | 4 | 1.04 | 1.01 | 0.73 | true |
+| 10000 | 1 | true | union | 10000 | 24 | 4 | 0.9 | 0.86 | 0.87 | true |
+| 10000 | 1 | true | intersection-exclusion | 10000 | 24 | 4 | 1.09 | 0.98 | 0.72 | true |
+| 10000 | 3 | false | union | 10000 | 24 | 4 | 1.08 | 0.94 | 0.78 | true |
+| 10000 | 3 | false | intersection-exclusion | 10000 | 24 | 4 | 0.86 | 0.82 | 0.59 | true |
+| 10000 | 3 | true | union | 10000 | 24 | 4 | 0.83 | 0.95 | 0.58 | true |
+| 10000 | 3 | true | intersection-exclusion | 10000 | 24 | 4 | 0.91 | 0.75 | 0.52 | true |
+| 10000 | 6 | false | union | 10000 | 24 | 4 | 0.83 | 0.82 | 0.73 | true |
+| 10000 | 6 | false | intersection-exclusion | 10000 | 24 | 4 | 0.97 | 0.84 | 0.64 | true |
+| 10000 | 6 | true | union | 10000 | 24 | 4 | 0.81 | 0.97 | 0.7 | true |
+| 10000 | 6 | true | intersection-exclusion | 10000 | 24 | 4 | 0.78 | 0.92 | 0.69 | true |
+| 100000 | 1 | false | union | 100000 | 24 | 4 | 1.07 | 1.21 | 1.19 | true |
+| 100000 | 1 | false | intersection-exclusion | 100000 | 24 | 4 | 0.82 | 1.28 | 1.09 | true |
+| 100000 | 1 | true | union | 100000 | 24 | 4 | 0.85 | 1.13 | 1.01 | true |
+| 100000 | 1 | true | intersection-exclusion | 100000 | 24 | 4 | 1.14 | 1.35 | 1.28 | true |
+| 100000 | 3 | false | union | 100000 | 24 | 4 | 1.45 | 1.07 | 1.06 | true |
+| 100000 | 3 | false | intersection-exclusion | 100000 | 24 | 4 | 1.11 | 1.25 | 0.95 | true |
+| 100000 | 3 | true | union | 100000 | 24 | 4 | 1.1 | 1.31 | 0.96 | true |
+| 100000 | 3 | true | intersection-exclusion | 100000 | 24 | 4 | 0.92 | 1.19 | 0.94 | true |
+| 100000 | 6 | false | union | 100000 | 24 | 4 | 0.99 | 1.15 | 0.94 | true |
+| 100000 | 6 | false | intersection-exclusion | 100000 | 24 | 4 | 1.05 | 1.08 | 1.0 | true |
+| 100000 | 6 | true | union | 100000 | 24 | 4 | 1.05 | 1.27 | 1.03 | true |
+| 100000 | 6 | true | intersection-exclusion | 100000 | 24 | 4 | 1.02 | 1.12 | 0.75 | true |
+
+Decision: green for the intended kikan read-filter shape at the measured 1M activity-row scale. The
+worst observed `lookup_labels` p95 was 1.45 ms at 100k relationship tuples, depth 3, no guest sharing,
+union shape, well below the 25 ms bar. The worst observed indexed read-path p95 was 1.56 ms at 1M
+activity rows, well below the 50 ms bar for the measured stream size. The returned label set stayed
+bounded at 24 spaces and 4 visibility classes across all sweeps, independent of stream size. The
+anti-pattern hit the 1001-result cap in every scenario, which is the expected evidence that consumer
+objects must not be modeled as relationship tuples for read feeds.

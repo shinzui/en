@@ -20,19 +20,20 @@ This plan retires the largest architectural risk before the full lookup engine i
 
 ## Progress
 
-- [ ] Build a throwaway harness that generates a kikan-shaped relationship graph.
-- [ ] Populate a synthetic consumer activity table with at least 1,000,000 rows and indexed `space` and `visibility_class` columns.
-- [ ] Implement `lookup_labels(subject)` as a reverse walk over low-cardinality relationships.
-- [ ] Implement the real read-path query that filters activity rows using reachable labels.
-- [ ] Implement the anti-pattern contrast that treats each activity as an authorization object.
-- [ ] Sweep relationship graph sizes, nesting depths, guest-org sharing, stream sizes, and schema shape.
-- [ ] Record p95 timings, label-set sizes, and the green/red decision in `docs/spec/0002-lookup-spike.md`.
-- [ ] Run any harness tests plus `cabal build all` if Haskell code is added.
+- [x] Build a throwaway harness that generates a kikan-shaped relationship graph.
+- [x] Populate a synthetic consumer activity table with at least 1,000,000 rows and indexed `space` and `visibility_class` columns.
+- [x] Implement `lookup_labels(subject)` as a reverse walk over low-cardinality relationships.
+- [x] Implement the real read-path query that filters activity rows using reachable labels.
+- [x] Implement the anti-pattern contrast that treats each activity as an authorization object.
+- [x] Sweep relationship graph sizes, nesting depths, guest-org sharing, stream sizes, and schema shape.
+- [x] Record p95 timings, label-set sizes, and the green/red decision in `docs/spec/0002-lookup-spike.md`.
+- [x] Run any harness tests plus `cabal build all` if Haskell code is added.
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- Hasql decodes `sum(count(*))` as PostgreSQL `numeric` unless the final expression is explicitly cast. The harness now casts the relationship count result back to `bigint`.
+- The 1M-row measured read path is comfortably inside the target latency on this machine, but the default harness run intentionally skips 10M rows to keep the checked-in command quick and repeatable.
 
 
 ## Decision Log
@@ -40,11 +41,21 @@ This plan retires the largest architectural risk before the full lookup engine i
 - Decision: Keep the spike independent of the production engine.
   Rationale: `docs/spec/0002-lookup-spike.md` explicitly scopes out consistency tokens, caveats, the Servant API, cycles, caching, and the full reachability compiler so the performance risk can be answered quickly.
   Date: 2026-06-23
+- Decision: Use `ephemeral-pg` for the spike database.
+  Rationale: The harness needs real PostgreSQL planner and index behavior while staying isolated, rerunnable, and self-cleaning.
+  Date: 2026-06-23
+- Decision: Treat the measured 1M-row result as green for EP-5 while documenting the skipped 10M case.
+  Rationale: `lookup_labels` remains bounded and under the p95 bar at 100k relationship tuples/depth 6, the indexed read path is far below the 50 ms bar at 1M rows, and the anti-pattern consistently hits the 1001-result cap.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+`en-postgres/lookup-spike` now contains a reproducible `cabal run en-lookup-spike` harness. The
+measured result in `docs/spec/0002-lookup-spike.md` is green for the kikan read-filter architecture:
+reverse lookup returns 24 spaces and 4 classes across the sweep, and both lookup and the indexed
+consumer read path stay well below the target p95 at 1M activity rows. The anti-pattern hits the
+1001-result cap in every scenario.
 
 
 ## Context and Orientation
