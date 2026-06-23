@@ -1,0 +1,15 @@
+with-compiler: ghc-9.12.4
+
+packages:
+    en-core
+    en-migrations
+    en-postgres
+    en-servant
+    en-server
+    en-client
+
+-- ============================================================
+-- DEPENDENCY OVERRIDES — each milestone appends its own block; none rewrites another's.
+-- (None required yet. The persistence stack — codd + ephemeral-pg — will be pinned
+--  here when en-migrations/en-postgres land, mirroring shomei's cabal.project.)
+-- ============================================================

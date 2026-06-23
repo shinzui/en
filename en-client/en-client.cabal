@@ -1,0 +1,32 @@
+cabal-version:      3.0
+name:               en-client
+version:            0.1.0.0
+synopsis:           Haskell client for the standalone en authorization service
+description:
+  A typed Haskell client for the standalone en service (check / lookup / expand /
+  write), for consumers that talk to en over HTTP rather than embedding en-core.
+  Mirrors shomei-client.
+
+license:            MIT
+author:             Nadeem Bitar
+maintainer:         nadeem@gmail.com
+category:           Security, Authorization
+
+common warnings
+  ghc-options:
+    -Wall -Wcompat -Widentities -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+
+common shared
+  default-language:   GHC2024
+  default-extensions:
+    OverloadedStrings
+
+library
+  import:          warnings, shared
+  hs-source-dirs:  src
+  exposed-modules:  En.Client
+  build-depends:
+    , base    >=4.19 && <5
+    , en-core
+    , text

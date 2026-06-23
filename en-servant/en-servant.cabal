@@ -1,0 +1,39 @@
+cabal-version:      3.0
+name:               en-servant
+version:            0.1.0.0
+synopsis:           Servant API and authorization combinators for en
+description:
+  The en HTTP API (check / lookup / expand / write) as a Servant API type, plus a
+  RequirePermission/Authorize combinator that gates a host route on en.check
+  against the caller's verified shomei identity (kikan C11) and an object derived
+  from the request. Mirrors shomei-servant.
+
+license:            MIT
+author:             Nadeem Bitar
+maintainer:         nadeem@gmail.com
+category:           Security, Authorization, Web
+
+common warnings
+  ghc-options:
+    -Wall -Wcompat -Widentities -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+
+common shared
+  default-language:   GHC2024
+  default-extensions:
+    DataKinds
+    OverloadedStrings
+    TypeFamilies
+
+library
+  import:          warnings, shared
+  hs-source-dirs:  src
+  exposed-modules:
+    En.Servant.API
+    En.Servant.Authorize
+  build-depends:
+    , base    >=4.19 && <5
+    , en-core
+    , text
+    -- , servant         -- added when the API type lands
+    -- , servant-server

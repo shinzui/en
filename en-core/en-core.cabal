@@ -1,0 +1,51 @@
+cabal-version:      3.0
+name:               en-core
+version:            0.1.0.0
+synopsis:           Schema-parametric ReBAC engine: model, reachability, check/lookup, revisions
+description:
+  en-core is the transport- and database-agnostic heart of en. It defines the
+  authorization model (relation tuples, userset-rewrite rules, caveats), the
+  Schema -> reachability-graph compiler, the check / lookup / expand algorithms
+  expressed over a TupleStore effect interface, and the revision / consistency-token
+  types. It depends on no Servant, WAI, PostgreSQL, or HTTP library; concrete
+  implementations live in en-postgres, en-servant, and en-server.
+
+license:            MIT
+author:             Nadeem Bitar
+maintainer:         nadeem@gmail.com
+category:           Security, Authorization
+
+common warnings
+  ghc-options:
+    -Wall -Wcompat -Widentities -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+
+common shared
+  default-language:   GHC2024
+  default-extensions:
+    BlockArguments
+    DerivingStrategies
+    DuplicateRecordFields
+    LambdaCase
+    OverloadedRecordDot
+    OverloadedStrings
+
+library
+  import:          warnings, shared
+  hs-source-dirs:  src
+  exposed-modules:
+    En.Prelude
+    En.Error
+    En.Schema
+    En.Tuple
+    En.Revision
+    En.Reachability
+    En.Check
+    En.Lookup
+    En.Effect.TupleStore
+  build-depends:
+    , base              >=4.19 && <5
+    , bytestring
+    , containers
+    , text
+    , unordered-containers

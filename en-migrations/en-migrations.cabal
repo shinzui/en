@@ -1,0 +1,31 @@
+cabal-version:      3.0
+name:               en-migrations
+version:            0.1.0.0
+synopsis:           codd-managed PostgreSQL schema for en's relationship tuples
+description:
+  PostgreSQL schema migrations for en: the relation-tuple table (with xid8
+  created/deleted columns for MVCC point-in-time reads) and the revision /
+  transaction table. SQL is managed by codd, mirroring shomei-migrations.
+
+license:            MIT
+author:             Nadeem Bitar
+maintainer:         nadeem@gmail.com
+category:           Security, Authorization, Database
+
+common warnings
+  ghc-options:
+    -Wall -Wcompat -Widentities -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+
+common shared
+  default-language:   GHC2024
+  default-extensions:
+    OverloadedStrings
+
+library
+  import:          warnings, shared
+  hs-source-dirs:  src
+  exposed-modules:  En.Migrations
+  build-depends:
+    , base   >=4.19 && <5
+    , text
