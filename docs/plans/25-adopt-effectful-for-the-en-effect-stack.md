@@ -73,7 +73,7 @@ This section must always reflect the actual current state of the work.
 - [x] **M2 — en-postgres interpreters.** Completed 2026-06-23T23:23:54Z. Added `En.Postgres.Database`; replaced the record constructors with `runTupleStorePostgres` / `runConsistencyStorePostgres`; migrated the PostgreSQL integration test to the interpreter stack; `cabal build en-postgres`, `cabal test en-postgres:en-postgres-revision-tests`, `cabal test en-postgres:en-postgres-integration-tests`, and `cabal build en-postgres:en-postgres-bench` are green.
 - [x] **M3 — en-servant seam + en-example host.** Completed 2026-06-23T23:30:52Z. Replaced IO-store record fields with an `Eff`→`Handler` seam (`AppEffects`, polymorphic `Env`, `runEngine`); migrated all handlers including `/batch-check`; migrated `en-example` from `AuthorizationEnv` and record stores to seam environments and interpreters, including the failing consistency interpreter and resolver-style gate; `cabal build en-servant en-example` and `cabal test en-servant en-example` are green.
 - [x] **M4 — en-server assembly.** Completed 2026-06-23T23:34:57Z. Composed `runAppIO` in `en-server/app/Main.hs` from the PostgreSQL `Database`, tuple-store, consistency-store, error, and IO interpreters; `cabal build en-server` is green. Boot and HTTP transcript validation require `EN_DATABASE_URL` pointing at a migrated PostgreSQL database and were not run in this shell because that environment variable is unset.
-- [ ] **M5 — whole-repo build/test + en-client check + cleanup.** `cabal build all` and `cabal test all` green (including `en-core-conformance`, `en-servant-tests`, `en-example-tests`, both benchmark gates); confirm `en-client` builds unchanged; remove dead code.
+- [x] **M5 — whole-repo build/test + en-client check + cleanup.** Completed 2026-06-23T23:36:45Z. `cabal build all`, `cabal test all`, `cabal bench all`, and `cabal build en-client` are green; the stale-record-store API search produced no matches; the working tree was clean before the plan-only completion update.
 
 
 ## Surprises & Discoveries
@@ -295,6 +295,25 @@ Compare the result against the original purpose.
   The executable build passed. `EN_DATABASE_URL` was unset, so the database boot and HTTP
   end-to-end transcript remain environment-dependent validation rather than a command run in this
   shell.
+
+- M5 completed on 2026-06-23T23:36:45Z. The full workspace builds, tests, and benchmark gates pass
+  after the migration. `en-client` still builds unchanged against the Servant API surface, and the
+  old record-store constructors/usages are absent from migrated packages.
+
+  Validation:
+
+  ```text
+  rg -n 'data TupleStore m|data ConsistencyStore m|postgresTupleStoreIO|postgresTupleStore\b|postgresConsistencyStore\b|PostgresSessionRunner|AuthorizationEnv|:: TupleStore IO|:: ConsistencyStore IO|inMemoryTupleStore|failingConsistencyStore' en-core en-postgres en-servant en-server en-example en-client
+  cabal build all
+  cabal test all
+  cabal bench all
+  cabal build en-client
+  git status --short
+  ```
+
+  The `rg` command produced no matches. `cabal build all`, `cabal test all`, `cabal bench all`,
+  and `cabal build en-client` all passed. `git status --short` was empty before this plan-only
+  completion update.
 
 
 ## Context and Orientation
