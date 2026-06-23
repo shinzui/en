@@ -3,27 +3,37 @@
 
 module Main (main) where
 
+import Data.Foldable (traverse_)
+import Data.Functor.Contravariant ((>$<))
+import Data.Int (Int64)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Time (UTCTime, defaultTimeLocale, parseTimeOrError)
+import Data.Word (Word64)
+import Numeric (readDec)
 
 import En.Check (CheckDecision (..), check)
-import En.Effect.ConsistencyStore (TokenMetadata (..))
-import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleStore (..), UsersetQuery (..))
+import En.Effect.ConsistencyStore (ConsistencyStore (..), TokenMetadata (..))
+import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore (..), UsersetQuery (..))
+import En.Error (EnError (..))
 import En.Lookup (LookupCursor (..), LookupLimit (..), LookupObject (..), LookupPage (..), LookupRequest (..), LookupState (..))
 import En.Lookup qualified as Lookup
-import En.Postgres.Revision (ConsistencyConfig (..), postgresConsistencyStore, tokenMetadataFromPayload)
+import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgSnapshot, parsePgSnapshot, postgresConsistencyStore, renderPgSnapshot, tokenMetadataFromPayload, transactionVisible)
 import En.Postgres.TupleStore (postgresTupleStoreIO)
 import En.Reachability (compile)
-import En.Revision (Consistency (..), DatastoreId (..))
+import En.Revision (Consistency (..), DatastoreId (..), Revision (..), RevisionOrder (..))
 import En.Schema (AllowedSubject (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..), Schema (..))
 import En.Schema qualified as Schema
 import En.Tuple (CaveatContext (..), ObjectRef (..), Subject (..), Tuple (..))
 import EphemeralPg qualified as Pg
 import Hasql.Connection qualified as Connection
+import Hasql.Decoders qualified as Decoders
+import Hasql.Encoders qualified as Encoders
 import Hasql.Session qualified as Session
+import Hasql.Statement (Statement)
+import Hasql.Statement qualified as Statement
 
 main :: IO ()
 main = do
@@ -54,10 +64,11 @@ runTupleStoreScenario connection = do
             ConsistencyConfig
                 { datastoreId = DatastoreId "test-datastore"
                 , schemaHash = Schema.schemaHash checkSchema
+                , gcWindow = "24 hours"
                 }
         store = postgresTupleStoreIO connection config
         consistencyStore =
-            postgresConsistencyStore config (pure testTime) store.optimizedRevision store.headRevision
+            postgresConsistencyStore config (pure testTime) store.optimizedRevision store.headRevision store.oldestRetainedXid
         projectX = ObjectRef (ObjectType "space") "project-x"
         projectY = ObjectRef (ObjectType "space") "project-y"
         tuple =
@@ -93,9 +104,14 @@ runTupleStoreScenario connection = do
                 }
     writeToken <- store.writeTuples [tuple, tuple2]
     TokenMetadata{revision = writeRevision} <- either (fail . show) pure (tokenMetadataFromPayload writeToken)
+    headAfterWrite <- store.headRevision
+    writeSnapshot <- either (fail . Text.unpack) pure (parsePgSnapshot writeRevision.revisionEncoding)
+    headAfterWriteSnapshot <- either (fail . Text.unpack) pure (parsePgSnapshot headAfterWrite.revisionEncoding)
+    assertEqual "write token is not fresher than immediate head revision" True (writeSnapshot.xmax <= headAfterWriteSnapshot.xmax)
     TuplePage{rows = rowsAtWrite, state = stateAtWrite} <- store.readStartingWithUser writeRevision query
     assertEqual "write token read sees tuple count" 2 (length rowsAtWrite)
     assertEqual "write token read is exhausted" Exhausted stateAtWrite
+    runSnapshotOracleScenario connection
     graph <- either (fail . show) pure (compile checkSchema)
     checkDecision <- check consistencyStore store graph (AtLeastAsFresh writeToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX
     assertEqual "postgres-backed check sees written tuple" (Right Allowed) checkDecision
@@ -125,6 +141,22 @@ runTupleStoreScenario connection = do
     TuplePage{rows = rowsAtDelete} <- store.readStartingWithUser deleteRevision query
     assertEqual "old revision still sees deleted tuple" 2 (length rowsAtOldRevision)
     assertEqual "delete revision hides tuple" 0 (length rowsAtDelete)
+    let deletedXids = traverse (parseTupleDeletedXid . (.deletedAt)) rowsAtOldRevision
+    deletedHorizon <- maybe (fail "deleted tuple rows did not carry deleted_xid") (pure . (+ 1) . maximum) deletedXids
+    reaped <- store.reapDeletedTuples deletedHorizon
+    assertEqual "reaper removes safely old soft-deleted tuples" 2 reaped
+    reapedAgain <- store.reapDeletedTuples deletedHorizon
+    assertEqual "reaper is idempotent" 0 reapedAgain
+    staleStore <-
+        let staleConfig = config{gcWindow = "0 seconds"}
+         in pure (postgresTupleStoreIO connection staleConfig)
+    let staleConsistencyStore =
+            postgresConsistencyStore config{gcWindow = "0 seconds"} (pure testTime) staleStore.optimizedRevision staleStore.headRevision staleStore.oldestRetainedXid
+    staleResult <- staleConsistencyStore.resolveConsistency (AtExactSnapshot writeToken)
+    assertEqual
+        "stale snapshot token is rejected after GC horizon advances"
+        (Left (InvalidConsistencyToken "token is older than the garbage-collection window"))
+        staleResult
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
 assertEqual label expected actual
@@ -136,6 +168,112 @@ assertEqual label expected actual
                 <> show expected
                 <> "\nactual:   "
                 <> show actual
+
+runSnapshotOracleScenario :: Connection.Connection -> IO ()
+runSnapshotOracleScenario connection =
+    traverse_ assertPair (take 240 generatedSnapshotPairs)
+  where
+    assertPair (left, right) = do
+        oracle <- oracleCompare connection left right
+        assertEqual ("snapshot comparator agrees with PostgreSQL oracle for " <> Text.unpack (renderPgSnapshot left) <> " vs " <> Text.unpack (renderPgSnapshot right)) oracle (comparePgSnapshot left right)
+
+oracleCompare :: Connection.Connection -> PgSnapshot -> PgSnapshot -> IO RevisionOrder
+oracleCompare connection left right = do
+    let maxTxid = fromIntegral (max left.xmax right.xmax + 2)
+    leftVisibility <- visibleRows connection left maxTxid
+    rightVisibility <- visibleRows connection right maxTxid
+    traverse_
+        ( \(txid, visible) ->
+            assertEqual
+                ("transactionVisible agrees with PostgreSQL for " <> show txid <> " in " <> Text.unpack (renderPgSnapshot left))
+                visible
+                (transactionVisible txid left)
+        )
+        leftVisibility
+    traverse_
+        ( \(txid, visible) ->
+            assertEqual
+                ("transactionVisible agrees with PostgreSQL for " <> show txid <> " in " <> Text.unpack (renderPgSnapshot right))
+                visible
+                (transactionVisible txid right)
+        )
+        rightVisibility
+    let leftIncludesRight = and [not rightVisible || leftVisible | ((_, leftVisible), (_, rightVisible)) <- zip leftVisibility rightVisibility]
+        rightIncludesLeft = and [not leftVisible || rightVisible | ((_, leftVisible), (_, rightVisible)) <- zip leftVisibility rightVisibility]
+    pure $
+        case (leftIncludesRight, rightIncludesLeft) of
+            (True, True) -> REqual
+            (True, False) -> RAfter
+            (False, True) -> RBefore
+            (False, False) -> RConcurrent
+
+visibleRows :: Connection.Connection -> PgSnapshot -> Int64 -> IO [(Word64, Bool)]
+visibleRows connection snapshot maxTxid =
+    Connection.use connection (Session.statement (renderPgSnapshot snapshot, maxTxid) snapshotVisibilityStatement) >>= \case
+        Right rows -> traverse decode rows
+        Left err -> fail ("Could not query pg_visible_in_snapshot oracle: " <> show err)
+  where
+    decode (txidText, visible) =
+        case parseWord64 txidText of
+            Just txid -> pure (txid, visible)
+            Nothing -> fail ("PostgreSQL returned non-Word64 txid: " <> Text.unpack txidText)
+
+snapshotVisibilityStatement :: Statement (Text, Int64) [(Text, Bool)]
+snapshotVisibilityStatement =
+    Statement.preparable
+        """
+        SELECT txid::text, pg_visible_in_snapshot(txid::text::xid8, $1::pg_snapshot)
+        FROM generate_series(1, $2::bigint) AS txid
+        """
+        ( (fst >$< Encoders.param (Encoders.nonNullable Encoders.text))
+            <> (snd >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+        )
+        ( Decoders.rowList
+            ( (,)
+                <$> Decoders.column (Decoders.nonNullable Decoders.text)
+                <*> Decoders.column (Decoders.nonNullable Decoders.bool)
+            )
+        )
+
+generatedSnapshotPairs :: [(PgSnapshot, PgSnapshot)]
+generatedSnapshotPairs =
+    edgePairs <> zip generatedSnapshots (drop 7 generatedSnapshots)
+  where
+    edgePairs =
+        [ (PgSnapshot{xmin = 10, xmax = 15, xip = []}, PgSnapshot{xmin = 20, xmax = 25, xip = []})
+        , (PgSnapshot{xmin = 10, xmax = 20, xip = [11]}, PgSnapshot{xmin = 10, xmax = 20, xip = [12]})
+        ]
+    generatedSnapshots =
+        snapshotFromSeed <$> iterate lcg 1
+
+snapshotFromSeed :: Word64 -> PgSnapshot
+snapshotFromSeed seed =
+    let xmin = 1 + seed `mod` 40
+        width = 1 + (seed `div` 41) `mod` 40
+        xmax = xmin + width
+        candidates = [xmin .. xmax - 1]
+        xip =
+            [ txid
+            | (index, txid) <- zip [1 ..] candidates
+            , ((seed `div` (index + 3)) + txid) `mod` 5 == 0
+            ]
+     in PgSnapshot{xmin, xmax, xip}
+
+lcg :: Word64 -> Word64
+lcg seed =
+    seed * 6364136223846793005 + 1442695040888963407
+
+parseTupleDeletedXid :: Maybe Revision -> Maybe Word64
+parseTupleDeletedXid =
+    \case
+        Nothing -> Nothing
+        Just revision -> parseWord64 revision.revisionEncoding
+
+parseWord64 :: Text -> Maybe Word64
+parseWord64 text =
+    case readDec (Text.unpack text) of
+        [(value, "")] -> Just value
+        _ -> Nothing
 
 checkSchema :: Schema
 checkSchema =
@@ -213,6 +351,13 @@ schemaSql =
       ON relation_tuple
         (subject_type, subject_id, coalesce(subject_relation, ''), object_type, relation, id)
       WHERE deleted_xid IS NULL;
+
+    CREATE INDEX relation_tuple_object_hist_idx
+      ON relation_tuple (object_type, object_id, relation, id);
+
+    CREATE INDEX relation_tuple_subject_hist_idx
+      ON relation_tuple
+        (subject_type, subject_id, coalesce(subject_relation, ''), object_type, relation, id);
 
     CREATE INDEX relation_tuple_created_xid_idx
       ON relation_tuple (created_xid);

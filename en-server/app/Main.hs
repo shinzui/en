@@ -24,6 +24,7 @@ main :: IO ()
 main = do
     databaseUrl <- requiredEnv "EN_DATABASE_URL"
     port <- maybe 8080 parsePort <$> lookupEnv "EN_PORT"
+    gcWindow <- maybe "24 hours" Text.pack <$> lookupEnv "EN_GC_WINDOW"
     graph <- either (fail . ("Invalid built-in demo schema: " <>) . show) pure (compile demoSchema)
     connection <-
         Connection.acquire (Settings.connectionString (Text.pack databaseUrl)) >>= \case
@@ -39,10 +40,11 @@ main = do
             ConsistencyConfig
                 { datastoreId = DatastoreId "en-server"
                 , schemaHash = schemaHash demoSchema
+                , gcWindow = gcWindow
                 }
         tupleStore = postgresTupleStoreIO connection config
         consistencyStore =
-            postgresConsistencyStore config getCurrentTime tupleStore.optimizedRevision tupleStore.headRevision
+            postgresConsistencyStore config getCurrentTime tupleStore.optimizedRevision tupleStore.headRevision tupleStore.oldestRetainedXid
         serverEnv =
             EnServer
                 { consistencyStore

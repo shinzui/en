@@ -213,14 +213,15 @@ PostgreSQL datastore, this is **mostly Postgres MVCC + a codec**, not a consiste
 - **A revision is a `pg_snapshot`** (`xmin:xmax:xip`), not a sequence number. Each write inserts
   an `en_transaction` row with `xid xid8` + `snapshot pg_snapshot DEFAULT pg_current_snapshot()`.
 - **Tuples are soft-deleted by xid**: `relation_tuple` carries `created_xid`/`deleted_xid`
-  (xid8, sentinel max = live). Upsert inserts a new row; delete stamps `deleted_xid`. Never
-  update in place — that is what makes point-in-time reads possible.
+  (`deleted_xid IS NULL` means live; a non-null `deleted_xid` records the deleting
+  transaction). Upsert inserts a new row; delete stamps `deleted_xid`. Never update in place — that
+  is what makes point-in-time reads possible.
 - **Read at revision `R`** is one predicate:
   `pg_visible_in_snapshot(created_xid, R) AND NOT pg_visible_in_snapshot(deleted_xid, R)`.
   Postgres decides visibility; `en` does not build a consistency protocol.
-- **The token** (`ConsistencyToken`) is an opaque base64-proto wrapping the revision string +
-  a datastore-id prefix + a schema hash (so a token from a different datastore/schema is
-  detected).
+- **The token** (`ConsistencyToken`) is an opaque, versioned string wrapping the revision string +
+  a datastore-id prefix + a schema hash + an optional ISO-8601 expiry (so a token from a different
+  datastore/schema is detected).
 - **The four modes** (`En.Revision.Consistency`): `MinimizeLatency` (a **quantized** revision —
   floor-now-to-window, pick first txn, so many requests share a snapshot and caches hit),
   `FullyConsistent` (head / `pg_current_snapshot()`), `AtLeastAsFresh token` (the new-enemy fix:

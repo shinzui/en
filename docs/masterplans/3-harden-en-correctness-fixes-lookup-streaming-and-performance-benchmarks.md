@@ -76,7 +76,7 @@ each independently verifiable.
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-14 | Harden consistency: faithful snapshot visibility, GC window, and token reconciliation | docs/plans/14-harden-consistency-faithful-snapshot-visibility-gc-window-and-token-reconciliation.md | None | None | Not Started |
+| EP-14 | Harden consistency: faithful snapshot visibility, GC window, and token reconciliation | docs/plans/14-harden-consistency-faithful-snapshot-visibility-gc-window-and-token-reconciliation.md | None | None | Complete |
 | EP-15 | Generalize the caveat evaluator and unify the decision algebra | docs/plans/15-generalize-the-caveat-evaluator-and-unify-the-decision-algebra.md | None | None | Not Started |
 | EP-16 | Make lookup streaming with resumable cursors and a deadline budget | docs/plans/16-make-lookup-streaming-with-resumable-cursors-and-a-deadline-budget.md | None | EP-15 | Not Started |
 | EP-17 | Strengthen the lookup spike and add performance-regression benchmarks | docs/plans/17-strengthen-the-lookup-spike-and-add-performance-regression-benchmarks.md | None | EP-14, EP-15, EP-16 | Not Started |
@@ -180,10 +180,10 @@ GraphQL-field workload.
 
 ## Progress
 
-- [ ] EP-14: Replace `snapshotIncludes` with a faithful port and prove it against a reference oracle via a property test.
-- [ ] EP-14: Add a GC-window check for `AtExactSnapshot`/`AtLeastAsFresh` tokens and a soft-delete reaper job.
-- [ ] EP-14: Anchor the write-returned token to the transaction's own snapshot (stop using a post-commit `pg_current_snapshot()`), or document why not.
-- [ ] EP-14: Reconcile the `deleted_xid` sentinel (NULL vs max-xid) and add an index that serves point-in-time reads of since-deleted rows; reconcile the token format (base64-proto + ISO-8601 expiry) and remove the `En.Revision.compareRevision` error stub.
+- [x] EP-14: Replace `snapshotIncludes` with a faithful port and prove it against a reference oracle via a property test.
+- [x] EP-14: Add a GC-window check for `AtExactSnapshot`/`AtLeastAsFresh` tokens and a soft-delete reaper job.
+- [x] EP-14: Anchor the write-returned token to the transaction's own snapshot (stop using a post-commit `pg_current_snapshot()`), or document why not.
+- [x] EP-14: Reconcile the `deleted_xid` sentinel (NULL vs max-xid) and add an index that serves point-in-time reads of since-deleted rows; reconcile the token format (base64-proto + ISO-8601 expiry) and remove the `En.Revision.compareRevision` error stub.
 - [ ] EP-15: Replace the hardcoded `within_autonomy`/`requested_autonomy` caveat logic with a generic typed evaluator over `CaveatDefinition`/`CaveatParameterType`.
 - [ ] EP-15: Extract the three-valued decision algebra into `En.Decision` and use it from `En.Check` and `En.Lookup` (audit `En.Expand`, which computes no decision); remove the `evalThis` error partial; model wildcard/public subjects.
 - [ ] EP-16: Replace eager-compute-then-cap `lookup` with a resumable cursor and a deadline budget; remove the `ensureExhausted` hard-fail on multi-page intermediate reads.
@@ -211,6 +211,13 @@ GraphQL-field workload.
   MasterPlan 1), so EP-18 is extraction + completion, not authoring. (3) The repo has no CI yet (no
   `.github/workflows`), so EP-17's regression gate is greenfield CI. (4) The spike's §7 "green" verdict
   was recorded at 1M rows though the spec §4 bar is 10M — the gap EP-17 closes. _(2026-06-23)_
+- EP-14's PostgreSQL oracle found that snapshot inclusion cannot be reduced to
+  `candidate.xmax >= required.xmax`: a lower-`xmax` snapshot can include a higher-`xmax` snapshot if
+  the entire gap is present in the required snapshot's `xip`. EP-14 therefore landed a gap-coverage
+  rule rather than the initial simplified formula. _(2026-06-23)_
+- EP-14 also proved that the raw `pg_current_snapshot()` stored inside a write transaction does not
+  see the write's own xid when used later as a token revision. The returned token now stays anchored
+  to the write xid but constructs a write-visible snapshot from it. _(2026-06-23)_
 
 
 ## Decision Log
@@ -249,6 +256,13 @@ GraphQL-field workload.
   right surface; it composes with MasterPlan 2 EP-11's decision cache and is benchmarked by EP-17.
   EP-18 additionally gains a resolver-style guarded example so the GraphQL pattern is proven, not just
   documented.
+  Date: 2026-06-23
+
+- Decision: Mark EP-14 complete after landing the consistency hardening implementation.
+  Rationale: The child plan's source changes, migration/spec cleanup, and validation are complete:
+  `cabal build all`, `cabal test en-postgres-revision-tests`, and
+  `cabal test en-postgres-integration-tests` passed. EP-14 also recorded the oracle-discovered
+  comparator correction and the write-token fallback in its living sections.
   Date: 2026-06-23
 
 

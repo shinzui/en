@@ -65,6 +65,13 @@ main = do
             PgSnapshot{xmin = 10, xmax = 20, xip = [11]}
             PgSnapshot{xmin = 10, xmax = 20, xip = [12]}
         )
+    assertEqual
+        "xmax-gap snapshot compares before later snapshot"
+        RBefore
+        ( comparePgSnapshot
+            PgSnapshot{xmin = 10, xmax = 15, xip = []}
+            PgSnapshot{xmin = 20, xmax = 25, xip = []}
+        )
     let payload =
             TokenPayload
                 { datastoreId = DatastoreId "primary"
@@ -97,20 +104,25 @@ main = do
     assertEqual
         "wrong datastore is rejected"
         (Left (InvalidConsistencyToken "token datastore does not match this en datastore"))
-        (validateTokenMetadata config now metadataWithWrongDatastore)
+        (validateTokenMetadata config now 0 metadataWithWrongDatastore)
     assertEqual
         "wrong schema hash is rejected"
         (Left (InvalidConsistencyToken "token schema hash does not match the active schema"))
-        (validateTokenMetadata config now metadataWithWrongSchema)
+        (validateTokenMetadata config now 0 metadataWithWrongSchema)
     assertEqual
         "expired token is rejected"
         (Left (InvalidConsistencyToken "token is expired"))
-        (validateTokenMetadata config now expiredMetadata)
+        (validateTokenMetadata config now 0 expiredMetadata)
+    assertEqual
+        "token older than GC horizon is rejected"
+        (Left (InvalidConsistencyToken "token is older than the garbage-collection window"))
+        (validateTokenMetadata config now 20 metadata)
   where
     config =
         ConsistencyConfig
             { datastoreId = DatastoreId "primary"
             , schemaHash = SchemaHash "schema:hash"
+            , gcWindow = "24 hours"
             }
     now = parseUtc "2026-06-23T00:00:00Z"
     optimizedRevision = Revision "10:30:"
@@ -160,7 +172,7 @@ main = do
                         }
             Left err -> Left (InvalidConsistencyToken (showText err))
     validateMetadata =
-        validateTokenMetadata config now
+        validateTokenMetadata config now 0
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
 assertEqual label expected actual

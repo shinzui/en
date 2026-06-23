@@ -562,6 +562,8 @@ inMemoryTupleStore tuples =
         , deleteTuples = \_ -> pure (ConsistencyToken "in-memory-delete")
         , headRevision = pure testRevision
         , optimizedRevision = pure testRevision
+        , oldestRetainedXid = pure 0
+        , reapDeletedTuples = \_ -> pure 0
         }
 
 pageTuples :: Int -> Maybe StoreCursor -> [Tuple] -> TuplePage

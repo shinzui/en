@@ -9,6 +9,7 @@ module En.Postgres.TupleStore (
     hasqlConnectionRunner,
     postgresTupleStore,
     postgresTupleStoreIO,
+    reapDeletedTuples,
 ) where
 
 import Control.Exception (throwIO)
@@ -25,6 +26,7 @@ import Data.Map.Strict qualified as Map
 import Data.Scientific (floatingOrInteger)
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Data.Word (Word64)
 
 import En.Effect.TupleStore (
     PageState (..),
@@ -37,8 +39,11 @@ import En.Effect.TupleStore (
  )
 import En.Postgres.Revision (
     ConsistencyConfig (..),
+    PgSnapshot (..),
     TokenPayload (..),
     encodeToken,
+    parsePgSnapshot,
+    renderPgSnapshot,
  )
 import En.Revision (
     ConsistencyToken,
@@ -63,6 +68,7 @@ import Hasql.Session (Session)
 import Hasql.Session qualified as Session
 import Hasql.Statement (Statement)
 import Hasql.Statement qualified as Statement
+import Numeric (readDec)
 
 -- | An effect-polymorphic runner for Hasql sessions.
 newtype PostgresSessionRunner m = PostgresSessionRunner
@@ -89,6 +95,10 @@ postgresTupleStore (PostgresSessionRunner run) config =
             run headRevisionSession
         , optimizedRevision =
             run headRevisionSession
+        , oldestRetainedXid =
+            run (oldestRetainedXidSession config.gcWindow)
+        , reapDeletedTuples = \horizon ->
+            run (reapDeletedTuples horizon)
         }
 
 -- | Convenience constructor for the common direct-connection IO case.
@@ -108,8 +118,7 @@ writeTuplesSession config tuples = do
     anchor <- Session.statement schemaHashText anchorTransactionStatement
     traverse_ (\tuple -> Session.statement (tupleInsertParams anchor.xid tuple) insertTupleStatement) tuples
     Session.script commitScript
-    snapshot <- Session.statement () currentSnapshotStatement
-    pure (tokenFromAnchor config Anchor{xid = anchor.xid, snapshot = snapshot})
+    pure (tokenFromAnchor config anchor)
   where
     SchemaHash schemaHashText = config.schemaHash
 
@@ -119,14 +128,21 @@ deleteTuplesSession config tuples = do
     anchor <- Session.statement schemaHashText anchorTransactionStatement
     traverse_ (\tuple -> Session.statement (tupleDeleteParams anchor.xid tuple) deleteTupleStatement) tuples
     Session.script commitScript
-    snapshot <- Session.statement () currentSnapshotStatement
-    pure (tokenFromAnchor config Anchor{xid = anchor.xid, snapshot = snapshot})
+    pure (tokenFromAnchor config anchor)
   where
     SchemaHash schemaHashText = config.schemaHash
 
 headRevisionSession :: Session Revision
 headRevisionSession =
     Revision <$> Session.statement () currentSnapshotStatement
+
+oldestRetainedXidSession :: Text -> Session Word64
+oldestRetainedXidSession window =
+    fromIntegral <$> Session.statement window oldestRetainedXidStatement
+
+reapDeletedTuples :: Word64 -> Session Int64
+reapDeletedTuples horizon =
+    Session.statement (Text.pack (show horizon)) reapDeletedTuplesStatement
 
 readStartingWithUserSession :: Revision -> UsersetQuery -> Session TuplePage
 readStartingWithUserSession revision query = do
@@ -149,10 +165,11 @@ pageFromRows limit rows =
             case extraRows of
                 [] -> Exhausted
                 nextRow : _ ->
-                    HasMore . StoreCursor . rowIdEncoding . rowId $
-                        case visibleRows of
-                            [] -> nextRow
-                            _ -> last visibleRows
+                    let cursorRow =
+                            case visibleRows of
+                                [] -> nextRow
+                                _ -> last visibleRows
+                     in HasMore (StoreCursor cursorRow.rowId.rowIdEncoding)
      in TuplePage{rows = visibleRows, state = pageState}
 
 data Anchor = Anchor
@@ -167,9 +184,25 @@ tokenFromAnchor config anchor =
         TokenPayload
             { datastoreId = config.datastoreId
             , schemaHash = config.schemaHash
-            , revision = Revision anchor.snapshot
+            , revision = Revision (writeVisibleSnapshot anchor)
             , expiresAt = Nothing
             }
+
+writeVisibleSnapshot :: Anchor -> Text
+writeVisibleSnapshot anchor =
+    case (parsePgSnapshot anchor.snapshot, parseWord64 anchor.xid) of
+        (Right snapshot, Just xid) ->
+            renderPgSnapshot
+                snapshot
+                    { xmax = max snapshot.xmax (succBounded xid)
+                    , xip = filter (/= xid) snapshot.xip
+                    }
+        _ -> anchor.snapshot
+
+succBounded :: Word64 -> Word64
+succBounded value
+    | value == maxBound = maxBound
+    | otherwise = value + 1
 
 beginScript :: Text
 beginScript =
@@ -211,6 +244,32 @@ currentSnapshotStatement =
         """
         Encoders.noParams
         (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.text)))
+
+oldestRetainedXidStatement :: Statement Text Int64
+oldestRetainedXidStatement =
+    Statement.preparable
+        """
+        SELECT coalesce(min(xid), pg_snapshot_xmin(pg_current_snapshot()))::text::bigint
+        FROM en_transaction
+        WHERE created_at >= now() - $1::interval
+        """
+        (Encoders.param (Encoders.nonNullable Encoders.text))
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
+
+reapDeletedTuplesStatement :: Statement Text Int64
+reapDeletedTuplesStatement =
+    Statement.preparable
+        """
+        WITH reaped AS (
+          DELETE FROM relation_tuple
+          WHERE deleted_xid IS NOT NULL
+            AND deleted_xid < $1::xid8
+          RETURNING id
+        )
+        SELECT count(*) FROM reaped
+        """
+        (Encoders.param (Encoders.nonNullable Encoders.text))
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
 
 data TupleInsertParams = TupleInsertParams
     { createdXid :: !Text
@@ -538,6 +597,12 @@ decodeCaveatValue =
                 Right integer -> pure (ValueInteger integer)
                 Left (_double :: Double) -> fail "expected integer caveat number"
         _ -> fail "unsupported caveat value"
+
+parseWord64 :: Text -> Maybe Word64
+parseWord64 text =
+    case readDec (Text.unpack text) of
+        [(value, "")] -> Just value
+        _ -> Nothing
 
 decodeCursor :: StoreCursor -> Int64
 decodeCursor (StoreCursor cursorText) =

@@ -56,21 +56,29 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Milestone 1: Replace `snapshotIncludes` with a faithful per-transaction-id port of PostgreSQL
+- [x] Milestone 1: Replace `snapshotIncludes` with a faithful per-transaction-id port of PostgreSQL
       snapshot visibility, and add an oracle-backed property test (`en-postgres-integration-tests`)
       that compares `en`'s answer against real PostgreSQL `pg_visible_in_snapshot` over randomized
       snapshot pairs, including the xmax-gap and in-progress-xip cases. Confirm the new test fails on
-      the pre-fix code for the xmax-gap pair and passes after.
-- [ ] Milestone 2: Add a garbage-collection-window (GC-window) validity check to
+      the pre-fix code for the xmax-gap pair and passes after. Completed 2026-06-23: implemented
+      the gap-aware inclusion rule and a deterministic pseudo-random PostgreSQL oracle sweep over
+      240 generated pairs plus edge pairs.
+- [x] Milestone 2: Add a garbage-collection-window (GC-window) validity check to
       `validateTokenMetadata` so `AtExactSnapshot`/`AtLeastAsFresh` tokens older than the horizon are
       rejected, and add a soft-delete reaper session that deletes tuples whose `deleted_xid` is older
-      than the horizon. Prove both against PostgreSQL.
-- [ ] Milestone 3: Anchor the write-returned token to the write transaction's own snapshot by reading
+      than the horizon. Prove both against PostgreSQL. Completed 2026-06-23: `ConsistencyConfig`
+      carries `gcWindow`, `TupleStore` exposes `oldestRetainedXid` and `reapDeletedTuples`, and the
+      integration suite proves stale-token rejection plus idempotent reaping.
+- [x] Milestone 3: Anchor the write-returned token to the write transaction's own snapshot by reading
       back the `en_transaction.snapshot` row the write inserted (stop using a separate post-commit
-      `SELECT pg_current_snapshot()`).
-- [ ] Milestone 4: Reconcile the `deleted_xid` sentinel between spec and code, add an index that
+      `SELECT pg_current_snapshot()`). Completed 2026-06-23: write/delete sessions no longer issue a
+      post-commit snapshot read; the token is derived from the write anchor xid, with `xmax` adjusted
+      so the write's own xid is visible.
+- [x] Milestone 4: Reconcile the `deleted_xid` sentinel between spec and code, add an index that
       serves point-in-time reads of since-deleted rows, stabilize the token format and the `expiresAt`
-      timestamp encoding, and remove the `En.Revision.compareRevision` `error` stub.
+      timestamp encoding, and remove the `En.Revision.compareRevision` `error` stub. Completed
+      2026-06-23: added historical indexes in a new migration, updated the integration schema and
+      spec wording, switched token expiry to ISO-8601, and removed the core stub/export.
 
 
 ## Surprises & Discoveries
@@ -78,7 +86,19 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- Real PostgreSQL proved that the raw `pg_current_snapshot()` captured inside the write transaction
+  does not make the write's own xid visible to a later `pg_visible_in_snapshot` read. The integration
+  assertion "write token read sees tuple count" returned 0 when the token used the raw anchor
+  snapshot. The implementation now follows the plan's documented fallback: it builds the returned
+  write token from the anchor xid by ensuring `xmax >= xid + 1` and removing that xid from `xip`.
+  Evidence: `cabal test en-postgres-integration-tests` passed after the fallback. _(2026-06-23)_
+- The PostgreSQL oracle found that the plan's originally-proposed simplified inclusion rule
+  (`candidate.xmax >= required.xmax`) was still too strong. A lower-`xmax` snapshot can include a
+  higher-`xmax` snapshot when every transaction in the gap is present in the required snapshot's
+  `xip`, and therefore invisible there too. The final `snapshotIncludes` checks whether the gap has
+  any transaction visible in the required snapshot, plus the candidate-`xip` cases. Evidence: the
+  generated oracle pair `8:21:18,19,20` vs `17:18:` expected `REqual`; the corrected implementation
+  now agrees with PostgreSQL across the sweep. _(2026-06-23)_
 
 
 ## Decision Log
@@ -133,13 +153,42 @@ Record every decision made while working on the plan.
   token is rejected exactly when (and only when) the data it would read could have been reaped.
   Date: 2026-06-23
 
+- Decision: Keep the token payload as the existing versioned dotted string, but stabilize
+  `expiresAt` as ISO-8601 and update the spec away from the stale "base64-proto" wording.
+  Rationale: EP-14 allowed this minimal path if adding a base64/protobuf dependency was undesirable.
+  The format remains opaque to callers, keeps datastore/schema mismatch detection, and removes the
+  non-portable Haskell `show`/`read` timestamp coupling without adding a new dependency.
+  Date: 2026-06-23
+
+- Decision: The write-returned token uses a write-visible snapshot constructed from the anchor xid,
+  not the raw in-transaction `pg_current_snapshot()`.
+  Rationale: The raw anchor snapshot made the just-written tuples invisible in the integration test.
+  Constructing the revision from the anchor xid keeps the token tied to the write transaction while
+  satisfying the read-your-writes requirement.
+  Date: 2026-06-23
+
+- Decision: The faithful snapshot-inclusion implementation must test actual visibility in the
+  `[candidate.xmax, required.xmax)` gap rather than treating `candidate.xmax < required.xmax` as an
+  unconditional failure.
+  Rationale: PostgreSQL can report equality when the entire gap is in the required snapshot's `xip`.
+  The oracle-backed test found this case, so the final implementation uses a finite gap coverage
+  check against `required.xip`.
+  Date: 2026-06-23
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+EP-14 completed on 2026-06-23. The PostgreSQL revision comparator now agrees with a real
+`pg_visible_in_snapshot` oracle across generated and edge snapshot pairs; token validation rejects
+snapshots at or older than the GC horizon; `TupleStore` exposes an idempotent soft-delete reaper;
+write/delete tokens are anchored to the write xid without a post-commit snapshot read; historical
+read indexes are present in a new migration; token expiry is ISO-8601; the `deleted_xid` sentinel
+wording matches the `NULL = live` schema; and the partial `En.Revision.compareRevision` export is
+gone. Validation passed with `cabal build all`, `cabal test en-postgres-revision-tests`, and
+`cabal test en-postgres-integration-tests`; the broader `cabal test all` suite also passed.
 
 
 ## Context and Orientation

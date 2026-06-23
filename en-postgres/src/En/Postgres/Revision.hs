@@ -12,6 +12,7 @@ module En.Postgres.Revision (
     revisionFromPgSnapshot,
     revisionToPgSnapshot,
     transactionVisible,
+    snapshotIncludes,
     comparePgSnapshot,
     comparePostgresRevision,
     encodeToken,
@@ -27,9 +28,9 @@ import Data.List (nub, sort)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Time (UTCTime)
+import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
 import Data.Word (Word64)
 import Numeric (readDec, showHex)
-import Text.Read (readMaybe)
 
 import En.Effect.ConsistencyStore (
     ConsistencyStore,
@@ -66,6 +67,7 @@ data TokenPayload = TokenPayload
 data ConsistencyConfig = ConsistencyConfig
     { datastoreId :: !DatastoreId
     , schemaHash :: !SchemaHash
+    , gcWindow :: !Text
     }
     deriving stock (Eq, Show)
 
@@ -137,7 +139,7 @@ encodeToken TokenPayload{datastoreId, schemaHash, revision, expiresAt} =
             , escapeText datastoreText
             , escapeText schemaHashText
             , escapeText revisionText
-            , maybe "" (escapeText . Text.pack . show) expiresAt
+            , maybe "" (escapeText . Text.pack . iso8601Show) expiresAt
             ]
   where
     DatastoreId datastoreText = datastoreId
@@ -179,15 +181,22 @@ tokenMetadataFromPayload token =
                     , expiresAt = payload.expiresAt
                     }
 
-validateTokenMetadata :: ConsistencyConfig -> UTCTime -> TokenMetadata -> Either EnError ()
-validateTokenMetadata config now metadata
+validateTokenMetadata :: ConsistencyConfig -> UTCTime -> Word64 -> TokenMetadata -> Either EnError ()
+validateTokenMetadata config now oldestRetainedXid metadata
     | metadata.datastoreId /= config.datastoreId =
         Left (InvalidConsistencyToken "token datastore does not match this en datastore")
     | metadata.schemaHash /= config.schemaHash =
         Left (InvalidConsistencyToken "token schema hash does not match the active schema")
     | maybe False (<= now) metadata.expiresAt =
         Left (InvalidConsistencyToken "token is expired")
-    | otherwise = Right ()
+    | otherwise = do
+        snapshot <-
+            mapLeft
+                (InvalidConsistencyToken . ("token revision is not a PostgreSQL snapshot: " <>))
+                (revisionToPgSnapshot metadata.revision)
+        if snapshot.xmax <= oldestRetainedXid
+            then Left (InvalidConsistencyToken "token is older than the garbage-collection window")
+            else Right ()
 
 resolveConsistencyRequest ::
     Revision ->
@@ -226,46 +235,57 @@ postgresConsistencyStore ::
     IO UTCTime ->
     IO Revision ->
     IO Revision ->
+    IO Word64 ->
     ConsistencyStore IO
-postgresConsistencyStore config currentTime readOptimizedRevision readHeadRevision =
+postgresConsistencyStore config currentTime readOptimizedRevision readHeadRevision readOldestRetainedXid =
     ConsistencyStore.ConsistencyStore
         { ConsistencyStore.decodeToken = pure . tokenMetadataFromPayload
         , ConsistencyStore.validateToken = \metadata -> do
             now <- currentTime
-            pure (validateTokenMetadata config now metadata)
+            oldestXid <- readOldestRetainedXid
+            pure (validateTokenMetadata config now oldestXid metadata)
         , ConsistencyStore.resolveConsistency = \request -> do
             now <- currentTime
             optimized <- readOptimizedRevision
             currentHead <- readHeadRevision
+            oldestXid <- readOldestRetainedXid
             pure $
                 resolveConsistencyRequest
                     optimized
                     currentHead
                     tokenMetadataFromPayload
-                    (validateTokenMetadata config now)
+                    (validateTokenMetadata config now oldestXid)
                     request
         }
 
 snapshotIncludes :: PgSnapshot -> PgSnapshot -> Bool
 snapshotIncludes candidate required =
-    candidate.xmax >= required.xmax
+    not (hasRequiredVisibleFutureGap candidate required)
         && all
-            (\txid -> not (transactionVisible txid required) || transactionVisible txid candidate)
-            probeTxids
-  where
-    probeTxids =
-        sort . nub $
-            [minBounded required.xmin, required.xmin, minBounded required.xmax]
-                <> required.xip
-                <> candidate.xip
+            (\txid -> not (transactionVisible txid required))
+            (filter (< required.xmax) candidate.xip)
 
-minBounded :: Word64 -> Word64
-minBounded 0 = 0
-minBounded word = word - 1
+hasRequiredVisibleFutureGap :: PgSnapshot -> PgSnapshot -> Bool
+hasRequiredVisibleFutureGap candidate required =
+    candidate.xmax < required.xmax
+        && not (rangeFullyCoveredByXip candidate.xmax required.xmax required.xip)
+
+rangeFullyCoveredByXip :: Word64 -> Word64 -> [Word64] -> Bool
+rangeFullyCoveredByXip lower upper xip =
+    let covered =
+            length
+                [ txid
+                | txid <- nub xip
+                , txid >= lower
+                , txid < upper
+                ]
+        rangeLength =
+            toInteger upper - toInteger lower
+     in rangeLength == toInteger covered
 
 parseExpiry :: Text -> Either TokenDecodeError UTCTime
 parseExpiry text =
-    case readMaybe (Text.unpack text) of
+    case iso8601ParseM (Text.unpack text) of
         Just value -> Right value
         Nothing -> Left (TokenBadEscape text)
 

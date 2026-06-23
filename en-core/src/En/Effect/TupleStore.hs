@@ -1,3 +1,5 @@
+{-# LANGUAGE NoFieldSelectors #-}
+
 {- | The tuple-store effect: the storage interface the engine evaluates against.
 
 Expressed as a record of functions so a consumer or test can supply an in-memory
@@ -14,7 +16,9 @@ module En.Effect.TupleStore (
     PageState (..),
 ) where
 
+import Data.Int (Int64)
 import Data.Text (Text)
+import Data.Word (Word64)
 
 import En.Revision (ConsistencyToken, Revision)
 import En.Schema (ObjectType, RelationName)
@@ -74,4 +78,6 @@ data TupleStore m = TupleStore
     , deleteTuples :: [Tuple] -> m ConsistencyToken
     , headRevision :: m Revision
     , optimizedRevision :: m Revision
+    , oldestRetainedXid :: m Word64
+    , reapDeletedTuples :: Word64 -> m Int64
     }

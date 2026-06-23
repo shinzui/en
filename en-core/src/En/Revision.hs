@@ -2,7 +2,6 @@
 module En.Revision (
     Revision (..),
     RevisionOrder (..),
-    compareRevision,
     DatastoreId (..),
     SchemaHash (..),
     ConsistencyToken (..),
@@ -14,7 +13,8 @@ import Data.Text (Text)
 {- | An opaque datastore revision. For the PostgreSQL datastore this wraps a
 @pg_snapshot@ (xmin:xmax:xip); see @En.Postgres.Revision@. Revisions form a
 /partial/ order — two concurrent snapshots may be incomparable — so en
-deliberately gives 'Revision' no 'Ord' instance; use 'compareRevision'.
+deliberately gives 'Revision' no 'Ord' instance. Datastore-specific packages
+provide their own comparators.
 -}
 newtype Revision = Revision
     { revisionEncoding :: Text
@@ -33,11 +33,6 @@ total order would get wrong — and thereby break the new-enemy guarantee.
 -}
 data RevisionOrder = RBefore | RAfter | REqual | RConcurrent
     deriving stock (Eq, Show)
-
--- | Partial-order comparison. Datastore-specific (PostgreSQL snapshot visibility).
-compareRevision :: Revision -> Revision -> RevisionOrder
-compareRevision =
-    error "TODO(en): datastore partial order; see En.Postgres.Revision + docs/spec/0001-en-overview.md"
 
 {- | The opaque token handed back on write and presented on read for
 read-your-writes. Zanzibar's Zookie / SpiceDB's ZedToken.
