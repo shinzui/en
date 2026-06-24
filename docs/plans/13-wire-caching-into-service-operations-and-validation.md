@@ -21,16 +21,19 @@ This plan turns the lower-level cache support into a usable production feature. 
 
 ## Progress
 
-- [ ] Add cache-related environment parsing and startup wiring in `en-server`.
-- [ ] Use cached tuple store and cached check/lookup paths in `en-servant` or server wiring without breaking existing API shapes.
-- [ ] Add docs for cache settings, key safety, and known limitations.
-- [ ] Add integration or smoke validation covering cache-enabled service behavior.
-- [ ] Run `cabal test all` where available and `cabal build all`.
+- [x] Add cache-related environment parsing and startup wiring in `en-server`. Completed 2026-06-24T00:40:46Z.
+- [x] Use cached tuple store and cached check/lookup paths in `en-servant` or server wiring without breaking existing API shapes. Completed 2026-06-24T00:40:46Z.
+- [x] Add docs for cache settings, key safety, and known limitations. Completed 2026-06-24T00:40:46Z.
+- [x] Add integration or smoke validation covering cache-enabled service behavior. Completed 2026-06-24T00:40:46Z.
+- [x] Run `nix develop -c cabal test all` and `nix develop -c cabal build all`. Completed 2026-06-24T00:40:46Z.
 
 
 ## Surprises & Discoveries
 
 - MasterPlan 3 is already complete, including EP-17's `tasty-bench` harness. EP-13 can reuse that harness for cache-hit performance validation when useful, but the acceptance path remains a focused service/cache transcript or test proving repeated same-revision requests avoid repeated work. _(2026-06-24)_
+- The EP-9 PostgreSQL optimized-revision interpreter allocated its cache inside each interpreter run, which is fine for tests but not enough for `en-server` because `runPorts` runs once per request. EP-13 added `runTupleStorePostgresWithOptimizedRevisionCacheHandle` so server startup can allocate the cache once and share it across requests. _(2026-06-24)_
+- The clean Servant integration point is `En.Servant.Seam.Env`: it now carries explicit `checkOperation` and `lookupWithDeadlineOperation` hooks. Existing HTTP JSON remains unchanged, uncached callers supply `check`/`lookupWithDeadline`, and `en-server` supplies `checkCached`/`lookupWithDeadlineCached` when the decision cache is enabled. _(2026-06-24)_
+- `/batch-check` continues to use `checkMany`, so it keeps its within-request memoization and benefits from optimized-revision and tuple-read caches, but it does not yet use the cross-request decision cache directly. _(2026-06-24)_
 
 
 ## Decision Log
@@ -41,11 +44,31 @@ This plan turns the lower-level cache support into a usable production feature. 
 - Decision: Wire service caching after all lower cache layers are complete.
   Rationale: Service configuration should consume stable cache constructors rather than force API churn into `en-core` or `en-postgres`.
   Date: 2026-06-23
+- Decision: Add operation hooks to `En.Servant.Seam.Env` rather than branching inside every handler.
+  Rationale: The HTTP API shape stays stable while `en-server` can choose cached or uncached `check`/`lookup` implementations at startup. Embedded users and tests can keep using the uncached functions explicitly.
+  Date: 2026-06-24
+- Decision: Keep `/batch-check` on `checkMany` for EP-13.
+  Rationale: `checkMany` is the current batch API and already shares subproblem work within a request. Routing it through repeated `checkCached` calls would lose that property by resolving consistency per pair unless a dedicated cached batch helper is added later.
+  Date: 2026-06-24
 
 
 ## Outcomes & Retrospective
 
-To be filled during and after implementation.
+Implemented EP-13 on 2026-06-24. `en-server` now parses `EN_OPTIMIZED_REVISION_CACHE_TTL_MS`, `EN_TUPLE_READ_CACHE_MAX_ENTRIES`, and `EN_DECISION_CACHE_MAX_ENTRIES`; missing values and `0` disable the corresponding cache, and malformed values fail startup. Startup logs report the resolved cache settings.
+
+The service allocates cache state once at startup. Optimized revision caching uses a persistent PostgreSQL cache handle, tuple-read caching interposes `cachedTupleStore` around the PostgreSQL tuple store, and decision caching selects cached `check` and cached `lookup` confirmation operations through `En.Servant.Seam.Env`. Servant JSON request and response shapes are unchanged.
+
+Validation passed with:
+
+```text
+nix develop -c cabal test all
+All test suites passed, including en-servant-tests.
+
+nix develop -c cabal build all
+Build completed successfully.
+```
+
+The Servant test suite now repeats cached `/check` and `/lookup` handler calls through the same cache environment and asserts decision-cache hits increase on the second request.
 
 
 ## Context and Orientation
@@ -133,8 +156,8 @@ Edit:
 Run:
 
 ```bash
-cabal build all
-cabal test all
+nix develop -c cabal build all
+nix develop -c cabal test all
 ```
 
 If `cabal test all` reports that some packages have no test suites, record that in this plan during implementation rather than treating it as a failure.

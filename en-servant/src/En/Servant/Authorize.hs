@@ -3,21 +3,15 @@ module En.Servant.Authorize (
     requirePermission,
 ) where
 
-import Effectful qualified
-import Effectful.Error.Static (Error)
 import Servant (Handler, err403, throwError)
 
-import En.Check (CheckDecision (..), check)
-import En.Effect.ConsistencyStore (ConsistencyStore)
-import En.Effect.TupleStore (TupleStore)
-import En.Error (EnError)
+import En.Check (CheckDecision (..))
 import En.Revision (Consistency)
 import En.Schema (RelationName)
 import En.Servant.Seam (Env (..), jsonError, runEngine)
 import En.Tuple (CaveatContext, ObjectRef, Subject)
 
 requirePermission ::
-    (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es) =>
     Env es ->
     Consistency ->
     CaveatContext ->
@@ -29,7 +23,7 @@ requirePermission env consistency context subject permission object = do
     decision <-
         runEngine
             env
-            ( check
+            ( env.checkOperation
                 env.graph
                 consistency
                 context

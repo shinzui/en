@@ -50,6 +50,7 @@ import En.Conformance.Kikan qualified as Kikan
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
+import En.Lookup qualified as Lookup
 import En.Reachability (compile)
 import En.Revision (Consistency (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
@@ -109,6 +110,8 @@ mkEnv cStore tStore =
     Env
         { runPorts = runEff . runErrorNoCallStack . tStore . cStore
         , graph = either (error . show) id (compile exampleSchema)
+        , checkOperation = check
+        , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
         , maxBatchSize = 400
         }
 
@@ -143,8 +146,8 @@ resolveSecret env subject secretId =
     resolveWithGate env subject (secretRef secretId) (DocumentView secretId)
 
 resolveWithGate :: Env ExampleEffects -> Subject -> ObjectRef -> DocumentView -> IO (Either ResolverError DocumentView)
-resolveWithGate Env{runPorts, graph} subject object result =
-    runPorts (check graph MinimizeLatency emptyContext subject (RelationName "view") object) >>= \case
+resolveWithGate Env{runPorts, graph, checkOperation} subject object result =
+    runPorts (checkOperation graph MinimizeLatency emptyContext subject (RelationName "view") object) >>= \case
         Right Allowed -> pure (Right result)
         Right Denied -> pure (Left ResolverForbidden)
         Right (Conditional _) -> pure (Left ResolverForbidden)

@@ -70,7 +70,7 @@ import Servant (
     type (:>),
  )
 
-import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..), check, checkMany)
+import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..), checkMany)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore, deleteTuples, writeTuples)
 import En.Error (EnError)
@@ -322,7 +322,7 @@ deleteTuplesHandler env request = do
     token <- runEngine env (deleteTuples tuples)
     pure (tokenToWire token)
 
-checkHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es) => Env es -> CheckRequestWire -> Handler CheckResponseWire
+checkHandler :: Env es -> CheckRequestWire -> Handler CheckResponseWire
 checkHandler env request = do
     consistency <- either400 (consistencyFromWire request.consistency)
     context <- either400 (contextFromWire request.context)
@@ -331,7 +331,7 @@ checkHandler env request = do
     decision <-
         runEngine
             env
-            ( check
+            ( env.checkOperation
                 env.graph
                 consistency
                 context
@@ -370,7 +370,7 @@ batchCheckHandler env request = do
                 )
             <*> objectRefFromWire wire.object
 
-lookupHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> LookupRequestWire -> Handler LookupPageWire
+lookupHandler :: (IOE Effectful.:> es) => Env es -> LookupRequestWire -> Handler LookupPageWire
 lookupHandler env request = do
     consistency <- either400 (consistencyFromWire request.consistency)
     context <- either400 (contextFromWire request.context)
@@ -379,7 +379,7 @@ lookupHandler env request = do
     page <-
         runEngine
             env
-            ( Lookup.lookupWithDeadline
+            ( env.lookupWithDeadlineOperation
                 deadline
                 env.graph
                 consistency

@@ -3,17 +3,23 @@ module Main (main) where
 import Control.Exception (bracket)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
-import Effectful (Eff, runEff)
-import Effectful.Error.Static (runErrorNoCallStack)
+import Data.Time (getCurrentTime)
+import Effectful (Eff, IOE, runEff)
+import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Network.Wai.Handler.Warp qualified as Warp
 import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
 
+import En.Cache (Cache, CacheConfig (..), SubproblemKey, TupleReadKey, newCache)
+import En.Check (CheckCacheEnv (..), CheckDecision, check, checkCached)
+import En.Effect.CachedTupleStore (cachedTupleStore)
+import En.Effect.TupleStore (TuplePage, TupleStore)
 import En.Error (EnError)
+import En.Lookup qualified as Lookup
 import En.Migrations (migrationsDir)
-import En.Postgres.Database (runDatabaseConnection)
-import En.Postgres.Revision (ConsistencyConfig (..), runConsistencyStorePostgres)
-import En.Postgres.TupleStore (runTupleStorePostgres)
+import En.Postgres.Database (Database, runDatabaseConnection)
+import En.Postgres.Revision (ConsistencyConfig (..), OptimizedRevisionCache, OptimizedRevisionConfig (..), newOptimizedRevisionCache, runConsistencyStorePostgres)
+import En.Postgres.TupleStore (runTupleStorePostgres, runTupleStorePostgresWithOptimizedRevisionCacheHandle)
 import En.Reachability (compile)
 import En.Revision (DatastoreId (..))
 import En.Schema (Schema, schemaHash)
@@ -28,6 +34,9 @@ main = do
     databaseUrl <- requiredEnv "EN_DATABASE_URL"
     port <- maybe 8080 parsePort <$> lookupEnv "EN_PORT"
     gcWindow <- maybe "24 hours" Text.pack <$> lookupEnv "EN_GC_WINDOW"
+    optimizedRevisionTtlMs <- optionalNonNegativeIntEnv "EN_OPTIMIZED_REVISION_CACHE_TTL_MS"
+    tupleReadMaxEntries <- optionalNonNegativeIntEnv "EN_TUPLE_READ_CACHE_MAX_ENTRIES"
+    decisionMaxEntries <- optionalNonNegativeIntEnv "EN_DECISION_CACHE_MAX_ENTRIES"
     graph <- either (fail . ("Invalid built-in demo schema: " <>) . show) pure (compile demoSchema)
     connection <-
         Connection.acquire (Settings.connectionString (Text.pack databaseUrl)) >>= \case
@@ -45,21 +54,80 @@ main = do
                 , schemaHash = schemaHash demoSchema
                 , gcWindow = gcWindow
                 }
+        optimizedRevisionConfig =
+            OptimizedRevisionConfig
+                { enabled = optimizedRevisionTtlMs > 0
+                , ttl = fromRational (toRational optimizedRevisionTtlMs / 1000)
+                }
+        tupleReadConfig =
+            CacheConfig
+                { enabled = tupleReadMaxEntries > 0
+                , maxEntries = tupleReadMaxEntries
+                }
+        decisionConfig =
+            CacheConfig
+                { enabled = decisionMaxEntries > 0
+                , maxEntries = decisionMaxEntries
+                }
+    optimizedRevisionCache <- newOptimizedRevisionCache optimizedRevisionConfig getCurrentTime
+    tupleReadCache <- newCache tupleReadConfig :: IO (Cache TupleReadKey TuplePage)
+    decisionCache <- newCache decisionConfig :: IO (Cache SubproblemKey CheckDecision)
+    let checkCacheEnv =
+            CheckCacheEnv
+                { cacheDatastoreId = config.datastoreId
+                , cacheDecisions = decisionCache
+                }
         runAppIO :: Eff AppEffects a -> IO (Either EnError a)
-        runAppIO =
+        runAppIO action =
             runEff
-                . runDatabaseConnection connection
-                . runErrorNoCallStack
-                . runTupleStorePostgres config
-                . runConsistencyStorePostgres config
+                ( runDatabaseConnection
+                    connection
+                    ( runErrorNoCallStack
+                        ( runTupleStoreLayer
+                            optimizedRevisionCache
+                            (tupleReadLayer tupleReadCache (runConsistencyStorePostgres config action))
+                        )
+                    )
+                )
+        runTupleStoreLayer ::
+            OptimizedRevisionCache ->
+            Eff (TupleStore : '[Error EnError, Database, IOE]) a ->
+            Eff '[Error EnError, Database, IOE] a
+        runTupleStoreLayer cache action
+            | optimizedRevisionConfig.enabled =
+                runTupleStorePostgresWithOptimizedRevisionCacheHandle config cache action
+            | otherwise =
+                runTupleStorePostgres config action
+        tupleReadLayer ::
+            Cache TupleReadKey TuplePage ->
+            Eff '[TupleStore, Error EnError, Database, IOE] a ->
+            Eff '[TupleStore, Error EnError, Database, IOE] a
+        tupleReadLayer cache action
+            | tupleReadConfig.enabled = cachedTupleStore cache action
+            | otherwise = action
+        checkOperation graph' consistency context subject relation object
+            | decisionConfig.enabled =
+                checkCached checkCacheEnv graph' consistency context subject relation object
+            | otherwise =
+                check graph' consistency context subject relation object
+        lookupWithDeadlineOperation deadline graph' consistency request
+            | decisionConfig.enabled =
+                Lookup.lookupWithDeadlineCached checkCacheEnv deadline graph' consistency request
+            | otherwise =
+                Lookup.lookupWithDeadline deadline graph' consistency request
         serverEnv =
             Env
                 { runPorts = runAppIO
                 , graph
+                , checkOperation
+                , lookupWithDeadlineOperation
                 , maxBatchSize = 1000
                 }
     Text.putStrLn ("en-server listening on :" <> Text.pack (show port))
     Text.putStrLn ("Using built-in demo schema; run migrations from " <> Text.pack migrationsDir <> " before writes.")
+    Text.putStrLn ("Optimized revision cache: " <> describeMillisCache optimizedRevisionTtlMs)
+    Text.putStrLn ("Tuple-read cache: " <> describeEntryCache tupleReadMaxEntries)
+    Text.putStrLn ("Decision cache: " <> describeEntryCache decisionMaxEntries)
     bracket (pure connection) Connection.release \_ ->
         Warp.run port (app serverEnv)
 
@@ -80,6 +148,26 @@ parsePort value =
     case readMaybe value of
         Just port | port > 0 -> port
         _ -> 8080
+
+optionalNonNegativeIntEnv :: String -> IO Int
+optionalNonNegativeIntEnv name =
+    lookupEnv name >>= \case
+        Nothing -> pure 0
+        Just "" -> fail ("Invalid " <> name <> ": expected a non-negative integer")
+        Just value ->
+            case readMaybe value of
+                Just parsed | parsed >= 0 -> pure parsed
+                _ -> fail ("Invalid " <> name <> ": expected a non-negative integer")
+
+describeMillisCache :: Int -> Text.Text
+describeMillisCache ttlMs
+    | ttlMs <= 0 = "disabled"
+    | otherwise = "enabled, ttlMs=" <> Text.pack (show ttlMs)
+
+describeEntryCache :: Int -> Text.Text
+describeEntryCache maxEntries
+    | maxEntries <= 0 = "disabled"
+    | otherwise = "enabled, maxEntries=" <> Text.pack (show maxEntries)
 
 demoSchema :: Schema
 demoSchema =

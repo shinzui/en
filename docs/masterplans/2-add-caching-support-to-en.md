@@ -39,7 +39,7 @@ An alternative single large plan was rejected because it would couple revision s
 | EP-10 | Add core cache interfaces and configuration | docs/plans/10-add-core-cache-interfaces-and-configuration.md | None | EP-9 | Complete |
 | EP-12 | Implement tuple read caching | docs/plans/12-implement-tuple-read-caching.md | EP-10 | EP-9 | Complete |
 | EP-11 | Implement authorization decision caching | docs/plans/11-implement-authorization-decision-caching.md | EP-10 | EP-12 | Complete |
-| EP-13 | Wire caching into service operations and validation | docs/plans/13-wire-caching-into-service-operations-and-validation.md | EP-9, EP-10, EP-11, EP-12 | None | Not Started |
+| EP-13 | Wire caching into service operations and validation | docs/plans/13-wire-caching-into-service-operations-and-validation.md | EP-9, EP-10, EP-11, EP-12 | None | Complete |
 
 **Cross-MasterPlan ordering (decided 2026-06-23).** MasterPlan 3 (en hardening) is implemented **in full
 before** this MasterPlan. That order satisfies both hard cross-MasterPlan prerequisites naturally — **EP-9
@@ -136,8 +136,8 @@ the soft, gracefully-degrading EP-11→EP-19 efficiency upgrade.
 - [x] EP-12: Prove repeated tuple reads at the same revision hit cache and reads at different revisions miss.
 - [x] EP-11: Add decision/subproblem caching for forward `check` and lookup confirmation checks.
 - [x] EP-11: Prove repeated authorization checks reuse cached subproblems without changing `Allowed`, `Denied`, or `Conditional` results.
-- [ ] EP-13: Wire cache configuration into `en-server` and embedded-library examples.
-- [ ] EP-13: Update production docs and run full build/test validation with cache-enabled scenarios.
+- [x] EP-13: Wire cache configuration into `en-server` and embedded-library examples.
+- [x] EP-13: Update production docs and run full build/test validation with cache-enabled scenarios.
 
 
 ## Surprises & Discoveries
@@ -166,6 +166,8 @@ the soft, gracefully-degrading EP-11→EP-19 efficiency upgrade.
 - EP-10 preserved the current `Revision` invariant: `en-core/src/En/Revision.hs` intentionally has no global `Ord Revision` because revisions are semantically partially ordered. The cache key types in `En.Cache` therefore define local `Ord` instances that compare `revisionEncoding` only as an opaque identity component for `Map` storage. _(2026-06-24)_
 - EP-12 also had to adapt to the post-planning effectful migration. The tuple-read cache is an `interpose`/`passthrough` transformer over an existing `TupleStore` handler rather than a record wrapper; this keeps PostgreSQL, in-memory, and test interpreters reusable while caching only read pages. _(2026-06-24)_
 - EP-11 reused the existing `checkMany` memoized evaluator as the cross-request cache insertion point. Lookup integration stayed additive by threading an internal confirmation-check function through traversal: uncached lookup supplies `check`, while `lookupCached` supplies `checkCached`. _(2026-06-24)_
+- EP-13 found that the EP-9 convenience PostgreSQL interpreter allocated its optimized-revision cache per interpreter run. Since `en-server` calls `runPorts` per HTTP request, EP-13 added a cache-handle interpreter so optimized revision cache state is allocated once at startup and reused across requests. _(2026-06-24)_
+- EP-13 kept `/batch-check` on `checkMany`: it preserves one consistency resolution and within-request subproblem sharing, while optimized-revision and tuple-read caches still apply underneath. A future dedicated cached batch helper would be needed before batch decisions also use the cross-request decision cache. _(2026-06-24)_
 
 
 ## Decision Log
@@ -218,6 +220,8 @@ EP-12 is complete. `en-core` now exposes `En.Effect.CachedTupleStore.cachedTuple
 
 EP-11 is complete. `en-core` now exposes `En.Check.checkCached`, `En.Check.CheckCacheEnv`, `En.Lookup.lookupCached`, and `En.Lookup.lookupWithDeadlineCached`. Decision cache keys include datastore id, schema hash, resolved revision, subject, relation, object, and caveat context. Focused tests prove allowed, denied, and conditional decision reuse, context/revision/schema separation, and cached lookup confirmation hits; `nix develop -c cabal test en-core-interface-tests` and `nix develop -c cabal build all` pass as of 2026-06-24T00:21:55Z.
 
+EP-13 is complete. `en-server` now parses `EN_OPTIMIZED_REVISION_CACHE_TTL_MS`, `EN_TUPLE_READ_CACHE_MAX_ENTRIES`, and `EN_DECISION_CACHE_MAX_ENTRIES`; missing values and `0` disable the corresponding cache, and startup logs report active settings. Servant's environment now carries explicit check and lookup operation hooks so the HTTP API shape stays unchanged while the server can choose cached `check` and cached `lookup` confirmations. Tuple-read caching interposes under the service, optimized revision caching uses a persistent startup-allocated cache handle, and the production guide documents safety, limitations, and knobs. `nix develop -c cabal test all` and `nix develop -c cabal build all` pass as of 2026-06-24T00:40:46Z.
+
 
 ---
 
@@ -245,3 +249,7 @@ EP-9, EP-11, and EP-13 for self-containment. No scope was added to this MasterPl
 **Revision note (2026-06-24).** Reconciled the EP-13 validation guidance with the implemented state of
 MasterPlan 3. EP-17's benchmark harness is now documented as already available, while remaining optional
 because EP-13 can still satisfy acceptance with focused counting-store transcripts.
+
+**Revision note (2026-06-24, completion).** Completed EP-13 and therefore the caching MasterPlan.
+The service now wires all cache layers through startup configuration, Servant operation hooks, persistent
+cache state, production documentation, and cache-hit Servant validation.

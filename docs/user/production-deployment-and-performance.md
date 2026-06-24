@@ -67,7 +67,7 @@ provide their own executable that:
 
 - Imports the production schema.
 - Compiles and validates it at startup.
-- Constructs `postgresTupleStoreIO` and `postgresConsistencyStore`.
+- Constructs the PostgreSQL `TupleStore` and `ConsistencyStore` interpreters.
 - Exposes `En.Servant.API` handlers.
 - Applies service-local authentication, request limits, logging, metrics, and
   timeouts.
@@ -253,9 +253,9 @@ indexes.
 When a UI or API already has a bounded page of candidate objects, batch checks
 are preferable to many single checks.
 
-`en` currently exposes single `check` and `lookup` operations. If a workload
-needs repeated checks for tables, dashboards, or mixed object pages, add a
-`checkMany` operation rather than issuing many independent service calls.
+`en` exposes single `check`, `lookup`, and `batch-check` operations. If a
+workload needs repeated checks for tables, dashboards, or mixed object pages,
+prefer `batch-check` over many independent service calls.
 
 A production `checkMany` should:
 
@@ -272,11 +272,28 @@ to their original correlation ids.
 
 ## Caching
 
-The current `en` libraries expose consistency and revision boundaries but do
-not yet ship a production decision cache. If you add one, keep the cache keyed
-by the resolved revision and the subproblem being answered.
+`en` ships bounded in-process caches for three layers:
 
-A practical cache key includes:
+- Optimized revision cache: shares the `MinimizeLatency` revision for a bounded
+  time window.
+- Tuple-read cache: caches object-relation and reverse-userset read pages at a
+  resolved revision.
+- Decision/subproblem cache: caches repeated `check` work and `lookup`
+  confirmation checks at a resolved revision.
+
+The standalone `en-server` enables these caches with environment variables.
+Missing values and `0` disable the cache.
+
+| Variable | Meaning |
+| --- | --- |
+| `EN_OPTIMIZED_REVISION_CACHE_TTL_MS` | Positive TTL in milliseconds for sharing optimized revisions. |
+| `EN_TUPLE_READ_CACHE_MAX_ENTRIES` | Maximum tuple-read cache entries. |
+| `EN_DECISION_CACHE_MAX_ENTRIES` | Maximum decision/subproblem cache entries for `/check` and `/lookup` confirmations. |
+
+Malformed cache values fail startup. At startup, `en-server` logs whether each
+cache is disabled or enabled and its configured size/window.
+
+Decision cache keys include:
 
 - Datastore id.
 - Schema hash.
@@ -286,22 +303,32 @@ A practical cache key includes:
 - Object.
 - Caveat context that affects the answer.
 
-Cache entries must not outlive the revision or schema assumptions that made
-them correct. A decision computed at one schema hash must not be reused under
-another schema hash.
+Tuple-read cache keys include the resolved revision and the read shape. Cache
+entries must not outlive the revision or schema assumptions that made them
+correct. A decision computed at one schema hash must not be reused under another
+schema hash.
 
-Cache at two levels:
+`FullyConsistent` still resolves the current head revision. `AtLeastAsFresh`
+first resolves a revision that satisfies the supplied token; cache reuse only
+happens after that resolution and only for the resolved revision. Cache settings
+therefore affect latency and memory, not authorization semantics.
 
-- Decision/subproblem cache: repeated `check` work at the same revision.
-- Tuple-read cache: repeated object-relation and reverse reads at the same
-  revision.
+The caches are per process and per service instance. There is no distributed
+invalidation, distributed cache, Watch API, or materialized authorization index
+in this repository yet. Load balancing affects hit rate; a small, stable pool
+of larger instances can have better cache behavior than a large pool of tiny
+instances.
 
-In a dedicated service, in-memory caches are usually enough to start. They are
-per process, so load balancing affects hit rate. A small, stable pool of larger
-instances can have better cache behavior than a large pool of tiny instances.
+The `/batch-check` endpoint uses `checkMany`, which resolves consistency once
+and shares subproblem work within the request. It does not yet use the
+cross-request decision cache directly. It still benefits from the optimized
+revision and tuple-read caches when those are enabled.
 
 If using embedded mode, cache ownership belongs to the host service. Be careful
-not to create subtly different cache semantics in every caller.
+not to create subtly different cache semantics in every caller. The library
+exposes cache statistics for embedded instrumentation; the standalone server
+currently logs cache configuration at startup but does not expose a metrics
+endpoint.
 
 ## Materialized Authorization Indexes
 

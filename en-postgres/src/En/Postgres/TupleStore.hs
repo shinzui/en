@@ -7,6 +7,7 @@
 module En.Postgres.TupleStore (
     runTupleStorePostgres,
     runTupleStorePostgresWithOptimizedRevisionCache,
+    runTupleStorePostgresWithOptimizedRevisionCacheHandle,
     reapDeletedTuplesSession,
 ) where
 
@@ -93,6 +94,15 @@ runTupleStorePostgresWithOptimizedRevisionCache ::
 runTupleStorePostgresWithOptimizedRevisionCache config optimizedConfig action = do
     cache <- liftIO (newOptimizedRevisionCache optimizedConfig getCurrentTime)
     interpretTupleStorePostgres config (cachedOptimizedRevision cache) action
+
+runTupleStorePostgresWithOptimizedRevisionCacheHandle ::
+    (Database :> es, IOE :> es, Error EnError :> es) =>
+    ConsistencyConfig ->
+    OptimizedRevisionCache ->
+    Eff (TupleStore : es) a ->
+    Eff es a
+runTupleStorePostgresWithOptimizedRevisionCacheHandle config cache =
+    interpretTupleStorePostgres config (cachedOptimizedRevision cache)
 
 interpretTupleStorePostgres ::
     (Database :> es, Error EnError :> es) =>

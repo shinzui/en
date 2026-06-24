@@ -21,17 +21,24 @@ import Effectful.Error.Static (Error)
 import GHC.Generics (Generic)
 import Servant (Handler, ServerError (..), err500, throwError)
 
+import En.Check (CheckDecision)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError)
+import En.Lookup qualified as Lookup
 import En.Postgres.Database (Database)
 import En.Reachability (ReachabilityGraph)
+import En.Revision (Consistency)
+import En.Schema (RelationName)
+import En.Tuple (CaveatContext, ObjectRef, Subject)
 
 type AppEffects = '[ConsistencyStore, TupleStore, Error EnError, Database, IOE]
 
 data Env es = Env
     { runPorts :: !(forall a. Eff es a -> IO (Either EnError a))
     , graph :: !ReachabilityGraph
+    , checkOperation :: !(ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckDecision)
+    , lookupWithDeadlineOperation :: !(Lookup.Deadline (Eff es) -> ReachabilityGraph -> Consistency -> Lookup.LookupRequest -> Eff es Lookup.LookupPage)
     , maxBatchSize :: !Int
     }
 
