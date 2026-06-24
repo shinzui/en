@@ -1,6 +1,6 @@
 module Main (main) where
 
-import Control.Exception (bracket)
+import Control.Exception (IOException, bracket, try)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Data.Time (getCurrentTime)
@@ -21,9 +21,10 @@ import En.Postgres.Database (Database, runDatabaseConnection)
 import En.Postgres.Revision (ConsistencyConfig (..), OptimizedRevisionCache, OptimizedRevisionConfig (..), newOptimizedRevisionCache, runConsistencyStorePostgres)
 import En.Postgres.TupleStore (runTupleStorePostgres, runTupleStorePostgresWithOptimizedRevisionCacheHandle)
 import En.Reachability (compile)
-import En.Revision (DatastoreId (..))
+import En.Revision (DatastoreId (..), SchemaHash (..))
 import En.Schema (Schema, schemaHash, validateSchema)
 import En.Schema.Builder qualified as Schema
+import En.Schema.Parse (parseSchema)
 import En.Servant.API (app)
 import En.Servant.Seam (AppEffects, Env (..))
 import Hasql.Connection qualified as Connection
@@ -37,8 +38,12 @@ main = do
     optimizedRevisionTtlMs <- optionalNonNegativeIntEnv "EN_OPTIMIZED_REVISION_CACHE_TTL_MS"
     tupleReadMaxEntries <- optionalNonNegativeIntEnv "EN_TUPLE_READ_CACHE_MAX_ENTRIES"
     decisionMaxEntries <- optionalNonNegativeIntEnv "EN_DECISION_CACHE_MAX_ENTRIES"
-    validSchema <- either (fail . ("Invalid built-in demo schema: " <>) . show) pure (validateSchema demoSchema)
-    let graph = compile validSchema
+    (schemaSource, rawSchema) <- loadSchema
+    validSchema <- either (fail . ("Invalid schema: " <>) . show) pure (validateSchema rawSchema)
+    let activeSchemaHash = schemaHash validSchema
+        graph = compile validSchema
+    logSchemaSource schemaSource
+    Text.putStrLn ("Schema hash: " <> renderSchemaHash activeSchemaHash)
     connection <-
         Connection.acquire (Settings.connectionString (Text.pack databaseUrl)) >>= \case
             Right value -> pure value
@@ -52,7 +57,7 @@ main = do
     let config =
             ConsistencyConfig
                 { datastoreId = DatastoreId "en-server"
-                , schemaHash = schemaHash validSchema
+                , schemaHash = activeSchemaHash
                 , gcWindow = gcWindow
                 }
         optimizedRevisionConfig =
@@ -125,12 +130,52 @@ main = do
                 , maxBatchSize = 1000
                 }
     Text.putStrLn ("en-server listening on :" <> Text.pack (show port))
-    Text.putStrLn ("Using built-in demo schema; run migrations from " <> Text.pack migrationsDir <> " before writes.")
     Text.putStrLn ("Optimized revision cache: " <> describeMillisCache optimizedRevisionTtlMs)
     Text.putStrLn ("Tuple-read cache: " <> describeEntryCache tupleReadMaxEntries)
     Text.putStrLn ("Decision cache: " <> describeEntryCache decisionMaxEntries)
     bracket (pure connection) Connection.release \_ ->
         Warp.run port (app serverEnv)
+
+data SchemaSource
+    = BuiltInDemoSchema
+    | SchemaFile FilePath
+
+loadSchema :: IO (SchemaSource, Schema)
+loadSchema =
+    lookupEnv "EN_SCHEMA_PATH" >>= \case
+        Nothing -> do
+            Text.putStrLn "WARNING: EN_SCHEMA_PATH not set; serving the built-in demo schema. Set EN_SCHEMA_PATH=/path/to/schema.en to serve your own model."
+            pure (BuiltInDemoSchema, demoSchema)
+        Just "" ->
+            fail "Invalid EN_SCHEMA_PATH: expected a non-empty schema file path."
+        Just path -> do
+            readResult <- try (Text.readFile path) :: IO (Either IOException Text.Text)
+            contents <-
+                case readResult of
+                    Right value -> pure value
+                    Left err ->
+                        fail $
+                            "Could not read schema file from EN_SCHEMA_PATH="
+                                <> path
+                                <> ": "
+                                <> show err
+            case parseSchema contents of
+                Left err ->
+                    fail $
+                        "Failed to parse schema from EN_SCHEMA_PATH="
+                            <> path
+                            <> ": "
+                            <> show err
+                Right parsed ->
+                    pure (SchemaFile path, parsed)
+
+logSchemaSource :: SchemaSource -> IO ()
+logSchemaSource =
+    \case
+        BuiltInDemoSchema ->
+            Text.putStrLn ("Using built-in demo schema; run migrations from " <> Text.pack migrationsDir <> " before writes.")
+        SchemaFile path ->
+            Text.putStrLn ("Loaded schema from " <> Text.pack path)
 
 requiredEnv :: String -> IO String
 requiredEnv name =
@@ -169,6 +214,10 @@ describeEntryCache :: Int -> Text.Text
 describeEntryCache maxEntries
     | maxEntries <= 0 = "disabled"
     | otherwise = "enabled, maxEntries=" <> Text.pack (show maxEntries)
+
+renderSchemaHash :: SchemaHash -> Text.Text
+renderSchemaHash (SchemaHash value) =
+    value
 
 demoSchema :: Schema
 demoSchema =

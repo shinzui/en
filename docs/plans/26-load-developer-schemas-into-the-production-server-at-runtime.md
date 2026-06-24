@@ -78,7 +78,7 @@ This section must always reflect the actual current state of the work.
 - [x] 2026-06-24T18:31:19Z: M1: Promote the text parser into a public runtime module `En.Schema.Parse` with
   signature `parseSchema :: Text -> Either EnError Schema`; refactor `En.Schema.TH` to call
   it; add parser unit tests. (No behavior change for the quasi-quoter.)
-- [ ] M2: Add a runtime schema-file loader and wire `EN_SCHEMA_PATH` into `en-server`,
+- [x] 2026-06-24T18:34:57Z: M2: Add a runtime schema-file loader and wire `EN_SCHEMA_PATH` into `en-server`,
   replacing the hard-coded `demoSchema` when the variable is set; fail closed on
   missing/malformed/invalid files; log the loaded path and schema hash.
 - [ ] M3: Extend the parser to intersection (`&`) and exclusion (`but not`) permission
@@ -177,6 +177,16 @@ Compare the result against the original purpose.
   `en-core`, `En.Schema.TH` delegates to it, and `en-core/test/Main.hs` now exercises valid
   parsing, syntax failures, and schema-assembly failures directly. Validation passed with
   `cabal build en-core` and `cabal test en-core`.
+
+- 2026-06-24T18:34:57Z: M2 completed. `en-server/app/Main.hs` now reads
+  `EN_SCHEMA_PATH`, parses the file with `En.Schema.Parse.parseSchema`, validates the resulting
+  schema, logs the source and schema hash, and fails startup on read or parse errors. Validation
+  passed with `cabal build en-server`; `EN_SCHEMA_PATH=/tmp/en-blog-schema-smoke.en` logged
+  `Loaded schema from /tmp/en-blog-schema-smoke.en` and `Schema hash:
+  fnv1a64:1061a4beb2d5506c` before an intentionally unreachable database failed; a missing
+  schema path exited non-zero with an error naming `EN_SCHEMA_PATH`; and the unset fallback
+  printed the demo-schema warning plus hash. Full HTTP `POST /check` verification still requires
+  a live PostgreSQL database with migrations applied.
 
 
 ## Context and Orientation
