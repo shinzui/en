@@ -21,16 +21,18 @@ This plan adds the shared cache vocabulary that later tuple-read and decision ca
 
 ## Progress
 
-- [ ] Add `En.Cache` with bounded cache operations, configuration, and stats.
-- [ ] Add cache key types for tuple reads and authorization decisions.
-- [ ] Expose the module from `en-core/en-core.cabal`.
-- [ ] Add `en-core` tests for hits, misses, eviction, and key separation.
-- [ ] Run `cabal test en-core-interface-tests` and `cabal build all`.
+- [x] Reconcile EP-10 with current `Revision` ordering semantics before implementation. Completed 2026-06-23T23:59:54Z.
+- [x] Add `En.Cache` with bounded cache operations, configuration, and stats. Completed 2026-06-24T00:05:35Z.
+- [x] Add cache key types for tuple reads and authorization decisions. Completed 2026-06-24T00:05:35Z.
+- [x] Expose the module from `en-core/en-core.cabal`. Completed 2026-06-24T00:05:35Z.
+- [x] Add `en-core` tests for hits, misses, eviction, and key separation. Completed 2026-06-24T00:05:35Z.
+- [x] Run `nix develop -c cabal test en-core-interface-tests` and `nix develop -c cabal build all`. Completed 2026-06-24T00:05:35Z.
 
 
 ## Surprises & Discoveries
 
-None yet.
+- `Revision` deliberately has no global `Ord` instance in `en-core/src/En/Revision.hs` because datastore revisions form a partial order. Cache key types still need deterministic `Map` ordering, so EP-10 should avoid adding `Ord Revision` and instead implement local `Ord` instances for cache keys that compare `revisionEncoding` only as opaque identity bytes. This preserves the semantic invariant while allowing in-process maps. _(2026-06-23)_
+- Exporting cache key record fields as normal selectors collided with the existing `En.Schema.schemaHash` function in the interface tests. `En.Cache` now uses `NoFieldSelectors`, so callers can construct and update keys without exporting selector functions that pollute importing modules. _(2026-06-24)_
 
 
 ## Decision Log
@@ -41,18 +43,33 @@ None yet.
 - Decision: Use a bounded in-process cache first.
   Rationale: The current production target is one organization on PostgreSQL. Revision-keyed in-process caches are easier to prove correct than distributed invalidation.
   Date: 2026-06-23
+- Decision: Do not add a global `Ord` instance to `Revision`.
+  Rationale: `Revision` represents datastore snapshots with a partial freshness order, and `En.Revision` intentionally withholds `Ord` to prevent accidental semantic ordering. The cache only needs a deterministic map key, so `En.Cache` key types will compare `revisionEncoding` locally as an opaque identity component.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
 
-To be filled during and after implementation.
+Implemented EP-10 on 2026-06-24. `en-core/src/En/Cache.hs` now exposes a bounded in-process cache, `CacheConfig`, `CacheStats`, and shared `TupleReadKey`, `DecisionKey`, and `SubproblemKey` types. The cache records misses even when disabled, records hits/inserts/evictions when enabled, and evicts the oldest inserted entries when `maxEntries` is exceeded. `en-core/en-core.cabal` exposes the module.
+
+Validation passed with:
+
+```text
+nix develop -c cabal test en-core-interface-tests
+Test suite en-core-interface-tests: PASS
+
+nix develop -c cabal build all
+Build completed successfully.
+```
+
+The implementation preserves the absence of a global `Ord Revision` instance; the cache key `Ord` instances compare `revisionEncoding` locally only as an opaque map-key component.
 
 
 ## Context and Orientation
 
 `en-core` currently has no cache module. It defines authorization data in `en-core/src/En/Tuple.hs`, schema identity in `en-core/src/En/Schema.hs`, revisions and consistency tokens in `en-core/src/En/Revision.hs`, and store reads in `en-core/src/En/Effect/TupleStore.hs`.
 
-The types already derive enough ordering for deterministic `Map` keys: `ObjectRef`, `Subject`, `Tuple`, `TupleCaveat`, and `CaveatContext` derive `Ord`; `Revision`, `DatastoreId`, and `SchemaHash` currently derive `Eq` and `Show`, while `DatastoreId` and `SchemaHash` derive `Ord`. If `Revision` is used inside `Map` keys, add `Ord` deriving to `Revision` in `en-core/src/En/Revision.hs`; its encoding is opaque but stable enough for equality and map ordering within a process.
+The types already derive enough ordering for deterministic `Map` keys: `ObjectRef`, `Subject`, `Tuple`, `TupleCaveat`, `CaveatContext`, `DatastoreId`, and `SchemaHash` derive `Ord`. `Revision` intentionally derives only `Eq` and `Show`, because revisions have a partial semantic order. Do not add a global `Ord Revision` instance. Instead, write explicit `Ord` instances for `TupleReadKey`, `DecisionKey`, and `SubproblemKey` that compare `revisionEncoding` locally as an opaque identity component.
 
 The new production guide at `docs/user/production-deployment-and-performance.md` already states the desired key shape: datastore id, schema hash, resolved revision, subject, permission or relation, object, and caveat context that affects the answer.
 
@@ -180,3 +197,8 @@ The cache module is additive. If a test split creates Cabal configuration issues
 Use only existing dependencies already available to `en-core`: `base`, `containers`, `text`, `time`, and `unordered-containers` if needed. Prefer `Data.Map.Strict` so key ordering is explicit and deterministic.
 
 At completion, later plans can import `En.Cache` to create bounded caches for tuple pages and authorization decisions. The module must not depend on Servant, Hasql, Warp, or PostgreSQL.
+
+
+---
+
+**Revision note (2026-06-24).** Reconciled EP-10 with the current `Revision` invariant before implementation and then completed the plan. The plan now preserves the absence of a global `Ord Revision` instance, uses local cache-key ordering by opaque `revisionEncoding`, and records the passing Nix-shell validation commands.

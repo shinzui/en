@@ -16,6 +16,17 @@ import Effectful (Eff, IOE, liftIO, runEff)
 import Effectful.Dispatch.Dynamic (interpret_)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 
+import En.Cache (
+    Cache,
+    CacheConfig (..),
+    CacheStats (..),
+    DecisionKey (..),
+    TupleReadKey (..),
+    cacheStats,
+    insertCache,
+    lookupCache,
+    newCache,
+ )
 import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..))
 import En.Check qualified as Check
 import En.Conformance.Kikan
@@ -96,6 +107,7 @@ main = do
         _ = sampleExpandRequest
         _ = sampleExpandTree
         _ = sampleCaveatDefinition
+    testCacheOperations
     assertEqual "kikan-shaped fixture validates" (Right ()) (validate kikanSchema)
     assertEqual "builder schema equals manual schema" kikanSchemaManual kikanSchema
     assertEqual "builder schema hash matches manual schema hash" (schemaHash kikanSchemaManual) (schemaHash kikanSchema)
@@ -320,6 +332,56 @@ sampleCaveatDefinition =
                     (OperandParam FromContext (CaveatParameterName "current_time"))
                     (OperandParam FromPayload (CaveatParameterName "until"))
                 ]
+        }
+
+testCacheOperations :: IO ()
+testCacheOperations = do
+    cache <- newCache CacheConfig{enabled = True, maxEntries = 2} :: IO (Cache Text Int)
+    assertEqual "cache miss returns Nothing" Nothing =<< lookupCache cache "missing"
+    insertCache cache "a" 1
+    assertEqual "cache hit returns inserted value" (Just 1) =<< lookupCache cache "a"
+    insertCache cache "b" 2
+    insertCache cache "c" 3
+    assertEqual "bounded cache evicts oldest entry" Nothing =<< lookupCache cache "a"
+    assertEqual
+        "cache stats count hits, misses, inserts, and evictions"
+        CacheStats{hits = 1, misses = 2, inserts = 3, evictions = 1}
+        =<< cacheStats cache
+
+    disabledCache <- newCache CacheConfig{enabled = False, maxEntries = 2} :: IO (Cache Text Int)
+    insertCache disabledCache "a" 1
+    assertEqual "disabled cache always misses" Nothing =<< lookupCache disabledCache "a"
+    assertEqual
+        "disabled cache records misses but not inserts"
+        CacheStats{hits = 0, misses = 1, inserts = 0, evictions = 0}
+        =<< cacheStats disabledCache
+
+    decisionCache <- newCache CacheConfig{enabled = True, maxEntries = 10} :: IO (Cache DecisionKey Text)
+    let baseKey = sampleDecisionKey
+    insertCache decisionCache baseKey "cached"
+    assertEqual "decision cache hits identical key" (Just "cached") =<< lookupCache decisionCache baseKey
+    assertEqual "decision key separates schema hash" Nothing =<< lookupCache decisionCache (sampleDecisionKeyWith (SchemaHash "schema:other") testRevision requestContext)
+    assertEqual "decision key separates revision" Nothing =<< lookupCache decisionCache (sampleDecisionKeyWith (SchemaHash "schema:kikan") (Revision "revision:other") requestContext)
+    assertEqual "decision key separates caveat context" Nothing =<< lookupCache decisionCache (sampleDecisionKeyWith (SchemaHash "schema:kikan") testRevision adminContext)
+
+    let objectKey = ObjectRelationReadKey (Revision "r1") space (RelationName "view") 10 Nothing
+    assertBool "tuple read key separates cursor" (objectKey /= ObjectRelationReadKey (Revision "r1") space (RelationName "view") 10 (Just (StoreCursor "after")))
+    assertBool "tuple read key separates read shape" (objectKey /= StartingWithUserReadKey (Revision "r1") sampleUsersetQuery)
+
+sampleDecisionKey :: DecisionKey
+sampleDecisionKey =
+    sampleDecisionKeyWith (SchemaHash "schema:kikan") testRevision requestContext
+
+sampleDecisionKeyWith :: SchemaHash -> Revision -> CaveatContext -> DecisionKey
+sampleDecisionKeyWith keySchemaHash keyRevision keyContext =
+    DecisionKey
+        { datastoreId = DatastoreId "primary"
+        , schemaHash = keySchemaHash
+        , revision = keyRevision
+        , subject = SubjectId user
+        , permission = RelationName "view"
+        , object = space
+        , context = keyContext
         }
 
 lookupRequest :: Subject -> RelationName -> ObjectType -> CaveatContext -> LookupLimit -> Maybe LookupCursor -> LookupRequest
