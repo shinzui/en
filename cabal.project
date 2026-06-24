@@ -8,12 +8,11 @@ packages:
     en-server
     en-client
     en-example
-    /Users/shinzui/Keikaku/bokuno/ephemeral-pg-project/ephemeral-pg
 
 -- ============================================================
--- DEPENDENCY OVERRIDES — each milestone appends its own block; none rewrites another's.
--- ephemeral-pg is a local Mori-registered package used by en-postgres integration tests.
+-- DEPENDENCY VERSION PINS — use Hackage packages, not local checkouts.
 -- ============================================================
 
--- EP-17: tasty-bench for the en-core regression benchmark suite.
-packages: /Users/shinzui/Keikaku/hub/haskell/tasty-bench-project/tasty-bench
+constraints:
+    ephemeral-pg ==0.2.1.0,
+    tasty-bench ==0.5
