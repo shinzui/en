@@ -75,7 +75,7 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Promote the text parser into a public runtime module `En.Schema.Parse` with
+- [x] 2026-06-24T18:31:19Z: M1: Promote the text parser into a public runtime module `En.Schema.Parse` with
   signature `parseSchema :: Text -> Either EnError Schema`; refactor `En.Schema.TH` to call
   it; add parser unit tests. (No behavior change for the quasi-quoter.)
 - [ ] M2: Add a runtime schema-file loader and wire `EN_SCHEMA_PATH` into `en-server`,
@@ -83,8 +83,9 @@ This section must always reflect the actual current state of the work.
   missing/malformed/invalid files; log the loaded path and schema hash.
 - [ ] M3: Extend the parser to intersection (`&`) and exclusion (`but not`) permission
   rewrites; add round-trip/coverage tests proving parity with the `En.Schema.Builder` output.
-- [ ] M4: Extend the parser to caveat definitions and caveated rewrites (`with`); add
-  coverage tests proving every `CaveatPredicate` shape parses.
+- [ ] M4: Extend the parser to caveat definitions and caveated rewrites (`with`), using
+  explicit `context.<name>` and `payload.<name>` operand syntax; add coverage tests proving
+  every `CaveatPredicate` shape parses and validates.
 - [ ] M5: Update `docs/user/production-deployment-and-performance.md`,
   `docs/user/getting-started.md`, and `docs/user/service-and-operations.md` to document the
   runtime schema-loading workflow and remove the "fork the executable" instruction.
@@ -143,6 +144,27 @@ Record every decision made while working on the plan.
   added deliberately as its own change with an explicit versioning policy.
   Date: 2026-06-24
 
+- Decision: Caveat parameter declarations in the text DSL declare only parameter names and
+  types; caveat predicates choose the value source at each operand with `context.<name>` or
+  `payload.<name>`.
+  Rationale: This matches the existing data model. `CaveatDefinition.parameters` stores a map
+  from parameter name to `CaveatParameterType` only; the source is not a property of the
+  parameter declaration. The source lives on each `CaveatOperand` as `OperandParam FromContext`
+  or `OperandParam FromPayload`, and the builder exposes that as `ctxParam` and `payloadParam`.
+  Requiring the source prefix at the operand site avoids a misleading declaration syntax and
+  makes tuple-payload-dependent caveats visibly different from request-context-dependent caveats.
+  Date: 2026-06-24
+
+- Decision: Keep tuple-local caveat payloads out of the schema-file DSL; schema files declare
+  caveat definitions and schema-level `with` rewrites only.
+  Rationale: Tuple caveat payloads are relationship data supplied through `TupleCaveat` on writes,
+  not schema structure. The engine evaluates a schema-level `Caveated` rewrite with an empty
+  `CaveatPayload`, while it evaluates a tuple caveat with the payload stored on that tuple.
+  Documentation and tests must therefore demonstrate both paths separately: a context-only
+  schema-level `with` caveat, and a direct tuple relation with a tuple-local payload caveat
+  supplied through the write API.
+  Date: 2026-06-24
+
 
 ## Outcomes & Retrospective
 
@@ -150,6 +172,11 @@ Summarize outcomes, gaps, and lessons learned at major milestones or at completi
 Compare the result against the original purpose.
 
 (To be filled during and after implementation.)
+
+- 2026-06-24T18:31:19Z: M1 completed. `En.Schema.Parse.parseSchema` is exposed from
+  `en-core`, `En.Schema.TH` delegates to it, and `en-core/test/Main.hs` now exercises valid
+  parsing, syntax failures, and schema-assembly failures directly. Validation passed with
+  `cabal build en-core` and `cabal test en-core`.
 
 
 ## Context and Orientation
@@ -193,7 +220,9 @@ data type are:
 - A **caveat** (`En.Schema.Types.CaveatDefinition`) is a bounded condition attached to a grant
   — for example "only during business hours" or "only at autonomy level >= 2". It has a name,
   a map of typed **parameters**, and a **predicate** (`En.Schema.Types.CaveatPredicate`). The
-  predicate is itself a small data AST:
+  parameter map records only each parameter's type. Whether a parameter value comes from the
+  request context or from a tuple-local payload is recorded on each predicate operand, not in the
+  parameter declaration. The predicate is itself a small data AST:
   - `PredTrue` — always allow.
   - `PredCompare comparator left right` — compare two **operands** with one of
     `CmpEq, CmpNe, CmpLt, CmpLe, CmpGt, CmpGe` (`En.Schema.Types.CaveatCompare`).
@@ -203,9 +232,12 @@ data type are:
   (`OperandLiteral CaveatValue`) or a named parameter with a **source**
   (`OperandParam source name`). The source (`En.Schema.Types.CaveatSource`) is either
   `FromContext` (supplied by the caller on each request) or `FromPayload` (stored on the tuple
-  when the grant was written). A **caveat value** (`En.Caveat.Value.CaveatValue`) is one of a
-  text, bool, integer, timestamp, or enum literal. The runtime interpreter that evaluates these
-  predicates against a request is `En.Caveat.evaluateCaveat` in
+  when the grant was written). Schema-level `Caveated` rewrites are evaluated with an empty tuple
+  payload, so a `with` caveat that references `payload.<name>` will deny because no payload is
+  available on that path. Payload-dependent caveats are enforced as tuple-local caveats on direct
+  tuples. A **caveat value**
+  (`En.Caveat.Value.CaveatValue`) is one of a text, bool, integer, timestamp, or enum literal.
+  The runtime interpreter that evaluates these predicates against a request is `En.Caveat.evaluateCaveat` in
   `en-core/src/En/Caveat.hs`; this plan does not change evaluation, only how the predicate gets
   into the schema.
 
@@ -491,13 +523,13 @@ Define the grammar precisely and implement it in `en-core/src/En/Schema/Parse.hs
 concrete syntax (record it in the Decision Log on implementation):
 
 ```text
-caveat within_hours(now: timestamp from context, start: timestamp from payload, end: timestamp from payload) {
-  now >= start & now <= end
+caveat request_allowed(allowed: bool) {
+  context.allowed == true
 }
 
 object document {
   relation viewer: user
-  permission view = viewer with within_hours
+  permission view = viewer with request_allowed
 }
 ```
 
@@ -508,31 +540,38 @@ Grammar details to implement:
   `caveat ` prefix in addition to `object `, and collect caveats separately so they can be
   passed to `En.Schema.Builder.buildWithCaveats`). The current top level only handles `object`;
   add a branch.
-- A parameter is `<name>: <type> from <source>`, where `<type>` is one of `text`, `bool`,
-  `integer`, `timestamp`, `enum` (mapping to `CaveatParameterType` — read
-  `en-core/src/En/Schema/Types.hs` for the exact constructors and confirm whether `enum`
-  carries extra data), and `<source>` is `context` or `payload` (mapping to
-  `CaveatSource.FromContext`/`FromPayload`). Defaulting: if `from <source>` is omitted, default
-  to `from context` and record that decision. Use the builder helpers `parameter`, `ctxParam`,
-  `payloadParam` so parameter construction matches the builder.
+- A parameter is `<name>: <type>`, where `<type>` is one of `text`, `bool`, `integer`,
+  `timestamp`, or `enum[value1, value2, ...]`. These map to
+  `ParameterText`, `ParameterBool`, `ParameterInteger`, `ParameterTimestamp`, and
+  `ParameterEnum [Text]` in `en-core/src/En/Schema/Types.hs`. Do not put `from context` or
+  `from payload` on the declaration; the existing `CaveatDefinition` type has no source field on
+  parameters. Use `En.Schema.Builder.parameter` for the declarations.
 - A predicate expression supporting, in precedence order lowest-to-highest: `|` (→ `predOr`),
   `&` (→ `predAnd`), `!` prefix (→ `predNot`), then atoms. Atoms are:
   - a comparison `<operand> <cmp> <operand>` where `<cmp>` is one of `==`, `!=`, `<`, `<=`,
-    `>`, `>=` mapping to `cmpEq/cmpNe/cmpLt/cmpLe/cmpGt/cmpGe` (→ `predCompare`);
+    `>`, `>=` mapping to `cmpEq/cmpNe/cmpLt/cmpLe/cmpGt/cmpGe`, which construct
+    `PredCompare` values;
   - a membership `<operand> in [ <literal>, <literal>, ... ]` (→ `predMember`);
   - the literal `true` (→ `predTrue`);
   - a parenthesized sub-predicate.
-  An operand is either a declared parameter name (resolved to `OperandParam` with the source
-  recorded in its declaration — keep a name→source map while parsing the caveat) or a literal.
-  A literal is a quoted string (`"x"` → `litText`), `true`/`false` (→ `litBool` — disambiguate
-  from the `true` predicate by context: bare `true` as a whole predicate is `PredTrue`, whereas
-  `flag == true` is a bool literal operand), an integer (→ `litInteger`), a timestamp in ISO-8601
-  (→ `litTimestamp`; reuse whatever timestamp parse the builder/`time` package uses — read how
-  `litTimestamp` expects its `UTCTime`), or an enum token (→ `litEnum`). Define the literal
-  lexer carefully and test each shape.
+  An operand is either an explicitly sourced declared parameter, written `context.<name>` or
+  `payload.<name>`, or a literal. `context.<name>` maps to `Schema.ctxParam "<name>"`;
+  `payload.<name>` maps to `Schema.payloadParam "<name>"`. A literal is a quoted string
+  (`"x"` → `litText`), `true`/`false` (→ `litBool` — disambiguate from the `true` predicate by
+  context: bare `true` as a whole predicate is `PredTrue`, whereas `context.flag == true` uses a
+  bool literal operand), an integer (→ `litInteger`), a timestamp literal written
+  `timestamp("2026-06-24T12:00:00Z")` (→ `litTimestamp` using `Data.Time.Format.ISO8601` or the
+  equivalent `time` parser that returns `UTCTime`), or an enum literal written `enum("read")`
+  (→ `litEnum`). Define the literal lexer carefully and test each shape. A parameter reference
+  to an undeclared name should either be rejected during parsing with `SchemaViolation` or caught
+  by `validateSchema`; in either case the tests must assert that parse-plus-validation fails.
 - A caveated rewrite: extend the M3 atom grammar with `<rewrite-atom> with <caveatName>` mapping
   to `caveated`/`Caveated`. Decide precedence of `with` relative to `&`/`|`/`but not` (bind
-  `with` tightly to its atom) and record it.
+  `with` tightly to its atom) and record it. A schema-level `with` caveat is evaluated with an
+  empty tuple payload by `En.Check.applyRewriteCaveat` and `En.Lookup.applyRewriteCaveat`, so
+  examples and end-to-end tests for `with` must use context-only operands or literals. Payload
+  operands are still valid in caveat definitions, but they are exercised through tuple-local
+  caveats on direct relation tuples.
 
 Pass collected caveats to `En.Schema.Builder.buildWithCaveats` instead of `build` when any
 caveats are present (the builder already exposes `buildWithCaveats`; confirm its signature in
@@ -542,14 +581,18 @@ Add coverage tests in `en-core/test/Main.hs` that parse a schema exercising ever
 `CaveatPredicate` constructor (`PredTrue`, `PredCompare` for all six comparators, `PredAnd`,
 `PredOr`, `PredNot`, `PredMember`) and both operand sources, and compare the parsed
 `CaveatDefinition` to a builder-constructed one for equality (`CaveatPredicate` and
-`CaveatDefinition` derive `Eq`). Add at least one negative test (unknown caveat name referenced
-by a `with` clause; unknown parameter referenced in a predicate) and assert it surfaces an
-`EnError`.
+`CaveatDefinition` derive `Eq`). Add negative tests for unknown caveat names referenced by a
+`with` clause and unknown parameters referenced in a predicate. Because `parseSchema` returns a
+raw `Schema`, some reference errors are validation errors rather than syntax errors; assert that
+the parse-plus-`validateSchema` path returns `Left EnError`, not necessarily that parsing alone
+fails.
 
-Acceptance: `cabal test en-core` passes; a schema file with a time-bounded caveat loads in
-`en-server`, and a `POST /check` that supplies the required context yields `Allowed` inside the
-window and `Denied`/`Conditional` outside it, demonstrating the caveat is actually enforced
-end-to-end (extend the manual scenario in Concrete Steps).
+Acceptance: `cabal test en-core` passes; a schema file with a context-only `with` caveat loads
+in `en-server`, and `POST /check` yields `Allowed` when the request context satisfies the
+predicate, `Denied` when it does not, and `Conditional` when required context is missing. A
+separate manual scenario writes a tuple-local caveat payload through `POST /tuples` and checks a
+payload-dependent caveat such as `context.clearance >= payload.level`, proving that caveat
+definitions parsed from the schema file are also enforced for tuple-local payloads.
 
 
 ### Milestone 5: Documentation
@@ -658,9 +701,41 @@ EN_DATABASE_URL='postgresql://localhost:5432/en' cabal run en-server
 # expect: a WARNING line about serving the built-in demo schema, then normal startup.
 ```
 
-After M3/M4, extend `/tmp/blog.en` with intersection/exclusion and a caveat and repeat the
-check, confirming the decision reflects the new algebra and that a caveat is enforced (allowed
-inside its window, denied outside).
+After M3, extend `/tmp/blog.en` with intersection and exclusion and repeat the check, confirming
+the decision reflects the new algebra.
+
+After M4, use two caveat scenarios. First, add a context-only schema-level rewrite caveat:
+
+```text
+caveat request_allowed(allowed: bool) {
+  context.allowed == true
+}
+
+object user {}
+
+object document {
+  relation viewer: user
+  permission view = viewer with request_allowed
+}
+```
+
+Write a direct `document#viewer@user` tuple, then `POST /check` with context
+`allowed = true`, `allowed = false`, and no `allowed` value. Expect `Allowed`, `Denied`, and
+`Conditional` respectively.
+
+Second, add a payload-dependent caveat definition that is not attached with `with`:
+
+```text
+caveat min_level(clearance: integer, level: integer) {
+  context.clearance >= payload.level
+}
+```
+
+Write a direct tuple whose `TupleCaveatWire` is `min_level` with payload `level = 3`, then
+check with context `clearance = 5` and `clearance = 2`. Expect `Allowed` and `Denied`. Compose
+the exact JSON from the derived wire types in `en-servant/src/En/Servant/API.hs`; the important
+observable behavior is that the caveat definition came from the runtime-loaded schema file while
+the tuple payload came from the write request.
 
 
 ## Validation and Acceptance
@@ -740,11 +815,12 @@ New and changed interfaces, by milestone, using full module paths:
 - M4: `En.Schema.Parse` gains a top-level `caveat` block parser producing
   `En.Schema.Types.CaveatDefinition` values and a `with` clause producing
   `En.Schema.Types.Caveated` rewrites; the parser calls `En.Schema.Builder.buildWithCaveats`,
-  the caveat constructors (`caveat`, `parameter`, `ctxParam`, `payloadParam`), the literal
+  the caveat constructors (`caveatWith`, `parameter`, `ctxParam`, `payloadParam`), the literal
   helpers (`litText`, `litBool`, `litInteger`, `litTimestamp`, `litEnum`), the comparison
   helpers (`cmpEq`…`cmpGe`), and the predicate constructors (`predTrue`, `predAnd`, `predOr`,
-  `predNot`, `predMember`, `predCompare`). No new dependencies (`time` already present for
-  timestamps).
+  `predNot`, `predMember`). Parameter declarations use type-only syntax, including
+  `enum[...]`; predicate operands use `context.<name>` and `payload.<name>` to select
+  `FromContext` or `FromPayload`. No new dependencies (`time` already present for timestamps).
 
 - M5: Documentation only — `docs/user/production-deployment-and-performance.md`,
   `docs/user/getting-started.md`, `docs/user/service-and-operations.md`. No code interfaces.
@@ -770,3 +846,12 @@ language, so there is no text round-trip serializer today and this plan does not
   Decision Log. Affected sections updated: Purpose / Big Picture, Progress, Decision Log, Plan of
   Work (intro and removed milestone), Validation and Acceptance, Idempotence and Recovery, and
   Interfaces and Dependencies.
+
+- 2026-06-24: Corrected the caveat DSL design after checking `En.Schema.Types`,
+  `En.Schema.Builder`, and the check/lookup caveat evaluation paths. Reason: parameter source is
+  carried by `CaveatOperand`, not by `CaveatDefinition.parameters`, and schema-level `with`
+  rewrites evaluate with an empty tuple payload. The plan now requires `context.<name>` /
+  `payload.<name>` operand syntax, explicit `enum[...]` parameter types and `enum("...")`
+  literals, validation-aware negative tests, and separate end-to-end checks for schema-level
+  context caveats and tuple-local payload caveats. Affected sections updated: Progress, Decision
+  Log, Context and Orientation, Milestone 4, Concrete Steps, and Interfaces and Dependencies.

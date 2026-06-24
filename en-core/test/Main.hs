@@ -100,6 +100,7 @@ import En.Schema (
     validateSchema,
  )
 import En.Schema.Builder qualified as Schema
+import En.Schema.Parse qualified as SchemaParse
 import En.Schema.Render (renderMarkdown, renderMermaid)
 import En.Schema.TH (mkValidSchema, schema)
 import En.Tuple (
@@ -257,6 +258,7 @@ main = do
     assertEqual "builder schema hash matches manual schema hash" (schemaHash validKikanManual) (schemaHash validKikan)
     assertEqual "compile-time validated schema equals builder fixture" kikanSchema (unValidSchema validatedKikanTH)
     assertEqual "schema quasi-quoter builds compact schema" quotedSchemaFixture (unValidSchema quotedSchemaTH)
+    testSchemaParserDirect
     assertEqual "handle form equals string form" handleStringSchema handleReferenceSchema
     assertEqual "renderMarkdown emits stable kikan reference" expectedKikanMarkdown (renderMarkdown kikanSchema)
     assertEqual "renderMermaid emits stable kikan diagram" expectedKikanMermaid (renderMermaid kikanSchema)
@@ -522,6 +524,35 @@ sampleCaveatDefinition =
                     (OperandParam FromPayload (CaveatParameterName "until"))
                 ]
         }
+
+testSchemaParserDirect :: IO ()
+testSchemaParserDirect = do
+    let compactSchemaText =
+            Text.unlines
+                [ "object user {}"
+                , "object space {"
+                , "  relation owner: user"
+                , "  relation parent: space"
+                , "  permission view = owner | parent->view"
+                , "}"
+                ]
+    assertEqual "parseSchema parses compact schema text" (Right quotedSchemaFixture) (SchemaParse.parseSchema compactSchemaText)
+    parsed <- either (fail . show) pure (SchemaParse.parseSchema compactSchemaText)
+    assertBool "parseSchema output validates" (isRight (validateSchema parsed))
+    assertBool "parseSchema rejects malformed permissions" (isLeft (SchemaParse.parseSchema "object space {\n  permission view owner\n}"))
+    assertBool "parseSchema rejects objects missing closing braces" (isLeft (SchemaParse.parseSchema "object space {\n  relation owner: user"))
+    assertLeftEq
+        "parseSchema reports schema assembly errors"
+        (SchemaViolation "duplicate relation declared: space#owner")
+        ( SchemaParse.parseSchema $
+            Text.unlines
+                [ "object user {}"
+                , "object space {"
+                , "  relation owner: user"
+                , "  relation owner: user"
+                , "}"
+                ]
+        )
 
 testCacheOperations :: IO ()
 testCacheOperations = do
