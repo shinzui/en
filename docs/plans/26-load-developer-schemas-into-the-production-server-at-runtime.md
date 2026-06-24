@@ -62,9 +62,7 @@ three first-class features of `en`'s model. If the runtime loader used that pars
 a developer could write a schema file that *appears* to load but cannot express caveated
 (time-bounded / autonomy-bounded) grants or intersection/exclusion permissions at all. This
 plan extends the parser to full coverage so a schema file can express everything the in-memory
-schema type and the `En.Schema.Builder` API can express, and adds a machine-friendly JSON
-loading format as an escape hatch so tooling (and any feature the text language has not yet
-caught up to) always has a way to express the full model.
+schema type and the `En.Schema.Builder` API can express.
 
 The plan deliberately keeps the existing compile-time path intact. A Haskell application that
 prefers to compile its schema into its own binary (the embedded-library posture) continues to
@@ -87,9 +85,7 @@ This section must always reflect the actual current state of the work.
   rewrites; add round-trip/coverage tests proving parity with the `En.Schema.Builder` output.
 - [ ] M4: Extend the parser to caveat definitions and caveated rewrites (`with`); add
   coverage tests proving every `CaveatPredicate` shape parses.
-- [ ] M5 (escape hatch): Add `FromJSON`/`ToJSON` instances for `Schema` and let the loader
-  accept a `.json` file, guaranteeing full-model coverage independent of the text language.
-- [ ] M6: Update `docs/user/production-deployment-and-performance.md`,
+- [ ] M5: Update `docs/user/production-deployment-and-performance.md`,
   `docs/user/getting-started.md`, and `docs/user/service-and-operations.md` to document the
   runtime schema-loading workflow and remove the "fork the executable" instruction.
 
@@ -106,18 +102,17 @@ implementation. Provide concise evidence.
 
 Record every decision made while working on the plan.
 
-- Decision: Use a runtime *text-file* loader (`EN_SCHEMA_PATH`) as the primary way developers
-  supply schemas, keep the compile-time/embedded path unchanged, and add JSON only as a
-  secondary escape hatch.
+- Decision: Use a runtime *text-file* loader (`EN_SCHEMA_PATH`) as the way developers supply
+  schemas, and keep the compile-time/embedded path unchanged.
   Rationale: `en`'s schema is a pure, fully serializable algebraic value with no embedded
   functions — even caveats are a data AST (`En.Schema.Types.CaveatPredicate`, interpreted by
   `En.Caveat.evaluateCaveat`), not Haskell closures. A text parser that produces a `Schema`
   already exists (`parseSchema` inside `en-core/src/En/Schema/TH.hs`) and runs as an ordinary
   pure function; only its *call site* is compile-time. Reusing it at runtime is the smallest
   change that yields a single prebuilt server, and it matches how SpiceDB/OpenFGA let operators
-  load a schema without recompiling the engine. JSON is added so the full model is always
-  expressible even before the text grammar reaches 100% coverage and so external tools can
-  generate schemas.
+  load a schema without recompiling the engine. Extending the same text grammar to the full model
+  (M3/M4) means the file format covers everything the schema type can hold, so no second
+  (machine) format is needed.
   Date: 2026-06-24
 
 - Decision: When `EN_SCHEMA_PATH` is unset, keep serving the existing built-in `demoSchema`
@@ -134,6 +129,18 @@ Record every decision made while working on the plan.
   and the consistency layer derives one `schemaHash`. Hot reload and multi-schema are separate,
   larger designs (they require swapping the compiled graph under in-flight requests and careful
   cache/token invalidation). They are explicitly out of scope and noted as follow-ups.
+  Date: 2026-06-24
+
+- Decision: Drop the JSON loading format (formerly milestone M5) from this plan; keep it only as
+  a deferred out-of-scope follow-up.
+  Rationale: Deriving `FromJSON`/`ToJSON` is nearly free, but a *serialized `Schema` format is a
+  compatibility contract*: once any developer has `.json` schema files on disk, the encoding can
+  never be broken across changes to the schema data types, and it adds a second load path to test
+  and document. The text DSL reaches full model coverage in M3/M4, which makes the JSON path
+  redundant for expressiveness, so its only lasting effect would be that standing
+  format-compatibility burden — i.e. drag — for no unique capability. If a machine-generated
+  schema format is ever genuinely needed (e.g. external tooling that emits schemas), it can be
+  added deliberately as its own change with an explicit versioning policy.
   Date: 2026-06-24
 
 
@@ -158,8 +165,8 @@ A **schema** in `en` is a value of type `Schema`, defined in
 `en-core/src/En/Schema/Types.hs` and re-exported from `en-core/src/En/Schema.hs`. It is a plain
 algebraic data value: a map of object types to their relations, and a map of caveat names to
 caveat definitions. Nothing inside a `Schema` is a function — it is data through and through,
-which is why it can be parsed from text, validated, compiled, hashed, and (after this plan)
-serialized to and from JSON. The key pieces of that data type are:
+which is why it can be parsed from text, validated, compiled, and hashed. The key pieces of that
+data type are:
 
 - An **object type** (`En.Schema.Types.ObjectType`, a wrapper around `Text`) such as `user`,
   `post`, or `space`. Each object type owns a set of named **relations**.
@@ -247,7 +254,7 @@ There are two existing ways to construct a `Schema`, and a third that this plan 
    is either `splitArrow` or a bare `computed` reference. This subset is the core problem M3 and
    M4 fix.
 
-3. The **runtime text/JSON loader** this plan adds (M1, M2, M5).
+3. The **runtime text loader** this plan adds (M1, M2).
 
 Validation and compilation already exist and are unchanged by this plan. `validateSchema ::
 Schema -> Either EnError ValidSchema` lives in `en-core/src/En/Schema.hs` and checks the schema
@@ -280,12 +287,11 @@ by the quasi-quoter tests live under `en-core/test/fixtures/` (e.g. `BadQuotedSc
 
 ## Plan of Work
 
-The work proceeds in six milestones. M1 and M2 together deliver the headline capability — a
+The work proceeds in five milestones. M1 and M2 together deliver the headline capability — a
 prebuilt server that loads a developer's schema file — for the subset of the model the text
 language already covers. M3 and M4 widen the text language to the full model so that subset is
-no longer a limitation. M5 adds a JSON escape hatch that guarantees full coverage regardless of
-the text grammar. M6 updates the user documentation. Each milestone is independently verifiable
-and leaves the tree building and tests passing.
+no longer a limitation. M5 updates the user documentation. Each milestone is independently
+verifiable and leaves the tree building and tests passing.
 
 
 ### Milestone 1: Promote the parser into a public runtime module
@@ -546,43 +552,14 @@ window and `Denied`/`Conditional` outside it, demonstrating the caveat is actual
 end-to-end (extend the manual scenario in Concrete Steps).
 
 
-### Milestone 5: JSON escape hatch
-
-Scope: guarantee the full model is always expressible from a file, independent of the text
-grammar, and give tooling a machine format. At the end of this milestone the loader also accepts
-a `.json` file containing a serialized `Schema`.
-
-Add `FromJSON`/`ToJSON` instances for `Schema` and all the types it transitively contains
-(`ObjectType`, `Relation`, `AllowedSubject`, `Rewrite`, `CaveatName`, `CaveatDefinition`,
-`CaveatParameterName`, `CaveatParameterType`, `CaveatSource`, `CaveatOperand`, `CaveatCompare`,
-`CaveatPredicate`, `CaveatValue`). Put the instances in `en-core` — either as `deriving anyclass`
-in `en-core/src/En/Schema/Types.hs` and `En.Caveat.Value`, or in a dedicated
-`En.Schema.Json` module — and add `aeson` to `en-core`'s `build-depends` in `en-core.cabal` if
-it is not already present (the `en-servant` wire types already use `aeson`, so the dependency is
-available in the project). Prefer derived generic instances for a first cut; if the derived
-encoding for the sum types (`Rewrite`, `CaveatPredicate`, `CaveatValue`) is unwieldy, use a
-tagged object encoding and document the shape with one example in the module haddock.
-
-In the loader (M2), branch on the file extension: `.json` → decode with `aeson`
-(`eitherDecodeFileStrict`) into `Schema`, surfacing a decode error as a `fail` naming the path;
-anything else → the text `parseSchema`. Keep both behind the same fail-closed contract.
-
-Add a round-trip test in `en-core/test/Main.hs`: take a representative `Schema` (including a
-caveat, an intersection, and an exclusion), encode to JSON, decode back, and assert structural
-equality with the original. This proves the JSON format covers the entire model.
-
-Acceptance: `cabal test en-core` passes including the JSON round-trip; `EN_SCHEMA_PATH` pointing
-at a `.json` file produced by encoding a schema loads and serves it in `en-server`.
-
-
-### Milestone 6: Documentation
+### Milestone 5: Documentation
 
 Scope: make the new workflow discoverable and remove the obsolete "fork the executable"
 guidance. At the end, the user docs describe loading a schema file into the prebuilt server.
 
 Update `docs/user/production-deployment-and-performance.md`: in the "Dedicated Service" section,
 replace the paragraph that tells developers to write their own executable importing the
-production schema with the `EN_SCHEMA_PATH` workflow (text or JSON file, validated and compiled
+production schema with the `EN_SCHEMA_PATH` workflow (a text schema file, validated and compiled
 at startup, fail-closed). Note that the embedded-library path remains available for Haskell
 applications that prefer compiling the schema in. Update `docs/user/getting-started.md` to show
 the minimal "write a `.en` file, set `EN_SCHEMA_PATH`, run the server" flow. Update
@@ -693,9 +670,8 @@ The change is validated at three levels.
 Unit level: `cabal test en-core` exercises the parser directly. After M1 it proves valid text
 parses and invalid text fails. After M3 it proves intersection/exclusion parse to the same
 `Rewrite` values the builder produces. After M4 it proves every `CaveatPredicate` shape and both
-operand sources round-trip. After M5 it proves a `Schema` containing caveats, intersection, and
-exclusion survives a JSON encode/decode round-trip unchanged. These are decidable equality checks
-because the schema data types derive `Eq`.
+operand sources round-trip. These are decidable equality checks because the schema data types
+derive `Eq`.
 
 Integration level: starting `en-server` with `EN_SCHEMA_PATH` pointed at a text file and issuing
 HTTP `check`/`lookup` requests against object types and permissions that exist *only* in that
@@ -729,11 +705,13 @@ or switching from the demo schema to a file) changes the hash, and consistency t
 under the old hash are rejected after the change — this is the existing, intended behavior, not a
 regression introduced here. Treat a schema change like a database migration: roll it out
 deliberately, and expect old tokens to be invalidated. This plan does not change that mechanism;
-it only changes where the schema originates. Document this in M6.
+it only changes where the schema originates. Document this in M5.
 
-If M4 (caveats) proves larger than expected, M5 (JSON) is a complete fallback for full-model
-coverage: a developer can express caveats via a `.json` schema file even if the text grammar for
-caveats is still in progress. M1–M3 remain valuable and shippable on their own.
+The milestones are ordered so value lands incrementally and each is shippable on its own: M1–M2
+deliver a working developer-schema server for the union/computed/arrow subset, M3 adds
+intersection/exclusion, and M4 adds caveats. If M4 (caveats) proves larger than expected, M1–M3
+remain valuable and shippable, and caveat support can land in a later increment without
+disturbing them.
 
 
 ## Interfaces and Dependencies
@@ -768,17 +746,27 @@ New and changed interfaces, by milestone, using full module paths:
   `predNot`, `predMember`, `predCompare`). No new dependencies (`time` already present for
   timestamps).
 
-- M5: `FromJSON`/`ToJSON` instances for `Schema` and its transitive types, in `en-core` (in
-  `En.Schema.Types`/`En.Caveat.Value` or a new `En.Schema.Json` module). Adds `aeson` to
-  `en-core/en-core.cabal` `build-depends` (already used elsewhere in the project). The M2 loader
-  branches on `.json` extension to `Data.Aeson.eitherDecodeFileStrict`.
-
-- M6: Documentation only — `docs/user/production-deployment-and-performance.md`,
+- M5: Documentation only — `docs/user/production-deployment-and-performance.md`,
   `docs/user/getting-started.md`, `docs/user/service-and-operations.md`. No code interfaces.
 
 Out of scope (explicit follow-ups, not part of this plan): hot reload of the schema without
 restart; serving multiple schemas from one process (multi-tenant); a `zed`-style schema-write
-admin endpoint; and a DSL serializer (`Schema → Text`) — note that `En.Schema.Render` produces
-Markdown and Mermaid for documentation, not the loadable text language, so there is no text
-round-trip serializer today and this plan does not add one (the M5 JSON round-trip provides the
-machine round-trip instead).
+admin endpoint; a JSON (or other machine-generated) schema loading format — deliberately
+deferred because a serialized `Schema` encoding becomes a compatibility contract (see the Decision
+Log entry dated 2026-06-24), so it should only be added with an explicit versioning policy if
+external tooling ever needs it; and a DSL serializer (`Schema → Text`) — note that
+`En.Schema.Render` produces Markdown and Mermaid for documentation, not the loadable text
+language, so there is no text round-trip serializer today and this plan does not add one.
+
+
+## Revision Notes
+
+- 2026-06-24: Removed the JSON loading format (formerly milestone M5) from the committed plan and
+  renumbered the documentation milestone from M6 to M5; the plan now has five milestones instead
+  of six. Reason: a serialized `Schema` format is a long-lived compatibility contract whose only
+  unique benefit (full-model expressiveness from a file) is already delivered by the text DSL once
+  M3/M4 land, so committing to it would add standing maintenance drag for no distinct capability.
+  JSON is retained only as a deferred out-of-scope follow-up with the rationale recorded in the
+  Decision Log. Affected sections updated: Purpose / Big Picture, Progress, Decision Log, Plan of
+  Work (intro and removed milestone), Validation and Acceptance, Idempotence and Recovery, and
+  Interfaces and Dependencies.
