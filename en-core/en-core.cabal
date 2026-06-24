@@ -55,6 +55,8 @@ library
     En.Revision
     En.Schema
     En.Schema.Builder
+    En.Schema.Internal
+    En.Schema.Types
     En.Tuple
 
   build-depends:

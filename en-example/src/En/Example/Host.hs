@@ -51,7 +51,7 @@ import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (.
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
-import En.Reachability (compile)
+import En.Reachability (compileSchema)
 import En.Revision (Consistency (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
 import En.Schema.Builder qualified as Schema
@@ -111,7 +111,7 @@ mkEnv :: ConsistencyInterpreter -> TupleInterpreter -> Env ExampleEffects
 mkEnv cStore tStore =
     Env
         { runPorts = runEff . runErrorNoCallStack . tStore . cStore
-        , graph = either (error . show) id (compile exampleSchema)
+        , graph = either (error . show) id (compileSchema exampleSchema)
         , checkOperation = check
         , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
         , maxBatchSize = 400

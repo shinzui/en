@@ -7,6 +7,7 @@ module En.Reachability (
     EntryKind (..),
     RewriteStep (..),
     compile,
+    compileSchema,
 ) where
 
 import En.Error (EnError)
@@ -20,8 +21,10 @@ import En.Schema (
     RelationName,
     Rewrite (..),
     Schema (..),
+    ValidSchema,
     schemaHash,
-    validate,
+    unValidSchema,
+    validateSchema,
  )
 
 import Data.Map.Strict (Map)
@@ -83,31 +86,37 @@ data EntryPoint = EntryPoint
     }
     deriving stock (Eq, Show)
 
-{- | Compile a consumer schema into the reachability graph 'En.Check.check' and
-'En.Lookup.lookup' traverse. In a fixed-schema design this could be hand-written;
-en makes it generic over the supplied 'Schema' (the cost of being a toolkit).
+{- | Compile a validated schema into the reachability graph 'En.Check.check' and
+'En.Lookup.lookup' traverse. Total: the only thing that could fail is validation,
+and the 'ValidSchema' argument is proof that already happened.
 -}
-compile :: Schema -> Either EnError ReachabilityGraph
-compile schema = do
-    validate schema
-    pure
-        ReachabilityGraph
-            { entries =
-                Map.fromList
-                    [ (target, compileRelation schema target relation)
-                    | (objectType, relations) <- Map.toAscList schema.objectTypes
-                    , (relationName, relation) <- Map.toAscList relations
-                    , let target = RelationRef{objectType, relation = relationName}
-                    ]
-            , relations =
-                Map.fromList
-                    [ (RelationRef{objectType, relation = relationName}, relation)
-                    | (objectType, objectRelations) <- Map.toAscList schema.objectTypes
-                    , (relationName, relation) <- Map.toAscList objectRelations
-                    ]
-            , caveats = schema.caveats
-            , hash = schemaHash schema
-            }
+compile :: ValidSchema -> ReachabilityGraph
+compile valid =
+    ReachabilityGraph
+        { entries =
+            Map.fromList
+                [ (target, compileRelation schema target relation)
+                | (objectType, relations) <- Map.toAscList schema.objectTypes
+                , (relationName, relation) <- Map.toAscList relations
+                , let target = RelationRef{objectType, relation = relationName}
+                ]
+        , relations =
+            Map.fromList
+                [ (RelationRef{objectType, relation = relationName}, relation)
+                | (objectType, objectRelations) <- Map.toAscList schema.objectTypes
+                , (relationName, relation) <- Map.toAscList objectRelations
+                ]
+        , caveats = schema.caveats
+        , hash = schemaHash valid
+        }
+  where
+    schema =
+        unValidSchema valid
+
+-- | Validate a raw schema and compile it in one step.
+compileSchema :: Schema -> Either EnError ReachabilityGraph
+compileSchema schema =
+    compile <$> validateSchema schema
 
 compileRelation :: Schema -> RelationRef -> Relation -> [EntryPoint]
 compileRelation schema target relation =

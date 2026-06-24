@@ -22,7 +22,7 @@ import En.Postgres.Revision (ConsistencyConfig (..), OptimizedRevisionCache, Opt
 import En.Postgres.TupleStore (runTupleStorePostgres, runTupleStorePostgresWithOptimizedRevisionCacheHandle)
 import En.Reachability (compile)
 import En.Revision (DatastoreId (..))
-import En.Schema (Schema, schemaHash)
+import En.Schema (Schema, schemaHash, validateSchema)
 import En.Schema.Builder qualified as Schema
 import En.Servant.API (app)
 import En.Servant.Seam (AppEffects, Env (..))
@@ -37,7 +37,8 @@ main = do
     optimizedRevisionTtlMs <- optionalNonNegativeIntEnv "EN_OPTIMIZED_REVISION_CACHE_TTL_MS"
     tupleReadMaxEntries <- optionalNonNegativeIntEnv "EN_TUPLE_READ_CACHE_MAX_ENTRIES"
     decisionMaxEntries <- optionalNonNegativeIntEnv "EN_DECISION_CACHE_MAX_ENTRIES"
-    graph <- either (fail . ("Invalid built-in demo schema: " <>) . show) pure (compile demoSchema)
+    validSchema <- either (fail . ("Invalid built-in demo schema: " <>) . show) pure (validateSchema demoSchema)
+    let graph = compile validSchema
     connection <-
         Connection.acquire (Settings.connectionString (Text.pack databaseUrl)) >>= \case
             Right value -> pure value
@@ -51,7 +52,7 @@ main = do
     let config =
             ConsistencyConfig
                 { datastoreId = DatastoreId "en-server"
-                , schemaHash = schemaHash demoSchema
+                , schemaHash = schemaHash validSchema
                 , gcWindow = gcWindow
                 }
         optimizedRevisionConfig =

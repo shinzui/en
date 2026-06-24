@@ -17,7 +17,7 @@ import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError)
 import En.Lookup (LookupLimit (..), LookupRequest (..))
 import En.Lookup qualified as Lookup
-import En.Reachability (compile)
+import En.Reachability (compileSchema)
 import En.Revision (Consistency (..))
 import En.Schema (ObjectType (..), RelationName (..), Schema)
 import En.Schema.Builder qualified as Schema
@@ -25,7 +25,7 @@ import En.Tuple (CaveatContext (..), ObjectRef (..), Subject (..), Tuple (..))
 
 main :: IO ()
 main = do
-    graph <- either (fail . show) pure (compile benchSchema)
+    graph <- either (fail . show) pure (compileSchema benchSchema)
     defaultMain
         [ bgroup
             "check"

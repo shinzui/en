@@ -63,18 +63,18 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Add the `ValidSchema` newtype to `En.Schema` and add `validateSchema :: Schema -> Either EnError ValidSchema`, keeping `validate :: Schema -> Either EnError ()` as a thin wrapper.
-- [ ] Update the `En.Schema` module export list: export `ValidSchema` (type only, no constructor), `unValidSchema`, and `validateSchema`; change `schemaHash` to operate on `ValidSchema`.
-- [ ] Change `schemaHash` to `schemaHash :: ValidSchema -> SchemaHash` and route its internal rendering through the wrapped `Schema`.
-- [ ] Change `compile` in `En.Reachability` to `compile :: ValidSchema -> ReachabilityGraph` (total, no `Either`) and add `compileSchema :: Schema -> Either EnError ReachabilityGraph`.
-- [ ] Update `En.Reachability`'s imports and export list (export `compile` and `compileSchema`); update the internal use of `schemaHash` to pass the `ValidSchema`.
-- [ ] Update `en-server/app/Main.hs` to call `validateSchema demoSchema` once and reuse the resulting `ValidSchema` for both `compile` and `schemaHash`.
-- [ ] Update `en-core/test/Main.hs`: replace `compile`/`schemaHash` usages, import `ValidSchema`/`validateSchema`/`compileSchema`.
-- [ ] Add tests: a `ValidSchema` is only obtainable via `validateSchema`; an invalid schema yields `Left`; `compileSchema` round-trips the existing `kikanSchema` fixture to an identical `ReachabilityGraph`.
-- [ ] Add a new module `En.Schema.Internal` that is the definition home of the `ValidSchema` newtype and exports its constructor plus `unsafeValidSchema :: Schema -> ValidSchema`, marked internal/unsafe, for the EP-22 Template Haskell splice path only.
-- [ ] Break the resulting `En.Schema` <-> `En.Schema.Internal` import cycle (recommended: factor the bare `Schema`/data declarations into `En.Schema.Types`; alternative: an `.hs-boot` stub); record the choice in the Decision Log.
-- [ ] Add `En.Schema.Internal` (and `En.Schema.Types` if used) to `en-core/en-core.cabal` `exposed-modules`/`other-modules`; confirm no new `build-depends` are needed.
-- [ ] Run `cabal build all` and `cabal test en-core-interface-tests` from the repository root and confirm both pass.
+- [x] 2026-06-24: Add the `ValidSchema` newtype to `En.Schema.Internal` and add `validateSchema :: Schema -> Either EnError ValidSchema`, keeping `validate :: Schema -> Either EnError ()` as a thin wrapper.
+- [x] 2026-06-24: Update the `En.Schema` module export list: export `ValidSchema` (type only, no constructor), `unValidSchema`, and `validateSchema`; change `schemaHash` to operate on `ValidSchema`.
+- [x] 2026-06-24: Change `schemaHash` to `schemaHash :: ValidSchema -> SchemaHash` and route its internal rendering through the wrapped `Schema`.
+- [x] 2026-06-24: Change `compile` in `En.Reachability` to `compile :: ValidSchema -> ReachabilityGraph` (total, no `Either`) and add `compileSchema :: Schema -> Either EnError ReachabilityGraph`.
+- [x] 2026-06-24: Update `En.Reachability`'s imports and export list (export `compile` and `compileSchema`); update the internal use of `schemaHash` to pass the `ValidSchema`.
+- [x] 2026-06-24: Update `en-server/app/Main.hs` to call `validateSchema demoSchema` once and reuse the resulting `ValidSchema` for both `compile` and `schemaHash`.
+- [x] 2026-06-24: Update all compiled non-server call sites: `en-core/test/Main.hs`, `en-core/src/En/Conformance/Kikan.hs`, `en-core/bench/Main.hs`, `en-example/src/En/Example/Host.hs`, and `en-postgres/integration-test/Main.hs`.
+- [x] 2026-06-24: Add tests: a `ValidSchema` is only obtainable via `validateSchema`; an invalid schema yields `Left`; `compileSchema` round-trips the existing `kikanSchema` fixture to an identical `ReachabilityGraph`.
+- [x] 2026-06-24: Add a new module `En.Schema.Internal` that is the definition home of the `ValidSchema` newtype and exports its constructor plus `unsafeValidSchema :: Schema -> ValidSchema`, marked internal/unsafe, for the EP-22 Template Haskell splice path only.
+- [x] 2026-06-24: Break the resulting `En.Schema` <-> `En.Schema.Internal` import cycle by factoring the bare `Schema`/data declarations into `En.Schema.Types`; record the choice in the Decision Log.
+- [x] 2026-06-24: Add `En.Schema.Internal` and `En.Schema.Types` to `en-core/en-core.cabal` `exposed-modules`; confirm no new `build-depends` are needed.
+- [x] 2026-06-24: Run `cabal build all` and `cabal test en-core-interface-tests` from the repository root and confirm both pass.
 
 
 ## Surprises & Discoveries
@@ -82,7 +82,18 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- Discovery: the validated-schema change touches more compiled call sites than the initial
+  plan named. In addition to `en-server/app/Main.hs` and `en-core/test/Main.hs`,
+  `en-core/src/En/Conformance/Kikan.hs`, `en-core/bench/Main.hs`,
+  `en-example/src/En/Example/Host.hs`, and `en-postgres/integration-test/Main.hs` needed
+  updates so raw schemas pass through `compileSchema` or `validateSchema` before compile/hash.
+  Date: 2026-06-24
+
+- Discovery: factoring the raw data declarations into `En.Schema.Types` was straightforward
+  and kept `En.Schema`'s public re-exports intact while avoiding `.hs-boot`.
+  `nix develop --command cabal build en-core:lib:en-core` compiled the new
+  `En.Schema.Types`, `En.Schema.Internal`, `En.Schema`, and downstream modules successfully.
+  Date: 2026-06-24
 
 
 ## Decision Log
@@ -126,11 +137,13 @@ Record every decision made while working on the plan.
   Rationale: The master plan (`docs/masterplans/4-harden-the-en-schema-dsl-for-release.md`)
   states the goal that the value feeding consistency-token metadata must be provably
   validated. Keeping a `Schema`-taking `schemaHash` around would leave the unvalidated path
-  open, defeating the purpose. The only non-test caller, `en-server/app/Main.hs`, is updated
-  by this plan; the en-postgres modules consume a precomputed `SchemaHash` value through
-  config and never call `schemaHash` themselves (verified: `En.Postgres.Revision` and
-  `En.Postgres.TupleStore` receive `schemaHash` as a record field on `ConsistencyConfig`,
-  not the function), so there is no hidden caller to break.
+  open, defeating the purpose. `en-server/app/Main.hs` and
+  `en-postgres/integration-test/Main.hs` are updated by this plan because they need a
+  `SchemaHash` from a local schema value; the en-postgres library modules consume a
+  precomputed `SchemaHash` value through config and never call `schemaHash` themselves
+  (verified: `En.Postgres.Revision` and `En.Postgres.TupleStore` receive `schemaHash` as a
+  record field on `ConsistencyConfig`, not the function), so there is no hidden library
+  caller to break.
   Date: 2026-06-23
 
 - Decision: Expose `unValidSchema :: ValidSchema -> Schema` (a read-only accessor) but no
@@ -168,9 +181,8 @@ Record every decision made while working on the plan.
   Date: 2026-06-23 (added during cross-plan reconciliation with EP-22)
 
 - Decision: Break the `En.Schema` <-> `En.Schema.Internal` import cycle by factoring the bare
-  `Schema` data declaration into a small `En.Schema.Types` module that both import, rather than
-  using an `.hs-boot` file. (This is a recommendation; the implementer may choose `.hs-boot`
-  and must record which they used here.)
+  `Schema` data declarations into a small `En.Schema.Types` module that both import, rather
+  than using an `.hs-boot` file.
   Rationale: `En.Schema.Internal` references `Schema` in the `ValidSchema` newtype's field, and
   `En.Schema` imports `ValidSchema` from `En.Schema.Internal` — a mutual import that Haskell
   rejects without `.hs-boot` stubs. `.hs-boot` files are easy to get subtly wrong (the boot
@@ -181,7 +193,7 @@ Record every decision made while working on the plan.
   still re-exports `Schema (..)` so existing `import En.Schema (Schema (..))` call sites (the
   builder, the tests, the server) are unaffected. This decision is local to this plan and does
   not change any signature EP-22 or EP-24 consumes.
-  Date: 2026-06-23 (added during cross-plan reconciliation with EP-22)
+  Date: 2026-06-24
 
 
 ## Outcomes & Retrospective
@@ -189,7 +201,23 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Completed on 2026-06-24. `ValidSchema` is defined in `En.Schema.Internal`, with the
+constructor exposed only from that internal module; `En.Schema` re-exports the type name,
+`unValidSchema`, `validateSchema`, and a compatibility `validate` wrapper. The raw schema
+data declarations now live in `En.Schema.Types`, which avoids an import cycle and preserves
+the existing `En.Schema` public re-export surface. `schemaHash` requires `ValidSchema`,
+`compile` is total on `ValidSchema`, and `compileSchema` preserves the old raw-schema
+ergonomics by validating before compiling.
+
+All compiled callers were migrated. `en-server/app/Main.hs` validates `demoSchema` once and
+reuses the evidence for `compile` and `schemaHash`; tests, conformance fixtures, benchmarks,
+examples, and the PostgreSQL integration test use either `compileSchema` or a validated
+schema value as appropriate. Validation passed with:
+
+```bash
+nix develop --command cabal build all
+nix develop --command cabal test en-core-interface-tests
+```
 
 
 ## Context and Orientation
@@ -201,20 +229,17 @@ relationship facts plus a rule model. The rule model is a value of type `Schema`
 
 The files you must understand:
 
-`en-core/src/En/Schema.hs` defines the `Schema` type and everything it contains. A `Schema`
-has two fields: `objectTypes` (a map from object type to its relations) and `caveats` (named
-conditional predicates). The same module defines `validate :: Schema -> Either EnError ()`,
-which walks the schema and returns `Left` with an `EnError` describing the first problem it
-finds (an unknown relation, an empty union or intersection, a `This` rewrite with no allowed
-subjects, an incompatible tuple-to-userset arrow, an unknown caveat, or a rewrite cycle that
-has no productive base case). On a clean schema it returns `Right ()`. The module also defines
-`schemaHash :: Schema -> SchemaHash`, which renders the schema to a canonical text form and
-hashes it with FNV-1a (a small, deterministic, non-cryptographic hash) into a `SchemaHash`
-value used as part of consistency-token metadata. The module's export list at the top
-currently exports the schema data types, `validate`, and `schemaHash` (it does *not* export
-any helper functions). The package uses GHC2024 with `DerivingStrategies` and
-`OverloadedRecordDot` enabled (see `en-core/en-core.cabal`), so record access is written
-`schema.objectTypes` and newtypes derive via `deriving stock`.
+`en-core/src/En/Schema/Types.hs` defines the raw `Schema` data type and everything it
+contains. A `Schema` has two fields: `objectTypes` (a map from object type to its relations)
+and `caveats` (named conditional predicates). `en-core/src/En/Schema.hs` re-exports those
+types, defines `validateSchema :: Schema -> Either EnError ValidSchema`, preserves
+`validate :: Schema -> Either EnError ()` as a wrapper, and defines
+`schemaHash :: ValidSchema -> SchemaHash`. `schemaHash` renders the wrapped schema to a
+canonical text form and hashes it with FNV-1a (a small, deterministic, non-cryptographic
+hash) into a `SchemaHash` value used as part of consistency-token metadata. The package uses
+GHC2024 with `DerivingStrategies` and `OverloadedRecordDot` enabled (see
+`en-core/en-core.cabal`), so record access is written `schema.objectTypes` and newtypes
+derive via `deriving stock`.
 
 "Newtype" means a zero-cost wrapper around a single existing type; at runtime it is
 identical to the wrapped value, but at compile time it is a distinct type. We use that
@@ -222,11 +247,11 @@ distinctness to carry a *proof*: a `ValidSchema` is "a `Schema` that has been va
 because we will not export its constructor, no one can fabricate that proof.
 
 `en-core/src/En/Reachability.hs` defines `ReachabilityGraph` (the compiled, traversable form
-of a schema) and `compile :: Schema -> Either EnError ReachabilityGraph`. Reading `compile`'s
-body (around line 89): it first runs `validate schema`, and if that succeeds it constructs a
-`ReachabilityGraph` purely — building the `entries`, `relations`, and `caveats` maps and
-storing `hash = schemaHash schema`. The crucial fact for this plan is that `validate schema`
-is the *only* source of failure in `compile`; the rest is total.
+of a schema), `compile :: ValidSchema -> ReachabilityGraph`, and
+`compileSchema :: Schema -> Either EnError ReachabilityGraph`. The total `compile` unwraps
+the validated schema, constructs the graph, and stores `hash = schemaHash validSchema`.
+`compileSchema` preserves the old raw-schema ergonomics by running `validateSchema` and then
+`compile`.
 
 `en-core/src/En/Schema/Builder.hs` provides ergonomic constructors (`build`,
 `buildWithCaveats`, `object`, `relation`, `permission`, and so on) that assemble a `Schema`
@@ -239,12 +264,9 @@ replacement for `Schema`, and the builder is out of scope for this plan.
 `en-core/src/En/Error.hs` defines `EnError`, the closed sum of engine failures. Validation
 failures surface as `SchemaViolation Text` and `UnknownRelation Text`.
 
-`en-server/app/Main.hs` is the only non-test program that calls both `compile` and
-`schemaHash`. Around line 28 it does
-`graph <- either (fail . ...) pure (compile demoSchema)`, and around line 42 it sets
-`schemaHash = schemaHash demoSchema` inside a `ConsistencyConfig` record. `demoSchema ::
-Schema` is built at the bottom of the file with the builder. This plan rewrites these two
-call sites to validate once and reuse the evidence.
+`en-server/app/Main.hs` validates `demoSchema` once with `validateSchema`, then reuses the
+resulting `ValidSchema` for both `compile` and `schemaHash` inside its `ConsistencyConfig`.
+`demoSchema :: Schema` is built at the bottom of the file with the builder.
 
 `en-postgres/src/En/Postgres/Revision.hs` and `en-postgres/src/En/Postgres/TupleStore.hs`
 consume a *precomputed* `SchemaHash` through a `schemaHash` field on `ConsistencyConfig`; they
@@ -252,11 +274,12 @@ never call the `schemaHash` function. This plan does not touch them, and changin
 `schemaHash` function's signature does not affect them because they only see the already-built
 `SchemaHash` value.
 
-`en-core/test/Main.hs` is the interface test harness for `en-core`. It builds a fixture schema
-`kikanSchema`, asserts `validate kikanSchema == Right ()`, compiles it with `compile
-kikanSchema`, checks `graph.hash == schemaHash kikanSchema`, and runs many `check`/`lookup`/
-`expand` assertions against the resulting graph. It also has nine `assertValidationFails`
-cases that each call `validate` on a deliberately broken schema and expect `Left`.
+`en-core/test/Main.hs` is the interface test harness for `en-core`. It imports the shared
+fixture schema `kikanSchema`, validates it into `validKikan`, compiles it with total
+`compile validKikan`, checks `graph.hash == schemaHash validKikan`, and runs many
+`check`/`lookup`/`expand` assertions against the resulting graph. It also has
+`assertValidationFails` cases that each call `validate` on a deliberately broken schema and
+expect `Left`, plus evidence-specific assertions for `validateSchema` and `compileSchema`.
 
 Two checked-in sibling plans depend on this one and must consume (not redefine) the types it
 introduces: `docs/plans/22-add-a-compile-time-schema-quasi-quoter.md` will splice a
@@ -536,26 +559,12 @@ unsafeValidSchema :: Schema -> ValidSchema
 unsafeValidSchema = ValidSchema
 ```
 
-One import detail to resolve while editing: `En.Schema.Internal` needs the `Schema` type, but
-`Schema` is defined in `En.Schema`, and `En.Schema` will import `ValidSchema` from
-`En.Schema.Internal` — a potential import cycle. Haskell does not allow mutual module imports
-without `.hs-boot` files, which are awkward. The simplest, cleanest fix is to have
-`En.Schema.Internal` NOT import `En.Schema` at all: since `Schema` is just a plain data type, you
-can either (a) `import {-# SOURCE #-} En.Schema (Schema)` via an `.hs-boot` stub, or
-(b, recommended) avoid the cycle entirely by keeping the `Schema` data type where it is and
-having `En.Schema.Internal` depend only on it through a non-cyclic path. Because
-`En.Schema.Internal` references `Schema` only inside the newtype field, the pragmatic approach
-used here is: `En.Schema.Internal` imports `Schema` from `En.Schema`, and `En.Schema` imports
-`ValidSchema` from `En.Schema.Internal`, and the cycle is broken with a one-line `.hs-boot`
-file `en-core/src/En/Schema.hs-boot` that declares just `data Schema` and exports it. If you
-prefer to avoid `.hs-boot`, factor the bare `Schema` data declaration into a tiny
-`En.Schema.Types` module that both `En.Schema` and `En.Schema.Internal` import; the placeholder
-`import En.Schema.Types (Schema)` in the file above reflects that option. Pick whichever the
-implementer finds cleaner at the time and record the choice in the Decision Log — both yield the
-identical public surface. The default recommendation is the `En.Schema.Types` factoring, because
-`.hs-boot` files are easy to get subtly wrong and harder for a novice to maintain; if you take
-that route, add `En.Schema.Types` to `exposed-modules` (or keep it as an `other-modules` private
-module if nothing outside the package needs the bare type) as well.
+The implementation uses the recommended import-cycle fix: the raw schema data declarations
+live in `en-core/src/En/Schema/Types.hs`, and both `En.Schema` and
+`En.Schema.Internal` import that module. No `.hs-boot` file is needed. `En.Schema` keeps the
+existing public surface by re-exporting `Schema (..)`, `ObjectType (..)`, `Relation (..)`,
+and the other raw types from `En.Schema.Types`, so existing consumers can continue importing
+from `En.Schema`.
 
 With the newtype's home moved to `En.Schema.Internal`, update Milestone 1's edits accordingly:
 `En.Schema.hs` no longer *declares* the newtype; it adds
@@ -577,11 +586,13 @@ all already present.
 
 ### Milestone 3 — Update the server call site, the tests, and add new tests
 
-Scope: migrate the two real call sites (`en-server/app/Main.hs` and `en-core/test/Main.hs`) to
-the new API and add tests that prove the evidence property. At the end, `cabal build all` and
-`cabal test en-core-interface-tests` both pass. Commands: `cabal build all` then
-`cabal test en-core-interface-tests`, both from the repository root. Acceptance: the build is
-clean and every test assertion passes, including the new ones.
+Scope: migrate every compiled call site to the new API and add tests that prove the
+evidence property. The implementation updates `en-server/app/Main.hs`,
+`en-core/test/Main.hs`, `en-core/src/En/Conformance/Kikan.hs`, `en-core/bench/Main.hs`,
+`en-example/src/En/Example/Host.hs`, and `en-postgres/integration-test/Main.hs`. At the
+end, `cabal build all` and `cabal test en-core-interface-tests` both pass. Commands:
+`cabal build all` then `cabal test en-core-interface-tests`, both from the repository root.
+Acceptance: the build is clean and every test assertion passes, including the new ones.
 
 Edit `en-server/app/Main.hs`. Change the import from `En.Schema (Schema, schemaHash)` to also
 bring in `ValidSchema` and `validateSchema`, and import `compileSchema` is *not* needed because
@@ -666,6 +677,12 @@ existing `check`/`lookup`/`expand` assertions already exercise the graph built f
 the old `compile kikanSchema` did (same inputs, same pure construction), those assertions
 continue to pass unchanged and serve as the end-to-end proof that behavior is preserved.
 
+Also migrate the additional compiled callers discovered during implementation:
+`en-core/src/En/Conformance/Kikan.hs`, `en-core/bench/Main.hs`, and
+`en-example/src/En/Example/Host.hs` use `compileSchema` for raw schema fixtures.
+`en-postgres/integration-test/Main.hs` validates `checkSchema` once, uses the resulting
+`ValidSchema` for `Schema.schemaHash`, and passes that same evidence to total `compile`.
+
 
 ## Concrete Steps
 
@@ -710,8 +727,8 @@ Expected: a clean library build that now exposes `En.Schema.Internal`. You can s
 module is exposed with `cabal repl en-core` and `:browse En.Schema.Internal`, which should list
 `ValidSchema`, `unValidSchema`, and `unsafeValidSchema`.
 
-Step 3 — make the Milestone 3 edits to `en-server/app/Main.hs` and `en-core/test/Main.hs`,
-then build everything:
+Step 3 — make the Milestone 3 edits to all compiled callers named above, then build
+everything:
 
 ```bash
 cabal build all
@@ -797,14 +814,13 @@ If an edit leaves the tree in a non-building state mid-milestone, that is expect
 milestones (Milestone 1 leaves `En.Reachability` referring to the old `compile` shape until
 Milestone 2 fixes it). The recovery path is simply to finish the next milestone's edits; the
 plan is ordered so that completing all four milestones (1, 2, 2.5, 3) always reaches a clean
-`cabal build all`. This plan adds exactly one new file, `en-core/src/En/Schema/Internal.hs`,
-and edits four existing files: `en-core/src/En/Schema.hs`, `en-core/src/En/Reachability.hs`,
-`en-core/en-core.cabal` (one line added to `exposed-modules`), `en-server/app/Main.hs`, and
-`en-core/test/Main.hs`. To abandon the work entirely, run
-`git checkout -- en-core/src/En/Schema.hs en-core/src/En/Reachability.hs en-core/en-core.cabal
-en-server/app/Main.hs en-core/test/Main.hs` to restore the edited files and
-`rm en-core/src/En/Schema/Internal.hs` (or `git clean -f en-core/src/En/Schema/Internal.hs`) to
-remove the new module.
+`cabal build all`. This plan adds `en-core/src/En/Schema/Internal.hs` and
+`en-core/src/En/Schema/Types.hs`, and edits `en-core/src/En/Schema.hs`,
+`en-core/src/En/Reachability.hs`, `en-core/en-core.cabal`, `en-server/app/Main.hs`,
+`en-core/test/Main.hs`, `en-core/src/En/Conformance/Kikan.hs`, `en-core/bench/Main.hs`,
+`en-example/src/En/Example/Host.hs`, and `en-postgres/integration-test/Main.hs`. To
+abandon the work entirely, restore those edited files and remove the two new schema
+modules.
 
 Because `ValidSchema` is a zero-cost newtype and `validate` is preserved as a wrapper over
 `validateSchema`, there is no behavioral drift to recover from even on partial application: any
@@ -880,7 +896,10 @@ local `validSchema :: ValidSchema` and reuses it for `compile validSchema` (now 
 `schemaHash validSchema` inside its `ConsistencyConfig`. The test harness
 `en-core/test/Main.hs` uses `compileSchema` where it previously used `compile`, and validated
 local bindings (`validKikan`, `validKikanManual`, `validKikanReordered`) wherever `schemaHash`
-is needed.
+is needed. `en-core/src/En/Conformance/Kikan.hs`, `en-core/bench/Main.hs`, and
+`en-example/src/En/Example/Host.hs` use `compileSchema` for raw schema fixtures.
+`en-postgres/integration-test/Main.hs` validates `checkSchema` once and reuses that
+`ValidSchema` for both `Schema.schemaHash` and total `compile`.
 
 Integration points with other checked-in plans:
 

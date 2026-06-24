@@ -51,7 +51,7 @@ import En.Effect.TupleStore (
     UsersetQuery (..),
  )
 import En.Error (EnError)
-import En.Reachability (ReachabilityGraph, compile)
+import En.Reachability (ReachabilityGraph, compileSchema)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (CaveatName (..), CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
 import En.Schema.Builder qualified as Schema
@@ -136,7 +136,7 @@ kikanSchema =
 
 kikanGraph :: ReachabilityGraph
 kikanGraph =
-    either (error . show) id (compile kikanSchema)
+    either (error . show) id (compileSchema kikanSchema)
 
 fixtureSchemaOrError :: Either EnError Schema -> Schema
 fixtureSchemaOrError =

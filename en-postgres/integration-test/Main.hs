@@ -66,10 +66,11 @@ resetSchema connection =
 
 runTupleStoreScenario :: Connection.Connection -> IO ()
 runTupleStoreScenario connection = do
+    validCheckSchema <- either (fail . show) pure (Schema.validateSchema checkSchema)
     let config =
             ConsistencyConfig
                 { datastoreId = DatastoreId "test-datastore"
-                , schemaHash = Schema.schemaHash checkSchema
+                , schemaHash = Schema.schemaHash validCheckSchema
                 , gcWindow = "24 hours"
                 }
         projectX = ObjectRef (ObjectType "space") "project-x"
@@ -116,7 +117,7 @@ runTupleStoreScenario connection = do
     assertEqual "write token read sees tuple count" 2 (length rowsAtWrite)
     assertEqual "write token read is exhausted" Exhausted stateAtWrite
     runSnapshotOracleScenario connection
-    graph <- either (fail . show) pure (compile checkSchema)
+    let graph = compile validCheckSchema
     checkDecision <- runPg connection config (check graph (AtLeastAsFresh writeToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX)
     assertEqual "postgres-backed check sees written tuple" (Right Allowed) checkDecision
     lookupFirstPage <- runPg connection config (Lookup.lookup graph (AtLeastAsFresh writeToken) (lookupRequest Nothing))

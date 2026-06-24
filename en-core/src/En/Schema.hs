@@ -27,15 +27,18 @@ module En.Schema (
     CaveatValue (..),
     CaveatPayload (..),
     CaveatContext (..),
+    ValidSchema,
+    unValidSchema,
     validate,
+    validateSchema,
     schemaHash,
 ) where
 
+import Control.Monad (void)
 import Data.Bits (xor)
 import Data.Foldable (traverse_)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -45,120 +48,31 @@ import Numeric (showHex)
 import En.Caveat.Value (CaveatContext (..), CaveatPayload (..), CaveatValue (..))
 import En.Error (EnError (..))
 import En.Revision (SchemaHash (..))
+import En.Schema.Internal (ValidSchema (..), unValidSchema)
+import En.Schema.Types (
+    AllowedSubject (..),
+    CaveatCompare (..),
+    CaveatDefinition (..),
+    CaveatName (..),
+    CaveatOperand (..),
+    CaveatParameterName (..),
+    CaveatParameterType (..),
+    CaveatPredicate (..),
+    CaveatSource (..),
+    ObjectType (..),
+    Relation (..),
+    RelationName (..),
+    Rewrite (..),
+    Schema (..),
+ )
 
-newtype ObjectType = ObjectType Text
-    deriving stock (Eq, Ord, Show)
-
-newtype RelationName = RelationName Text
-    deriving stock (Eq, Ord, Show)
-
-newtype CaveatName = CaveatName Text
-    deriving stock (Eq, Ord, Show)
-
-newtype CaveatParameterName = CaveatParameterName Text
-    deriving stock (Eq, Ord, Show)
-
-{- | The bounded value kinds a caveat can ask for. The evaluator remains small
-and total; these are enough for time bounds, booleans, ids, and autonomy
-levels without embedding a general policy language.
--}
-data CaveatParameterType
-    = ParameterText
-    | ParameterBool
-    | ParameterInteger
-    | ParameterTimestamp
-    | ParameterEnum [Text]
-    deriving stock (Eq, Ord, Show)
-
-data CaveatSource
-    = FromContext
-    | FromPayload
-    deriving stock (Eq, Ord, Show)
-
-data CaveatOperand
-    = OperandParam !CaveatSource !CaveatParameterName
-    | OperandLiteral !CaveatValue
-    deriving stock (Eq, Ord, Show)
-
-data CaveatCompare
-    = CmpEq
-    | CmpNe
-    | CmpLt
-    | CmpLe
-    | CmpGt
-    | CmpGe
-    deriving stock (Eq, Ord, Show)
-
-data CaveatPredicate
-    = PredTrue
-    | PredCompare !CaveatCompare !CaveatOperand !CaveatOperand
-    | PredAnd ![CaveatPredicate]
-    | PredOr ![CaveatPredicate]
-    | PredNot !CaveatPredicate
-    | PredMember !CaveatOperand ![CaveatValue]
-    deriving stock (Eq, Ord, Show)
-
--- | Declares the request or tuple arguments a named caveat expects.
-data CaveatDefinition = CaveatDefinition
-    { name :: !CaveatName
-    , parameters :: !(Map CaveatParameterName CaveatParameterType)
-    , predicate :: !CaveatPredicate
-    }
-    deriving stock (Eq, Show)
-
--- | A complete authorization model: every object type and its relations.
-data Schema = Schema
-    { objectTypes :: !(Map ObjectType (Map RelationName Relation))
-    , caveats :: !(Map CaveatName CaveatDefinition)
-    }
-    deriving stock (Eq, Show)
-
--- | A relation is a name plus the rewrite rule that computes its effective members.
-data Relation = Relation
-    { relationName :: !RelationName
-    , allowedSubjects :: !(Set AllowedSubject)
-    , rewrite :: !Rewrite
-    }
-    deriving stock (Eq, Show)
-
-{- | A subject shape accepted by direct tuples on a relation.
-
-@AllowedSubject t Nothing@ accepts concrete subjects of object type @t@, such
-as @user:alice@. @AllowedSubject t (Just r)@ accepts userset subjects of shape
-@t#r@, such as @org:acme#member@.
--}
-data AllowedSubject = AllowedSubject
-    { objectType :: !ObjectType
-    , relation :: !(Maybe RelationName)
-    , wildcard :: !Bool
-    }
-    deriving stock (Eq, Ord, Show)
-
-{- | Userset-rewrite expressions — the Zanzibar relation algebra. @en@ leans on
-'Union', 'ComputedUserset', and 'TupleToUserset'; 'Intersection' / 'Exclusion'
-are supported but are the expensive, non-streaming cases for 'En.Lookup.lookup'.
--}
-data Rewrite
-    = -- | Directly assigned tuples on this relation (Zanzibar @_this@).
-      This
-    | -- | The members of another relation on the same object.
-      ComputedUserset RelationName
-    | -- | Arrow: follow a tupleset relation, then a relation on the target.
-      TupleToUserset RelationName RelationName
-    | Union [Rewrite]
-    | Intersection [Rewrite]
-    | -- | @a but not b@.
-      Exclusion Rewrite Rewrite
-    | -- | A rewrite gated by a named caveat (bounded ABAC: time-bound, autonomy-level).
-      Caveated CaveatName Rewrite
-    deriving stock (Eq, Show)
-
--- | Validate schema references and rewrite shapes before compilation.
-validate :: Schema -> Either EnError ()
-validate schema = do
+-- | Validate a schema and, on success, return it wrapped as evidence.
+validateSchema :: Schema -> Either EnError ValidSchema
+validateSchema schema = do
     traverse_ validateCaveatDefinition (Map.toAscList schema.caveats)
     traverse_ validateObjectType (Map.toAscList schema.objectTypes)
     validateProductiveCycles schema
+    pure (ValidSchema schema)
   where
     validateCaveatDefinition (name, definition)
         | name /= definition.name =
@@ -270,6 +184,11 @@ validate schema = do
     hasRelation objectType relationName =
         maybe False (Map.member relationName) (Map.lookup objectType schema.objectTypes)
 
+-- | Validate schema references and rewrite shapes before compilation.
+validate :: Schema -> Either EnError ()
+validate =
+    void . validateSchema
+
 validateProductiveCycles :: Schema -> Either EnError ()
 validateProductiveCycles schema =
     traverse_ validateRef (Map.keys relationGraph)
@@ -360,9 +279,9 @@ rewriteContainsThis =
         Caveated _ rewrite -> rewriteContainsThis rewrite
 
 -- | A deterministic semantic schema fingerprint for consistency-token metadata.
-schemaHash :: Schema -> SchemaHash
+schemaHash :: ValidSchema -> SchemaHash
 schemaHash =
-    SchemaHash . ("fnv1a64:" <>) . Text.pack . flip showHex "" . fnv1a64 . renderSchema
+    SchemaHash . ("fnv1a64:" <>) . Text.pack . flip showHex "" . fnv1a64 . renderSchema . unValidSchema
 
 renderSchema :: Schema -> Text
 renderSchema schema =

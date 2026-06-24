@@ -5,6 +5,7 @@ module Main (
     main,
 ) where
 
+import Data.Either (isLeft, isRight)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.List (sort)
@@ -71,6 +72,7 @@ import En.Reachability (
     RelationRef (..),
     SubjectSelector (..),
     compile,
+    compileSchema,
  )
 import En.Reachability qualified as Reachability
 import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
@@ -91,6 +93,7 @@ import En.Schema (
     Schema (..),
     schemaHash,
     validate,
+    validateSchema,
  )
 import En.Schema.Builder qualified as Schema
 import En.Tuple (
@@ -116,15 +119,21 @@ main = do
         _ = sampleCaveatDefinition
     testCacheOperations
     testCachedTupleStore
+    validKikan <- either (fail . show) pure (validateSchema kikanSchema)
+    validKikanManual <- either (fail . show) pure (validateSchema kikanSchemaManual)
+    validKikanReordered <- either (fail . show) pure (validateSchema kikanSchemaReordered)
     assertEqual "kikan-shaped fixture validates" (Right ()) (validate kikanSchema)
     assertEqual "builder schema equals manual schema" kikanSchemaManual kikanSchema
-    assertEqual "builder schema hash matches manual schema hash" (schemaHash kikanSchemaManual) (schemaHash kikanSchema)
+    assertEqual "builder schema hash matches manual schema hash" (schemaHash validKikanManual) (schemaHash validKikan)
+    assertBool "validateSchema produces evidence for a valid schema" (isRight (validateSchema kikanSchema))
+    assertBool "validateSchema rejects an invalid schema (no evidence)" (isLeft (validateSchema unproductiveCycleSchema))
     assertEqual "builder anyOf constructs a non-empty union" (Union [This, ComputedUserset (RelationName "owner")]) (Schema.anyOf Schema.this [Schema.computed "owner"])
     assertEqual "builder allOf constructs a non-empty intersection" (Intersection [This, ComputedUserset (RelationName "owner")]) (Schema.allOf Schema.this [Schema.computed "owner"])
-    graph <- either (fail . show) pure (compile kikanSchema)
+    let graph = compile validKikan
+    assertEqual "compileSchema round-trips identically to compile . validateSchema" (Right graph) (compileSchema kikanSchema)
     testDecisionCache graph
-    assertEqual "graph stores schema hash" (schemaHash kikanSchema) graph.hash
-    assertEqual "schema hash is stable across map insertion order" (schemaHash kikanSchema) (schemaHash kikanSchemaReordered)
+    assertEqual "graph stores schema hash" (schemaHash validKikan) graph.hash
+    assertEqual "schema hash is stable across map insertion order" (schemaHash validKikan) (schemaHash validKikanReordered)
     assertBool "space view has a direct user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Direct False graph)
     assertBool "space view has a guest-org userset entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "org") (Just (RelationName "member")) False) Reachability.Direct False graph)
     assertBool "space view has a recursive parent entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "space") (Just (RelationName "view")) False) Reachability.Direct True graph)
@@ -227,14 +236,14 @@ main = do
     assertEqual "delegation caveat denies higher autonomy" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency adminContext (SubjectId user) (RelationName "view") intention
     assertEqual "delegation caveat is conditional with missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}])) =<< check consistencyStore tupleStore graph MinimizeLatency missingAutonomyContext (SubjectId user) (RelationName "view") intention
     assertEqual "expired delegation caveat denies access" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency expiredContext (SubjectId user) (RelationName "view") intention
-    minLevelGraph <- either (fail . show) pure (compile minLevelSchema)
+    minLevelGraph <- either (fail . show) pure (compileSchema minLevelSchema)
     let minLevelStore = runTupleStoreInMemory [minLevelTuple]
     assertEqual "generic integer caveat allows sufficient clearance" (Right Allowed) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelAllowedContext (SubjectId user) (RelationName "view") minLevelDocument
     assertEqual "generic integer caveat denies insufficient clearance" (Right Denied) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelDeniedContext (SubjectId user) (RelationName "view") minLevelDocument
     assertEqual "generic integer caveat reports missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "min_level", missingContext = ["clearance"]}])) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency (CaveatContext Map.empty) (SubjectId user) (RelationName "view") minLevelDocument
     let cursorState = LookupCursorState{version = 1, revision = testRevision, lastObject = Just childSpace}
     assertEqual "lookup cursor codec round-trips" (Right cursorState) (decodeLookupCursor (encodeLookupCursor cursorState))
-    publicGraph <- either (fail . show) pure (compile publicSchema)
+    publicGraph <- either (fail . show) pure (compileSchema publicSchema)
     let publicStore = runTupleStoreInMemory [publicTuple]
     assertBool "public view has a wildcard user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing True) Reachability.Direct False publicGraph)
     assertEqual "wildcard subject grants concrete users" (Right Allowed) =<< check consistencyStore publicStore publicGraph MinimizeLatency requestContext (SubjectId bob) (RelationName "view") publicSpace
@@ -242,7 +251,7 @@ main = do
     assertEqual "lookup includes public wildcard rows for concrete users" (Right (lookupPage [allowed publicSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore publicStore publicGraph MinimizeLatency (lookupRequest (SubjectId bob) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     publicExpansion <- expandEngine consistencyStore publicStore publicGraph MinimizeLatency (expandRequest publicSpace (RelationName "view") requestContext (ExpandLimit 20) Nothing)
     assertBool "expand renders wildcard subjects" (treeHasSubject (SubjectWildcard (ObjectType "user")) publicExpansion)
-    streamingGraph <- either (fail . show) pure (compile streamingSchema)
+    streamingGraph <- either (fail . show) pure (compileSchema streamingSchema)
     let streamingStore = runTupleStoreInMemory streamingTuples
         expectedFolders = allowed <$> sort folders
     streamedFolders <- collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)

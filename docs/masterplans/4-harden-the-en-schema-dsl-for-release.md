@@ -91,7 +91,7 @@ their being different concerns (soundness vs. ergonomics), and would have scatte
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | 20 | Detect duplicate names in the schema builder | docs/plans/20-detect-duplicate-names-in-the-schema-builder.md | None | None | Complete |
-| 21 | Introduce a validated-schema evidence type | docs/plans/21-introduce-a-validated-schema-evidence-type.md | None | EP-20 | Not Started |
+| 21 | Introduce a validated-schema evidence type | docs/plans/21-introduce-a-validated-schema-evidence-type.md | None | EP-20 | Complete |
 | 22 | Add a compile-time schema quasi-quoter | docs/plans/22-add-a-compile-time-schema-quasi-quoter.md | EP-21 | EP-20 | Not Started |
 | 23 | Polish builder ergonomics and reference safety | docs/plans/23-polish-builder-ergonomics-and-reference-safety.md | None | EP-20 | Not Started |
 | 24 | Render schemas as docs and diagrams | docs/plans/24-render-schemas-as-docs-and-diagrams.md | None | EP-21 | Not Started |
@@ -127,9 +127,10 @@ shared artifact. `EP-21` owns it: it defines `ValidSchema` (a newtype over `Sche
 produced only by `validate`/the builder's validating entry point) and changes
 `En.Reachability.compile` and `En.Schema.schemaHash`'s callers to demand it. `EP-22`
 consumes `ValidSchema` as the type its quasi-quoter splices. `EP-24` consumes it as the
-input type for rendering. The single non-test consumer of `compile` and `schemaHash`
-today is `en-server/app/Main.hs` (lines 28 and 42); `EP-21` is responsible for updating
-it, and `EP-22`/`EP-24` must not re-change that call site.
+input type for rendering. After EP-21, `en-server/app/Main.hs` validates its demo schema
+once and reuses that `ValidSchema` for both `compile` and `schemaHash`; other raw-schema
+fixtures use `compileSchema` or validate once before hashing. `EP-22`/`EP-24` must consume
+that surface rather than re-changing the server startup path.
 
 The `EnError` value used to report a duplicate name is a shared artifact between `EP-20`
 and `EP-22`. `EP-20` owns the choice (reuse `SchemaViolation Text` from
@@ -168,8 +169,8 @@ and the milestone. This section provides an at-a-glance view of the entire initi
 
 - [x] 2026-06-24: EP-20: Builder rejects duplicate object/relation/caveat/parameter names with an `EnError`
 - [x] 2026-06-24: EP-20: Tests prove each duplicate class is reported rather than silently dropped
-- [ ] EP-21: `ValidSchema` newtype defined; `validate` (and a validating builder entry point) produce it
-- [ ] EP-21: `compile`/`schemaHash` consumers demand `ValidSchema`; `en-server` call site updated
+- [x] 2026-06-24: EP-21: `ValidSchema` newtype defined; `validateSchema` produces it and `validate` remains a wrapper
+- [x] 2026-06-24: EP-21: `compile`/`schemaHash` consumers demand `ValidSchema`; compiled call sites updated
 - [ ] EP-22: Prototype a quasi-quoter that parses a compact schema syntax and runs `validate` at compile time
 - [ ] EP-22: `[schema| … |]` splices a `ValidSchema` and fails the build on unknown relations/caveats/duplicates
 - [ ] EP-23: `permission` cannot be given a bare `this`; intra-object references can be made by handle
@@ -206,6 +207,13 @@ interactions between child plans. Provide concise evidence.
   `en-example/src/En/Example/Host.hs`, all of which author schemas through
   `En.Schema.Builder`. Future plans that change the builder surface, especially EP-21 and
   EP-23, should include these call sites in their search/validation pass.
+  Date: 2026-06-24
+
+- Discovery (during EP-21): the validated-schema evidence type also affects compiled
+  callers outside the original server/test description. `en-core/src/En/Conformance/Kikan.hs`,
+  `en-core/bench/Main.hs`, `en-example/src/En/Example/Host.hs`, and
+  `en-postgres/integration-test/Main.hs` needed migration to `compileSchema` or
+  `validateSchema` before calling `compile`/`schemaHash`.
   Date: 2026-06-24
 
 
