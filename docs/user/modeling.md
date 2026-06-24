@@ -37,7 +37,9 @@ Use computed relations as permissions:
 
 Permissions usually have `allowedSubjects = Set.empty` because callers should
 not write direct tuples to them. Instead, the permission rewrites over stored
-relations.
+relations. `Schema.this` belongs on a writable `Schema.relation` that declares
+allowed subjects; `Schema.permission "view" Schema.this` is rejected by the
+builder API because a permission has no direct tuples to read.
 
 ```haskell
 import En.Schema.Builder qualified as Schema
@@ -82,6 +84,30 @@ Tuple
 
 Any user in `org:agency#member` is now treated as a member of `space:guest-space`.
 
+## Reference safety with handles
+
+String references are still supported, but within one object you can bind a
+relation handle and pass that handle to `Schema.computed` or `Schema.arrow`.
+This turns a typo in a sibling relation name into an ordinary Haskell
+"variable not in scope" error.
+
+```haskell
+document <-
+    Schema.object
+        "document"
+        ( let (ownerRel, owner) =
+                  Schema.relationH "owner" [Schema.subject "user"] Schema.this
+           in [ ownerRel
+              , Schema.permission "view" (Schema.computed owner)
+              ]
+        )
+```
+
+Handles are intentionally local to the authoring scope where you bind them.
+Cross-object arrows such as `Schema.arrow "guest_org" "member"` usually still
+use names for the target object's relation, because that target relation is
+defined in a different object block.
+
 ## Rewrite choices
 
 Prefer these rewrites:
@@ -101,6 +127,11 @@ Use these carefully:
 
 `check` handles all rewrites. `lookup` is fastest and easiest to reason about
 when permissions are shallow and mostly union-shaped.
+
+`Schema.anyOf` and `Schema.allOf` take a required first branch plus a list of
+additional branches. That shape makes empty unions and intersections
+unrepresentable through the builder, matching the runtime validation rule that
+rejects empty rewrites.
 
 ## Caveats
 

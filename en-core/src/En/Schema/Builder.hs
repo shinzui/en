@@ -7,6 +7,10 @@ and expand already consume.
 module En.Schema.Builder (
     SchemaObject,
     SchemaRelation,
+    PermissionRewrite,
+    RewriteExpr (..),
+    RelationHandle,
+    relationRef,
     SubjectSpec,
     CaveatSpec,
     ParameterSpec,
@@ -14,6 +18,7 @@ module En.Schema.Builder (
     buildWithCaveats,
     object,
     relation,
+    relationH,
     permission,
     subject,
     userset,
@@ -40,18 +45,14 @@ module En.Schema.Builder (
     predNot,
     predMember,
     this,
-    computed,
-    arrow,
-    anyOf,
-    allOf,
-    minus,
-    caveated,
 ) where
 
 import Control.Monad (foldM)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
+import Data.String (IsString (..))
 import Data.Text (Text)
+import Data.Text qualified as Text
 import Data.Time (UTCTime)
 
 import En.Error (EnError (SchemaViolation))
@@ -61,6 +62,10 @@ import En.Schema qualified as Raw
 data SchemaObject = SchemaObject Raw.ObjectType (Map.Map Raw.RelationName Raw.Relation)
 
 data SchemaRelation = SchemaRelation Raw.RelationName Raw.Relation
+
+newtype PermissionRewrite = PermissionRewrite Rewrite
+
+newtype RelationHandle = RelationHandle Raw.RelationName
 
 newtype SubjectSpec = SubjectSpec Raw.AllowedSubject
 
@@ -116,9 +121,25 @@ relation name subjects rewrite =
     subjectValue (SubjectSpec allowedSubject) =
         allowedSubject
 
-permission :: Text -> Rewrite -> SchemaRelation
+relationH :: Text -> [SubjectSpec] -> Rewrite -> (SchemaRelation, RelationHandle)
+relationH name subjects rewrite =
+    (relation name subjects rewrite, RelationHandle (Raw.RelationName name))
+
+relationRef :: Text -> RelationHandle
+relationRef =
+    RelationHandle . Raw.RelationName
+
+instance IsString RelationHandle where
+    fromString =
+        relationRef . Text.pack
+
+permission :: Text -> PermissionRewrite -> SchemaRelation
 permission name =
-    relation name []
+    relation name [] . permissionRewrite
+
+permissionRewrite :: PermissionRewrite -> Rewrite
+permissionRewrite (PermissionRewrite rewrite) =
+    rewrite
 
 subject :: Text -> SubjectSpec
 subject name =
@@ -238,26 +259,52 @@ this :: Rewrite
 this =
     Raw.This
 
-computed :: Text -> Rewrite
-computed =
-    Raw.ComputedUserset . Raw.RelationName
+class RewriteExpr r where
+    computed :: RelationHandle -> r
+    arrow :: RelationHandle -> RelationHandle -> r
+    anyOf :: r -> [r] -> r
+    allOf :: r -> [r] -> r
+    minus :: r -> r -> r
+    caveated :: Text -> r -> r
 
-arrow :: Text -> Text -> Rewrite
-arrow tupleset computedRelation =
-    Raw.TupleToUserset (Raw.RelationName tupleset) (Raw.RelationName computedRelation)
+instance RewriteExpr Rewrite where
+    computed =
+        Raw.ComputedUserset . relationHandleName
 
-anyOf :: Rewrite -> [Rewrite] -> Rewrite
-anyOf first rest =
-    Raw.Union (first : rest)
+    arrow tupleset computedRelation =
+        Raw.TupleToUserset (relationHandleName tupleset) (relationHandleName computedRelation)
 
-allOf :: Rewrite -> [Rewrite] -> Rewrite
-allOf first rest =
-    Raw.Intersection (first : rest)
+    anyOf first rest =
+        Raw.Union (first : rest)
 
-minus :: Rewrite -> Rewrite -> Rewrite
-minus =
-    Raw.Exclusion
+    allOf first rest =
+        Raw.Intersection (first : rest)
 
-caveated :: Text -> Rewrite -> Rewrite
-caveated name =
-    Raw.Caveated (Raw.CaveatName name)
+    minus =
+        Raw.Exclusion
+
+    caveated name =
+        Raw.Caveated (Raw.CaveatName name)
+
+instance RewriteExpr PermissionRewrite where
+    computed =
+        PermissionRewrite . computed
+
+    arrow tupleset computedRelation =
+        PermissionRewrite (arrow tupleset computedRelation)
+
+    anyOf first rest =
+        PermissionRewrite (Raw.Union (permissionRewrite <$> (first : rest)))
+
+    allOf first rest =
+        PermissionRewrite (Raw.Intersection (permissionRewrite <$> (first : rest)))
+
+    minus left right =
+        PermissionRewrite (Raw.Exclusion (permissionRewrite left) (permissionRewrite right))
+
+    caveated name body =
+        PermissionRewrite (Raw.Caveated (Raw.CaveatName name) (permissionRewrite body))
+
+relationHandleName :: RelationHandle -> Raw.RelationName
+relationHandleName (RelationHandle relationName) =
+    relationName

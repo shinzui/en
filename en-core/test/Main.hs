@@ -139,6 +139,37 @@ object space {
 }
 |]
 
+handleStringSchema :: Either EnError Schema
+handleStringSchema = do
+    userObject <- Schema.object "user" []
+    documentObject <-
+        Schema.object
+            "document"
+            [ Schema.relation "owner" [Schema.subject "user"] Schema.this
+            , Schema.permission "view" (Schema.computed "owner")
+            ]
+    Schema.build [userObject, documentObject]
+
+handleReferenceSchema :: Either EnError Schema
+handleReferenceSchema = do
+    userObject <- Schema.object "user" []
+    let (ownerRelation, owner) =
+            Schema.relationH "owner" [Schema.subject "user"] Schema.this
+    documentObject <-
+        Schema.object
+            "document"
+            [ ownerRelation
+            , Schema.permission "view" (Schema.computed owner)
+            ]
+    Schema.build [userObject, documentObject]
+
+-- Negative compile fixture: a permission may not be a bare `this`.
+-- Uncommenting the next definition must fail with a type error like:
+--   Couldn't match expected type `Schema.PermissionRewrite`
+--     with actual type `Rewrite`
+-- badPermission :: Schema.SchemaRelation
+-- badPermission = Schema.permission "view" Schema.this
+
 main :: IO ()
 main = do
     let _ = sampleTuple
@@ -160,6 +191,7 @@ main = do
     assertEqual "builder schema hash matches manual schema hash" (schemaHash validKikanManual) (schemaHash validKikan)
     assertEqual "compile-time validated schema equals builder fixture" kikanSchema (unValidSchema validatedKikanTH)
     assertEqual "schema quasi-quoter builds compact schema" quotedSchemaFixture (unValidSchema quotedSchemaTH)
+    assertEqual "handle form equals string form" handleStringSchema handleReferenceSchema
     assertBool "validateSchema produces evidence for a valid schema" (isRight (validateSchema kikanSchema))
     assertBool "validateSchema rejects an invalid schema (no evidence)" (isLeft (validateSchema unproductiveCycleSchema))
     assertEqual "builder anyOf constructs a non-empty union" (Union [This, ComputedUserset (RelationName "owner")]) (Schema.anyOf Schema.this [Schema.computed "owner"])

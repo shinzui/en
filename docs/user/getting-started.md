@@ -12,7 +12,8 @@ object types and relations as values.
 ```haskell
 import Data.Map.Strict qualified as Map
 
-import En.Schema (ObjectType (..), RelationName (..), Schema)
+import En.Error (EnError)
+import En.Schema (ObjectType (..), RelationName (..), Schema, validateSchema)
 import En.Schema.Builder qualified as Schema
 import En.Tuple
 import En.Reachability (compile)
@@ -30,31 +31,37 @@ view = RelationName "view"
 
 ## 2. Build a schema
 
-A direct relation uses `Schema.this`; a permission usually computes over one or
-more relations.
+A direct relation uses `Schema.this`; a permission computes over one or more
+relations.
 
 ```haskell
-schema :: Schema
-schema =
-    Schema.build
-        [ Schema.object "user" []
-        , Schema.object
+schemaResult :: Either EnError Schema
+schemaResult = do
+    user <- Schema.object "user" []
+    space <-
+        Schema.object
             "space"
             [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
             , Schema.permission "view" (Schema.computed "viewer")
             ]
-        ]
+    Schema.build [user, space]
 ```
 
 `viewer` accepts direct `user` subjects. `view` accepts no direct tuples; it is
-a permission computed from `viewer`.
+a permission computed from `viewer`. Use `Schema.relation` with allowed subjects
+for writable base relations, and use `Schema.permission` with
+`Schema.computed`, `Schema.arrow`, `Schema.anyOf`, or the other rewrite
+constructors for computed rules. A permission cannot be a bare `Schema.this`;
+that always-invalid shape is rejected by the builder API.
 
 ## 3. Validate and compile the schema
 
 Compile once at startup and fail fast if the schema is invalid.
 
 ```haskell
-graph <- either (fail . show) pure (compile schema)
+schema <- either (fail . show) pure schemaResult
+validSchema <- either (fail . show) pure (validateSchema schema)
+let graph = compile validSchema
 ```
 
 `compile` runs schema validation before building the `ReachabilityGraph` used by

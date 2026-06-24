@@ -20,7 +20,7 @@ import Language.Haskell.TH.Syntax (Code, Exp, Q)
 import Language.Haskell.TH.Syntax qualified as TH
 
 import En.Error (EnError)
-import En.Schema (Rewrite, Schema, ValidSchema, unValidSchema, validateSchema)
+import En.Schema (Schema, ValidSchema, unValidSchema, validateSchema)
 import En.Schema.Builder qualified as Builder
 import En.Schema.Internal (unsafeValidSchema)
 
@@ -165,27 +165,27 @@ parsePermission objectName rest =
             | Text.null rewriteText ->
                 Left ("permission in object " <> Text.unpack objectName <> " is missing '='")
             | otherwise -> do
-                rewrite <- parseRewrite (Text.drop 1 rewriteText)
+                rewrite <- parsePermissionRewrite (Text.drop 1 rewriteText)
                 pure (Builder.permission (Text.strip name) rewrite)
 
-parseRewrite :: Text -> Either String Rewrite
-parseRewrite rewriteText =
+parsePermissionRewrite :: Text -> Either String Builder.PermissionRewrite
+parsePermissionRewrite rewriteText =
     case pipeList rewriteText of
         [] -> Left "empty rewrite"
         first : rest -> do
-            firstRewrite <- parseRewriteTerm first
-            restRewrites <- traverse parseRewriteTerm rest
+            firstRewrite <- parsePermissionRewriteTerm first
+            restRewrites <- traverse parsePermissionRewriteTerm rest
             pure $
                 case restRewrites of
                     [] -> firstRewrite
                     _ -> Builder.anyOf firstRewrite restRewrites
 
-parseRewriteTerm :: Text -> Either String Rewrite
-parseRewriteTerm term
+parsePermissionRewriteTerm :: Text -> Either String Builder.PermissionRewrite
+parsePermissionRewriteTerm term
     | Text.null trimmed = Left "empty rewrite term"
-    | trimmed == "this" = Right Builder.this
-    | Just (tupleset, computed) <- splitArrow trimmed = Right (Builder.arrow tupleset computed)
-    | otherwise = Right (Builder.computed trimmed)
+    | trimmed == "this" = Left "permission rewrite cannot contain this"
+    | Just (tupleset, computedRelation) <- splitArrow trimmed = Right (Builder.arrow (Builder.relationRef tupleset) (Builder.relationRef computedRelation))
+    | otherwise = Right (Builder.computed (Builder.relationRef trimmed))
   where
     trimmed =
         Text.strip term

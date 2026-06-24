@@ -73,33 +73,49 @@ workspace.
 
 ## Progress
 
-- [ ] Read EP-20 (`docs/plans/20-detect-duplicate-names-in-the-schema-builder.md`)
+- [x] 2026-06-24: Read EP-20 (`docs/plans/20-detect-duplicate-names-in-the-schema-builder.md`)
       to learn which duplicate-detection helpers it added to
       `en-core/src/En/Schema/Builder.hs`, then rebase these edits on top without
       redefining them.
-- [ ] Add a `PermissionRewrite` newtype and its smart constructors to
+- [x] 2026-06-24: Add a `PermissionRewrite` newtype and its smart constructors to
       `En.Schema.Builder`, and re-type `permission` to take a `PermissionRewrite`
       so `permission "view" this` no longer compiles.
-- [ ] Keep `this`, `computed`, `arrow`, `anyOf`, `allOf`, `minus`, `caveated`
+- [x] 2026-06-24: Keep `this`, `computed`, `arrow`, `anyOf`, `allOf`, `minus`, `caveated`
       producing plain `Rewrite` for use inside `relation`; add the permission-side
       constructors so permissions read identically at the call site.
-- [ ] Add an opt-in handle API: a `RelationHandle` value returned alongside
-      `relation`, consumable by `computed`/`arrow` via overloading, so a relation
-      can be referenced by a bound value rather than a re-typed string.
-- [ ] Update `en-core/test/Main.hs`: convert the `kikanSchema` permission rewrites
+- [x] 2026-06-24: Add an opt-in handle API: a `RelationHandle` value returned alongside
+      `relation`, consumable by `computed`/`arrow`, so a relation can be referenced by a
+      bound value rather than a re-typed string.
+- [x] 2026-06-24: Update `en-core/test/Main.hs`: convert the `kikanSchema` permission rewrites
       to the new permission constructors (graph unchanged), add a semantic-equality
       test for the handle form, and add the commented does-not-compile fixture for
       `permission this`.
-- [ ] Update `en-server/app/Main.hs` (`demoSchema`) to the new permission
+- [x] 2026-06-24: Add `en-core/test/fixtures/BadPermissionThis.hs` as a runnable manual
+      should-not-compile fixture for the `permission this` type error.
+- [x] 2026-06-24: Update `en-server/app/Main.hs` (`demoSchema`) to the new permission
       constructors if it uses bare-`this` permissions (it does not, but verify).
-- [ ] Update `docs/user/getting-started.md` and `docs/user/modeling.md` to state
+- [x] 2026-06-24: Update `docs/user/getting-started.md` and `docs/user/modeling.md` to state
       the permission rule and show the handle API, with builder-style examples.
-- [ ] Run `cabal build all` and `cabal test en-core-interface-tests`; confirm both pass.
+- [x] 2026-06-24: Run `nix develop --command cabal build all` and
+      `nix develop --command cabal test en-core-interface-tests`; confirm both pass.
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- Discovery: `validate` rejects `This` anywhere inside a relation whose allowed-subject set is
+  empty, not only when the top-level rewrite is exactly `This`.
+  Evidence: `rewriteContainsThis` recursively traverses `Union`, `Intersection`, `Exclusion`,
+  and `Caveated` in `en-core/src/En/Schema.hs`. The builder implementation therefore makes
+  `PermissionRewrite` recursive too: permission-side `anyOf`, `allOf`, `minus`, and `caveated`
+  take `PermissionRewrite` branches, so `this` cannot be smuggled inside a larger permission
+  expression.
+  Date: 2026-06-24
+
+- Discovery: the originally planned `RelationRef` typeclass made existing string-literal calls
+  such as `Schema.computed "owner"` ambiguous under `OverloadedStrings`.
+  Evidence: `nix develop --command cabal build en-core:lib:en-core` failed in
+  `En.Conformance.Kikan` with ambiguous `RelationRef a` and `IsString a` constraints.
+  Date: 2026-06-24
 
 
 ## Decision Log
@@ -139,10 +155,41 @@ workspace.
   papered over.
   Date: 2026-06-23
 
+- Decision: Implement handles as a concrete `RelationHandle` with an `IsString` instance and a
+  `relationRef :: Text -> RelationHandle` helper, rather than the planned `RelationRef`
+  typeclass.
+  Rationale: a typeclass over both `Text` and `RelationHandle` made unchanged
+  `Schema.computed "owner"` call sites ambiguous. A concrete handle keeps those call sites
+  unchanged in modules that already use `OverloadedStrings` (the documented builder mode), and
+  `relationH` still returns a bound value that catches intra-object typos through Haskell name
+  resolution. Callers with dynamic `Text` names can use `Schema.relationRef name`.
+  Date: 2026-06-24
+
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Completed on 2026-06-24. `Schema.permission` now requires `PermissionRewrite`, whose
+constructor is hidden; `Schema.this` remains a plain `Rewrite`, so
+`Schema.permission "view" Schema.this` fails at compile time. The permission-side rewrite
+surface is recursive, so `this` cannot appear inside permission unions, intersections,
+exclusions, or caveated rewrites through the builder. `relationH` returns both a
+`SchemaRelation` and a `RelationHandle`, and `computed`/`arrow` consume that handle while
+continuing to accept string literals via `OverloadedStrings`.
+
+Validation evidence:
+
+```bash
+nix develop --command cabal build all
+nix develop --command cabal test en-core-interface-tests
+nix develop --command cabal exec -- ghc -fno-code -package en-core en-core/test/fixtures/BadPermissionThis.hs
+```
+
+The first two commands pass. The manual fixture exits non-zero with:
+
+```text
+Couldn't match expected type ‘Schema.PermissionRewrite’
+              with actual type ‘En.Schema.Types.Rewrite’
+```
 
 
 ## Context and Orientation
@@ -525,7 +572,7 @@ Make the Milestone 1 edits to `en-core/src/En/Schema/Builder.hs` (add
 and the combinators), then build:
 
 ```bash
-cabal build en-core
+nix develop --command cabal build en-core
 ```
 
 Expected: a clean build. If GHC reports a missing extension for the class
@@ -536,14 +583,14 @@ Make the Milestone 2 edits (add `RelationHandle`, `RelationRef` class and
 instances, overload `computed`/`arrow`, add `relationH`), then build again:
 
 ```bash
-cabal build all
+nix develop --command cabal build all
 ```
 
 Make the Milestone 3 edits to `en-core/test/Main.hs` and the two docs, then run
 the tests:
 
 ```bash
-cabal test en-core-interface-tests
+nix develop --command cabal test en-core-interface-tests
 ```
 
 Expected transcript (abbreviated):
@@ -556,11 +603,11 @@ en-core-interface-tests> Test suite en-core-interface-tests: PASS
 en-core-interface-tests> 1 of 1 test suites (1 of 1 test cases) passed.
 ```
 
-To demonstrate the compile-time rejection of `permission this`, temporarily
-uncomment the `badPermission` fixture in `en-core/test/Main.hs` and build:
+To demonstrate the compile-time rejection of `permission this`, compile the
+manual should-not-compile fixture:
 
 ```bash
-cabal build en-core-interface-tests
+nix develop --command cabal exec -- ghc -fno-code -package en-core en-core/test/fixtures/BadPermissionThis.hs
 ```
 
 Expected: a type error similar to:
@@ -574,19 +621,19 @@ en-core/test/Main.hs:NN:NN: error:
     • In the second argument of 'Schema.permission', namely 'Schema.this'
 ```
 
-Re-comment the fixture and confirm the suite is green again with
-`cabal test en-core-interface-tests`.
+Confirm the suite is green with
+`nix develop --command cabal test en-core-interface-tests`.
 
 
 ## Validation and Acceptance
 
 The change is acceptable when all of the following hold.
 
-`cabal build all` from the repository root succeeds with no errors. This proves
+`nix develop --command cabal build all` from the repository root succeeds with no errors. This proves
 the library, the demo server (`en-server/app/Main.hs`), and all dependents still
 compile under the new `permission` signature and the overloaded combinators.
 
-`cabal test en-core-interface-tests` passes. The two pre-existing guard tests —
+`nix develop --command cabal test en-core-interface-tests` passes. The two pre-existing guard tests —
 `"builder schema equals manual schema"` and
 `"builder schema hash matches manual schema hash"` — prove the `kikanSchema`
 fixture compiles to exactly the same `Schema` value (and the same `schemaHash`)
@@ -595,12 +642,10 @@ The new test `"handle form equals string form"` proves the opt-in handle API
 produces a `Schema` byte-for-byte identical to the string form, so authors can
 adopt handles with zero semantic difference.
 
-The compile-time rejection is demonstrated, not merely asserted: following the
-Concrete Steps, uncommenting `badPermission = Schema.permission "view"
-Schema.this` causes `cabal build en-core-interface-tests` to fail with a type
-error naming `PermissionRewrite`/`Rewrite`. Re-commenting restores a green build.
-This is the honest way to validate a type-level restriction — the always-invalid
-shape is rejected by the compiler, not by a runtime check at startup.
+The compile-time rejection is demonstrated, not merely asserted:
+`en-core/test/fixtures/BadPermissionThis.hs` fails to compile with a type error naming
+`PermissionRewrite`/`Rewrite`. This proves the always-invalid shape is rejected by the
+compiler, not by a runtime check at startup.
 
 The docs are validated by reading them: `docs/user/getting-started.md` and
 `docs/user/modeling.md` must state that a permission cannot be a bare `this`,
