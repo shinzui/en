@@ -213,3 +213,42 @@ That keeps `en.lookup` bounded and avoids an N+1 `check` across every row.
 - `TupleToUserset` arrows whose target object types do not define the computed
   relation.
 - Rewrite cycles with no productive direct `This` base.
+
+## Visualize your schema
+
+Because a `Schema` is an ordinary value, `En.Schema.Render` can fold it into a
+Mermaid diagram or a Markdown reference without extra dependencies:
+
+```haskell
+import Data.Text.IO qualified as Text
+import En.Schema.Render (renderMarkdown, renderMermaid)
+
+Text.writeFile "schema.mmd" (renderMermaid mySchema)
+Text.writeFile "schema.md" (renderMarkdown mySchema)
+```
+
+Paste `schema.mmd` into <https://mermaid.live> or any Mermaid-aware Markdown
+viewer to inspect the object/relation graph. The Kikan-style schema renders as:
+
+```mermaid
+flowchart LR
+  object_intention["intention"]
+  object_org["org"]
+  object_space["space"]
+  object_user["user"]
+  object_visibility_class["visibility_class"]
+  object_intention -->|delegate| object_user
+  object_intention -->|"view = delegate"| object_intention
+  object_org -->|member| object_user
+  object_space -->|"act = owner ∪ member"| object_space
+  object_space -->|"audit = owner ∩ member"| object_space
+  object_space -->|guest_org| object_org
+  object_space -->|"member (org#member)"| object_org
+  object_space -->|member| object_user
+  object_space -->|"member_not_owner = member ∖ owner"| object_space
+  object_space -->|owner| object_user
+  object_space -->|parent| object_space
+  object_space -->|"view = owner ∪ member ∪ guest_org→member ∪ parent→view ∪ visibility_class→viewer"| object_space
+  object_space -->|visibility_class| object_visibility_class
+  object_visibility_class -->|viewer| object_user
+```

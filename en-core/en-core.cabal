@@ -57,6 +57,7 @@ library
     En.Schema
     En.Schema.Builder
     En.Schema.Internal
+    En.Schema.Render
     En.Schema.TH
     En.Schema.Types
     En.Tuple

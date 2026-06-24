@@ -94,7 +94,7 @@ their being different concerns (soundness vs. ergonomics), and would have scatte
 | 21 | Introduce a validated-schema evidence type | docs/plans/21-introduce-a-validated-schema-evidence-type.md | None | EP-20 | Complete |
 | 22 | Add a compile-time schema quasi-quoter | docs/plans/22-add-a-compile-time-schema-quasi-quoter.md | EP-21 | EP-20 | Complete |
 | 23 | Polish builder ergonomics and reference safety | docs/plans/23-polish-builder-ergonomics-and-reference-safety.md | None | EP-20 | Complete |
-| 24 | Render schemas as docs and diagrams | docs/plans/24-render-schemas-as-docs-and-diagrams.md | None | EP-21 | Not Started |
+| 24 | Render schemas as docs and diagrams | docs/plans/24-render-schemas-as-docs-and-diagrams.md | None | EP-21 | Complete |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
 Hard Deps and Soft Deps reference other rows by their # prefix (e.g., EP-1, EP-3).
@@ -175,8 +175,8 @@ and the milestone. This section provides an at-a-glance view of the entire initi
 - [x] 2026-06-24: EP-22: `[schema| … |]` splices a `ValidSchema` and fails the build on unknown relations/caveats/duplicates
 - [x] 2026-06-24: EP-23: `permission` cannot be given a bare `this`; intra-object references can be made by handle
 - [x] 2026-06-24: EP-23: Builder docs updated; always-invalid shapes are unrepresentable through the builder
-- [ ] EP-24: `En.Schema.Render` folds a schema into a Mermaid diagram
-- [ ] EP-24: `En.Schema.Render` folds a schema (and/or its reachability graph) into a Markdown reference
+- [x] 2026-06-24: EP-24: `En.Schema.Render` folds a schema into a Mermaid diagram
+- [x] 2026-06-24: EP-24: `En.Schema.Render` folds a schema and its reachability graph into documentation/diagram views
 
 
 ## Surprises & Discoveries
@@ -227,6 +227,11 @@ interactions between child plans. Provide concise evidence.
   handle API uses a concrete `RelationHandle` with an `IsString` instance plus
   `relationRef :: Text -> RelationHandle`, preserving string-literal call sites and still
   allowing bound handles from `relationH`.
+  Date: 2026-06-24
+
+- Discovery (during EP-24): generated renderer output follows `Map.toAscList`, so golden
+  output is alphabetic by object/relation/parameter key rather than the authoring order in the
+  builder. This is intentional and keeps docs deterministic.
   Date: 2026-06-24
 
 
@@ -283,19 +288,27 @@ plan.
   larger permission expression.
   Date: 2026-06-24
 
+- Decision: EP-24 uses generated Mermaid ids such as `object_space` while preserving the raw
+  object names as visible labels.
+  Rationale: renderer output should remain valid even when future object type names contain
+  punctuation that Mermaid ids do not accept.
+  Date: 2026-06-24
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original vision.
 
-2026-06-24: EP-20, EP-21, EP-22, and EP-23 are complete. The schema builder now rejects duplicate
+2026-06-24: EP-20, EP-21, EP-22, EP-23, and EP-24 are complete. The schema builder now rejects duplicate
 declarations instead of silently dropping them, `ValidSchema` evidence gates compilation and
 schema hashing, and `En.Schema.TH` offers both `$$(mkValidSchema ...)` and expression-only
 `[schema| ... |]` compile-time authoring. Builder permissions now require
 `PermissionRewrite`, making `permission this` a compile-time type error, and `relationH`
-provides opt-in intra-object handles. Validation evidence: `nix develop --command cabal
-build all` and `nix develop --command cabal test en-core-interface-tests` pass. Manual
+provides opt-in intra-object handles. `En.Schema.Render` now produces Markdown references,
+schema Mermaid diagrams, and reachability Mermaid diagrams with golden tests for the Kikan
+schema. Validation evidence: `nix develop --command cabal build all` and
+`nix develop --command cabal test en-core-interface-tests` pass. Manual
 should-not-compile fixtures fail with the intended messages for unknown relations and
 duplicate relations, including the quasi-quoter variants, and for `permission this`:
 

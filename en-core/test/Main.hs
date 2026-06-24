@@ -100,6 +100,7 @@ import En.Schema (
     validateSchema,
  )
 import En.Schema.Builder qualified as Schema
+import En.Schema.Render (renderMarkdown, renderMermaid)
 import En.Schema.TH (mkValidSchema, schema)
 import En.Tuple (
     CaveatContext (..),
@@ -170,6 +171,71 @@ handleReferenceSchema = do
 -- badPermission :: Schema.SchemaRelation
 -- badPermission = Schema.permission "view" Schema.this
 
+expectedKikanMarkdown :: Text
+expectedKikanMarkdown =
+    Text.intercalate
+        "\n"
+        [ "# Schema reference"
+        , ""
+        , "## intention"
+        , ""
+        , "- **delegate** — subjects: user; rule: directly assigned"
+        , "- **view** — subjects: (none); rule: delegate"
+        , ""
+        , "## org"
+        , ""
+        , "- **member** — subjects: user; rule: directly assigned"
+        , ""
+        , "## space"
+        , ""
+        , "- **act** — subjects: (none); rule: owner ∪ member"
+        , "- **audit** — subjects: (none); rule: owner ∩ member"
+        , "- **guest_org** — subjects: org; rule: directly assigned"
+        , "- **member** — subjects: org#member, user; rule: directly assigned"
+        , "- **member_not_owner** — subjects: (none); rule: member ∖ owner"
+        , "- **owner** — subjects: user; rule: directly assigned"
+        , "- **parent** — subjects: space; rule: directly assigned"
+        , "- **view** — subjects: (none); rule: owner ∪ member ∪ guest_org→member ∪ parent→view ∪ visibility_class→viewer"
+        , "- **visibility_class** — subjects: visibility_class; rule: directly assigned"
+        , ""
+        , "## user"
+        , ""
+        , "(no relations)"
+        , ""
+        , "## visibility_class"
+        , ""
+        , "- **viewer** — subjects: user; rule: directly assigned"
+        , ""
+        , "## Caveats"
+        , ""
+        , "- **within_autonomy** — parameters: autonomy: enum[act, admin, read], current_time: timestamp, requested_autonomy: enum[act, read], until: timestamp"
+        ]
+
+expectedKikanMermaid :: Text
+expectedKikanMermaid =
+    Text.unlines
+        [ "flowchart LR"
+        , "  object_intention[\"intention\"]"
+        , "  object_org[\"org\"]"
+        , "  object_space[\"space\"]"
+        , "  object_user[\"user\"]"
+        , "  object_visibility_class[\"visibility_class\"]"
+        , "  object_intention -->|delegate| object_user"
+        , "  object_intention -->|\"view = delegate\"| object_intention"
+        , "  object_org -->|member| object_user"
+        , "  object_space -->|\"act = owner ∪ member\"| object_space"
+        , "  object_space -->|\"audit = owner ∩ member\"| object_space"
+        , "  object_space -->|guest_org| object_org"
+        , "  object_space -->|\"member (org#member)\"| object_org"
+        , "  object_space -->|member| object_user"
+        , "  object_space -->|\"member_not_owner = member ∖ owner\"| object_space"
+        , "  object_space -->|owner| object_user"
+        , "  object_space -->|parent| object_space"
+        , "  object_space -->|\"view = owner ∪ member ∪ guest_org→member ∪ parent→view ∪ visibility_class→viewer\"| object_space"
+        , "  object_space -->|visibility_class| object_visibility_class"
+        , "  object_visibility_class -->|viewer| object_user"
+        ]
+
 main :: IO ()
 main = do
     let _ = sampleTuple
@@ -192,6 +258,8 @@ main = do
     assertEqual "compile-time validated schema equals builder fixture" kikanSchema (unValidSchema validatedKikanTH)
     assertEqual "schema quasi-quoter builds compact schema" quotedSchemaFixture (unValidSchema quotedSchemaTH)
     assertEqual "handle form equals string form" handleStringSchema handleReferenceSchema
+    assertEqual "renderMarkdown emits stable kikan reference" expectedKikanMarkdown (renderMarkdown kikanSchema)
+    assertEqual "renderMermaid emits stable kikan diagram" expectedKikanMermaid (renderMermaid kikanSchema)
     assertBool "validateSchema produces evidence for a valid schema" (isRight (validateSchema kikanSchema))
     assertBool "validateSchema rejects an invalid schema (no evidence)" (isLeft (validateSchema unproductiveCycleSchema))
     assertEqual "builder anyOf constructs a non-empty union" (Union [This, ComputedUserset (RelationName "owner")]) (Schema.anyOf Schema.this [Schema.computed "owner"])

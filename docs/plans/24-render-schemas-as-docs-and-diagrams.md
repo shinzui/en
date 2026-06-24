@@ -63,22 +63,24 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Read `en-core/src/En/Schema.hs`, `en-core/src/En/Reachability.hs`, and the
+- [x] 2026-06-24: Read `en-core/src/En/Schema.hs`, `en-core/src/En/Reachability.hs`, and the
   `kikanSchema` fixture in `en-core/test/Main.hs` to confirm the types and ordering this plan
   assumes still hold.
-- [ ] Create `en-core/src/En/Schema/Render.hs` exporting `renderMarkdown`, `renderMermaid`,
+- [x] 2026-06-24: Create `en-core/src/En/Schema/Render.hs` exporting `renderMarkdown`, `renderMermaid`,
   and `renderReachabilityMermaid` (signatures in Interfaces and Dependencies).
-- [ ] Implement the rewrite-to-readable-string fold (shared helper) used by both renderers.
-- [ ] Implement `renderMarkdown :: Schema -> Text`.
-- [ ] Implement `renderMermaid :: Schema -> Text`.
-- [ ] Implement `renderReachabilityMermaid :: ReachabilityGraph -> Text`.
-- [ ] Add `En.Schema.Render` to the `exposed-modules` list in `en-core/en-core.cabal`.
-- [ ] Add golden tests to `en-core/test/Main.hs` asserting `renderMermaid kikanSchema` and
+- [x] 2026-06-24: Implement the rewrite-to-readable-string fold (shared helper) used by both renderers.
+- [x] 2026-06-24: Implement `renderMarkdown :: Schema -> Text`.
+- [x] 2026-06-24: Implement `renderMermaid :: Schema -> Text`.
+- [x] 2026-06-24: Implement `renderReachabilityMermaid :: ReachabilityGraph -> Text`.
+- [x] 2026-06-24: Add `En.Schema.Render` to the `exposed-modules` list in `en-core/en-core.cabal`.
+- [x] 2026-06-24: Add golden tests to `en-core/test/Main.hs` asserting `renderMermaid kikanSchema` and
   `renderMarkdown kikanSchema` equal embedded expected `Text`.
-- [ ] Add a "Visualize your schema" section to `docs/user/modeling.md` showing the emitted
+- [x] 2026-06-24: Add a "Visualize your schema" section to `docs/user/modeling.md` showing the emitted
   Mermaid for `kikanSchema`.
-- [ ] Run `cabal build all` and `cabal test en-core-interface-tests`; confirm both pass.
-- [ ] Paste the emitted Mermaid into a Mermaid renderer and confirm it draws the graph.
+- [x] 2026-06-24: Run `nix develop --command cabal build all` and
+  `nix develop --command cabal test en-core-interface-tests`; confirm both pass.
+- [x] 2026-06-24: Confirm the emitted Mermaid is committed in `docs/user/modeling.md`; no local
+  Mermaid CLI (`mmdc`/`mermaid`) is installed, and no new renderer dependency was added.
 
 
 ## Surprises & Discoveries
@@ -86,7 +88,18 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- Discovery: the hand-written ordering in this plan was illustrative, not the actual golden
+  order. `Map.toAscList` sorts `space` relations alphabetically as `act`, `audit`,
+  `guest_org`, `member`, `member_not_owner`, `owner`, `parent`, `view`, `visibility_class`.
+  Evidence: generated `renderMarkdown kikanSchema` and `renderMermaid kikanSchema` with
+  `ghc -e` after implementing the renderer and embedded that output in the golden tests.
+  Date: 2026-06-24
+
+- Discovery: no local Mermaid CLI is installed (`command -v mmdc` and `command -v mermaid`
+  both exit non-zero). The implementation keeps the no-new-dependencies decision and validates
+  the diagram text through deterministic golden tests plus the committed Mermaid block in
+  `docs/user/modeling.md`.
+  Date: 2026-06-24
 
 
 ## Decision Log
@@ -127,13 +140,34 @@ Record every decision made while working on the plan.
   should be able to tell a conditional edge from an unconditional one at a glance.
   Date: 2026-06-23
 
+- Decision: Use stable generated Mermaid ids such as `object_space` rather than raw object
+  names as ids.
+  Rationale: Kikan object names happen to be Mermaid-safe, but a general renderer should handle
+  punctuation and other non-id characters without producing invalid graph syntax. The visible
+  node labels remain the original object type names.
+  Date: 2026-06-24
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Completed on 2026-06-24. `En.Schema.Render` now exposes pure `renderMarkdown`,
+`renderMermaid`, and `renderReachabilityMermaid` folds. The two schema renderers are covered
+by Kikan golden tests in `en-core-interface-tests`, and `docs/user/modeling.md` includes the
+generated Mermaid block plus write-to-file examples. The reachability renderer is implemented
+as the complementary resolved-graph view over `ReachabilityGraph.entries`.
+
+Validation evidence:
+
+```bash
+nix develop --command cabal build all
+nix develop --command cabal test en-core-interface-tests
+```
+
+Both pass. Visual rendering was not automated because no Mermaid CLI is installed and this
+plan explicitly avoids adding a renderer dependency.
 
 
 ## Context and Orientation
@@ -274,24 +308,25 @@ ascending order). Show this in the plan so a reader can eyeball it:
 
 ```text
 flowchart LR
-  intention["intention"]
-  org["org"]
-  space["space"]
-  user["user"]
-  visibility_class["visibility_class"]
-  intention -->|delegate| user
-  intention -->|"view = delegate"| intention
-  org -->|member| user
-  space -->|owner| user
-  space -->|member| user
-  space -->|"member (org#member)"| org
-  space -->|guest_org| org
-  space -->|parent| space
-  space -->|visibility_class| visibility_class
-  space -->|"view = owner ∪ member ∪ guest_org→member ∪ parent→view ∪ visibility_class→viewer"| space
-  space -->|"act = owner ∪ member"| space
-  space -->|"audit = owner ∩ member"| space
-  space -->|"member_not_owner = member ∖ owner"| space
+  object_intention["intention"]
+  object_org["org"]
+  object_space["space"]
+  object_user["user"]
+  object_visibility_class["visibility_class"]
+  object_intention -->|delegate| object_user
+  object_intention -->|"view = delegate"| object_intention
+  object_org -->|member| object_user
+  object_space -->|"act = owner ∪ member"| object_space
+  object_space -->|"audit = owner ∩ member"| object_space
+  object_space -->|guest_org| object_org
+  object_space -->|"member (org#member)"| object_org
+  object_space -->|member| object_user
+  object_space -->|"member_not_owner = member ∖ owner"| object_space
+  object_space -->|owner| object_user
+  object_space -->|parent| object_space
+  object_space -->|"view = owner ∪ member ∪ guest_org→member ∪ parent→view ∪ visibility_class→viewer"| object_space
+  object_space -->|visibility_class| object_visibility_class
+  object_visibility_class -->|viewer| object_user
 ```
 
 The encoding choices, stated so a reader can reproduce them: a relation whose rewrite is `This`
@@ -322,15 +357,15 @@ The renderer must emit, for the same fixture, exactly this Markdown. Show it in 
 
 ## space
 
-- **owner** — subjects: user; rule: directly assigned
-- **member** — subjects: user, org#member; rule: directly assigned
-- **guest_org** — subjects: org; rule: directly assigned
-- **parent** — subjects: space; rule: directly assigned
-- **visibility_class** — subjects: visibility_class; rule: directly assigned
-- **view** — subjects: (none); rule: owner ∪ member ∪ guest_org→member ∪ parent→view ∪ visibility_class→viewer
 - **act** — subjects: (none); rule: owner ∪ member
 - **audit** — subjects: (none); rule: owner ∩ member
+- **guest_org** — subjects: org; rule: directly assigned
+- **member** — subjects: org#member, user; rule: directly assigned
 - **member_not_owner** — subjects: (none); rule: member ∖ owner
+- **owner** — subjects: user; rule: directly assigned
+- **parent** — subjects: space; rule: directly assigned
+- **view** — subjects: (none); rule: owner ∪ member ∪ guest_org→member ∪ parent→view ∪ visibility_class→viewer
+- **visibility_class** — subjects: visibility_class; rule: directly assigned
 
 ## user
 
