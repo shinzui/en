@@ -37,7 +37,7 @@ An alternative single large plan was rejected because it would couple revision s
 |---|-------|------|-----------|-----------|--------|
 | EP-9 | Implement optimized revision caching | docs/plans/9-implement-optimized-revision-caching.md | None | None | Complete |
 | EP-10 | Add core cache interfaces and configuration | docs/plans/10-add-core-cache-interfaces-and-configuration.md | None | EP-9 | Complete |
-| EP-12 | Implement tuple read caching | docs/plans/12-implement-tuple-read-caching.md | EP-10 | EP-9 | Not Started |
+| EP-12 | Implement tuple read caching | docs/plans/12-implement-tuple-read-caching.md | EP-10 | EP-9 | Complete |
 | EP-11 | Implement authorization decision caching | docs/plans/11-implement-authorization-decision-caching.md | EP-10 | EP-12 | Not Started |
 | EP-13 | Wire caching into service operations and validation | docs/plans/13-wire-caching-into-service-operations-and-validation.md | EP-9, EP-10, EP-11, EP-12 | None | Not Started |
 
@@ -132,8 +132,8 @@ the soft, gracefully-degrading EP-11→EP-19 efficiency upgrade.
 - [x] EP-9: Prove `MinimizeLatency` can reuse a cached optimized revision while `FullyConsistent` still reads the head revision.
 - [x] EP-10: Add shared bounded cache types, cache configuration, and cache statistics in `en-core`.
 - [x] EP-10: Add focused tests proving cache keys include datastore id, schema hash, revision, and request-shaping values.
-- [ ] EP-12: Add a `TupleStore` cache wrapper for object-relation and reverse userset reads.
-- [ ] EP-12: Prove repeated tuple reads at the same revision hit cache and reads at different revisions miss.
+- [x] EP-12: Add a `TupleStore` cache wrapper for object-relation and reverse userset reads.
+- [x] EP-12: Prove repeated tuple reads at the same revision hit cache and reads at different revisions miss.
 - [ ] EP-11: Add decision/subproblem caching for forward `check` and lookup confirmation checks.
 - [ ] EP-11: Prove repeated authorization checks reuse cached subproblems without changing `Allowed`, `Denied`, or `Conditional` results.
 - [ ] EP-13: Wire cache configuration into `en-server` and embedded-library examples.
@@ -164,6 +164,7 @@ the soft, gracefully-degrading EP-11→EP-19 efficiency upgrade.
   were cascaded into EP-9, EP-11, and EP-13. _(2026-06-23)_
 - EP-9 implementation had to account for the later effectful migration (`docs/plans/25-adopt-effectful-for-the-en-effect-stack.md`). Instead of adding the obsolete record-of-functions `postgresTupleStoreIOWithOptimizedRevision`, EP-9 preserved the uncached `runTupleStorePostgres` interpreter and added `runTupleStorePostgresWithOptimizedRevisionCache` as the opt-in cached interpreter for EP-13 service wiring. _(2026-06-23)_
 - EP-10 preserved the current `Revision` invariant: `en-core/src/En/Revision.hs` intentionally has no global `Ord Revision` because revisions are semantically partially ordered. The cache key types in `En.Cache` therefore define local `Ord` instances that compare `revisionEncoding` only as an opaque identity component for `Map` storage. _(2026-06-24)_
+- EP-12 also had to adapt to the post-planning effectful migration. The tuple-read cache is an `interpose`/`passthrough` transformer over an existing `TupleStore` handler rather than a record wrapper; this keeps PostgreSQL, in-memory, and test interpreters reusable while caching only read pages. _(2026-06-24)_
 
 
 ## Decision Log
@@ -211,6 +212,8 @@ the soft, gracefully-degrading EP-11→EP-19 efficiency upgrade.
 EP-9 is complete. `en-postgres` now exposes an optimized revision cache configuration and an opt-in PostgreSQL tuple-store interpreter that caches only `OptimizedRevision` reads. Focused tests prove enabled TTL reuse, expiry refresh, disabled behavior, and `FullyConsistent` head-revision selection; `nix develop -c cabal test en-postgres-revision-tests` and `nix develop -c cabal build all` pass as of 2026-06-23T23:59:54Z.
 
 EP-10 is complete. `en-core` now exposes `En.Cache` with bounded in-process cache operations, hit/miss/insert/eviction stats, and shared tuple-read/decision/subproblem cache keys. Focused tests prove hit, miss, disabled, eviction, schema-hash separation, revision separation, caveat-context separation, and tuple-read request-shape separation; `nix develop -c cabal test en-core-interface-tests` and `nix develop -c cabal build all` pass as of 2026-06-24T00:05:35Z.
+
+EP-12 is complete. `en-core` now exposes `En.Effect.CachedTupleStore.cachedTupleStore`, an effectful interposer that caches object-relation and reverse userset `TupleStore` read pages by resolved revision and read parameters while forwarding writes, revision reads, and maintenance operations unchanged. Focused tests prove same-revision hits, different-revision misses, request-shape misses, disabled-cache pass-through behavior, and non-read forwarding; `nix develop -c cabal test en-core-interface-tests` and `nix develop -c cabal build all` pass as of 2026-06-24T00:10:39Z.
 
 
 ---

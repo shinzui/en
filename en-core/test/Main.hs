@@ -30,6 +30,7 @@ import En.Cache (
 import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..))
 import En.Check qualified as Check
 import En.Conformance.Kikan
+import En.Effect.CachedTupleStore (cachedTupleStore)
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
 import En.Effect.TupleStore (
     PageState (..),
@@ -39,6 +40,11 @@ import En.Effect.TupleStore (
     TupleRowId (..),
     TupleStore (..),
     UsersetQuery (..),
+    headRevision,
+    optimizedRevision,
+    readObjectRelation,
+    readStartingWithUser,
+    writeTuples,
  )
 import En.Error (EnError (..))
 import En.Expand (ExpandCursor (..), ExpandLimit (..), ExpandNode (..), ExpandRequest (..), ExpandState (..), ExpandTree (..))
@@ -108,6 +114,7 @@ main = do
         _ = sampleExpandTree
         _ = sampleCaveatDefinition
     testCacheOperations
+    testCachedTupleStore
     assertEqual "kikan-shaped fixture validates" (Right ()) (validate kikanSchema)
     assertEqual "builder schema equals manual schema" kikanSchemaManual kikanSchema
     assertEqual "builder schema hash matches manual schema hash" (schemaHash kikanSchemaManual) (schemaHash kikanSchema)
@@ -383,6 +390,62 @@ sampleDecisionKeyWith keySchemaHash keyRevision keyContext =
         , object = space
         , context = keyContext
         }
+
+testCachedTupleStore :: IO ()
+testCachedTupleStore = do
+    readCount <- newIORef 0
+    cache <- newCache CacheConfig{enabled = True, maxEntries = 10}
+    result <-
+        runEff
+            ( runErrorNoCallStack
+                ( interpretFixtureTupleStore (Just readCount) Nothing fixtureTuples
+                    . cachedTupleStore cache
+                    $ do
+                        firstObjectRead <- readObjectRelation (Revision "r1") space (RelationName "view") 10 Nothing
+                        secondObjectRead <- readObjectRelation (Revision "r1") space (RelationName "view") 10 Nothing
+                        otherRevisionRead <- readObjectRelation (Revision "r2") space (RelationName "view") 10 Nothing
+                        otherLimitRead <- readObjectRelation (Revision "r1") space (RelationName "view") 1 Nothing
+                        firstUsersetRead <- readStartingWithUser (Revision "r1") sampleUsersetQuery
+                        secondUsersetRead <- readStartingWithUser (Revision "r1") sampleUsersetQuery
+                        writeToken <- writeTuples []
+                        headRev <- headRevision
+                        optimizedRev <- optimizedRevision
+                        pure
+                            ( firstObjectRead == secondObjectRead
+                            , otherRevisionRead
+                            , otherLimitRead
+                            , firstUsersetRead == secondUsersetRead
+                            , writeToken
+                            , headRev
+                            , optimizedRev
+                            )
+                )
+            )
+    assertEqual
+        "cached tuple store returns cached pages and forwards non-read operations"
+        (Right (True, sampleObjectPage 10 Nothing, sampleObjectPage 1 Nothing, True, ConsistencyToken "in-memory-write", testRevision, testRevision))
+        result
+    assertEqual "cached tuple store reads underlying store only on misses" 4 =<< readIORef readCount
+
+    disabledReadCount <- newIORef 0
+    disabledCache <- newCache CacheConfig{enabled = False, maxEntries = 10}
+    disabledResult <-
+        runEff
+            ( runErrorNoCallStack
+                ( interpretFixtureTupleStore (Just disabledReadCount) Nothing fixtureTuples
+                    . cachedTupleStore disabledCache
+                    $ do
+                        firstObjectRead <- readObjectRelation (Revision "r1") space (RelationName "view") 10 Nothing
+                        secondObjectRead <- readObjectRelation (Revision "r1") space (RelationName "view") 10 Nothing
+                        pure (firstObjectRead == secondObjectRead)
+                )
+            )
+    assertEqual "disabled tuple read cache preserves results" (Right True) disabledResult
+    assertEqual "disabled tuple read cache does not suppress reads" 2 =<< readIORef disabledReadCount
+
+sampleObjectPage :: Int -> Maybe StoreCursor -> TuplePage
+sampleObjectPage limit cursor =
+    pageTuples limit cursor [tuple | tuple <- fixtureTuples, tuple.object == space, tuple.relation == RelationName "view"]
 
 lookupRequest :: Subject -> RelationName -> ObjectType -> CaveatContext -> LookupLimit -> Maybe LookupCursor -> LookupRequest
 lookupRequest subject permission objectType context limit cursor =
