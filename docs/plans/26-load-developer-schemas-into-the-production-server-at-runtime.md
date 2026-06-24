@@ -83,7 +83,7 @@ This section must always reflect the actual current state of the work.
   missing/malformed/invalid files; log the loaded path and schema hash.
 - [x] 2026-06-24T18:37:33Z: M3: Extend the parser to intersection (`&`) and exclusion (`but not`) permission
   rewrites; add round-trip/coverage tests proving parity with the `En.Schema.Builder` output.
-- [ ] M4: Extend the parser to caveat definitions and caveated rewrites (`with`), using
+- [x] 2026-06-24T18:41:55Z: M4: Extend the parser to caveat definitions and caveated rewrites (`with`), using
   explicit `context.<name>` and `payload.<name>` operand syntax; add coverage tests proving
   every `CaveatPredicate` shape parses and validates.
 - [ ] M5: Update `docs/user/production-deployment-and-performance.md`,
@@ -172,6 +172,15 @@ Record every decision made while working on the plan.
   authors to parenthesize ambiguous chains instead of relying on surprising grouping.
   Date: 2026-06-24
 
+- Decision: Parse caveats with top-level `caveat name(params) { predicate }` blocks, type-only
+  parameter declarations, explicit `context.` / `payload.` operand prefixes, and a tightly bound
+  rewrite `with` clause.
+  Rationale: This mirrors the existing schema data model: caveat parameter declarations record
+  names and types, while operand source is chosen at the use site. Binding `with` to a rewrite
+  atom keeps `viewer with request_allowed | owner` readable as a caveated viewer branch unioned
+  with an uncaveated owner branch; broader caveated expressions can use parentheses.
+  Date: 2026-06-24
+
 
 ## Outcomes & Retrospective
 
@@ -203,6 +212,18 @@ Compare the result against the original purpose.
   `/tmp/en-operator-schema-smoke.en` logged `Loaded schema from
   /tmp/en-operator-schema-smoke.en` and `Schema hash: fnv1a64:42a02f6218db3acd` before the
   intentionally unreachable database failed.
+
+- 2026-06-24T18:41:55Z: M4 completed. `En.Schema.Parse` now parses top-level caveat
+  definitions, caveat parameter types (`text`, `bool`, `integer`, `timestamp`, `enum[...]`),
+  predicate expressions, sourced operands (`context.<name>` and `payload.<name>`), literal
+  values, membership, all six comparison operators, boolean composition, negation, and `with`
+  rewrites. `en-core/test/Main.hs` compares a caveat-heavy parsed schema to an equivalent
+  builder schema and verifies validation failures for unknown caveats and unknown parameters.
+  Validation passed with `cabal test en-core`; an `en-server` smoke check with
+  `/tmp/en-caveat-schema-smoke.en` logged `Loaded schema from /tmp/en-caveat-schema-smoke.en`
+  and `Schema hash: fnv1a64:5535c0c913ac9b60` before the intentionally unreachable database
+  failed. Full `POST /check` verification for `Allowed`/`Denied`/`Conditional` still requires a
+  live PostgreSQL database with migrations applied.
 
 
 ## Context and Orientation

@@ -15,6 +15,8 @@ import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Data.Time (UTCTime)
+import Data.Time.Format.ISO8601 (iso8601ParseM)
 import Effectful (Eff, IOE, liftIO, runEff)
 import Effectful.Dispatch.Dynamic (interpret_)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
@@ -259,6 +261,7 @@ main = do
     assertEqual "compile-time validated schema equals builder fixture" kikanSchema (unValidSchema validatedKikanTH)
     assertEqual "schema quasi-quoter builds compact schema" quotedSchemaFixture (unValidSchema quotedSchemaTH)
     testSchemaParserDirect
+    testSchemaParserCaveats
     assertEqual "handle form equals string form" handleStringSchema handleReferenceSchema
     assertEqual "renderMarkdown emits stable kikan reference" expectedKikanMarkdown (renderMarkdown kikanSchema)
     assertEqual "renderMermaid emits stable kikan diagram" expectedKikanMermaid (renderMermaid kikanSchema)
@@ -591,6 +594,96 @@ rewriteOperatorSchema =
                 , Schema.permission "grouped" (Schema.allOf (Schema.anyOf (Schema.computed "a") [Schema.computed "b"]) [Schema.computed "c"])
                 ]
         Schema.build [userObject, spaceObject]
+
+testSchemaParserCaveats :: IO ()
+testSchemaParserCaveats = do
+    assertEqual "parseSchema supports caveats and caveated rewrites" (Right caveatParserSchema) (SchemaParse.parseSchema caveatParserSchemaText)
+    assertBool "parseSchema caveat output validates" (isRight (SchemaParse.parseSchema caveatParserSchemaText >>= validateSchema))
+    assertBool "parseSchema validation rejects unknown caveat references" (isLeft (SchemaParse.parseSchema unknownCaveatSchemaText >>= validateSchema))
+    assertBool "parseSchema validation rejects unknown caveat parameters" (isLeft (SchemaParse.parseSchema unknownCaveatParameterSchemaText >>= validateSchema))
+
+caveatParserSchemaText :: Text
+caveatParserSchemaText =
+    Text.unlines
+        [ "caveat request_allowed(allowed: bool) {"
+        , "  context.allowed == true"
+        , "}"
+        , "caveat complex(flag: bool, clearance: integer, level: integer, now: timestamp, mode: enum[read, act], name: text) {"
+        , "  true & context.clearance >= payload.level & context.clearance > 0 & context.level < 10 & context.level <= 7 & context.name != \"blocked\" & context.now <= timestamp(\"2026-06-24T12:00:00Z\") & context.mode in [enum(\"read\"), enum(\"act\")] & !(context.flag == false) | context.name == \"admin\""
+        , "}"
+        , "object user {}"
+        , "object document {"
+        , "  relation viewer: user"
+        , "  permission view = viewer with request_allowed"
+        , "}"
+        ]
+
+caveatParserSchema :: Schema
+caveatParserSchema =
+    testSchemaOrError $ do
+        requestAllowed <-
+            Schema.caveatWith
+                "request_allowed"
+                [Schema.parameter "allowed" ParameterBool]
+                (Schema.cmpEq (Schema.ctxParam "allowed") (Schema.litBool True))
+        complex <-
+            Schema.caveatWith
+                "complex"
+                [ Schema.parameter "flag" ParameterBool
+                , Schema.parameter "clearance" ParameterInteger
+                , Schema.parameter "level" ParameterInteger
+                , Schema.parameter "now" ParameterTimestamp
+                , Schema.parameter "mode" (ParameterEnum ["read", "act"])
+                , Schema.parameter "name" ParameterText
+                ]
+                ( Schema.predOr
+                    [ Schema.predAnd
+                        [ Schema.predTrue
+                        , Schema.cmpGe (Schema.ctxParam "clearance") (Schema.payloadParam "level")
+                        , Schema.cmpGt (Schema.ctxParam "clearance") (Schema.litInteger 0)
+                        , Schema.cmpLt (Schema.ctxParam "level") (Schema.litInteger 10)
+                        , Schema.cmpLe (Schema.ctxParam "level") (Schema.litInteger 7)
+                        , Schema.cmpNe (Schema.ctxParam "name") (Schema.litText "blocked")
+                        , Schema.cmpLe (Schema.ctxParam "now") (Schema.litTimestamp testTimestamp)
+                        , Schema.predMember (Schema.ctxParam "mode") [ValueEnum "read", ValueEnum "act"]
+                        , Schema.predNot (Schema.cmpEq (Schema.ctxParam "flag") (Schema.litBool False))
+                        ]
+                    , Schema.cmpEq (Schema.ctxParam "name") (Schema.litText "admin")
+                    ]
+                )
+        userObject <- Schema.object "user" []
+        documentObject <-
+            Schema.object
+                "document"
+                [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
+                , Schema.permission "view" (Schema.caveated "request_allowed" (Schema.computed "viewer"))
+                ]
+        Schema.buildWithCaveats [requestAllowed, complex] [userObject, documentObject]
+
+testTimestamp :: UTCTime
+testTimestamp =
+    case iso8601ParseM "2026-06-24T12:00:00Z" of
+        Just value -> value
+        Nothing -> error "invalid test timestamp"
+
+unknownCaveatSchemaText :: Text
+unknownCaveatSchemaText =
+    Text.unlines
+        [ "object user {}"
+        , "object document {"
+        , "  relation viewer: user"
+        , "  permission view = viewer with missing_caveat"
+        , "}"
+        ]
+
+unknownCaveatParameterSchemaText :: Text
+unknownCaveatParameterSchemaText =
+    Text.unlines
+        [ "caveat bad(allowed: bool) {"
+        , "  context.missing == true"
+        , "}"
+        , "object user {}"
+        ]
 
 testCacheOperations :: IO ()
 testCacheOperations = do
