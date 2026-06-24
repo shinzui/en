@@ -30,7 +30,7 @@ This plan turns the lower-level cache support into a usable production feature. 
 
 ## Surprises & Discoveries
 
-None yet.
+- MasterPlan 3 is already complete, including EP-17's `tasty-bench` harness. EP-13 can reuse that harness for cache-hit performance validation when useful, but the acceptance path remains a focused service/cache transcript or test proving repeated same-revision requests avoid repeated work. _(2026-06-24)_
 
 
 ## Decision Log
@@ -144,7 +144,7 @@ If `cabal test all` reports that some packages have no test suites, record that 
 
 Acceptance requires the service to build and the cache-enabled path to be observable. At minimum, a cache-enabled test or transcript must prove that an authorization request still returns the correct decision and that the second identical request at the same resolved revision hits a cache or avoids repeated underlying work. The production docs must accurately describe what is implemented and what remains future work.
 
-Cross-MasterPlan (optional, soft): because MasterPlan 3 (en hardening) is implemented in full before this MasterPlan (see `docs/masterplans/2-add-caching-support-to-en.md`), MasterPlan 3 EP-17's `tasty-bench` suite (`docs/plans/17-strengthen-the-lookup-spike-and-add-performance-regression-benchmarks.md`) already exists and is kept independent of cache configuration. You may reuse that harness to measure cache-hit performance (e.g. run the same `check`/`lookup` workload with caches on vs off) instead of writing a bespoke benchmark. This is optional and does not block acceptance — counting-store transcripts proving fewer underlying reads are sufficient.
+Cross-MasterPlan (optional, soft): MasterPlan 3 (en hardening) is implemented in full before this MasterPlan (see `docs/masterplans/2-add-caching-support-to-en.md`), so MasterPlan 3 EP-17's `tasty-bench` suite (`docs/plans/17-strengthen-the-lookup-spike-and-add-performance-regression-benchmarks.md`) already exists and is kept independent of cache configuration. You may reuse that harness to measure cache-hit performance (e.g. run the same `check`/`lookup` workload with caches on vs off) instead of writing a bespoke benchmark. This is optional and does not block acceptance; counting-store transcripts proving fewer underlying reads are sufficient.
 
 
 ## Idempotence and Recovery
@@ -157,3 +157,10 @@ If cached Servant wiring becomes too invasive, first expose the lower-level cach
 ## Interfaces and Dependencies
 
 This plan consumes the interfaces added by EP-9, EP-10, EP-11, and EP-12. It may touch `en-server`, `en-servant`, `en-core`, and docs, but it should not change the external HTTP request and response JSON shapes unless a prior plan explicitly required it.
+
+
+---
+
+**Revision note (2026-06-24).** Updated the cross-MasterPlan validation guidance after confirming
+MasterPlan 3 is already implemented. EP-17's benchmark harness is available to EP-13, but not required
+when a simpler counting-store proof demonstrates cache hits.

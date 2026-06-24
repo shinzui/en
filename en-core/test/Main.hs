@@ -21,13 +21,14 @@ import En.Cache (
     CacheConfig (..),
     CacheStats (..),
     DecisionKey (..),
+    SubproblemKey,
     TupleReadKey (..),
     cacheStats,
     insertCache,
     lookupCache,
     newCache,
  )
-import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..))
+import En.Check (BatchPair (..), CaveatObligation (..), CheckCacheEnv (..), CheckDecision (..))
 import En.Check qualified as Check
 import En.Conformance.Kikan
 import En.Effect.CachedTupleStore (cachedTupleStore)
@@ -121,6 +122,7 @@ main = do
     assertEqual "builder anyOf constructs a non-empty union" (Union [This, ComputedUserset (RelationName "owner")]) (Schema.anyOf Schema.this [Schema.computed "owner"])
     assertEqual "builder allOf constructs a non-empty intersection" (Intersection [This, ComputedUserset (RelationName "owner")]) (Schema.allOf Schema.this [Schema.computed "owner"])
     graph <- either (fail . show) pure (compile kikanSchema)
+    testDecisionCache graph
     assertEqual "graph stores schema hash" (schemaHash kikanSchema) graph.hash
     assertEqual "schema hash is stable across map insertion order" (schemaHash kikanSchema) (schemaHash kikanSchemaReordered)
     assertBool "space view has a direct user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Direct False graph)
@@ -446,6 +448,84 @@ testCachedTupleStore = do
 sampleObjectPage :: Int -> Maybe StoreCursor -> TuplePage
 sampleObjectPage limit cursor =
     pageTuples limit cursor [tuple | tuple <- fixtureTuples, tuple.object == space, tuple.relation == RelationName "view"]
+
+testDecisionCache :: ReachabilityGraph -> IO ()
+testDecisionCache graph = do
+    allowedReadCount <- newIORef 0
+    allowedEnv <- newCheckCacheEnv
+    assertEqual "cached allowed check returns Allowed first" (Right Allowed) =<< checkCachedEngine consistencyStore (countingTupleStore allowedReadCount tupleStore) allowedEnv graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
+    allowedReadsAfterFirst <- readIORef allowedReadCount
+    assertBool "cached allowed check reads on first miss" (allowedReadsAfterFirst > 0)
+    assertEqual "cached allowed check returns Allowed second" (Right Allowed) =<< checkCachedEngine consistencyStore (countingTupleStore allowedReadCount tupleStore) allowedEnv graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
+    assertEqual "cached allowed check suppresses second read" allowedReadsAfterFirst =<< readIORef allowedReadCount
+
+    deniedReadCount <- newIORef 0
+    deniedEnv <- newCheckCacheEnv
+    assertEqual "cached denied check returns Denied first" (Right Denied) =<< checkCachedEngine consistencyStore (countingTupleStore deniedReadCount tupleStore) deniedEnv graph MinimizeLatency requestContext (SubjectId bob) (RelationName "view") space
+    deniedReadsAfterFirst <- readIORef deniedReadCount
+    assertEqual "cached denied check returns Denied second" (Right Denied) =<< checkCachedEngine consistencyStore (countingTupleStore deniedReadCount tupleStore) deniedEnv graph MinimizeLatency requestContext (SubjectId bob) (RelationName "view") space
+    assertEqual "cached denied check suppresses second read" deniedReadsAfterFirst =<< readIORef deniedReadCount
+
+    conditionalReadCount <- newIORef 0
+    conditionalEnv <- newCheckCacheEnv
+    let conditionalDecision = Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}]
+    assertEqual "cached conditional check returns Conditional first" (Right conditionalDecision) =<< checkCachedEngine consistencyStore (countingTupleStore conditionalReadCount tupleStore) conditionalEnv graph MinimizeLatency missingAutonomyContext (SubjectId user) (RelationName "view") intention
+    conditionalReadsAfterFirst <- readIORef conditionalReadCount
+    assertEqual "cached conditional check returns Conditional second" (Right conditionalDecision) =<< checkCachedEngine consistencyStore (countingTupleStore conditionalReadCount tupleStore) conditionalEnv graph MinimizeLatency missingAutonomyContext (SubjectId user) (RelationName "view") intention
+    assertEqual "cached conditional check suppresses second read" conditionalReadsAfterFirst =<< readIORef conditionalReadCount
+    assertEqual "decision key separates caveat context through checkCached" (Right Allowed) =<< checkCachedEngine consistencyStore (countingTupleStore conditionalReadCount tupleStore) conditionalEnv graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") intention
+    readsAfterContextMiss <- readIORef conditionalReadCount
+    assertBool "different caveat context misses decision cache" (readsAfterContextMiss > conditionalReadsAfterFirst)
+
+    separationReadCount <- newIORef 0
+    separationEnv <- newCheckCacheEnv
+    assertEqual "cached check baseline for revision/schema separation" (Right Allowed) =<< checkCachedEngine consistencyStore (countingTupleStore separationReadCount tupleStore) separationEnv graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
+    separationReadsAfterFirst <- readIORef separationReadCount
+    assertEqual "decision key separates revision through checkCached" (Right Allowed) =<< checkCachedEngine (fixedRevisionConsistencyStore (Revision "revision:other")) (countingTupleStore separationReadCount tupleStore) separationEnv graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
+    separationReadsAfterRevisionMiss <- readIORef separationReadCount
+    assertBool "different revision misses decision cache" (separationReadsAfterRevisionMiss > separationReadsAfterFirst)
+    let graphWithOtherHash = graph{hash = SchemaHash "schema:other"}
+    assertEqual "decision key separates schema hash through checkCached" (Right Allowed) =<< checkCachedEngine consistencyStore (countingTupleStore separationReadCount tupleStore) separationEnv graphWithOtherHash MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
+    assertBool "different schema hash misses decision cache" =<< ((> separationReadsAfterRevisionMiss) <$> readIORef separationReadCount)
+
+    lookupEnv@CheckCacheEnv{cacheDecisions} <- newCheckCacheEnv
+    let lookupAudit =
+            lookupRequest (SubjectId memberOwner) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing
+    assertEqual "cached lookup confirms candidates first" (Right (lookupPage [allowed auditedSpace, allowed exclusionSpace] LookupExhausted)) =<< lookupCachedEngine consistencyStore tupleStore lookupEnv graph MinimizeLatency lookupAudit
+    lookupStatsAfterFirst <- cacheStats cacheDecisions
+    assertEqual "cached lookup confirms candidates second" (Right (lookupPage [allowed auditedSpace, allowed exclusionSpace] LookupExhausted)) =<< lookupCachedEngine consistencyStore tupleStore lookupEnv graph MinimizeLatency lookupAudit
+    lookupStatsAfterSecond <- cacheStats cacheDecisions
+    assertBool "cached lookup reuses decision cache for confirmations" (lookupStatsAfterSecond.hits > lookupStatsAfterFirst.hits)
+
+newCheckCacheEnv :: IO CheckCacheEnv
+newCheckCacheEnv = do
+    cache <- newCache CacheConfig{enabled = True, maxEntries = 100} :: IO (Cache SubproblemKey CheckDecision)
+    pure CheckCacheEnv{cacheDatastoreId = DatastoreId "test", cacheDecisions = cache}
+
+checkCachedEngine ::
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    CheckCacheEnv ->
+    ReachabilityGraph ->
+    Consistency ->
+    CaveatContext ->
+    Subject ->
+    RelationName ->
+    ObjectRef ->
+    IO (Either EnError CheckDecision)
+checkCachedEngine cStore tStore cacheEnv graph consistency context subject relation object =
+    runEngine cStore tStore (Check.checkCached cacheEnv graph consistency context subject relation object)
+
+lookupCachedEngine ::
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    CheckCacheEnv ->
+    ReachabilityGraph ->
+    Consistency ->
+    LookupRequest ->
+    IO (Either EnError LookupPage)
+lookupCachedEngine cStore tStore cacheEnv graph consistency request =
+    runEngine cStore tStore (Lookup.lookupCached cacheEnv graph consistency request)
 
 lookupRequest :: Subject -> RelationName -> ObjectType -> CaveatContext -> LookupLimit -> Maybe LookupCursor -> LookupRequest
 lookupRequest subject permission objectType context limit cursor =
@@ -851,6 +931,16 @@ recursiveTupleStore =
 consistencyStore :: ConsistencyInterpreter
 consistencyStore =
     runConsistencyStoreInMemory
+
+fixedRevisionConsistencyStore :: Revision -> ConsistencyInterpreter
+fixedRevisionConsistencyStore revision =
+    interpret_ \case
+        DecodeToken token ->
+            pure (TokenMetadata token revision (DatastoreId "test") (SchemaHash "schema") Nothing)
+        ValidateToken _ ->
+            pure ()
+        ResolveConsistency consistency ->
+            pure ResolvedConsistency{consistency, revision}
 
 countingConsistencyStore :: IORef Int -> ConsistencyInterpreter -> ConsistencyInterpreter
 countingConsistencyStore count _ =

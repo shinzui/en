@@ -21,16 +21,19 @@ This plan adds decision caching for repeated authorization work. After implement
 
 ## Progress
 
-- [ ] Add an explicit cached check API without breaking the existing `check` function.
-- [ ] Cache top-level and useful recursive subproblem decisions by schema identity and resolved revision.
-- [ ] Route lookup confirmation checks through the cached path when a cache is provided.
-- [ ] Add tests for allowed, denied, conditional, context separation, schema separation, and revision separation.
-- [ ] Run `cabal test en-core-interface-tests` and `cabal build all`.
+- [x] Reconcile EP-11 with current `effectful` APIs and already-landed `checkMany` memoization before implementation. Completed 2026-06-24T00:12:00Z.
+- [x] Add an explicit cached check API without breaking the existing `check` function. Completed 2026-06-24T00:21:55Z.
+- [x] Cache top-level and useful recursive subproblem decisions by schema identity and resolved revision. Completed 2026-06-24T00:21:55Z.
+- [x] Route lookup confirmation checks through the cached path when a cache is provided. Completed 2026-06-24T00:21:55Z.
+- [x] Add tests for allowed, denied, conditional, context separation, schema separation, and revision separation. Completed 2026-06-24T00:21:55Z.
+- [x] Run `nix develop -c cabal test en-core-interface-tests` and `nix develop -c cabal build all`. Completed 2026-06-24T00:21:55Z.
 
 
 ## Surprises & Discoveries
 
-None yet.
+- A later ExecPlan (`docs/plans/25-adopt-effectful-for-the-en-effect-stack.md`) migrated `check`, `lookup`, and store access to `effectful`. The cached API should therefore be effect-polymorphic with `ConsistencyStore :> es`, `TupleStore :> es`, `IOE :> es`, and `Error EnError :> es` constraints rather than the obsolete `ConsistencyStore IO -> TupleStore IO -> IO (Either ...)` shape. _(2026-06-24)_
+- MasterPlan 3 EP-19 already added `checkMany` with a within-call `Map` memo keyed by `Revision` text and `(subject, object, relation)`. EP-11 can reuse that private memoization boundary as the cross-request cache boundary by adding a cache environment to the memo evaluator rather than inventing a parallel traversal. _(2026-06-24)_
+- The cached lookup path can avoid changing the uncached lookup API by passing an internal confirmation-check function through lookup traversal. `lookupWithDeadline` keeps using `check`, while `lookupCached` and `lookupWithDeadlineCached` use `checkCached`; the shared traversal only knows about the supplied function. _(2026-06-24)_
 
 
 ## Decision Log
@@ -44,32 +47,47 @@ None yet.
 - Decision: Cache the `CheckDecision` from `En.Check`'s monadic `runCheck` subproblem evaluation, treating MasterPlan 3 EP-15's `En.Decision` as the type seam (not the cache target), and keep the cache key batch-friendly for MasterPlan 3 EP-19.
   Rationale: MasterPlan 3 is implemented in full before this MasterPlan (see `docs/masterplans/2-add-caching-support-to-en.md` Decision Log), so `En.Decision` already exists and `CheckDecision` is re-exported through `En.Check`. The expensive, cacheable work is the tuple-reading subproblem evaluation, not the pure `En.Decision` combinators. Keeping the key a plain per-pair tuple under one resolved revision (no per-call state) lets MasterPlan 3 EP-19's `BatchCheck` reuse entries across requests with no EP-19-specific code.
   Date: 2026-06-23
+- Decision: Reuse `checkMany`'s subproblem memo evaluator as the cached traversal.
+  Rationale: `checkMany` already proves that a memoized evaluator can share subproblem work without changing decisions. Extending that evaluator with optional `En.Cache` lookup/insert keeps the public uncached `check` path intact, keeps batch behavior compatible, and gives EP-11 cross-request reuse for the same per-pair subproblem key.
+  Date: 2026-06-24
 
 
 ## Outcomes & Retrospective
 
-To be filled during and after implementation.
+Implemented EP-11 on 2026-06-24. `en-core/src/En/Check.hs` now exposes `CheckCacheEnv` and `checkCached`. The existing `check` API remains unchanged. The cached path resolves consistency once, uses the already-existing memo evaluator, checks `En.Cache` before evaluating subproblems, and inserts successful `CheckDecision` results under a `SubproblemKey` containing datastore id, `ReachabilityGraph.hash`, resolved revision, subject, relation, object, and caveat context.
+
+`en-core/src/En/Lookup.hs` now exposes `lookupCached` and `lookupWithDeadlineCached`. The uncached lookup path still calls `check`; the cached path supplies `checkCached` to the same confirmation traversal used for intersection and exclusion candidates.
+
+Validation passed with:
+
+```text
+nix develop -c cabal test en-core-interface-tests
+Test suite en-core-interface-tests: PASS
+
+nix develop -c cabal build all
+Build completed successfully.
+```
+
+The focused tests prove allowed, denied, and conditional decisions are reused on repeated cached checks without extra tuple reads; different caveat context, revision, and schema hash miss the cache; and repeated cached lookup confirmations produce cache hits while returning the same lookup page.
 
 
 ## Context and Orientation
 
-The forward authorization algorithm is in `en-core/src/En/Check.hs`. The public function:
+The forward authorization algorithm is in `en-core/src/En/Check.hs`. The current public function is effect-polymorphic:
 
 ```haskell
 check ::
-    Monad m =>
-    ConsistencyStore m ->
-    TupleStore m ->
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
     ReachabilityGraph ->
     Consistency ->
     CaveatContext ->
     Subject ->
     RelationName ->
     ObjectRef ->
-    m (Either EnError CheckDecision)
+    Eff es CheckDecision
 ```
 
-resolves consistency and calls a private `runCheck`, which recursively evaluates relations and rewrites. The recursion identifies subproblems by subject, object, and relation. Those subproblems are natural cache entries.
+It resolves consistency and calls a private `runCheck`, which recursively evaluates relations and rewrites. `checkMany` resolves consistency once and calls `runCheckMemo`, a private memoized evaluator. The recursion identifies subproblems by subject, object, and relation. Those subproblems are natural cache entries.
 
 `en-core/src/En/Lookup.hs` imports `check` and uses it inside `confirmCandidates` for conditional entrypoints. Caching should help those confirmation checks too. The existing uncached lookup API should stay available; add a cached variant only if needed for service wiring.
 
@@ -98,8 +116,7 @@ Add a function:
 
 ```haskell
 checkCached ::
-    ConsistencyStore IO ->
-    TupleStore IO ->
+    (ConsistencyStore :> es, TupleStore :> es, IOE :> es, Error EnError :> es) =>
     CheckCacheEnv ->
     ReachabilityGraph ->
     Consistency ->
@@ -107,7 +124,7 @@ checkCached ::
     Subject ->
     RelationName ->
     ObjectRef ->
-    IO (Either EnError CheckDecision)
+    Eff es CheckDecision
 ```
 
 Keep `check` as it is. `checkCached` should resolve consistency once, then call an internal evaluator that checks the cache before evaluating a subproblem. On `Left EnError`, do not insert a cache entry. On `Right CheckDecision`, insert the decision.
@@ -128,13 +145,12 @@ Milestone 3 wires lookup confirmation through the cached path. Add a cached look
 
 ```haskell
 lookupCached ::
-    ConsistencyStore IO ->
-    TupleStore IO ->
+    (ConsistencyStore :> es, TupleStore :> es, IOE :> es, Error EnError :> es) =>
     CheckCacheEnv ->
     ReachabilityGraph ->
     Consistency ->
     LookupRequest ->
-    IO (Either EnError LookupPage)
+    Eff es LookupPage
 ```
 
 The existing `lookup` remains uncached. Inside lookup, the only required decision-cache integration is `confirmCandidates`, which currently calls `check`. Refactor the confirmation function to accept a check function argument, or define a small local record that contains the check operation. This avoids duplicating lookup traversal.
@@ -194,3 +210,8 @@ The cached API is additive. If lookup integration becomes too invasive, implemen
 ## Interfaces and Dependencies
 
 This plan depends on `docs/plans/10-add-core-cache-interfaces-and-configuration.md` and optionally benefits from `docs/plans/12-implement-tuple-read-caching.md`. It uses `En.Cache`, `En.Check`, `En.Lookup`, `En.Reachability`, `En.Effect.ConsistencyStore`, and `En.Effect.TupleStore`. It should not depend on PostgreSQL, Servant, or Warp.
+
+
+---
+
+**Revision note (2026-06-24).** Reconciled EP-11 with the current effectful engine and completed the implementation. The plan now documents the effect-polymorphic cached APIs, the reuse of `checkMany`'s memo evaluator, the lookup confirmation injection approach, and the passing Nix-shell validation commands.
