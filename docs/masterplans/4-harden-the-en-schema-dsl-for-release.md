@@ -92,7 +92,7 @@ their being different concerns (soundness vs. ergonomics), and would have scatte
 |---|-------|------|-----------|-----------|--------|
 | 20 | Detect duplicate names in the schema builder | docs/plans/20-detect-duplicate-names-in-the-schema-builder.md | None | None | Complete |
 | 21 | Introduce a validated-schema evidence type | docs/plans/21-introduce-a-validated-schema-evidence-type.md | None | EP-20 | Complete |
-| 22 | Add a compile-time schema quasi-quoter | docs/plans/22-add-a-compile-time-schema-quasi-quoter.md | EP-21 | EP-20 | Not Started |
+| 22 | Add a compile-time schema quasi-quoter | docs/plans/22-add-a-compile-time-schema-quasi-quoter.md | EP-21 | EP-20 | In Progress |
 | 23 | Polish builder ergonomics and reference safety | docs/plans/23-polish-builder-ergonomics-and-reference-safety.md | None | EP-20 | Not Started |
 | 24 | Render schemas as docs and diagrams | docs/plans/24-render-schemas-as-docs-and-diagrams.md | None | EP-21 | Not Started |
 

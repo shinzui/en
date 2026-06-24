@@ -19,20 +19,21 @@ module En.Schema.Types (
 import Data.Map.Strict (Map)
 import Data.Set (Set)
 import Data.Text (Text)
+import Language.Haskell.TH.Syntax (Lift)
 
 import En.Caveat.Value (CaveatValue)
 
 newtype ObjectType = ObjectType Text
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Lift)
 
 newtype RelationName = RelationName Text
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Lift)
 
 newtype CaveatName = CaveatName Text
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Lift)
 
 newtype CaveatParameterName = CaveatParameterName Text
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Lift)
 
 {- | The bounded value kinds a caveat can ask for. The evaluator remains small
 and total; these are enough for time bounds, booleans, ids, and autonomy
@@ -44,17 +45,17 @@ data CaveatParameterType
     | ParameterInteger
     | ParameterTimestamp
     | ParameterEnum [Text]
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Lift)
 
 data CaveatSource
     = FromContext
     | FromPayload
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Lift)
 
 data CaveatOperand
     = OperandParam !CaveatSource !CaveatParameterName
     | OperandLiteral !CaveatValue
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Lift)
 
 data CaveatCompare
     = CmpEq
@@ -63,7 +64,7 @@ data CaveatCompare
     | CmpLe
     | CmpGt
     | CmpGe
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Lift)
 
 data CaveatPredicate
     = PredTrue
@@ -72,7 +73,7 @@ data CaveatPredicate
     | PredOr ![CaveatPredicate]
     | PredNot !CaveatPredicate
     | PredMember !CaveatOperand ![CaveatValue]
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Lift)
 
 -- | Declares the request or tuple arguments a named caveat expects.
 data CaveatDefinition = CaveatDefinition
@@ -80,14 +81,14 @@ data CaveatDefinition = CaveatDefinition
     , parameters :: !(Map CaveatParameterName CaveatParameterType)
     , predicate :: !CaveatPredicate
     }
-    deriving stock (Eq, Show)
+    deriving stock (Eq, Show, Lift)
 
 -- | A complete authorization model: every object type and its relations.
 data Schema = Schema
     { objectTypes :: !(Map ObjectType (Map RelationName Relation))
     , caveats :: !(Map CaveatName CaveatDefinition)
     }
-    deriving stock (Eq, Show)
+    deriving stock (Eq, Show, Lift)
 
 -- | A relation is a name plus the rewrite rule that computes its effective members.
 data Relation = Relation
@@ -95,7 +96,7 @@ data Relation = Relation
     , allowedSubjects :: !(Set AllowedSubject)
     , rewrite :: !Rewrite
     }
-    deriving stock (Eq, Show)
+    deriving stock (Eq, Show, Lift)
 
 {- | A subject shape accepted by direct tuples on a relation.
 
@@ -108,7 +109,7 @@ data AllowedSubject = AllowedSubject
     , relation :: !(Maybe RelationName)
     , wildcard :: !Bool
     }
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Lift)
 
 {- | Userset-rewrite expressions — the Zanzibar relation algebra. @en@ leans on
 'Union', 'ComputedUserset', and 'TupleToUserset'; 'Intersection' / 'Exclusion'
@@ -127,4 +128,4 @@ data Rewrite
       Exclusion Rewrite Rewrite
     | -- | A rewrite gated by a named caveat (bounded ABAC: time-bound, autonomy-level).
       Caveated CaveatName Rewrite
-    deriving stock (Eq, Show)
+    deriving stock (Eq, Show, Lift)

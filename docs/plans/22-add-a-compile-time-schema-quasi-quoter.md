@@ -62,16 +62,16 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Confirm EP-21 (`docs/plans/21-introduce-a-validated-schema-evidence-type.md`) is landed and `En.Schema.Validated` exports `ValidSchema` and `validateSchema :: Schema -> Either EnError ValidSchema`. If not landed, block on it (this is a HARD dependency).
-- [ ] Milestone 0 (PROTOTYPING): add `template-haskell` to the `en-core` library `build-depends`; add `DeriveLift` to default-extensions; derive `Lift` for the `En.Schema` types and confirm `cabal build en-core` still succeeds.
-- [ ] Milestone 0 (PROTOTYPING): add `En.Schema.TH` with `mkValidSchema :: Schema -> Code Q ValidSchema` (typed-TH); write a throwaway test module that splices `kikanSchema` through it and asserts equality with the builder fixture.
-- [ ] Milestone 0 (PROTOTYPING): create a *should-not-compile* fixture using `Schema.computed "ownr"`, run `cabal build` on it manually, and capture the exact validation error transcript; confirm the build fails.
-- [ ] Milestone 0 (PROTOTYPING): write the prototyping retrospective in Outcomes & Retrospective — promote or discard approach (B).
-- [ ] Milestone 1: harden `En.Schema.TH` (rename to final API, doc comments, error formatting) and wire the good-path test into `en-core-interface-tests`.
-- [ ] Milestone 1: encode the should-not-compile case as a committed, runnable check (manual `cabal build` of a fixture target whose expected stderr is recorded here) so regressions are catchable.
+- [x] 2026-06-24: Confirm EP-21 (`docs/plans/21-introduce-a-validated-schema-evidence-type.md`) is landed and `En.Schema` exports `ValidSchema` and `validateSchema :: Schema -> Either EnError ValidSchema`, with `En.Schema.Internal.unsafeValidSchema` available for TH.
+- [x] 2026-06-24: Milestone 0 (PROTOTYPING): add `template-haskell` to the `en-core` library `build-depends`; add `DeriveLift` to default-extensions; derive `Lift` for the schema data types and confirm `nix develop --command cabal build en-core:lib:en-core` succeeds.
+- [x] 2026-06-24: Milestone 0 (PROTOTYPING): add `En.Schema.TH` with `mkValidSchema :: Schema -> Code Q ValidSchema`; wire a permanent test that splices `kikanSchema` through it and asserts equality with the builder fixture.
+- [x] 2026-06-24: Milestone 0 (PROTOTYPING): create a *should-not-compile* fixture using `Schema.computed "ownr"`, run it manually, and capture the validation error transcript; confirm the build fails.
+- [x] 2026-06-24: Milestone 0 (PROTOTYPING): promote approach (B), the typed-TH function over the existing builder surface, to the real implementation.
+- [x] 2026-06-24: Milestone 1: harden `En.Schema.TH` with final API, doc comments, error formatting, and a good-path test in `en-core-interface-tests`.
+- [x] 2026-06-24: Milestone 1: encode the should-not-compile cases as committed, runnable manual checks: `BadSchema.hs` for unknown relation and `DuplicateName.hs` for EP-20 duplicate relation.
 - [ ] Milestone 2 (OPTIONAL, budget permitting): add the `schema` QuasiQuoter (`[schema| ... |]`) with a small textual grammar parsed to `Schema`, validated at compile time, spliced as `ValidSchema`.
-- [ ] Update `exposed-modules` in `en-core/en-core.cabal`; run `cabal build all` and `cabal test en-core-interface-tests`; record outputs.
-- [ ] Final retrospective.
+- [x] 2026-06-24: Update `exposed-modules` in `en-core/en-core.cabal`; run `nix develop --command cabal build all` and `nix develop --command cabal test en-core-interface-tests`; record outputs.
+- [ ] Final retrospective after deciding whether Milestone 2 lands or is explicitly deferred.
 
 
 ## Surprises & Discoveries
@@ -192,6 +192,16 @@ Record every decision made while working on the plan.
   not yet caught by either path; nothing in this plan needs to change when it lands.
   Date: 2026-06-23
 
+- Decision: Add `mkValidSchemaEither :: Either EnError Schema -> Code Q ValidSchema` alongside
+  `mkValidSchema :: Schema -> Code Q ValidSchema`.
+  Rationale: EP-20 made the builder entry points return `Either EnError ...`, so duplicate
+  object/relation/caveat/parameter declarations fail before a raw `Schema` exists. A TH helper
+  that accepts builder results lets compile-time authoring surface those builder-side
+  `EnError`s directly, with the same error text, instead of forcing users to unwrap with
+  `error` before calling `mkValidSchema`. `mkValidSchema` remains the simple raw-schema API and
+  delegates to `mkValidSchemaEither . Right`.
+  Date: 2026-06-24
+
 
 ## Outcomes & Retrospective
 
@@ -202,6 +212,22 @@ Compare the result against the original purpose.
 explicitly state whether approach (B) is promoted to the real implementation or discarded, and
 why; the final entry must compare the delivered behavior against the Purpose above — namely
 that a typo like `Schema.computed "ownr"` now fails the build with the validation message.)
+
+2026-06-24 milestone note: approach (B) is promoted. `En.Schema.TH.mkValidSchema` validates a
+raw `Schema` at compile time and splices a `ValidSchema`; `mkValidSchemaEither` does the same
+for fallible builder results, preserving EP-20 duplicate-declaration errors at compile time.
+The good path is now a permanent `en-core-interface-tests` assertion named
+`compile-time validated schema equals builder fixture`. The bad-path fixtures fail manually
+with the intended messages:
+
+```text
+schema validation failed at compile time: UnknownRelation "unknown relation: space#ownr"
+schema validation failed at compile time: SchemaViolation "duplicate relation declared: space#owner"
+```
+
+The textual `[schema| ... |]` quasi-quoter remains unfinished and is tracked by the remaining
+Milestone 2 checkbox; EP-22 stays In Progress until that milestone is implemented or
+explicitly deferred in the MasterPlan.
 
 
 ## Context and Orientation

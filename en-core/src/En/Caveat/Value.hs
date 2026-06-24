@@ -8,6 +8,7 @@ module En.Caveat.Value (
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Time (UTCTime)
+import Language.Haskell.TH.Syntax (Lift)
 
 -- | Concrete values accepted by the bounded caveat evaluator.
 data CaveatValue
@@ -16,7 +17,7 @@ data CaveatValue
     | ValueInteger !Integer
     | ValueTimestamp !UTCTime
     | ValueEnum !Text
-    deriving stock (Eq, Ord, Show)
+    deriving stock (Eq, Ord, Show, Lift)
 
 -- | Arguments stored on a tuple with a named caveat.
 newtype CaveatPayload = CaveatPayload (Map Text CaveatValue)

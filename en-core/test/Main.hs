@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Main (
     main,
@@ -91,11 +92,14 @@ import En.Schema (
     RelationName (..),
     Rewrite (..),
     Schema (..),
+    ValidSchema,
     schemaHash,
+    unValidSchema,
     validate,
     validateSchema,
  )
 import En.Schema.Builder qualified as Schema
+import En.Schema.TH (mkValidSchema)
 import En.Tuple (
     CaveatContext (..),
     CaveatPayload (..),
@@ -105,6 +109,10 @@ import En.Tuple (
     Tuple (..),
     TupleCaveat (..),
  )
+
+validatedKikanTH :: ValidSchema
+validatedKikanTH =
+    $$(mkValidSchema kikanSchema)
 
 main :: IO ()
 main = do
@@ -125,6 +133,7 @@ main = do
     assertEqual "kikan-shaped fixture validates" (Right ()) (validate kikanSchema)
     assertEqual "builder schema equals manual schema" kikanSchemaManual kikanSchema
     assertEqual "builder schema hash matches manual schema hash" (schemaHash validKikanManual) (schemaHash validKikan)
+    assertEqual "compile-time validated schema equals builder fixture" kikanSchema (unValidSchema validatedKikanTH)
     assertBool "validateSchema produces evidence for a valid schema" (isRight (validateSchema kikanSchema))
     assertBool "validateSchema rejects an invalid schema (no evidence)" (isLeft (validateSchema unproductiveCycleSchema))
     assertEqual "builder anyOf constructs a non-empty union" (Union [This, ComputedUserset (RelationName "owner")]) (Schema.anyOf Schema.this [Schema.computed "owner"])

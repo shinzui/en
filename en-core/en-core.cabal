@@ -27,6 +27,7 @@ common shared
   default-extensions:
     BlockArguments
     DeriveAnyClass
+    DeriveLift
     DerivingStrategies
     DuplicateRecordFields
     LambdaCase
@@ -56,6 +57,7 @@ library
     En.Schema
     En.Schema.Builder
     En.Schema.Internal
+    En.Schema.TH
     En.Schema.Types
     En.Tuple
 
@@ -65,6 +67,7 @@ library
     , containers
     , effectful
     , effectful-core
+    , template-haskell
     , text
     , time
     , unordered-containers
