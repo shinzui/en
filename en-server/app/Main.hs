@@ -171,11 +171,12 @@ describeEntryCache maxEntries
 
 demoSchema :: Schema
 demoSchema =
-    Schema.build
-        [ Schema.object "user" []
-        , Schema.object
-            "space"
-            [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
-            , Schema.permission "view" (Schema.computed "viewer")
-            ]
-        ]
+    either (error . ("invalid demo schema: " <>) . show) id $ do
+        userObject <- Schema.object "user" []
+        spaceObject <-
+            Schema.object
+                "space"
+                [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
+                , Schema.permission "view" (Schema.computed "viewer")
+                ]
+        Schema.build [userObject, spaceObject]

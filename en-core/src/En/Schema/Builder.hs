@@ -48,11 +48,13 @@ module En.Schema.Builder (
     caveated,
 ) where
 
+import Control.Monad (foldM)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Time (UTCTime)
 
+import En.Error (EnError (SchemaViolation))
 import En.Schema (CaveatCompare (..), CaveatOperand (..), CaveatParameterType, CaveatPredicate (..), CaveatSource (..), CaveatValue (..), Rewrite, Schema)
 import En.Schema qualified as Raw
 
@@ -66,13 +68,15 @@ data CaveatSpec = CaveatSpec Raw.CaveatName Raw.CaveatDefinition
 
 data ParameterSpec = ParameterSpec Raw.CaveatParameterName CaveatParameterType
 
-build :: [SchemaObject] -> Schema
+build :: [SchemaObject] -> Either EnError Schema
 build =
     buildWithCaveats []
 
-buildWithCaveats :: [CaveatSpec] -> [SchemaObject] -> Schema
-buildWithCaveats caveatSpecs objectSpecs =
-    Raw.Schema (Map.fromList (objectEntry <$> objectSpecs)) (Map.fromList (caveatEntry <$> caveatSpecs))
+buildWithCaveats :: [CaveatSpec] -> [SchemaObject] -> Either EnError Schema
+buildWithCaveats caveatSpecs objectSpecs = do
+    objectTypes <- fromListUnique duplicateObjectType (objectEntry <$> objectSpecs)
+    caveats <- fromListUnique duplicateCaveat (caveatEntry <$> caveatSpecs)
+    pure (Raw.Schema objectTypes caveats)
   where
     objectEntry (SchemaObject name relations) =
         (name, relations)
@@ -80,14 +84,25 @@ buildWithCaveats caveatSpecs objectSpecs =
     caveatEntry (CaveatSpec name definition) =
         (name, definition)
 
-object :: Text -> [SchemaRelation] -> SchemaObject
-object name relations =
-    SchemaObject
-        (Raw.ObjectType name)
-        (Map.fromList (relationEntry <$> relations))
+    duplicateObjectType (Raw.ObjectType name) =
+        SchemaViolation ("duplicate object type declared: " <> name)
+
+    duplicateCaveat (Raw.CaveatName name) =
+        SchemaViolation ("duplicate caveat declared: " <> name)
+
+object :: Text -> [SchemaRelation] -> Either EnError SchemaObject
+object name relations = do
+    relationMap <- fromListUnique duplicateRelation (relationEntry <$> relations)
+    pure (SchemaObject objectType relationMap)
   where
+    objectType =
+        Raw.ObjectType name
+
     relationEntry (SchemaRelation relationName relationValue) =
         (relationName, relationValue)
+
+    duplicateRelation (Raw.RelationName relationName) =
+        SchemaViolation ("duplicate relation declared: " <> name <> "#" <> relationName)
 
 relation :: Text -> [SubjectSpec] -> Rewrite -> SchemaRelation
 relation name subjects rewrite =
@@ -117,21 +132,31 @@ wildcardSubject :: Text -> SubjectSpec
 wildcardSubject name =
     SubjectSpec (Raw.AllowedSubject (Raw.ObjectType name) Nothing True)
 
-caveat :: Text -> [ParameterSpec] -> CaveatSpec
+caveat :: Text -> [ParameterSpec] -> Either EnError CaveatSpec
 caveat name parameterSpecs =
     caveatWith name parameterSpecs PredTrue
 
-caveatWith :: Text -> [ParameterSpec] -> CaveatPredicate -> CaveatSpec
-caveatWith name parameterSpecs predicate =
-    CaveatSpec
-        caveatName
-        (Raw.CaveatDefinition caveatName (Map.fromList (parameterEntry <$> parameterSpecs)) predicate)
+caveatWith :: Text -> [ParameterSpec] -> CaveatPredicate -> Either EnError CaveatSpec
+caveatWith name parameterSpecs predicate = do
+    parameterMap <- fromListUnique duplicateParameter (parameterEntry <$> parameterSpecs)
+    pure (CaveatSpec caveatName (Raw.CaveatDefinition caveatName parameterMap predicate))
   where
     caveatName =
         Raw.CaveatName name
 
     parameterEntry (ParameterSpec parameterName parameterType) =
         (parameterName, parameterType)
+
+    duplicateParameter (Raw.CaveatParameterName parameterName) =
+        SchemaViolation ("duplicate caveat parameter declared: " <> name <> "." <> parameterName)
+
+fromListUnique :: (Ord k) => (k -> EnError) -> [(k, v)] -> Either EnError (Map.Map k v)
+fromListUnique onDuplicate =
+    foldM insertUnique Map.empty
+  where
+    insertUnique acc (key, value)
+        | Map.member key acc = Left (onDuplicate key)
+        | otherwise = Right (Map.insert key value acc)
 
 parameter :: Text -> CaveatParameterType -> ParameterSpec
 parameter name =

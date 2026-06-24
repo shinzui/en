@@ -57,26 +57,28 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Read `en-core/src/En/Schema/Builder.hs`, `en-core/src/En/Schema.hs`, and
+- [x] 2026-06-24: Read `en-core/src/En/Schema/Builder.hs`, `en-core/src/En/Schema.hs`, and
       `en-core/src/En/Error.hs` and confirm the three `Map.fromList` sites (around lines
       74, 86, and 123 of `Builder.hs`) match the descriptions in this plan.
-- [ ] Add the `fromListUnique` helper to `En.Schema.Builder` and the `SchemaError` import
+- [x] 2026-06-24: Add the `fromListUnique` helper to `En.Schema.Builder` and the `EnError` import
       wiring as described under Plan of Work (Milestone 1).
-- [ ] Change `buildWithCaveats`, `build`, `object`, `caveat`, and `caveatWith` to return
+- [x] 2026-06-24: Change `buildWithCaveats`, `build`, `object`, `caveat`, and `caveatWith` to return
       `Either EnError ...` and route every collection through `fromListUnique` with a
       duplicate-message builder for each of the four name classes (Milestone 1).
-- [ ] Write the four NEW negative tests in `en-core/test/Main.hs` (one per name class),
+- [x] 2026-06-24: Write the four NEW negative tests in `en-core/test/Main.hs` (one per name class),
       each asserting the build returns `Left (SchemaViolation <expected message>)`
       (Milestone 2).
-- [ ] Confirm the new tests FAIL against the unmodified builder (run them on a stash of
+- [x] 2026-06-24: Confirm the new tests FAIL against the unmodified builder (run them on a stash of
       the builder change to prove they catch the bug), then pass after the fix
       (Milestone 2).
-- [ ] Update the existing call sites that now see an `Either`: the `kikanSchema` /
-      `kikanSchemaManual` fixtures and helpers in `en-core/test/Main.hs`, and `demoSchema`
-      in `en-server/app/Main.hs` (Milestone 3).
-- [ ] Run `cabal build all` and `cabal test en-core-interface-tests` from the repo root
+- [x] 2026-06-24: Update the existing call sites that now see an `Either`: the shared
+      `kikanSchema` fixture in `en-core/src/En/Conformance/Kikan.hs`, local fixtures in
+      `en-core/test/Main.hs`, `benchSchema` in `en-core/bench/Main.hs`, `exampleSchema`
+      in `en-example/src/En/Example/Host.hs`, and `demoSchema` in
+      `en-server/app/Main.hs` (Milestone 3).
+- [x] 2026-06-24: Run `cabal build all` and `cabal test en-core-interface-tests` from the repo root
       and confirm both pass (Validation and Acceptance).
-- [ ] Fill in Surprises & Discoveries, Decision Log dates, and Outcomes & Retrospective.
+- [x] 2026-06-24: Fill in Surprises & Discoveries, Decision Log dates, and Outcomes & Retrospective.
 
 
 ## Surprises & Discoveries
@@ -84,7 +86,34 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- Discovery: the plan initially named only `en-core/test/Main.hs` and
+  `en-server/app/Main.hs` as compiled builder call sites, but `rg` and
+  `cabal build all` showed additional compiled consumers in
+  `en-core/src/En/Conformance/Kikan.hs`, `en-core/bench/Main.hs`, and
+  `en-example/src/En/Example/Host.hs`. The implementation updated all compiled call
+  sites so the fallible builder API is threaded consistently.
+  Evidence: `nix develop --command cabal build all` first failed in
+  `en-example/src/En/Example/Host.hs` after the core/test/server changes, then passed
+  after updating `exampleSchema`.
+  Date: 2026-06-24
+
+- Discovery: the repository's plain shell did not have `ghc-9.12.4` on `PATH`, so direct
+  `cabal build en-core:lib:en-core` failed before compilation. Validation used the
+  repository development shell instead.
+  Evidence:
+
+  ```text
+  Cannot find the program 'ghc'. User-specified path 'ghc-9.12.4' does not refer to an executable and the program is not on the system path.
+  ```
+
+  Date: 2026-06-24
+
+- Discovery: the pre-fix demonstration behaved as expected. With only
+  `en-core/src/En/Schema/Builder.hs` stashed back to the old pure API, the adapted
+  callers/tests failed to compile because they now expect `Either EnError ...` from
+  `Schema.object`, `Schema.caveatWith`, and `Schema.buildWithCaveats`. Restoring the
+  builder fix made `nix develop --command cabal test en-core-interface-tests` pass.
+  Date: 2026-06-24
 
 
 ## Decision Log
@@ -116,8 +145,8 @@ Record every decision made while working on the plan.
   exact place that has both the duplicate information (the raw list, before deduping) and
   the obligation to dedupe, so it is the natural place to detect the collision. The cost
   is that `build`/`object`/`caveat` change from pure values to `Either EnError ...`, which
-  is a breaking API change touching the two call sites (`en-core/test/Main.hs` and
-  `en-server/app/Main.hs`). That cost is small, mechanical, and contained, and the
+  is a breaking API change touching the compiled schema fixtures in `en-core`,
+  `en-example`, and `en-server`. That cost is small, mechanical, and contained, and the
   resulting signatures honestly advertise that schema construction can fail. We do not
   introduce a new `EnError` constructor; `SchemaViolation Text` already means "a schema is
   structurally invalid", which is exactly this case, and reusing it keeps the error
@@ -128,7 +157,7 @@ Record every decision made while working on the plan.
   is through the builder (or by hand-constructing `Map`s, which cannot have duplicate
   keys by definition). Duplicate detection therefore belongs at construction time, not
   re-validation time.
-  Date: (to be filled when the decision is committed)
+  Date: 2026-06-24
 
 - Decision: The duplicate-error messages are stable, descriptive, and qualified by their
   enclosing scope: `"duplicate object type declared: <name>"`,
@@ -140,7 +169,7 @@ Record every decision made while working on the plan.
   it must not change casually. The `<object>#<relation>` form mirrors the existing
   `relationText` rendering used elsewhere in `En.Schema.validate` (e.g. "relation map key
   does not match relation name: space#owner"), keeping the engine's diagnostics consistent.
-  Date: (to be filled when the decision is committed)
+  Date: 2026-06-24
 
 
 ## Outcomes & Retrospective
@@ -148,13 +177,28 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Completed on 2026-06-24. `En.Schema.Builder` now rejects duplicate object types,
+relations, caveats, and caveat parameters before any `Map.fromList`-style collapse can
+drop a declaration. The fallible builder signatures are threaded through the conformance
+fixture, test-only schemas, benchmark schema, example host schema, and server demo schema.
+The `en-core-interface-tests` suite includes one exact `SchemaViolation` assertion for
+each duplicate class, and the equality/hash assertions for the builder-produced Kikan
+schema still pass against the manual schema.
+
+Validation was performed through `nix develop` because the plain shell lacks the pinned
+GHC executable. The final successful commands were:
+
+```bash
+nix develop --command cabal build all
+nix develop --command cabal test en-core-interface-tests
+```
 
 
 ## Context and Orientation
 
-This task lives entirely inside the `en-core` library and its test suite, with one tiny
-follow-on edit in `en-server`. The reader needs to know four files.
+This task lives primarily inside the `en-core` library and its test suite, with follow-on
+edits in every compiled package that authored a schema through the builder. The reader
+needs to know eight files.
 
 `en-core/src/En/Schema.hs` defines the raw authorization data types and the runtime
 validator. The relevant types are `Schema` (a record with `objectTypes ::
@@ -202,17 +246,30 @@ entries into maps*, never how rewrites are constructed, so the combinators `this
 `computed`, `arrow`, `anyOf`, `allOf`, `minus`, `caveated`, and the `cmp*`/`pred*`/`lit*`
 helpers are untouched.
 
+`en-core/src/En/Conformance/Kikan.hs` holds the shared Kikan-shaped schema fixture used
+by tests and examples. It authors `kikanSchema` through the builder and compiles
+`kikanGraph`, so after the builder becomes fallible it must unwrap its known-good schema
+with a local helper that fails loudly if the fixture ever becomes invalid.
+
 `en-core/test/Main.hs` is the single test executable for `en-core` (cabal test-suite
 `en-core-interface-tests`, `main-is: test/Main.hs`). It is a plain `IO ()` `main` that
 runs assertions via three helpers defined near the bottom of the file: `assertEqual ::
 (Eq a, Show a) => String -> a -> a -> IO ()`, `assertBool :: String -> Bool -> IO ()`, and
 `assertValidationFails :: String -> Schema -> IO ()`. The fixture `kikanSchema` (around
-lines 303–360) is authored with the builder; the parallel `kikanSchemaManual` is the same
-schema hand-built from raw `En.Schema` constructors, and `main` asserts the two are equal.
+lines 303–360 in earlier revisions, now shared from `En.Conformance.Kikan`) is authored
+with the builder; the parallel `kikanSchemaManual` is the same schema hand-built from raw
+`En.Schema` constructors, and `main` asserts the two are equal. The test file also defines
+additional local builder-authored schemas for caveat, wildcard, and streaming scenarios.
 There is no test framework; failures are raised with `fail`.
 
 `en-server/app/Main.hs` builds a tiny `demoSchema :: Schema` with `Schema.build [...]`
-(around line 78). It is the only non-test consumer of `Schema.build` in the repo.
+(around line 78 in earlier revisions, around line 172 after this implementation).
+
+`en-core/bench/Main.hs` builds `benchSchema :: Schema` through `Schema.build [...]` for
+the benchmark executable, and `en-example/src/En/Example/Host.hs` builds
+`exampleSchema :: Schema` through `Schema.buildWithCaveats [...] [...]` for the example
+application. Both are compiled by `cabal build all`, so both must thread the new
+`Either EnError ...` results.
 
 Throughout, the import alias is `import En.Schema.Builder qualified as Schema`, so call
 sites write `Schema.build`, `Schema.object`, `Schema.relation`, and so on.
@@ -421,17 +478,24 @@ runs to completion with no `fail`, and the four new assertions are present.
 
 ### Milestone 3 — Repair existing call sites for the new `Either` signatures
 
-Scope: the two existing consumers of the lifted entry points must thread the `Either`. At
-the end, `cabal build all` succeeds across the whole project.
+Scope: every compiled consumer of the lifted entry points must thread the `Either`. The
+known compiled consumers after implementation are `en-core/src/En/Conformance/Kikan.hs`,
+`en-core/test/Main.hs`, `en-core/bench/Main.hs`, `en-example/src/En/Example/Host.hs`, and
+`en-server/app/Main.hs`. At the end, `cabal build all` succeeds across the whole project.
 
-In `en-core/test/Main.hs`, the `kikanSchema` fixture is built with
+In `en-core/src/En/Conformance/Kikan.hs`, the shared `kikanSchema` fixture is built with
 `Schema.buildWithCaveats [...] [...]` where the inner list elements are now
 `Either EnError SchemaObject` / `Either EnError CaveatSpec`. Rewrite the fixture to thread
 the `Either`. Because `kikanSchema :: Schema` is used pervasively, keep it a `Schema` by
-unwrapping a known-good build with a partial-but-test-only helper, or restructure as
-follows. The simplest mechanical change that preserves the `Schema` type used everywhere
-else is to introduce a helper that turns a builder result into a value and `error`s on
-`Left` (acceptable in a test fixture that is known to be valid):
+unwrapping a known-good build with a partial fixture helper that `error`s on `Left`; this
+is acceptable for checked-in static fixtures because a schema-authoring mistake should
+fail immediately during tests and example startup. The same pattern applies to the local
+test schemas in `en-core/test/Main.hs`, `benchSchema` in `en-core/bench/Main.hs`,
+`exampleSchema` in `en-example/src/En/Example/Host.hs`, and `demoSchema` in
+`en-server/app/Main.hs`.
+
+The simplest mechanical change that preserves the `Schema` type used everywhere else is
+to introduce a helper that turns a builder result into a value and `error`s on `Left`:
 
 ```haskell
 orFail :: Either EnError a -> a
@@ -548,7 +612,9 @@ cabal build en-core:lib:en-core
 Expected: it compiles. (The test suite and server will not yet — that is fine.)
 
 Apply Milestone 2 (add the four tests and `assertLeftEq` to `en-core/test/Main.hs`) and
-Milestone 3 (repair `kikanSchema` in `en-core/test/Main.hs` and `demoSchema` in
+Milestone 3 (repair `kikanSchema` in `en-core/src/En/Conformance/Kikan.hs`, the local
+test schemas in `en-core/test/Main.hs`, `benchSchema` in `en-core/bench/Main.hs`,
+`exampleSchema` in `en-example/src/En/Example/Host.hs`, and `demoSchema` in
 `en-server/app/Main.hs`). Then build and test the whole project:
 
 ```bash
@@ -582,7 +648,9 @@ The change is acceptance-complete when all of the following hold, each verifiabl
 human running a command from the repo root.
 
 `cabal build all` succeeds with no errors, proving the lifted `Either` signatures are
-threaded correctly through both call sites (`en-core/test/Main.hs`, `en-server/app/Main.hs`).
+threaded correctly through every compiled call site (`en-core/src/En/Conformance/Kikan.hs`,
+`en-core/test/Main.hs`, `en-core/bench/Main.hs`, `en-example/src/En/Example/Host.hs`, and
+`en-server/app/Main.hs`).
 
 `cabal test en-core-interface-tests` succeeds and includes the four new assertions. The
 behavioral proof is each new assertion: building a schema with a duplicate name yields the
@@ -620,7 +688,7 @@ demonstration in Concrete Steps is fully reversible with `git stash pop`; if int
 
 No data migration or destructive operation is involved. The only API change is the lifted
 return types; if the change must be rolled back, reverting `en-core/src/En/Schema/Builder.hs`
-and the two call-site files restores the prior behavior exactly.
+and the compiled call-site files restores the prior behavior exactly.
 
 
 ## Interfaces and Dependencies
@@ -663,8 +731,10 @@ type and will build on the now-fallible builder entry points) and EP-23 (which a
 `en-core/src/En/Schema/Builder.hs`). The coordination requirement is that **EP-23 must not
 redefine `fromListUnique` or re-lift these entry points**; it should treat the
 `Either EnError ...` signatures established here as fixed and reuse `fromListUnique` if it
-needs duplicate-safe collection of its own. The two call sites this plan modifies —
-`en-core/test/Main.hs` (the `kikanSchema` fixture and the new tests) and
-`en-server/app/Main.hs` (`demoSchema`) — are the complete set of consumers of the lifted
-entry points in the repository as of this plan; any future caller of `build`/`object`/
-`caveat` must thread the `Either` accordingly.
+needs duplicate-safe collection of its own. The compiled call sites this plan modifies —
+`en-core/src/En/Conformance/Kikan.hs` (`kikanSchema`), `en-core/test/Main.hs` (local
+fixtures and the new tests), `en-core/bench/Main.hs` (`benchSchema`),
+`en-example/src/En/Example/Host.hs` (`exampleSchema`), and `en-server/app/Main.hs`
+(`demoSchema`) — are the complete set of compiled consumers of the lifted entry points in
+the repository as of this implementation; any future caller of `build`/`object`/`caveat`
+must thread the `Either` accordingly.

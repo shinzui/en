@@ -140,6 +140,42 @@ main = do
     assertValidationFails "Caveated rejects unknown caveat" (schemaWithRelation "space" "viewer" userSubject (Caveated (CaveatName "missing") This))
     assertValidationFails "wildcard allowed subjects cannot be usersets" invalidWildcardUsersetSchema
     assertValidationFails "unproductive rewrite cycles are rejected" unproductiveCycleSchema
+    assertLeftEq
+        "duplicate relation is reported"
+        (SchemaViolation "duplicate relation declared: space#owner")
+        ( Schema.object
+            "space"
+            [ Schema.relation "owner" [Schema.subject "user"] Schema.this
+            , Schema.relation "owner" [Schema.subject "user"] Schema.this
+            ]
+        )
+    assertLeftEq
+        "duplicate object type is reported"
+        (SchemaViolation "duplicate object type declared: space")
+        ( do
+            spaceA <- Schema.object "space" [Schema.relation "owner" [Schema.subject "user"] Schema.this]
+            spaceB <- Schema.object "space" [Schema.relation "member" [Schema.subject "user"] Schema.this]
+            userObject <- Schema.object "user" []
+            Schema.build [userObject, spaceA, spaceB]
+        )
+    assertLeftEq
+        "duplicate caveat is reported"
+        (SchemaViolation "duplicate caveat declared: within_window")
+        ( do
+            userObject <- Schema.object "user" []
+            firstCaveat <- Schema.caveat "within_window" [Schema.parameter "until" ParameterTimestamp]
+            secondCaveat <- Schema.caveat "within_window" [Schema.parameter "from" ParameterTimestamp]
+            Schema.buildWithCaveats [firstCaveat, secondCaveat] [userObject]
+        )
+    assertLeftEq
+        "duplicate caveat parameter is reported"
+        (SchemaViolation "duplicate caveat parameter declared: within_window.until")
+        ( Schema.caveat
+            "within_window"
+            [ Schema.parameter "until" ParameterTimestamp
+            , Schema.parameter "until" ParameterTimestamp
+            ]
+        )
     assertEqual "owner can view a space" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
     assertEqual "non-member cannot view a space" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId bob) (RelationName "view") space
     assertEqual "agency org member can view guest space" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId agencyUser) (RelationName "view") guestSpace
@@ -1000,21 +1036,22 @@ interpretFixtureTupleStore countRef errorObject tuples =
 
 minLevelSchema :: Schema
 minLevelSchema =
-    Schema.buildWithCaveats
-        [ Schema.caveatWith
-            "min_level"
-            [ Schema.parameter "clearance" ParameterInteger
-            , Schema.parameter "level" ParameterInteger
-            ]
-            (Schema.cmpGe (Schema.ctxParam "clearance") (Schema.payloadParam "level"))
-        ]
-        [ Schema.object "user" []
-        , Schema.object
-            "document"
-            [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
-            , Schema.permission "view" (Schema.computed "viewer")
-            ]
-        ]
+    testSchemaOrError $ do
+        minLevel <-
+            Schema.caveatWith
+                "min_level"
+                [ Schema.parameter "clearance" ParameterInteger
+                , Schema.parameter "level" ParameterInteger
+                ]
+                (Schema.cmpGe (Schema.ctxParam "clearance") (Schema.payloadParam "level"))
+        userObject <- Schema.object "user" []
+        documentObject <-
+            Schema.object
+                "document"
+                [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
+                , Schema.permission "view" (Schema.computed "viewer")
+                ]
+        Schema.buildWithCaveats [minLevel] [userObject, documentObject]
 
 minLevelTuple :: Tuple
 minLevelTuple =
@@ -1047,17 +1084,19 @@ minLevelDocument =
 
 publicSchema :: Schema
 publicSchema =
-    Schema.build
-        [ Schema.object "user" []
-        , Schema.object
-            "org"
-            [Schema.relation "member" [Schema.subject "user"] Schema.this]
-        , Schema.object
-            "space"
-            [ Schema.relation "viewer" [Schema.wildcardSubject "user"] Schema.this
-            , Schema.permission "view" (Schema.computed "viewer")
-            ]
-        ]
+    testSchemaOrError $ do
+        userObject <- Schema.object "user" []
+        org <-
+            Schema.object
+                "org"
+                [Schema.relation "member" [Schema.subject "user"] Schema.this]
+        spaceObject <-
+            Schema.object
+                "space"
+                [ Schema.relation "viewer" [Schema.wildcardSubject "user"] Schema.this
+                , Schema.permission "view" (Schema.computed "viewer")
+                ]
+        Schema.build [userObject, org, spaceObject]
 
 publicTuple :: Tuple
 publicTuple =
@@ -1077,12 +1116,13 @@ publicSpace =
 
 streamingSchema :: Schema
 streamingSchema =
-    Schema.build
-        [ Schema.object "user" []
-        , Schema.object
-            "folder"
-            [Schema.relation "viewer" [Schema.subject "user"] Schema.this]
-        ]
+    testSchemaOrError $ do
+        userObject <- Schema.object "user" []
+        folderObject <-
+            Schema.object
+                "folder"
+                [Schema.relation "viewer" [Schema.subject "user"] Schema.this]
+        Schema.build [userObject, folderObject]
 
 streamingTuples :: [Tuple]
 streamingTuples =
@@ -1138,6 +1178,10 @@ showText :: (Show a) => a -> Text
 showText =
     Text.pack . show
 
+testSchemaOrError :: Either EnError Schema -> Schema
+testSchemaOrError =
+    either (error . ("invalid test schema fixture: " <>) . show) id
+
 assertValidationFails :: String -> Schema -> IO ()
 assertValidationFails label schema =
     case validate schema of
@@ -1159,6 +1203,24 @@ assertEqual label expected actual
                 <> show expected
                 <> "\nactual:   "
                 <> show actual
+
+assertLeftEq :: (Eq a, Show a) => String -> a -> Either a b -> IO ()
+assertLeftEq label expected actual =
+    case actual of
+        Left value | value == expected -> pure ()
+        Left value ->
+            fail $
+                label
+                    <> "\nexpected: Left "
+                    <> show expected
+                    <> "\nactual:   "
+                    <> show value
+        Right _ ->
+            fail $
+                label
+                    <> "\nexpected: Left "
+                    <> show expected
+                    <> "\nactual:   Right _"
 
 assertLookupObjects :: String -> [LookupObject] -> [LookupObject] -> IO ()
 assertLookupObjects label expected actual

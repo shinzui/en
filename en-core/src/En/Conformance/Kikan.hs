@@ -50,6 +50,7 @@ import En.Effect.TupleStore (
     TupleStore (..),
     UsersetQuery (..),
  )
+import En.Error (EnError)
 import En.Reachability (ReachabilityGraph, compile)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (CaveatName (..), CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
@@ -66,72 +67,80 @@ import En.Tuple (
 
 kikanSchema :: Schema
 kikanSchema =
-    Schema.buildWithCaveats
-        [ Schema.caveatWith
-            "within_autonomy"
-            [ Schema.parameter "requested_autonomy" (ParameterEnum ["read", "act"])
-            , Schema.parameter "autonomy" (ParameterEnum ["read", "act", "admin"])
-            , Schema.parameter "current_time" ParameterTimestamp
-            , Schema.parameter "until" ParameterTimestamp
-            ]
-            ( Schema.predAnd
-                [ Schema.cmpLe (Schema.ctxParam "requested_autonomy") (Schema.payloadParam "autonomy")
-                , Schema.cmpLe (Schema.ctxParam "current_time") (Schema.payloadParam "until")
+    fixtureSchemaOrError $ do
+        withinAutonomy <-
+            Schema.caveatWith
+                "within_autonomy"
+                [ Schema.parameter "requested_autonomy" (ParameterEnum ["read", "act"])
+                , Schema.parameter "autonomy" (ParameterEnum ["read", "act", "admin"])
+                , Schema.parameter "current_time" ParameterTimestamp
+                , Schema.parameter "until" ParameterTimestamp
                 ]
-            )
-        ]
-        [ Schema.object "user" []
-        , Schema.object
-            "org"
-            [ Schema.relation "member" [Schema.subject "user"] Schema.this
-            ]
-        , Schema.object
-            "visibility_class"
-            [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
-            ]
-        , Schema.object
-            "space"
-            [ Schema.relation "owner" [Schema.subject "user"] Schema.this
-            , Schema.relation "member" [Schema.subject "user", Schema.userset "org" "member"] Schema.this
-            , Schema.relation "guest_org" [Schema.subject "org"] Schema.this
-            , Schema.relation "parent" [Schema.subject "space"] Schema.this
-            , Schema.relation "visibility_class" [Schema.subject "visibility_class"] Schema.this
-            , Schema.permission
-                "view"
-                ( Schema.anyOf
-                    (Schema.computed "owner")
-                    [ Schema.computed "member"
-                    , Schema.arrow "guest_org" "member"
-                    , Schema.arrow "parent" "view"
-                    , Schema.arrow "visibility_class" "viewer"
+                ( Schema.predAnd
+                    [ Schema.cmpLe (Schema.ctxParam "requested_autonomy") (Schema.payloadParam "autonomy")
+                    , Schema.cmpLe (Schema.ctxParam "current_time") (Schema.payloadParam "until")
                     ]
                 )
-            , Schema.permission
-                "act"
-                ( Schema.anyOf
-                    (Schema.computed "owner")
-                    [Schema.computed "member"]
-                )
-            , Schema.permission
-                "audit"
-                ( Schema.allOf
-                    (Schema.computed "owner")
-                    [Schema.computed "member"]
-                )
-            , Schema.permission
-                "member_not_owner"
-                (Schema.minus (Schema.computed "member") (Schema.computed "owner"))
-            ]
-        , Schema.object
-            "intention"
-            [ Schema.relation "delegate" [Schema.subject "user"] Schema.this
-            , Schema.permission "view" (Schema.computed "delegate")
-            ]
-        ]
+        userObject <- Schema.object "user" []
+        org <-
+            Schema.object
+                "org"
+                [ Schema.relation "member" [Schema.subject "user"] Schema.this
+                ]
+        visibilityClass <-
+            Schema.object
+                "visibility_class"
+                [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
+                ]
+        spaceObject <-
+            Schema.object
+                "space"
+                [ Schema.relation "owner" [Schema.subject "user"] Schema.this
+                , Schema.relation "member" [Schema.subject "user", Schema.userset "org" "member"] Schema.this
+                , Schema.relation "guest_org" [Schema.subject "org"] Schema.this
+                , Schema.relation "parent" [Schema.subject "space"] Schema.this
+                , Schema.relation "visibility_class" [Schema.subject "visibility_class"] Schema.this
+                , Schema.permission
+                    "view"
+                    ( Schema.anyOf
+                        (Schema.computed "owner")
+                        [ Schema.computed "member"
+                        , Schema.arrow "guest_org" "member"
+                        , Schema.arrow "parent" "view"
+                        , Schema.arrow "visibility_class" "viewer"
+                        ]
+                    )
+                , Schema.permission
+                    "act"
+                    ( Schema.anyOf
+                        (Schema.computed "owner")
+                        [Schema.computed "member"]
+                    )
+                , Schema.permission
+                    "audit"
+                    ( Schema.allOf
+                        (Schema.computed "owner")
+                        [Schema.computed "member"]
+                    )
+                , Schema.permission
+                    "member_not_owner"
+                    (Schema.minus (Schema.computed "member") (Schema.computed "owner"))
+                ]
+        intentionObject <-
+            Schema.object
+                "intention"
+                [ Schema.relation "delegate" [Schema.subject "user"] Schema.this
+                , Schema.permission "view" (Schema.computed "delegate")
+                ]
+        Schema.buildWithCaveats [withinAutonomy] [userObject, org, visibilityClass, spaceObject, intentionObject]
 
 kikanGraph :: ReachabilityGraph
 kikanGraph =
     either (error . show) id (compile kikanSchema)
+
+fixtureSchemaOrError :: Either EnError Schema -> Schema
+fixtureSchemaOrError =
+    either (error . ("invalid conformance schema fixture: " <>) . show) id
 
 runTupleStoreInMemory :: [Tuple] -> Eff (TupleStore : es) a -> Eff es a
 runTupleStoreInMemory tuples =

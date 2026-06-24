@@ -66,15 +66,16 @@ runEngine action =
 
 benchSchema :: Schema
 benchSchema =
-    Schema.build
-        [ Schema.object "user" []
-        , Schema.object
-            "space"
-            [ Schema.relation "owner" [Schema.subject "user"] Schema.this
-            , Schema.relation "parent" [Schema.subject "space"] Schema.this
-            , Schema.permission "view" (Schema.anyOf (Schema.computed "owner") [Schema.arrow "parent" "view"])
-            ]
-        ]
+    either (error . ("invalid benchmark schema fixture: " <>) . show) id $ do
+        userObject <- Schema.object "user" []
+        spaceObject <-
+            Schema.object
+                "space"
+                [ Schema.relation "owner" [Schema.subject "user"] Schema.this
+                , Schema.relation "parent" [Schema.subject "space"] Schema.this
+                , Schema.permission "view" (Schema.anyOf (Schema.computed "owner") [Schema.arrow "parent" "view"])
+                ]
+        Schema.build [userObject, spaceObject]
 
 benchTuples :: [Tuple]
 benchTuples =

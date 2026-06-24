@@ -90,7 +90,7 @@ their being different concerns (soundness vs. ergonomics), and would have scatte
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| 20 | Detect duplicate names in the schema builder | docs/plans/20-detect-duplicate-names-in-the-schema-builder.md | None | None | Not Started |
+| 20 | Detect duplicate names in the schema builder | docs/plans/20-detect-duplicate-names-in-the-schema-builder.md | None | None | Complete |
 | 21 | Introduce a validated-schema evidence type | docs/plans/21-introduce-a-validated-schema-evidence-type.md | None | EP-20 | Not Started |
 | 22 | Add a compile-time schema quasi-quoter | docs/plans/22-add-a-compile-time-schema-quasi-quoter.md | EP-21 | EP-20 | Not Started |
 | 23 | Polish builder ergonomics and reference safety | docs/plans/23-polish-builder-ergonomics-and-reference-safety.md | None | EP-20 | Not Started |
@@ -166,8 +166,8 @@ breaks.
 Track milestone-level progress across all child plans. Each entry names the child plan
 and the milestone. This section provides an at-a-glance view of the entire initiative.
 
-- [ ] EP-20: Builder rejects duplicate object/relation/caveat/parameter names with an `EnError`
-- [ ] EP-20: Tests prove each duplicate class is reported rather than silently dropped
+- [x] 2026-06-24: EP-20: Builder rejects duplicate object/relation/caveat/parameter names with an `EnError`
+- [x] 2026-06-24: EP-20: Tests prove each duplicate class is reported rather than silently dropped
 - [ ] EP-21: `ValidSchema` newtype defined; `validate` (and a validating builder entry point) produce it
 - [ ] EP-21: `compile`/`schemaHash` consumers demand `ValidSchema`; `en-server` call site updated
 - [ ] EP-22: Prototype a quasi-quoter that parses a compact schema syntax and runs `validate` at compile time
@@ -199,6 +199,14 @@ interactions between child plans. Provide concise evidence.
   build against EP-23's combinator signatures if both have merged. Not a hard conflict;
   flagged so the interaction is not a surprise at integration time.
   Date: 2026-06-23
+
+- Discovery (during EP-20): the fallible builder API has more compiled consumers than the
+  initial plan named. Besides the server demo schema and core tests, `cabal build all`
+  compiles `en-core/src/En/Conformance/Kikan.hs`, `en-core/bench/Main.hs`, and
+  `en-example/src/En/Example/Host.hs`, all of which author schemas through
+  `En.Schema.Builder`. Future plans that change the builder surface, especially EP-21 and
+  EP-23, should include these call sites in their search/validation pass.
+  Date: 2026-06-24
 
 
 ## Decision Log

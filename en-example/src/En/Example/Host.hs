@@ -78,24 +78,26 @@ type GuardedAPI =
 
 exampleSchema :: Schema
 exampleSchema =
-    Schema.buildWithCaveats
-        [ Schema.caveatWith
-            "needs_clearance"
-            [Schema.parameter "clearance" ParameterBool]
-            (Schema.cmpEq (Schema.ctxParam "clearance") (Schema.litBool True))
-        ]
-        [ Schema.object "user" []
-        , Schema.object
-            "document"
-            [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
-            , Schema.permission "view" (Schema.computed "viewer")
-            ]
-        , Schema.object
-            "secret"
-            [ Schema.relation "reader" [Schema.subject "user"] (Schema.caveated "needs_clearance" Schema.this)
-            , Schema.permission "view" (Schema.computed "reader")
-            ]
-        ]
+    either (error . ("invalid example schema fixture: " <>) . show) id $ do
+        needsClearance <-
+            Schema.caveatWith
+                "needs_clearance"
+                [Schema.parameter "clearance" ParameterBool]
+                (Schema.cmpEq (Schema.ctxParam "clearance") (Schema.litBool True))
+        userObject <- Schema.object "user" []
+        documentObject <-
+            Schema.object
+                "document"
+                [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
+                , Schema.permission "view" (Schema.computed "viewer")
+                ]
+        secretObject <-
+            Schema.object
+                "secret"
+                [ Schema.relation "reader" [Schema.subject "user"] (Schema.caveated "needs_clearance" Schema.this)
+                , Schema.permission "view" (Schema.computed "reader")
+                ]
+        Schema.buildWithCaveats [needsClearance] [userObject, documentObject, secretObject]
 
 type ExampleEffects = '[ConsistencyStore, TupleStore, Error EnError, IOE]
 
