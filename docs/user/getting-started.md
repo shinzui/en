@@ -1,8 +1,9 @@
 # Getting Started
 
-This guide shows the embedded-library path: define a schema in Haskell, compile
-it, write relationship tuples through a store, and ask authorization questions.
-Examples assume `OverloadedStrings`.
+This guide starts with the embedded-library path: define a schema in Haskell,
+compile it, write relationship tuples through a store, and ask authorization
+questions. It also shows how to run the standalone `en-server` from a text
+schema file. Examples assume `OverloadedStrings`.
 
 ## 1. Define object and relation names
 
@@ -120,7 +121,40 @@ Use `Allowed` as the only successful authorization result. `Denied` and
 `Conditional` should both fail closed at the request boundary unless your caller
 can supply the missing caveat context and retry.
 
-## 6. Next steps
+## 6. Run the standalone server from a schema file
+
+For non-Haskell callers or a shared HTTP boundary, put the same model in a text
+schema file and point `en-server` at it with `EN_SCHEMA_PATH`:
+
+```shell
+cat > /tmp/blog.en <<'EOF'
+object user {}
+
+object post {
+  relation author: user
+  relation reader: user, user:*
+  permission view = author | reader
+  permission edit = author
+}
+EOF
+
+EN_DATABASE_URL='postgresql://user@localhost:5432/en' \
+EN_SCHEMA_PATH=/tmp/blog.en \
+  en-server
+```
+
+At startup the server logs the loaded path and schema hash:
+
+```text
+Loaded schema from /tmp/blog.en
+Schema hash: fnv1a64:...
+```
+
+If the file cannot be read, parsed, or validated, startup exits non-zero before
+serving traffic. If `EN_SCHEMA_PATH` is unset, the server warns and uses the
+built-in demo schema for local smoke tests.
+
+## 7. Next steps
 
 - Add parent or container relations with `Schema.arrow`.
 - Use `lookup` to protect list endpoints without doing one `check` per row.

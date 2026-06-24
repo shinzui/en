@@ -61,16 +61,26 @@ Use embedded mode when:
 Use a dedicated service when non-Haskell callers need the same authorization
 model or when you want a single network boundary for authorization decisions.
 
-The current `en-server` executable is a runnable demo service with a small
-built-in schema. Production applications with domain-specific schemas should
-provide their own executable that:
+`en-server` can load a domain-specific schema from a text file at startup. Write
+the schema in the same language accepted by the `[schema| ... |]` quasi-quoter,
+set `EN_SCHEMA_PATH=/path/to/schema.en`, and start the prebuilt server. The
+server reads, parses, validates, hashes, and compiles that schema before it
+connects to PostgreSQL or binds the HTTP port. If the file is missing,
+malformed, or invalid, startup fails closed rather than serving the built-in
+demo model.
 
-- Imports the production schema.
-- Compiles and validates it at startup.
-- Constructs the PostgreSQL `TupleStore` and `ConsistencyStore` interpreters.
-- Exposes `En.Servant.API` handlers.
-- Applies service-local authentication, request limits, logging, metrics, and
-  timeouts.
+```shell
+EN_DATABASE_URL='postgresql://user@localhost:5432/en' \
+EN_SCHEMA_PATH=/etc/en/schema.en \
+EN_PORT=8080 \
+  en-server
+```
+
+When `EN_SCHEMA_PATH` is unset, `en-server` logs a warning and serves the small
+demo schema. That fallback is useful for local smoke tests, not production.
+Haskell applications may still choose the embedded-library path when compiling
+the schema into the host application is simpler than operating a shared HTTP
+service.
 
 Treat the dedicated service as a read-path dependency. It should be deployed
 like a database-adjacent infrastructure service: low network latency to
@@ -486,7 +496,8 @@ relationship graph or a documented short-lived projection.
 
 Before serving production traffic:
 
-- [ ] Production schema is compiled and validated at startup.
+- [ ] Production schema is loaded from `EN_SCHEMA_PATH` or embedded in the host
+      service, then compiled and validated at startup.
 - [ ] `en-migrations` have run against the target PostgreSQL database.
 - [ ] `datastoreId` is stable and environment-specific.
 - [ ] Schema rollout plan handles `schemaHash` changes and old tokens.

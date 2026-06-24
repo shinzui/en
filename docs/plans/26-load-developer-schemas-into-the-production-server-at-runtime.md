@@ -86,7 +86,7 @@ This section must always reflect the actual current state of the work.
 - [x] 2026-06-24T18:41:55Z: M4: Extend the parser to caveat definitions and caveated rewrites (`with`), using
   explicit `context.<name>` and `payload.<name>` operand syntax; add coverage tests proving
   every `CaveatPredicate` shape parses and validates.
-- [ ] M5: Update `docs/user/production-deployment-and-performance.md`,
+- [x] 2026-06-24T18:43:57Z: M5: Update `docs/user/production-deployment-and-performance.md`,
   `docs/user/getting-started.md`, and `docs/user/service-and-operations.md` to document the
   runtime schema-loading workflow and remove the "fork the executable" instruction.
 
@@ -224,6 +224,25 @@ Compare the result against the original purpose.
   and `Schema hash: fnv1a64:5535c0c913ac9b60` before the intentionally unreachable database
   failed. Full `POST /check` verification for `Allowed`/`Denied`/`Conditional` still requires a
   live PostgreSQL database with migrations applied.
+
+- 2026-06-24T18:43:57Z: M5 completed. The three target user documents now describe
+  `EN_SCHEMA_PATH`, startup validation, loaded-path and schema-hash logging, fail-closed schema
+  file errors, and the built-in demo schema as a local fallback. A scan of
+  `docs/user/production-deployment-and-performance.md`, `docs/user/getting-started.md`, and
+  `docs/user/service-and-operations.md` found no remaining instructions to provide a custom
+  service executable instead of using the prebuilt `en-server`.
+
+- 2026-06-24T18:43:57Z: The plan's implementation is complete. A developer can now write a
+  `.en` text schema file, set `EN_SCHEMA_PATH`, and run the prebuilt `en-server`; startup loads,
+  parses, validates, hashes, compiles, and logs that model. The text schema language now covers
+  union, intersection, exclusion, grouped rewrites, caveat definitions, caveat predicates, and
+  schema-level `with` caveats. Remaining verification gap: the manual HTTP `POST /check`
+  scenarios were not run because this session did not have a live migrated PostgreSQL database;
+  startup smoke checks verified schema loading before the expected database connection failure.
+
+- 2026-06-24T18:44:27Z: Final validation passed with `cabal test en-core`, `cabal build
+  en-server`, and an `rg` scan over the three target docs confirming `EN_SCHEMA_PATH` is present
+  and the stale custom-executable guidance is absent.
 
 
 ## Context and Orientation

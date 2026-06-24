@@ -45,10 +45,14 @@ required schema.
 
 ## Standalone server
 
-`en-server` starts an HTTP service with a built-in demo schema:
+`en-server` starts an HTTP service. Set `EN_SCHEMA_PATH` to load your
+application schema from a text file at startup:
 
 ```shell
-EN_DATABASE_URL='postgresql://user@localhost:5432/en' EN_PORT=8080 en-server
+EN_DATABASE_URL='postgresql://user@localhost:5432/en' \
+EN_SCHEMA_PATH=/etc/en/schema.en \
+EN_PORT=8080 \
+  en-server
 ```
 
 Environment variables:
@@ -56,17 +60,35 @@ Environment variables:
 | Variable | Required | Meaning |
 | --- | --- | --- |
 | `EN_DATABASE_URL` | yes | PostgreSQL connection string passed to Hasql |
+| `EN_SCHEMA_PATH` | no | Path to a text schema file. When set, the server loads, parses, validates, hashes, and compiles this schema at startup. When unset, the server warns and serves the built-in demo schema. |
 | `EN_PORT` | no | HTTP port, default `8080` |
+| `EN_GC_WINDOW` | no | Consistency-token garbage-collection window, default `24 hours` |
+| `EN_OPTIMIZED_REVISION_CACHE_TTL_MS` | no | Positive TTL in milliseconds for the optimized-revision cache; missing or `0` disables it |
+| `EN_TUPLE_READ_CACHE_MAX_ENTRIES` | no | Positive maximum tuple-read cache entries; missing or `0` disables it |
+| `EN_DECISION_CACHE_MAX_ENTRIES` | no | Positive maximum decision/subproblem cache entries; missing or `0` disables it |
 
-The built-in schema is intentionally small:
+With `EN_SCHEMA_PATH` set, startup logs the loaded path and the active schema
+hash:
+
+```text
+Loaded schema from /etc/en/schema.en
+Schema hash: fnv1a64:...
+```
+
+If the schema file is missing, malformed, or invalid, startup exits non-zero
+before binding the HTTP port. Changing the schema changes the schema hash, so
+old consistency tokens from a previous schema hash are rejected by the existing
+token validation path.
+
+When `EN_SCHEMA_PATH` is unset, the built-in schema is intentionally small:
 
 - Object types: `user`, `space`
 - Direct relation: `space#viewer`
 - Permission: `space#view = viewer`
 
-Applications with domain-specific schemas should normally embed `en-core` and
-`en-servant` or provide their own service executable rather than relying on the
-demo schema.
+Treat the built-in schema as a local smoke-test fallback. Production service
+deployments should set `EN_SCHEMA_PATH`; Haskell applications that do not need a
+shared HTTP boundary can still embed `en-core` directly.
 
 ## Servant API
 
