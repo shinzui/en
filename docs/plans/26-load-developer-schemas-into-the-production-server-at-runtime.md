@@ -81,7 +81,7 @@ This section must always reflect the actual current state of the work.
 - [x] 2026-06-24T18:34:57Z: M2: Add a runtime schema-file loader and wire `EN_SCHEMA_PATH` into `en-server`,
   replacing the hard-coded `demoSchema` when the variable is set; fail closed on
   missing/malformed/invalid files; log the loaded path and schema hash.
-- [ ] M3: Extend the parser to intersection (`&`) and exclusion (`but not`) permission
+- [x] 2026-06-24T18:37:33Z: M3: Extend the parser to intersection (`&`) and exclusion (`but not`) permission
   rewrites; add round-trip/coverage tests proving parity with the `En.Schema.Builder` output.
 - [ ] M4: Extend the parser to caveat definitions and caveated rewrites (`with`), using
   explicit `context.<name>` and `payload.<name>` operand syntax; add coverage tests proving
@@ -165,6 +165,13 @@ Record every decision made while working on the plan.
   supplied through the write API.
   Date: 2026-06-24
 
+- Decision: Parse permission rewrites with `but not` as the lowest-precedence, non-associative
+  exclusion operator, `|` as union, `&` as intersection, and parentheses for explicit grouping.
+  Rationale: This matches the plan's readable grammar and avoids overloading a hyphen-like token
+  that could be confused with identifier spelling. Making exclusion non-associative forces
+  authors to parenthesize ambiguous chains instead of relying on surprising grouping.
+  Date: 2026-06-24
+
 
 ## Outcomes & Retrospective
 
@@ -187,6 +194,15 @@ Compare the result against the original purpose.
   schema path exited non-zero with an error naming `EN_SCHEMA_PATH`; and the unset fallback
   printed the demo-schema warning plus hash. Full HTTP `POST /check` verification still requires
   a live PostgreSQL database with migrations applied.
+
+- 2026-06-24T18:37:33Z: M3 completed. `En.Schema.Parse` now parses precedence-aware
+  permission rewrites with `but not`, `|`, `&`, arrows, bare computed usersets, and grouping
+  parentheses. `en-core/test/Main.hs` compares the parsed schema against an equivalent
+  `En.Schema.Builder` schema for intersection, exclusion, and grouped rewrites. Validation
+  passed with `cabal test en-core`; an `en-server` smoke check with
+  `/tmp/en-operator-schema-smoke.en` logged `Loaded schema from
+  /tmp/en-operator-schema-smoke.en` and `Schema hash: fnv1a64:42a02f6218db3acd` before the
+  intentionally unreachable database failed.
 
 
 ## Context and Orientation

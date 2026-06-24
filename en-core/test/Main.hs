@@ -553,6 +553,44 @@ testSchemaParserDirect = do
                 , "}"
                 ]
         )
+    assertEqual "parseSchema supports intersection, exclusion, and grouped rewrites" (Right rewriteOperatorSchema) (SchemaParse.parseSchema rewriteOperatorSchemaText)
+    assertBool "parseSchema rejects unbalanced rewrite grouping" (isLeft (SchemaParse.parseSchema "object user {}\nobject space {\n  relation a: user\n  permission view = (a | a\n}"))
+
+rewriteOperatorSchemaText :: Text
+rewriteOperatorSchemaText =
+    Text.unlines
+        [ "object user {}"
+        , "object space {"
+        , "  relation editor: user"
+        , "  relation active: user"
+        , "  relation banned: user"
+        , "  relation a: user"
+        , "  relation b: user"
+        , "  relation c: user"
+        , "  permission audit = editor & active"
+        , "  permission member_not_banned = editor but not banned"
+        , "  permission grouped = (a | b) & c"
+        , "}"
+        ]
+
+rewriteOperatorSchema :: Schema
+rewriteOperatorSchema =
+    testSchemaOrError $ do
+        userObject <- Schema.object "user" []
+        spaceObject <-
+            Schema.object
+                "space"
+                [ Schema.relation "editor" [Schema.subject "user"] Schema.this
+                , Schema.relation "active" [Schema.subject "user"] Schema.this
+                , Schema.relation "banned" [Schema.subject "user"] Schema.this
+                , Schema.relation "a" [Schema.subject "user"] Schema.this
+                , Schema.relation "b" [Schema.subject "user"] Schema.this
+                , Schema.relation "c" [Schema.subject "user"] Schema.this
+                , Schema.permission "audit" (Schema.allOf (Schema.computed "editor") [Schema.computed "active"])
+                , Schema.permission "member_not_banned" (Schema.minus (Schema.computed "editor") (Schema.computed "banned"))
+                , Schema.permission "grouped" (Schema.allOf (Schema.anyOf (Schema.computed "a") [Schema.computed "b"]) [Schema.computed "c"])
+                ]
+        Schema.build [userObject, spaceObject]
 
 testCacheOperations :: IO ()
 testCacheOperations = do

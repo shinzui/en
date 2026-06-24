@@ -116,7 +116,34 @@ parsePermission objectName rest =
 
 parsePermissionRewrite :: Text -> Either String Builder.PermissionRewrite
 parsePermissionRewrite rewriteText =
-    case pipeList rewriteText of
+    parseExclusion (Text.strip rewriteText)
+
+parseExclusion :: Text -> Either String Builder.PermissionRewrite
+parseExclusion rewriteText = do
+    parts <- topLevelSplit "but not" rewriteText
+    case parts of
+        [] -> Left "empty rewrite"
+        [body] -> parseUnion body
+        [left, right] -> Builder.minus <$> parseUnion left <*> parseUnion right
+        _ -> Left "exclusion rewrite may contain only one 'but not'"
+
+parseUnion :: Text -> Either String Builder.PermissionRewrite
+parseUnion rewriteText = do
+    parts <- topLevelSplit "|" rewriteText
+    case parts of
+        [] -> Left "empty rewrite"
+        first : rest -> do
+            firstRewrite <- parseIntersection first
+            restRewrites <- traverse parseIntersection rest
+            pure $
+                case restRewrites of
+                    [] -> firstRewrite
+                    _ -> Builder.anyOf firstRewrite restRewrites
+
+parseIntersection :: Text -> Either String Builder.PermissionRewrite
+parseIntersection rewriteText = do
+    parts <- topLevelSplit "&" rewriteText
+    case parts of
         [] -> Left "empty rewrite"
         first : rest -> do
             firstRewrite <- parsePermissionRewriteTerm first
@@ -124,12 +151,13 @@ parsePermissionRewrite rewriteText =
             pure $
                 case restRewrites of
                     [] -> firstRewrite
-                    _ -> Builder.anyOf firstRewrite restRewrites
+                    _ -> Builder.allOf firstRewrite restRewrites
 
 parsePermissionRewriteTerm :: Text -> Either String Builder.PermissionRewrite
 parsePermissionRewriteTerm term
     | Text.null trimmed = Left "empty rewrite term"
     | trimmed == "this" = Left "permission rewrite cannot contain this"
+    | Just inner <- stripOuterParens trimmed = parsePermissionRewrite inner
     | Just (tupleset, computedRelation) <- splitArrow trimmed = Right (Builder.arrow (Builder.relationRef tupleset) (Builder.relationRef computedRelation))
     | otherwise = Right (Builder.computed (Builder.relationRef trimmed))
   where
@@ -138,16 +166,67 @@ parsePermissionRewriteTerm term
 
 splitArrow :: Text -> Maybe (Text, Text)
 splitArrow term =
-    case Text.splitOn "->" term of
+    case either (const []) id (topLevelSplit "->" term) of
         [tupleset, computed]
             | not (Text.null (Text.strip tupleset)) && not (Text.null (Text.strip computed)) ->
                 Just (Text.strip tupleset, Text.strip computed)
         _ -> Nothing
 
+stripOuterParens :: Text -> Maybe Text
+stripOuterParens input
+    | Text.length input < 2 = Nothing
+    | Text.head input /= '(' || Text.last input /= ')' = Nothing
+    | otherwise =
+        if outerParensWrap input
+            then Just (Text.init (Text.tail input))
+            else Nothing
+
+outerParensWrap :: Text -> Bool
+outerParensWrap input =
+    go 0 0
+  where
+    lastIndex =
+        Text.length input - 1
+
+    go :: Int -> Int -> Bool
+    go index depth
+        | index > lastIndex = depth == 0
+        | otherwise =
+            case Text.index input index of
+                '(' -> go (index + 1) (depth + 1)
+                ')'
+                    | depth == 1 && index < lastIndex -> False
+                    | depth <= 0 -> False
+                    | otherwise -> go (index + 1) (depth - 1)
+                _ -> go (index + 1) depth
+
+topLevelSplit :: Text -> Text -> Either String [Text]
+topLevelSplit delimiter input
+    | Text.null (Text.strip input) = Right []
+    | Text.null delimiter = Left "empty delimiter"
+    | otherwise = do
+        parts <- go 0 [] [] input
+        pure (Text.strip <$> parts)
+  where
+    go :: Int -> [Text] -> [Text] -> Text -> Either String [Text]
+    go depth current acc remaining
+        | Text.null remaining =
+            if depth == 0
+                then Right (reverse (Text.concat (reverse current) : acc))
+                else Left "unclosed parenthesis in rewrite"
+        | depth == 0 && delimiter `Text.isPrefixOf` remaining =
+            go depth [] (Text.concat (reverse current) : acc) (Text.drop (Text.length delimiter) remaining)
+        | otherwise =
+            let char = Text.head remaining
+                rest = Text.tail remaining
+             in case char of
+                    '(' -> go (depth + 1) (Text.singleton char : current) acc rest
+                    ')' ->
+                        if depth <= 0
+                            then Left "unexpected closing parenthesis in rewrite"
+                            else go (depth - 1) (Text.singleton char : current) acc rest
+                    _ -> go depth (Text.singleton char : current) acc rest
+
 commaList :: Text -> [Text]
 commaList =
     filter (not . Text.null) . fmap Text.strip . Text.splitOn ","
-
-pipeList :: Text -> [Text]
-pipeList =
-    filter (not . Text.null) . fmap Text.strip . Text.splitOn "|"
