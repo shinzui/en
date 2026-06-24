@@ -35,7 +35,7 @@ An alternative single large plan was rejected because it would couple revision s
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-9 | Implement optimized revision caching | docs/plans/9-implement-optimized-revision-caching.md | None | None | Not Started |
+| EP-9 | Implement optimized revision caching | docs/plans/9-implement-optimized-revision-caching.md | None | None | Complete |
 | EP-10 | Add core cache interfaces and configuration | docs/plans/10-add-core-cache-interfaces-and-configuration.md | None | EP-9 | Not Started |
 | EP-12 | Implement tuple read caching | docs/plans/12-implement-tuple-read-caching.md | EP-10 | EP-9 | Not Started |
 | EP-11 | Implement authorization decision caching | docs/plans/11-implement-authorization-decision-caching.md | EP-10 | EP-12 | Not Started |
@@ -128,8 +128,8 @@ the soft, gracefully-degrading EP-11→EP-19 efficiency upgrade.
 
 ## Progress
 
-- [ ] EP-9: Add an optimized revision cache configuration and implementation for PostgreSQL-backed stores.
-- [ ] EP-9: Prove `MinimizeLatency` can reuse a cached optimized revision while `FullyConsistent` still reads the head revision.
+- [x] EP-9: Add an optimized revision cache configuration and implementation for PostgreSQL-backed stores.
+- [x] EP-9: Prove `MinimizeLatency` can reuse a cached optimized revision while `FullyConsistent` still reads the head revision.
 - [ ] EP-10: Add shared bounded cache types, cache configuration, and cache statistics in `en-core`.
 - [ ] EP-10: Add focused tests proving cache keys include datastore id, schema hash, revision, and request-shaping values.
 - [ ] EP-12: Add a `TupleStore` cache wrapper for object-relation and reverse userset reads.
@@ -162,6 +162,7 @@ the soft, gracefully-degrading EP-11→EP-19 efficiency upgrade.
   their own bodies — all coordination lived only in this MasterPlan's prose. Since each ExecPlan must be
   self-contained for an implementer reading it in isolation, the cross-MasterPlan prerequisite notes
   were cascaded into EP-9, EP-11, and EP-13. _(2026-06-23)_
+- EP-9 implementation had to account for the later effectful migration (`docs/plans/25-adopt-effectful-for-the-en-effect-stack.md`). Instead of adding the obsolete record-of-functions `postgresTupleStoreIOWithOptimizedRevision`, EP-9 preserved the uncached `runTupleStorePostgres` interpreter and added `runTupleStorePostgresWithOptimizedRevisionCache` as the opt-in cached interpreter for EP-13 service wiring. _(2026-06-23)_
 
 
 ## Decision Log
@@ -206,7 +207,7 @@ the soft, gracefully-degrading EP-11→EP-19 efficiency upgrade.
 
 ## Outcomes & Retrospective
 
-To be filled during and after implementation.
+EP-9 is complete. `en-postgres` now exposes an optimized revision cache configuration and an opt-in PostgreSQL tuple-store interpreter that caches only `OptimizedRevision` reads. Focused tests prove enabled TTL reuse, expiry refresh, disabled behavior, and `FullyConsistent` head-revision selection; `nix develop -c cabal test en-postgres-revision-tests` and `nix develop -c cabal build all` pass as of 2026-06-23T23:59:54Z.
 
 
 ---

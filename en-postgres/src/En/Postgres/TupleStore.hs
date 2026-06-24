@@ -6,6 +6,7 @@
 -- | PostgreSQL-backed 'TupleStore'.
 module En.Postgres.TupleStore (
     runTupleStorePostgres,
+    runTupleStorePostgresWithOptimizedRevisionCache,
     reapDeletedTuplesSession,
 ) where
 
@@ -22,8 +23,9 @@ import Data.Map.Strict qualified as Map
 import Data.Scientific (floatingOrInteger)
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Data.Time (getCurrentTime)
 import Data.Word (Word64)
-import Effectful (Eff, (:>))
+import Effectful (Eff, IOE, liftIO, (:>))
 import Effectful.Dispatch.Dynamic (interpret_)
 import Effectful.Error.Static (Error, throwError)
 
@@ -40,11 +42,16 @@ import En.Error (EnError (..))
 import En.Postgres.Database (Database, runSession)
 import En.Postgres.Revision (
     ConsistencyConfig (..),
+    OptimizedRevisionCache,
+    OptimizedRevisionConfig,
     PgSnapshot (..),
     TokenPayload (..),
     encodeToken,
+    lookupOptimizedRevisionCache,
+    newOptimizedRevisionCache,
     parsePgSnapshot,
     renderPgSnapshot,
+    storeOptimizedRevisionCache,
  )
 import En.Revision (
     ConsistencyToken,
@@ -75,6 +82,25 @@ runTupleStorePostgres ::
     Eff (TupleStore : es) a ->
     Eff es a
 runTupleStorePostgres config =
+    interpretTupleStorePostgres config uncachedOptimizedRevision
+
+runTupleStorePostgresWithOptimizedRevisionCache ::
+    (Database :> es, IOE :> es, Error EnError :> es) =>
+    ConsistencyConfig ->
+    OptimizedRevisionConfig ->
+    Eff (TupleStore : es) a ->
+    Eff es a
+runTupleStorePostgresWithOptimizedRevisionCache config optimizedConfig action = do
+    cache <- liftIO (newOptimizedRevisionCache optimizedConfig getCurrentTime)
+    interpretTupleStorePostgres config (cachedOptimizedRevision cache) action
+
+interpretTupleStorePostgres ::
+    (Database :> es, Error EnError :> es) =>
+    ConsistencyConfig ->
+    Eff es Revision ->
+    Eff (TupleStore : es) a ->
+    Eff es a
+interpretTupleStorePostgres config readOptimizedRevision =
     interpret_ \case
         ReadObjectRelation revision object relation limit cursor ->
             orThrow =<< runSession (readObjectRelationSession revision object relation limit cursor)
@@ -87,7 +113,7 @@ runTupleStorePostgres config =
         HeadRevision ->
             orThrow =<< runSession headRevisionSession
         OptimizedRevision ->
-            orThrow =<< runSession headRevisionSession
+            readOptimizedRevision
         OldestRetainedXid ->
             orThrow =<< runSession (oldestRetainedXidSession config.gcWindow)
         ReapDeletedTuples horizon ->
@@ -95,6 +121,28 @@ runTupleStorePostgres config =
   where
     orThrow =
         either (throwError . StoreError . Hasql.toDetailedText) pure
+
+uncachedOptimizedRevision ::
+    (Database :> es, Error EnError :> es) =>
+    Eff es Revision
+uncachedOptimizedRevision =
+    orThrow =<< runSession headRevisionSession
+  where
+    orThrow =
+        either (throwError . StoreError . Hasql.toDetailedText) pure
+
+cachedOptimizedRevision ::
+    (Database :> es, IOE :> es, Error EnError :> es) =>
+    OptimizedRevisionCache ->
+    Eff es Revision
+cachedOptimizedRevision cache = do
+    cached <- liftIO (lookupOptimizedRevisionCache cache)
+    case cached of
+        Just revision -> pure revision
+        Nothing -> do
+            revision <- uncachedOptimizedRevision
+            liftIO (storeOptimizedRevisionCache cache revision)
+            pure revision
 
 writeTuplesSession :: ConsistencyConfig -> [Tuple] -> Session ConsistencyToken
 writeTuplesSession config tuples = do

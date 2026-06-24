@@ -1,18 +1,23 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+
 module Main (main) where
 
 import Data.Either (isLeft)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text qualified as Text
-import Data.Time (UTCTime, defaultTimeLocale, parseTimeOrError)
+import Data.Time (UTCTime, addUTCTime, defaultTimeLocale, parseTimeOrError)
 
 import En.Effect.ConsistencyStore (ResolvedConsistency (..), TokenMetadata (..))
 import En.Error (EnError (..))
 import En.Postgres.Revision (
     ConsistencyConfig (..),
+    OptimizedRevisionConfig (..),
     PgSnapshot (..),
     TokenPayload (..),
     comparePgSnapshot,
     decodeToken,
     encodeToken,
+    newOptimizedRevisionReader,
     parsePgSnapshot,
     renderPgSnapshot,
     resolveConsistencyRequest,
@@ -31,6 +36,7 @@ import En.Revision (
 
 main :: IO ()
 main = do
+    testOptimizedRevisionReader
     assertEqual
         "pg_snapshot parses and renders canonically"
         (Right PgSnapshot{xmin = 10, xmax = 20, xip = [12, 15]})
@@ -85,6 +91,10 @@ main = do
         "exact snapshot resolves to token revision"
         (Right ResolvedConsistency{consistency = AtExactSnapshot (encodeToken payload), revision = payload.revision})
         (resolveConsistencyRequest optimizedRevision headRevision metadataFromToken validateMetadata (AtExactSnapshot (encodeToken payload)))
+    assertEqual
+        "fully consistent resolves to head revision"
+        (Right ResolvedConsistency{consistency = FullyConsistent, revision = headRevision})
+        (resolveConsistencyRequest optimizedRevision headRevision metadataFromToken validateMetadata FullyConsistent)
     assertEqual
         "at least as fresh uses optimized revision when it is after the token"
         (Right ResolvedConsistency{consistency = AtLeastAsFresh (encodeToken payload), revision = optimizedRevision})
@@ -192,3 +202,40 @@ parseUtc =
 showText :: (Show a) => a -> Text.Text
 showText =
     Text.pack . show
+
+testOptimizedRevisionReader :: IO ()
+testOptimizedRevisionReader = do
+    baseTime <- pure (parseUtc "2026-06-23T00:00:00Z")
+    clockRef <- newIORef baseTime
+    callsRef <- newIORef (0 :: Int)
+    cachedReader <-
+        newOptimizedRevisionReader
+            OptimizedRevisionConfig{enabled = True, ttl = 10}
+            (readIORef clockRef)
+            (nextRevision callsRef)
+    first <- cachedReader
+    second <- cachedReader
+    assertEqual "optimized revision cache reuses within ttl" first second
+    assertEqual "optimized revision cache reads once within ttl" 1 =<< readIORef callsRef
+    writeIORef clockRef (addUTCTime 11 baseTime)
+    third <- cachedReader
+    assertEqual "optimized revision cache refreshes after ttl" (Revision "10:22:") third
+    assertEqual "optimized revision cache increments after expiry" 2 =<< readIORef callsRef
+
+    disabledCallsRef <- newIORef (0 :: Int)
+    disabledReader <-
+        newOptimizedRevisionReader
+            OptimizedRevisionConfig{enabled = False, ttl = 10}
+            (readIORef clockRef)
+            (nextRevision disabledCallsRef)
+    disabledFirst <- disabledReader
+    disabledSecond <- disabledReader
+    assertEqual "disabled optimized revision cache returns fresh first revision" (Revision "10:21:") disabledFirst
+    assertEqual "disabled optimized revision cache returns fresh second revision" (Revision "10:22:") disabledSecond
+    assertEqual "disabled optimized revision cache reads every time" 2 =<< readIORef disabledCallsRef
+
+nextRevision :: IORef Int -> IO Revision
+nextRevision callsRef = do
+    modifyIORef' callsRef (+ 1)
+    calls <- readIORef callsRef
+    pure (Revision ("10:" <> Text.pack (show (20 + calls)) <> ":"))

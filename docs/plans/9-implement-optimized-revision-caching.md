@@ -21,15 +21,18 @@ Decision Log, and Outcomes & Retrospective must be kept up to date as work proce
 
 ## Progress
 
-- [ ] Add an optimized revision cache type and constructor in `en-postgres`.
-- [ ] Wire `postgresTupleStore` so `optimizedRevision` can use the cached reader while `headRevision` always calls `headRevisionSession`.
-- [ ] Add tests proving cached reuse, expiry, and disabled-cache behavior.
-- [ ] Run `cabal test en-postgres-revision-tests` and `cabal build all`.
+- [x] Confirm MasterPlan 3 is complete and adjust this plan to the current `effectful` interpreter architecture. Completed 2026-06-23T23:59:00Z.
+- [x] Add an optimized revision cache type and constructor in `en-postgres`. Completed 2026-06-23T23:59:54Z.
+- [x] Wire the PostgreSQL `TupleStore` interpreter so `OptimizedRevision` can use the cached reader while `HeadRevision` always calls `headRevisionSession`. Completed 2026-06-23T23:59:54Z.
+- [x] Add tests proving cached reuse, expiry, disabled-cache behavior, and `FullyConsistent` head revision selection. Completed 2026-06-23T23:59:54Z.
+- [x] Run `nix develop -c cabal test en-postgres-revision-tests` and `nix develop -c cabal build all`. Completed 2026-06-23T23:59:54Z.
 
 
 ## Surprises & Discoveries
 
-None yet.
+- MasterPlan 3 is already implemented in the current tree: `docs/masterplans/3-harden-en-correctness-fixes-lookup-streaming-and-performance-benchmarks.md` marks EP-14 through EP-19 Complete, and source inspection found the expected artifacts, including `En.Decision`, `checkMany`, and the faithful `comparePgSnapshot` implementation. This satisfies the cross-MasterPlan prerequisites for this plan before implementation begins. _(2026-06-23)_
+- A later ExecPlan (`docs/plans/25-adopt-effectful-for-the-en-effect-stack.md`) migrated the engine and PostgreSQL store from record-of-functions constructors to `effectful` interpreters. The implementation target is now `runTupleStorePostgres` in `en-postgres/src/En/Postgres/TupleStore.hs`; the cached path should be an additional interpreter/configuration path rather than the obsolete `postgresTupleStoreIOWithOptimizedRevision` constructor. _(2026-06-23)_
+- The existing `runTupleStorePostgres` interpreter can stay uncached and keep its no-`IOE` type. The new `runTupleStorePostgresWithOptimizedRevisionCache` allocates an `OptimizedRevisionCache` once around the interpreted action and only changes the `OptimizedRevision` operation, so current callers and `HeadRevision` behavior remain unchanged. _(2026-06-23)_
 
 
 ## Decision Log
@@ -43,18 +46,33 @@ None yet.
 - Decision: Build on MasterPlan 3 EP-14's corrected snapshot comparator rather than the pre-hardening `snapshotIncludes`.
   Rationale: MasterPlan 3 is implemented in full before this MasterPlan (see `docs/masterplans/2-add-caching-support-to-en.md` Decision Log), so EP-14's faithful `comparePgSnapshot`/`snapshotIncludes` and stabilized token codec are already in `en-postgres/src/En/Postgres/Revision.hs`. Sharing a snapshot across `MinimizeLatency` requests is only safe atop a correct partial order, so this plan must not reintroduce the old probe approximation and must preserve EP-14's `AtLeastAsFresh = max(optimized, token)` semantics.
   Date: 2026-06-23
+- Decision: Preserve the existing uncached `runTupleStorePostgres` interpreter and add a cached variant.
+  Rationale: `runTupleStorePostgres` intentionally has no `IOE` constraint after the effectful migration. Optimized revision caching needs an `IORef` and clock reads, so the least disruptive API is a new `runTupleStorePostgresWithOptimizedRevisionCache` interpreter that EP-13 can opt into from service wiring while existing callers remain unchanged.
+  Date: 2026-06-23
 
 
 ## Outcomes & Retrospective
 
-To be filled during and after implementation.
+Implemented EP-9 on 2026-06-23. `en-postgres/src/En/Postgres/Revision.hs` now exposes `OptimizedRevisionConfig`, `OptimizedRevisionCache`, and `newOptimizedRevisionReader` plus cache lookup/store helpers. `en-postgres/src/En/Postgres/TupleStore.hs` now exposes `runTupleStorePostgresWithOptimizedRevisionCache`, an opt-in interpreter that caches only `OptimizedRevision` reads. The original `runTupleStorePostgres` interpreter remains unchanged for existing callers.
+
+Validation passed with:
+
+```text
+nix develop -c cabal test en-postgres-revision-tests
+Test suite en-postgres-revision-tests: PASS
+
+nix develop -c cabal build all
+Build completed successfully.
+```
+
+The direct ambient `cabal test en-postgres-revision-tests` command was not usable because `ghc-9.12.4` is only available inside the Nix shell; the Nix-shell command is the authoritative validation for this workspace.
 
 
 ## Context and Orientation
 
-The relevant core type is `TupleStore` in `en-core/src/En/Effect/TupleStore.hs`. Its fields include `headRevision :: m Revision` and `optimizedRevision :: m Revision`. `headRevision` is for freshest reads. `optimizedRevision` is for lower-latency reads that may use a recent snapshot.
+The relevant core type is `TupleStore` in `en-core/src/En/Effect/TupleStore.hs`. It is an `effectful` effect with operations including `HeadRevision :: TupleStore m Revision` and `OptimizedRevision :: TupleStore m Revision`. `HeadRevision` is for freshest reads. `OptimizedRevision` is for lower-latency reads that may use a recent snapshot.
 
-The PostgreSQL implementation is in `en-postgres/src/En/Postgres/TupleStore.hs`. Today `postgresTupleStore` sets both fields to `run headRevisionSession`, so the optimized path does not cache anything. `headRevisionSession` runs:
+The PostgreSQL implementation is in `en-postgres/src/En/Postgres/TupleStore.hs`. The current code uses `effectful`: `runTupleStorePostgres` interprets the `TupleStore` effect by running Hasql sessions through `En.Postgres.Database.runSession`. Today the `OptimizedRevision` operation still runs `headRevisionSession`, the same Hasql session used by `HeadRevision`, so the optimized path does not cache anything. `headRevisionSession` runs:
 
 ```sql
 SELECT pg_current_snapshot()::text
@@ -92,24 +110,25 @@ newOptimizedRevisionReader ::
 
 When disabled or when `ttl <= 0`, the returned reader should call the underlying `IO Revision` every time. When enabled, it should return the cached revision if `now - loadedAt <= ttl`; otherwise it should read a fresh revision and replace the cache. Use `atomicModifyIORef'` or a simple `IORef` read/write with the understanding that occasional duplicate refreshes under concurrency are acceptable for this first version. The correctness property is that every returned value is a real PostgreSQL snapshot.
 
-Milestone 2 wires the cache into the PostgreSQL tuple store. Keep the existing `postgresTupleStore :: PostgresSessionRunner m -> ConsistencyConfig -> TupleStore m` for effect-polymorphic callers. Add an IO-specific constructor such as:
+Milestone 2 wires the cache into the PostgreSQL tuple-store interpreter. Keep the existing `runTupleStorePostgres` behavior unchanged for callers that want the current uncached interpreter. Add a cached interpreter such as:
 
 ```haskell
-postgresTupleStoreIOWithOptimizedRevision ::
-    Connection ->
+runTupleStorePostgresWithOptimizedRevisionCache ::
+    (Database :> es, IOE :> es, Error EnError :> es) =>
     ConsistencyConfig ->
     OptimizedRevisionConfig ->
-    IO (TupleStore IO)
+    Eff (TupleStore : es) a ->
+    Eff es a
 ```
 
-This constructor builds the normal store and replaces only `optimizedRevision` with the cached reader. Leave `headRevision` as `run headRevisionSession`. Keep `postgresTupleStoreIO` as the current uncached convenience function or make it call the new constructor with caching disabled only if doing so does not force unsafe top-level IO.
+This interpreter should allocate the cache once, before interpreting the supplied action, and replace only the `OptimizedRevision` operation with the cached reader. Leave `HeadRevision` as a direct `headRevisionSession` read. Keeping the uncached interpreter unchanged also preserves the no-`IOE` shape introduced by the effectful migration.
 
 Milestone 3 tests the behavior. Add pure or IO tests to `en-postgres/test/Main.hs` using a fake underlying revision reader that increments an `IORef` counter and returns deterministic revisions. Verify these cases:
 
 - Disabled config calls the underlying reader on every `optimizedRevision`.
 - Enabled config returns the same revision and increments the counter once inside the TTL.
 - Enabled config refreshes after the TTL.
-- `headRevision` remains uncached in the tuple store constructor that supports caching.
+- `headRevision` remains uncached in the tuple-store interpreter that supports caching.
 
 If the test needs controllable time, use an `IORef UTCTime` as the clock supplied to `newOptimizedRevisionReader`.
 
@@ -129,7 +148,7 @@ sed -n '1,260p' en-postgres/src/En/Postgres/Revision.hs
 sed -n '1,140p' en-postgres/src/En/Postgres/TupleStore.hs
 ```
 
-Edit the `en-postgres` source and package metadata. If adding a new module, expose it in `en-postgres/en-postgres.cabal`.
+Edit the `en-postgres` source. If adding a new module, expose it in `en-postgres/en-postgres.cabal`; otherwise export the cache types/functions from `En.Postgres.Revision` and the cached interpreter from `En.Postgres.TupleStore`.
 
 Run the focused tests:
 
@@ -159,11 +178,16 @@ Acceptance requires tests that demonstrate the cache changes observable behavior
 
 ## Idempotence and Recovery
 
-The changes are additive. Re-running the tests is safe. If the cached constructor causes API churn, keep the existing `postgresTupleStoreIO` behavior and add the new constructor alongside it rather than replacing callers. If concurrency concerns arise, choose correctness over perfect single-flight behavior; duplicate refreshes are acceptable, stale reuse beyond TTL is not.
+The changes are additive. Re-running the tests is safe. If the cached interpreter causes API churn, keep the existing `runTupleStorePostgres` behavior and add the new interpreter alongside it rather than replacing callers. If concurrency concerns arise, choose correctness over perfect single-flight behavior; duplicate refreshes are acceptable, stale reuse beyond TTL is not.
 
 
 ## Interfaces and Dependencies
 
 This plan uses only existing dependencies: `base`, `time`, `en-core`, `hasql`, and the current `en-postgres` modules. It must not add a third-party cache dependency.
 
-At completion, the repository should expose an optimized revision cache configuration and an IO constructor for a PostgreSQL `TupleStore` whose `optimizedRevision` uses that cache. The exact module name can be `En.Postgres.Revision` if the implementation is small, or `En.Postgres.OptimizedRevision` if the code is clearer as a separate module. If a new module is created, add it to `en-postgres/en-postgres.cabal`.
+At completion, the repository should expose an optimized revision cache configuration and a PostgreSQL `TupleStore` interpreter whose `OptimizedRevision` operation uses that cache. The exact module name can be `En.Postgres.Revision` if the implementation is small, or `En.Postgres.OptimizedRevision` if the code is clearer as a separate module. If a new module is created, add it to `en-postgres/en-postgres.cabal`.
+
+
+---
+
+**Revision note (2026-06-23).** Reconciled this plan with the already-complete MasterPlan 3 and the post-planning effectful migration before implementation. The plan now targets `runTupleStorePostgresWithOptimizedRevisionCache` rather than obsolete record-of-functions tuple-store constructors, and records that the existing uncached `runTupleStorePostgres` interpreter should remain API-compatible.

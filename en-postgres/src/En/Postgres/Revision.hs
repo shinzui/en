@@ -8,10 +8,16 @@ module En.Postgres.Revision (
     TokenPayload (..),
     TokenDecodeError (..),
     ConsistencyConfig (..),
+    OptimizedRevisionConfig (..),
+    OptimizedRevisionCache,
     parsePgSnapshot,
     renderPgSnapshot,
     revisionFromPgSnapshot,
     revisionToPgSnapshot,
+    newOptimizedRevisionCache,
+    lookupOptimizedRevisionCache,
+    storeOptimizedRevisionCache,
+    newOptimizedRevisionReader,
     transactionVisible,
     snapshotIncludes,
     comparePgSnapshot,
@@ -25,10 +31,11 @@ module En.Postgres.Revision (
 ) where
 
 import Data.Char (digitToInt, isDigit, ord)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (nub, sort)
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Time (UTCTime, getCurrentTime)
+import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
 import Data.Word (Word64)
 import Effectful (Eff, IOE, liftIO, (:>))
@@ -76,6 +83,23 @@ data ConsistencyConfig = ConsistencyConfig
     }
     deriving stock (Eq, Show)
 
+data OptimizedRevisionConfig = OptimizedRevisionConfig
+    { enabled :: !Bool
+    , ttl :: !NominalDiffTime
+    }
+    deriving stock (Eq, Show)
+
+data OptimizedRevisionCache = OptimizedRevisionCache
+    { config :: !OptimizedRevisionConfig
+    , clock :: !(IO UTCTime)
+    , state :: !(IORef (Maybe CachedOptimizedRevision))
+    }
+
+data CachedOptimizedRevision = CachedOptimizedRevision
+    { revision :: !Revision
+    , loadedAt :: !UTCTime
+    }
+
 data TokenDecodeError
     = TokenBadPrefix
     | TokenBadFieldCount
@@ -113,6 +137,46 @@ revisionFromPgSnapshot =
 revisionToPgSnapshot :: Revision -> Either Text PgSnapshot
 revisionToPgSnapshot =
     parsePgSnapshot . revisionEncoding
+
+newOptimizedRevisionCache :: OptimizedRevisionConfig -> IO UTCTime -> IO OptimizedRevisionCache
+newOptimizedRevisionCache config clock = do
+    state <- newIORef Nothing
+    pure OptimizedRevisionCache{config, clock, state}
+
+lookupOptimizedRevisionCache :: OptimizedRevisionCache -> IO (Maybe Revision)
+lookupOptimizedRevisionCache cache
+    | not cache.config.enabled || cache.config.ttl <= 0 = pure Nothing
+    | otherwise = do
+        now <- cache.clock
+        cached <- readIORef cache.state
+        pure do
+            entry <- cached
+            if diffUTCTime now entry.loadedAt <= cache.config.ttl
+                then Just entry.revision
+                else Nothing
+
+storeOptimizedRevisionCache :: OptimizedRevisionCache -> Revision -> IO ()
+storeOptimizedRevisionCache cache revision
+    | not cache.config.enabled || cache.config.ttl <= 0 = pure ()
+    | otherwise = do
+        now <- cache.clock
+        writeIORef cache.state (Just CachedOptimizedRevision{revision, loadedAt = now})
+
+newOptimizedRevisionReader ::
+    OptimizedRevisionConfig ->
+    IO UTCTime ->
+    IO Revision ->
+    IO (IO Revision)
+newOptimizedRevisionReader config clock readFresh = do
+    cache <- newOptimizedRevisionCache config clock
+    pure do
+        cached <- lookupOptimizedRevisionCache cache
+        case cached of
+            Just revision -> pure revision
+            Nothing -> do
+                revision <- readFresh
+                storeOptimizedRevisionCache cache revision
+                pure revision
 
 {- | Whether a transaction id is visible in a snapshot, mirroring PostgreSQL's
 @pg_visible_in_snapshot@ rules for committed transaction ids.
