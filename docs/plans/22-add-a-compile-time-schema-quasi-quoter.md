@@ -69,9 +69,9 @@ This section must always reflect the actual current state of the work.
 - [x] 2026-06-24: Milestone 0 (PROTOTYPING): promote approach (B), the typed-TH function over the existing builder surface, to the real implementation.
 - [x] 2026-06-24: Milestone 1: harden `En.Schema.TH` with final API, doc comments, error formatting, and a good-path test in `en-core-interface-tests`.
 - [x] 2026-06-24: Milestone 1: encode the should-not-compile cases as committed, runnable manual checks: `BadSchema.hs` for unknown relation and `DuplicateName.hs` for EP-20 duplicate relation.
-- [ ] Milestone 2 (OPTIONAL, budget permitting): add the `schema` QuasiQuoter (`[schema| ... |]`) with a small textual grammar parsed to `Schema`, validated at compile time, spliced as `ValidSchema`.
+- [x] 2026-06-24: Milestone 2 (OPTIONAL, budget permitting): add the `schema` QuasiQuoter (`[schema| ... |]`) with a small textual grammar parsed to `Schema`, validated at compile time, spliced as `ValidSchema`.
 - [x] 2026-06-24: Update `exposed-modules` in `en-core/en-core.cabal`; run `nix develop --command cabal build all` and `nix develop --command cabal test en-core-interface-tests`; record outputs.
-- [ ] Final retrospective after deciding whether Milestone 2 lands or is explicitly deferred.
+- [x] 2026-06-24: Final retrospective after landing Milestone 2.
 
 
 ## Surprises & Discoveries
@@ -202,6 +202,18 @@ Record every decision made while working on the plan.
   delegates to `mkValidSchemaEither . Right`.
   Date: 2026-06-24
 
+- Decision: Land the optional `[schema| ... |]` quasi-quoter with an intentionally small,
+  line-oriented grammar: `object name {}`, `object name { ... }`, `relation name: subject,
+  object#relation, object:*`, and `permission name = this | computed | tupleset->computed`
+  where `|` builds a union.
+  Rationale: the compile-time guarantee is the feature; the text grammar should be only large
+  enough to make that authoring path real without committing the project to a full SpiceDB
+  parser before EP-23/EP-24 shape the public DSL documentation. The quasi-quoter routes
+  builder-produced `EnError`s through `mkValidSchemaEither`, so duplicate declarations and
+  validation failures share the same `schema validation failed at compile time:` wording as the
+  typed TH helper.
+  Date: 2026-06-24
+
 
 ## Outcomes & Retrospective
 
@@ -225,9 +237,20 @@ schema validation failed at compile time: UnknownRelation "unknown relation: spa
 schema validation failed at compile time: SchemaViolation "duplicate relation declared: space#owner"
 ```
 
-The textual `[schema| ... |]` quasi-quoter remains unfinished and is tracked by the remaining
-Milestone 2 checkbox; EP-22 stays In Progress until that milestone is implemented or
-explicitly deferred in the MasterPlan.
+2026-06-24 final note: Milestone 2 landed. `En.Schema.TH.schema` is an expression-only
+quasi-quoter that parses the compact object/relation/permission grammar described in the
+Decision Log, builds the same `Schema` value through `En.Schema.Builder`, validates it at
+compile time, and splices a `ValidSchema`. `en-core-interface-tests` now includes
+`schema quasi-quoter builds compact schema`, comparing a quoted schema against the equivalent
+builder fixture. Two additional manual fixtures prove the text path fails the build with the
+same validation wording:
+
+```text
+schema validation failed at compile time: UnknownRelation "unknown relation: space#ownr"
+schema validation failed at compile time: SchemaViolation "duplicate relation declared: space#owner"
+```
+
+EP-22 is complete.
 
 
 ## Context and Orientation
@@ -436,18 +459,28 @@ Scope, budget permitting only: add ergonomic textual authoring. At the end, an a
 write a schema in a compact SpiceDB-like text block and get the same compile-time validation.
 This milestone is strictly additive and does not change Milestone 1.
 
-Work: design a minimal text grammar (object/relation/permission/caveat declarations), write a
-small total parser from `String` to `Either String Schema` (no new parser dependency — a
-hand-written recursive-descent or a `ReadP`/`Megaparsec`-free parser using `Data.Text`),
-define `schema :: QuasiQuoter` in `En.Schema.TH` whose `quoteExp` parses the body, on parse
-failure calls `fail` (build error), on success runs `validateSchema`, and on validation
-failure calls `fail` with the `EnError` message, otherwise lifts the `Schema` and produces a
-`ValidSchema` exactly as `mkValidSchema` does (factor the validate-and-lift tail into a shared
-helper). The grammar and parser are documented in full in this plan **before** any code is
-written for this milestone (we will not outsource grammar design to the implementer). Because
-this milestone is optional and (B) already delivers the win, the grammar is left unspecified
-here until Milestone 1 is complete and budget is confirmed; when started, this section is
-expanded with the full BNF and parse-error examples.
+Work: design a minimal text grammar, write a small total parser from `String` to
+`Either String (Either EnError Schema)` (no new parser dependency — a hand-written parser using
+`Data.Text`), define `schema :: QuasiQuoter` in `En.Schema.TH` whose `quoteExp` parses the
+body, on parse failure calls `fail` (build error), on success delegates to
+`mkValidSchemaEither` so builder errors and validation errors share the same compile-time
+format. The grammar deliberately covers only:
+
+```text
+schema      ::= object*
+object      ::= "object" name "{}"
+              | "object" name "{" object-line* "}"
+object-line ::= "relation" name ":" subject ("," subject)*
+              | "permission" name "=" rewrite
+subject     ::= object | object "#" relation | object ":*"
+rewrite     ::= term ("|" term)*
+term        ::= "this" | relation | relation "->" relation
+```
+
+Whitespace is line-oriented; a declaration occupies one line, blank lines are ignored, and a
+trailing semicolon is ignored. The parser maps relation declarations to
+`Builder.relation ... Builder.this`, permission terms to `Builder.this`, `Builder.computed`,
+`Builder.arrow`, and `|` unions to `Builder.anyOf`.
 
 
 ## Concrete Steps
@@ -567,7 +600,7 @@ Acceptance is behavioral and has three observable parts.
 First, the library and full build still work:
 
 ```bash
-cabal build all
+nix develop --command cabal build all
 ```
 
 Expected: ends with no errors (exit 0).
@@ -577,22 +610,17 @@ Second, a compile-time-validated schema equals the builder fixture. A permanent 
 that the validated schema is the same model as `kikanSchema`. Run:
 
 ```bash
-cabal test en-core-interface-tests
+nix develop --command cabal test en-core-interface-tests
 ```
 
-Expected: the suite passes, including a case named e.g. "compile-time validated schema equals
-builder fixture". A representative passing line:
-
-```text
-  compile-time validated schema equals builder fixture: OK
-All N tests passed
-```
+Expected: the suite passes, including `compile-time validated schema equals builder fixture`
+and `schema quasi-quoter builds compact schema`.
 
 Third — the headline behavior — a deliberately broken schema **fails to compile** with the
 validation message. With `en-core/test/fixtures/BadSchema.hs` from Concrete Steps in place:
 
 ```bash
-cabal exec -- ghc -fno-code -ien-core/src en-core/test/fixtures/BadSchema.hs
+nix develop --command cabal exec -- ghc -fno-code -package en-core en-core/test/fixtures/BadSchema.hs
 ```
 
 Expected: a non-zero exit and a compile error whose text contains the `validate`/EP-21
@@ -600,12 +628,13 @@ message for the typo (`computed "ownr"` references a relation that does not exis
 The transcript looks like:
 
 ```text
-en-core/test/fixtures/BadSchema.hs:9:8: error: [GHC-something]
+en-core/test/fixtures/BadSchema.hs:12:7: error: [GHC-39584]
     • schema validation failed at compile time: UnknownRelation "unknown relation: space#ownr"
-    • In the untyped splice: $$(mkValidSchema (Schema.build [ ... ]))
+    • In the Template Haskell splice
+        $$(mkValidSchema ...)
   |
-9 |     $$(mkValidSchema
-  |        ^^^^^^^^^^^^^^...
+12 |     $$( mkValidSchema $
+   |       ^^^^^^^^^^^^^^^^^...
 ```
 
 The load-bearing part is the line `schema validation failed at compile time:
@@ -625,12 +654,23 @@ build fails with EP-20's duplicate-name `EnError` text, demonstrating the soft d
 honored:
 
 ```text
-en-core/test/fixtures/DuplicateName.hs:…: error:
-    • schema validation failed at compile time: SchemaViolation "duplicate relation name: space#owner"
+en-core/test/fixtures/DuplicateName.hs:12:7: error: [GHC-39584]
+    • schema validation failed at compile time: SchemaViolation "duplicate relation declared: space#owner"
 ```
 
-(The precise duplicate-name wording is defined by EP-20; copy it verbatim once EP-20 is
-merged.)
+The quasi-quoter path has two equivalent manual checks:
+
+```bash
+nix develop --command cabal exec -- ghc -fno-code -package en-core en-core/test/fixtures/BadQuotedSchema.hs
+nix develop --command cabal exec -- ghc -fno-code -package en-core en-core/test/fixtures/DuplicateQuotedSchema.hs
+```
+
+Expected: both exit non-zero. The load-bearing error lines are:
+
+```text
+schema validation failed at compile time: UnknownRelation "unknown relation: space#ownr"
+schema validation failed at compile time: SchemaViolation "duplicate relation declared: space#owner"
+```
 
 
 ## Idempotence and Recovery

@@ -92,7 +92,7 @@ their being different concerns (soundness vs. ergonomics), and would have scatte
 |---|-------|------|-----------|-----------|--------|
 | 20 | Detect duplicate names in the schema builder | docs/plans/20-detect-duplicate-names-in-the-schema-builder.md | None | None | Complete |
 | 21 | Introduce a validated-schema evidence type | docs/plans/21-introduce-a-validated-schema-evidence-type.md | None | EP-20 | Complete |
-| 22 | Add a compile-time schema quasi-quoter | docs/plans/22-add-a-compile-time-schema-quasi-quoter.md | EP-21 | EP-20 | In Progress |
+| 22 | Add a compile-time schema quasi-quoter | docs/plans/22-add-a-compile-time-schema-quasi-quoter.md | EP-21 | EP-20 | Complete |
 | 23 | Polish builder ergonomics and reference safety | docs/plans/23-polish-builder-ergonomics-and-reference-safety.md | None | EP-20 | Not Started |
 | 24 | Render schemas as docs and diagrams | docs/plans/24-render-schemas-as-docs-and-diagrams.md | None | EP-21 | Not Started |
 
@@ -171,8 +171,8 @@ and the milestone. This section provides an at-a-glance view of the entire initi
 - [x] 2026-06-24: EP-20: Tests prove each duplicate class is reported rather than silently dropped
 - [x] 2026-06-24: EP-21: `ValidSchema` newtype defined; `validateSchema` produces it and `validate` remains a wrapper
 - [x] 2026-06-24: EP-21: `compile`/`schemaHash` consumers demand `ValidSchema`; compiled call sites updated
-- [ ] EP-22: Prototype a quasi-quoter that parses a compact schema syntax and runs `validate` at compile time
-- [ ] EP-22: `[schema| … |]` splices a `ValidSchema` and fails the build on unknown relations/caveats/duplicates
+- [x] 2026-06-24: EP-22: Prototype a quasi-quoter that parses a compact schema syntax and runs `validate` at compile time
+- [x] 2026-06-24: EP-22: `[schema| … |]` splices a `ValidSchema` and fails the build on unknown relations/caveats/duplicates
 - [ ] EP-23: `permission` cannot be given a bare `this`; intra-object references can be made by handle
 - [ ] EP-23: Builder docs updated; always-invalid shapes are unrepresentable through the builder
 - [ ] EP-24: `En.Schema.Render` folds a schema into a Mermaid diagram
@@ -216,6 +216,12 @@ interactions between child plans. Provide concise evidence.
   `validateSchema` before calling `compile`/`schemaHash`.
   Date: 2026-06-24
 
+- Discovery (during EP-22): the compile-time authoring path works best as two layers. The
+  typed helper `mkValidSchemaEither` is the common validation-and-splice tail, and the
+  `[schema| ... |]` quasi-quoter is only a small line-oriented parser in front of it. That
+  kept builder duplicate errors and validator errors on the same compile-time error path.
+  Date: 2026-06-24
+
 
 ## Decision Log
 
@@ -255,10 +261,29 @@ plan.
   shippable if it is deferred.
   Date: 2026-06-23
 
+- Decision: Ship EP-22's quasi-quoter with a deliberately compact grammar for object blocks,
+  relation subject lists, and permission rewrites using `this`, computed usersets,
+  tuple-to-userset arrows, and `|` unions.
+  Rationale: this is enough to prove the public compile-time authoring path without locking
+  the release to a full SpiceDB-compatible parser. The value-level builder remains the
+  canonical construction API underneath the text surface.
+  Date: 2026-06-24
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original vision.
 
-(To be filled during and after implementation.)
+2026-06-24: EP-20, EP-21, and EP-22 are complete. The schema builder now rejects duplicate
+declarations instead of silently dropping them, `ValidSchema` evidence gates compilation and
+schema hashing, and `En.Schema.TH` offers both `$$(mkValidSchema ...)` and expression-only
+`[schema| ... |]` compile-time authoring. Validation evidence: `nix develop --command cabal
+build all` and `nix develop --command cabal test en-core-interface-tests` pass. Manual
+should-not-compile fixtures fail with the intended messages for unknown relations and
+duplicate relations, including the quasi-quoter variants:
+
+```text
+schema validation failed at compile time: UnknownRelation "unknown relation: space#ownr"
+schema validation failed at compile time: SchemaViolation "duplicate relation declared: space#owner"
+```

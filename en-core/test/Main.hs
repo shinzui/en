@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TemplateHaskell #-}
 
@@ -99,7 +100,7 @@ import En.Schema (
     validateSchema,
  )
 import En.Schema.Builder qualified as Schema
-import En.Schema.TH (mkValidSchema)
+import En.Schema.TH (mkValidSchema, schema)
 import En.Tuple (
     CaveatContext (..),
     CaveatPayload (..),
@@ -113,6 +114,30 @@ import En.Tuple (
 validatedKikanTH :: ValidSchema
 validatedKikanTH =
     $$(mkValidSchema kikanSchema)
+
+quotedSchemaFixture :: Schema
+quotedSchemaFixture =
+    testSchemaOrError $ do
+        userObject <- Schema.object "user" []
+        spaceObject <-
+            Schema.object
+                "space"
+                [ Schema.relation "owner" [Schema.subject "user"] Schema.this
+                , Schema.relation "parent" [Schema.subject "space"] Schema.this
+                , Schema.permission "view" (Schema.anyOf (Schema.computed "owner") [Schema.arrow "parent" "view"])
+                ]
+        Schema.build [userObject, spaceObject]
+
+quotedSchemaTH :: ValidSchema
+quotedSchemaTH =
+    [schema|
+object user {}
+object space {
+  relation owner: user
+  relation parent: space
+  permission view = owner | parent->view
+}
+|]
 
 main :: IO ()
 main = do
@@ -134,6 +159,7 @@ main = do
     assertEqual "builder schema equals manual schema" kikanSchemaManual kikanSchema
     assertEqual "builder schema hash matches manual schema hash" (schemaHash validKikanManual) (schemaHash validKikan)
     assertEqual "compile-time validated schema equals builder fixture" kikanSchema (unValidSchema validatedKikanTH)
+    assertEqual "schema quasi-quoter builds compact schema" quotedSchemaFixture (unValidSchema quotedSchemaTH)
     assertBool "validateSchema produces evidence for a valid schema" (isRight (validateSchema kikanSchema))
     assertBool "validateSchema rejects an invalid schema (no evidence)" (isLeft (validateSchema unproductiveCycleSchema))
     assertEqual "builder anyOf constructs a non-empty union" (Union [This, ComputedUserset (RelationName "owner")]) (Schema.anyOf Schema.this [Schema.computed "owner"])
@@ -1201,8 +1227,8 @@ testSchemaOrError =
     either (error . ("invalid test schema fixture: " <>) . show) id
 
 assertValidationFails :: String -> Schema -> IO ()
-assertValidationFails label schema =
-    case validate schema of
+assertValidationFails label candidate =
+    case validate candidate of
         Left _ -> pure ()
         Right () -> fail (label <> "\nexpected validation failure")
 
