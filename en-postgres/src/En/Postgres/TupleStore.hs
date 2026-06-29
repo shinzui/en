@@ -615,11 +615,18 @@ caveatPayloadToJson (CaveatPayload values) =
 caveatValueToJson :: CaveatValue -> Aeson.Value
 caveatValueToJson =
     \case
-        ValueText value -> Aeson.toJSON value
-        ValueBool value -> Aeson.toJSON value
-        ValueInteger value -> Aeson.toJSON value
-        ValueTimestamp value -> Aeson.toJSON value
-        ValueEnum value -> Aeson.toJSON value
+        ValueText value -> taggedCaveatValue "text" value
+        ValueBool value -> taggedCaveatValue "bool" value
+        ValueInteger value -> taggedCaveatValue "integer" value
+        ValueTimestamp value -> taggedCaveatValue "timestamp" value
+        ValueEnum value -> taggedCaveatValue "enum" value
+
+taggedCaveatValue :: (Aeson.ToJSON a) => Text -> a -> Aeson.Value
+taggedCaveatValue valueType value =
+    Aeson.object
+        [ "type" Aeson..= valueType
+        , "value" Aeson..= value
+        ]
 
 decodeCaveatPayload :: Aeson.Value -> Maybe (Map.Map Text CaveatValue)
 decodeCaveatPayload =
@@ -634,6 +641,15 @@ decodeCaveatPayload =
 decodeCaveatValue :: Aeson.Value -> Aeson.Parser CaveatValue
 decodeCaveatValue =
     \case
+        Aeson.Object object ->
+            case AesonKeyMap.lookup "type" object of
+                Just (Aeson.String "text") -> ValueText <$> object Aeson..: "value"
+                Just (Aeson.String "bool") -> ValueBool <$> object Aeson..: "value"
+                Just (Aeson.String "integer") -> ValueInteger <$> object Aeson..: "value"
+                Just (Aeson.String "timestamp") -> ValueTimestamp <$> object Aeson..: "value"
+                Just (Aeson.String "enum") -> ValueEnum <$> object Aeson..: "value"
+                Just _ -> fail "unsupported tagged caveat value type"
+                Nothing -> fail "tagged caveat value missing type"
         Aeson.String value -> pure (ValueText value)
         Aeson.Bool value -> pure (ValueBool value)
         Aeson.Number value ->

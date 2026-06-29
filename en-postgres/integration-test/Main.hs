@@ -30,9 +30,9 @@ import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgS
 import En.Postgres.TupleStore (runTupleStorePostgres)
 import En.Reachability (ReachabilityGraph, compile)
 import En.Revision (Consistency (..), DatastoreId (..), Revision (..), RevisionOrder (..))
-import En.Schema (AllowedSubject (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..), Schema (..))
+import En.Schema (AllowedSubject (..), CaveatName (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..), Schema (..))
 import En.Schema qualified as Schema
-import En.Tuple (CaveatContext (..), ObjectRef (..), Subject (..), Tuple (..))
+import En.Tuple (CaveatContext (..), CaveatPayload (..), CaveatValue (..), ObjectRef (..), Subject (..), Tuple (..), TupleCaveat (..))
 import EphemeralPg qualified as Pg
 import Hasql.Connection qualified as Connection
 import Hasql.Decoders qualified as Decoders
@@ -170,6 +170,40 @@ runTupleStoreScenario connection = do
     TuplePage{rows = publicRows, state = publicState} <- runPgOrFail connection config (TupleStore.readStartingWithUser publicRevision publicQuery)
     assertEqual "postgres tuple store round-trips wildcard rows" [publicTuple] ((.tuple) <$> publicRows)
     assertEqual "postgres wildcard read is exhausted" Exhausted publicState
+    let caveatedTuple =
+            Tuple
+                { object = ObjectRef (ObjectType "space") "caveated"
+                , relation = RelationName "viewer"
+                , subject = SubjectId (ObjectRef (ObjectType "user") "typed-caveat")
+                , caveat =
+                    Just
+                        TupleCaveat
+                            { name = CaveatName "within_autonomy"
+                            , payload =
+                                CaveatPayload
+                                    ( Map.fromList
+                                        [ ("autonomy", ValueEnum "act")
+                                        , ("enabled", ValueBool True)
+                                        , ("label", ValueText "delegation")
+                                        , ("level", ValueInteger 3)
+                                        , ("until", ValueTimestamp (read "2026-07-01 00:00:00 UTC"))
+                                        ]
+                                    )
+                            }
+                }
+        caveatedQuery =
+            UsersetQuery
+                { queryType = ObjectType "space"
+                , queryRelation = RelationName "viewer"
+                , querySubjects = [caveatedTuple.subject]
+                , queryLimit = 10
+                , queryCursor = Nothing
+                }
+    caveatedToken <- runPgOrFail connection config (TupleStore.writeTuples [caveatedTuple])
+    TokenMetadata{revision = caveatedRevision} <- either (fail . show) pure (tokenMetadataFromPayload caveatedToken)
+    TuplePage{rows = caveatedRows, state = caveatedState} <- runPgOrFail connection config (TupleStore.readStartingWithUser caveatedRevision caveatedQuery)
+    assertEqual "postgres tuple store round-trips typed caveat payloads" [caveatedTuple] ((.tuple) <$> caveatedRows)
+    assertEqual "postgres caveated read is exhausted" Exhausted caveatedState
     let pgFolders =
             [ ObjectRef
                 { objectType = ObjectType "folder"
