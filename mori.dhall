@@ -81,6 +81,15 @@ in  Schema.Project::{
           , Schema.Dependency.ByName "en-servant"
           ]
         }
+      , Schema.Package::{
+        , name = "en-biscuit"
+        , type = Schema.PackageType.Library
+        , language = Schema.Language.Haskell
+        , path = Some "en-biscuit"
+        , description = Some
+            "Optional Biscuit decision-token layer: mints short-lived, attenuable Biscuit tokens from successful en decisions and verifies them locally (depends on biscuit-haskell; en-core stays token-agnostic)"
+        , dependencies = [ Schema.Dependency.ByName "en-core" ]
+        }
       ]
     , dependencies =
       [ "haskell-servant/servant"
@@ -89,5 +98,6 @@ in  Schema.Project::{
       , "haskell-hvr/uuid"
       , "haskell/time"
       , "system-f/validation"
+      , "eclipse-biscuit/biscuit-haskell"
       ]
     }

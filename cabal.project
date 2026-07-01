@@ -8,6 +8,7 @@ packages:
     en-server
     en-client
     en-example
+    en-biscuit
 
 -- ============================================================
 -- DEPENDENCY VERSION PINS — use Hackage packages, not local checkouts.
@@ -16,3 +17,21 @@ packages:
 constraints:
     ephemeral-pg ==0.2.1.0,
     tasty-bench ==0.5
+
+-- ------------------------------------------------------------
+-- biscuit-haskell for en-biscuit (optional Biscuit token layer).
+--
+-- The Hackage release of biscuit-haskell-0.4.0.0 caps
+-- template-haskell < 2.22, which excludes the template-haskell 2.23 that
+-- ships with GHC 9.12.4 (this project's compiler). The Mori-registered source
+-- (eclipse-biscuit/biscuit-haskell) has the same 0.4.0.0 version but widened
+-- bounds (template-haskell < 2.24, megaparsec < 9.8) that build under GHC 9.12.
+-- Until a fixed release is on Hackage, pin the GHC-9.12-compatible source here.
+-- biscuit-servant and biscuit-wai are deliberately not pulled in yet; add their
+-- subdirs when a later plan needs Servant/WAI integration.
+-- ------------------------------------------------------------
+source-repository-package
+    type:     git
+    location: https://github.com/shinzui/biscuit-haskell-project.git
+    tag:      aef4272f0d44eec75c79aa6c2dd00c4200401829
+    subdir:   biscuit-haskell/biscuit

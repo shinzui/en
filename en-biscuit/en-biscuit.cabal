@@ -1,0 +1,53 @@
+cabal-version: 3.0
+name:          en-biscuit
+version:       0.1.0.0
+synopsis:      Optional Biscuit decision-token integration for en
+description:
+  An optional integration layer that turns a successful en authorization
+  decision into a short-lived, attenuable Biscuit token that downstream
+  services can verify locally. This package depends on en-core and the
+  biscuit-haskell library; en-core itself stays free of any Biscuit, Servant,
+  WAI, or HTTP dependency. Later modules add the grant vocabulary, minting, and
+  verification helpers; this initial version only establishes the package and
+  dependency wiring.
+
+license:       MIT
+author:        Nadeem Bitar
+maintainer:    nadeem@gmail.com
+category:      Security, Authorization
+
+common warnings
+  ghc-options:
+    -Wall -Wcompat -Widentities -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+
+common shared
+  default-language:   GHC2024
+  default-extensions:
+    DuplicateRecordFields
+    NoFieldSelectors
+    OverloadedRecordDot
+    OverloadedStrings
+
+library
+  import:          warnings, shared
+  hs-source-dirs:  src
+  exposed-modules: En.Biscuit
+  build-depends:
+    , base             >=4.19 && <5
+    , biscuit-haskell
+    , bytestring
+    , en-core
+    , text
+    , time
+
+test-suite en-biscuit-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , biscuit-haskell
+    , bytestring
+    , en-biscuit

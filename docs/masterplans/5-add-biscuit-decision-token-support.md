@@ -83,7 +83,7 @@ decisions, not replace them.
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| 28 | Add the en-biscuit package and dependency wiring | docs/plans/28-add-the-en-biscuit-package-and-dependency-wiring.md | None | None | Not Started |
+| 28 | Add the en-biscuit package and dependency wiring | docs/plans/28-add-the-en-biscuit-package-and-dependency-wiring.md | None | None | Complete |
 | 29 | Define the en Biscuit grant vocabulary | docs/plans/29-define-the-en-biscuit-grant-vocabulary.md | EP-28 | None | Not Started |
 | 30 | Mint Biscuit grants from en decisions | docs/plans/30-mint-biscuit-grants-from-en-decisions.md | EP-29 | None | Not Started |
 | 31 | Verify and attenuate en Biscuit grants locally | docs/plans/31-verify-and-attenuate-en-biscuit-grants-locally.md | EP-29 | EP-30 | Not Started |
@@ -164,8 +164,8 @@ into an `En.Tuple.Subject` before minting or verification.
 Track milestone-level progress across all child plans. Each entry names the child plan
 and the milestone. This section provides an at-a-glance view of the entire initiative.
 
-- [ ] EP-28: `en-biscuit` package builds as an optional target without changing `en-core`
-- [ ] EP-28: Biscuit dependency wiring is validated against the Mori-registered local source
+- [x] EP-28: `en-biscuit` package builds as an optional target without changing `en-core` (2026-06-30)
+- [x] EP-28: Biscuit dependency wiring is validated against the Mori-registered local source (2026-06-30)
 - [ ] EP-29: Grant types and stable Biscuit predicate vocabulary are implemented and tested
 - [ ] EP-29: Encoding tests prove object and container grants round-trip through Biscuit facts
 - [ ] EP-30: Minting helpers create tokens only after `Allowed` decisions
@@ -233,6 +233,23 @@ interactions between child plans. Provide concise evidence.
   already-built `Subject`. This reinforces the initiative's decision to keep
   `shomei-*` out of `en-biscuit` deps and leave the `AuthUser`/`AuthClaims` →
   `En.Tuple.Subject` mapping to host applications (`EP-32`).
+  Date: 2026-06-30
+
+- EP-28 outcome 2026-06-30: the Hackage `biscuit-haskell-0.4.0.0` release does
+  **not** build under this repo's GHC 9.12.4 — it caps `template-haskell < 2.22`
+  while GHC 9.12.4 ships `template-haskell 2.23`. The Mori-registered source
+  (`eclipse-biscuit/biscuit-haskell`, GitHub `shinzui/biscuit-haskell-project`,
+  commit `aef4272f0d44eec75c79aa6c2dd00c4200401829` on `origin/master`) is the
+  same version 0.4.0.0 but has widened bounds (`template-haskell < 2.24`,
+  `megaparsec < 9.8`). EP-28 wired it via a `source-repository-package` git
+  stanza in `cabal.project` (`subdir: biscuit-haskell/biscuit`, only the
+  `biscuit-haskell` package). Consequence for **all later plans**: `biscuit-haskell`
+  is available from that pinned commit, not Hackage; when EP-31 needs
+  `biscuit-servant`/`biscuit-wai`, add sibling `source-repository-package`
+  stanzas for `subdir: biscuit-haskell/biscuit-servant` and
+  `biscuit-haskell/biscuit-wai` at the same (or a newer verified) commit rather
+  than expecting Hackage to resolve. The `En.Biscuit` module is currently an
+  empty placeholder awaiting EP-29's grant vocabulary.
   Date: 2026-06-30
 
 - Validation 2026-06-30: the grant vocabulary types all exist as `EP-29` assumes.
