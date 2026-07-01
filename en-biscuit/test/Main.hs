@@ -93,6 +93,7 @@ main = do
     verifyObjectTests
     verifyScopedTests
     attenuationTests
+    shomeiFlowTest
     putStrLn "en-biscuit tests PASS"
 
 -- | Wiring check for the biscuit-haskell dependency.
@@ -584,6 +585,66 @@ attenuationTests = do
                 verifyNow
                 (const (pure False))
     assertRestrictionFailed "attenuation blocks a different service" otherService
+
+{- | A stand-in for a verified Shomei principal. @en-biscuit@ does not depend on
+Shomei; the real host maps @Shomei.Servant.Auth.AuthUser@ the same way.
+-}
+newtype AuthenticatedUser = AuthenticatedUser {authUserId :: Text}
+
+{- | The whole coupling between authentication and authorization: a verified user
+id becomes an en subject.
+-}
+subjectFromUserId :: Text -> Subject
+subjectFromUserId userId = SubjectId (ObjectRef (ObjectType "user") userId)
+
+{- | End-to-end: gateway maps a verified identity to a subject and mints on
+Allowed; a downstream that authenticates the SAME subject verifies the token,
+but a downstream that authenticates a different caller fails closed.
+-}
+shomeiFlowTest :: IO ()
+shomeiFlowTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+        config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+
+    -- Gateway: verified Shomei identity -> en subject -> mint.
+    let AuthenticatedUser{authUserId = gatewayUserId} = AuthenticatedUser{authUserId = "alice"}
+        subject = subjectFromUserId gatewayUserId
+        grant =
+            EnGrant
+                { subject = subject
+                , permission = RelationName "view"
+                , object = ObjectRef (ObjectType "document") "roadmap"
+                , consistencyToken = ConsistencyToken "zk-123"
+                , schemaHash = SchemaHash "sha-abc"
+                , expiresAt = sampleExpiry
+                , audience = Audience "document-service"
+                , requestId = Nothing
+                , revocationId = Nothing
+                }
+    token <- either (die . show) pure =<< mintObjectGrant config Allowed grant
+
+    let requestFor authenticated =
+            mkVerifyRequest
+                (subjectFromUserId authenticated)
+                (Audience "document-service")
+                (RelationName "view")
+                (ObjectRef (ObjectType "document") "roadmap")
+                (Audience "document-service")
+                acceptedSchemas
+                verifyNow
+                (const (pure False))
+
+    -- Downstream authenticated the same caller -> the decision proof verifies.
+    sameCaller <- verifyGrant public token (requestFor "alice")
+    case sameCaller of
+        Right _ -> pure ()
+        Left e -> die ("shomei flow: same-subject request should verify, got " <> show e)
+
+    -- Downstream authenticated a different caller -> fail closed (identity
+    -- established by the downstream does not match the token's subject).
+    impostor <- verifyGrant public token (requestFor "mallory")
+    assertVerifyError "shomei flow: different caller" WrongSubject impostor
 
 verifyNow :: UTCTime
 verifyNow = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 1800)

@@ -110,6 +110,18 @@ as protected objects.
 This keeps authorization centralized in meaning, but not sprayed across every
 runtime hop.
 
+### Carrying a decision downstream with Biscuit
+
+When a gateway has already made an `en` decision and needs to forward the request
+through several services, the optional `en-biscuit` package can turn that
+`Allowed` decision into a short-lived, signed Biscuit token that downstream
+services verify locally — avoiding a repeat `en` call for the same
+subject/object/scope. Biscuit does not authenticate the caller (Shomei does) and
+is not a permission store; it carries a bounded proof of one decision. See
+[Biscuit decision tokens](biscuit-decision-tokens.md) for the full flow, the
+minting/verification API, and the rules for when a downstream must still call
+`en`.
+
 ## Tuple Ownership
 
 The service that owns a domain event should usually own the write that changes

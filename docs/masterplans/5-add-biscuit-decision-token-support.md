@@ -87,7 +87,7 @@ decisions, not replace them.
 | 29 | Define the en Biscuit grant vocabulary | docs/plans/29-define-the-en-biscuit-grant-vocabulary.md | EP-28 | None | Complete |
 | 30 | Mint Biscuit grants from en decisions | docs/plans/30-mint-biscuit-grants-from-en-decisions.md | EP-29 | None | Complete |
 | 31 | Verify and attenuate en Biscuit grants locally | docs/plans/31-verify-and-attenuate-en-biscuit-grants-locally.md | EP-29 | EP-30 | Complete |
-| 32 | Document Shomei-compatible Biscuit authorization flows | docs/plans/32-document-shomei-compatible-biscuit-authorization-flows.md | EP-30, EP-31 | None | Not Started |
+| 32 | Document Shomei-compatible Biscuit authorization flows | docs/plans/32-document-shomei-compatible-biscuit-authorization-flows.md | EP-30, EP-31 | None | Complete |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
 Hard Deps and Soft Deps reference other rows by their # prefix (e.g., EP-1, EP-3).
@@ -172,8 +172,8 @@ and the milestone. This section provides an at-a-glance view of the entire initi
 - [x] EP-30: Denied, conditional, and error decisions fail closed and do not mint tokens (2026-06-30)
 - [x] EP-31: Local verification accepts in-scope tokens and rejects wrong audience, expired, wrong subject, and wrong resource cases (2026-06-30)
 - [x] EP-31: Attenuation can narrow broad grants for a downstream service without contacting `en` (2026-06-30)
-- [ ] EP-32: User docs explain the Shomei authentication plus `en` authorization plus Biscuit delegation flow
-- [ ] EP-32: Example or test demonstrates a downstream service verifying Shomei identity and Biscuit authorization locally
+- [x] EP-32: User docs explain the Shomei authentication plus `en` authorization plus Biscuit delegation flow (2026-06-30)
+- [x] EP-32: Example or test demonstrates a downstream service verifying Shomei identity and Biscuit authorization locally (2026-06-30)
 
 
 ## Surprises & Discoveries
@@ -394,7 +394,50 @@ plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original vision.
 
-(To be filled during and after implementation.)
+### Completion 2026-06-30 — all five ExecPlans landed
+
+The vision is realized: an optional `en-biscuit` package turns a successful `en`
+decision into a short-lived, attenuable Biscuit token that downstream services
+verify locally, while `en-core` stays free of Biscuit/Servant/WAI/Shomei/HTTP
+dependencies and Shomei remains the authentication layer.
+
+What shipped, by plan:
+
+- **EP-28** — `en-biscuit` package + dependency wiring. `cabal build en-biscuit`
+  and `cabal test en-biscuit` work; `en-core` has no Biscuit dependency.
+- **EP-29** — `En.Biscuit.Grant`: the typed grant model and the stable `en_*`
+  Datalog vocabulary, built injection-safely through the `[block|…|]`
+  quasiquoter.
+- **EP-30** — `En.Biscuit.Mint`: the portable `MonadIO` "decision → token" API
+  plus an `effectful` check-running convenience; mints only on `Allowed`.
+- **EP-31** — `En.Biscuit.Verify`: local, fail-closed verification and
+  attenuation with a distinct error per failure.
+- **EP-32** — `docs/user/biscuit-decision-tokens.md` and a `shomeiFlowTest`
+  end-to-end example; README/index/idea-note pointers.
+
+Verification: `cabal build all`, `cabal test en-biscuit` (smoke + grant +
+mint + verify + attenuation + Shomei-flow), and `mori show --full` all pass.
+
+Deviations from the plan (all recorded in child Decision Logs):
+
+- Biscuit's Hackage release does not build under GHC 9.12.4; EP-28 pinned the
+  GHC-9.12-compatible Mori source via a `source-repository-package` git stanza.
+  When EP-31/future work needs `biscuit-servant`/`biscuit-wai`, add sibling
+  subdir stanzas at the same commit.
+- `grantFactsText` and `attenuateGrant` returned slightly different signatures
+  than the pseudocode (an `Either` and a bare biscuit respectively), and
+  `EnBiscuitMintError` dropped an unconstructable `BiscuitBuildFailed`.
+- `VerifyRequest` keeps both `expectedAudience` (grant target) and `serviceName`
+  (caller identity, the attenuable dimension); audience-as-identity is not
+  attenuable, so attenuation narrows the *service* dimension.
+- The optional `biscuit-servant` module (EP-31 M4) is deferred; the pure verifier
+  is the deliverable. The worked example lives in the `en-biscuit` test suite
+  rather than `en-example` (EP-32).
+
+Gaps / follow-ups: no Servant/WAI adapter yet (thin wrapper over `verifyGrant`);
+no revocation-list helper beyond the caller-supplied `revoked` callback; scoped
+verification enforces `resource ∈ containers` (the sound local statement) rather
+than graph-aware containment. None block the core value.
 
 
 ## Revision Notes

@@ -26,6 +26,9 @@ and implementation plans live under [`docs/spec`](../spec) and [`docs/plans`](..
 - [Production deployment and performance](production-deployment-and-performance.md):
   choose embedded vs service deployment, place enforcement boundaries, tune
   consistency, and avoid list-endpoint fan-out.
+- [Biscuit decision tokens](biscuit-decision-tokens.md): carry a short-lived,
+  signed proof of an `en` decision across microservices (Shomei authenticates,
+  `en` authorizes, Biscuit delegates) and verify it locally downstream.
 
 ## Mental model
 
@@ -55,6 +58,7 @@ and the query returns `Allowed`.
 | `en-servant` | Servant API types, handlers, and `requirePermission` helper |
 | `en-server` | Standalone HTTP service with a built-in demo schema |
 | `en-client` | Typed Haskell client for the standalone service |
+| `en-biscuit` | Optional: mint short-lived Biscuit tokens from `en` decisions and verify/attenuate them locally downstream — see [Biscuit decision tokens](biscuit-decision-tokens.md) |
 
 ## Current status
 

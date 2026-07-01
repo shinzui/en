@@ -1,5 +1,10 @@
 # Biscuit Integration Idea
 
+> **Status: shipped.** This initiative is implemented as the optional
+> `en-biscuit` package. For the user-facing guide and the shipped API, see
+> [`docs/user/biscuit-decision-tokens.md`](../user/biscuit-decision-tokens.md).
+> This note is retained as background design rationale.
+
 This note sketches how `en` could integrate with Biscuit tokens to reduce
 authorization fan-out across distributed microservices.
 

@@ -34,11 +34,11 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Update user docs to explain the Shomei authentication plus `en` authorization plus Biscuit delegation sequence.
-- [ ] M2: Add an example or test that maps a verified Shomei principal to an `en` subject before minting.
-- [ ] M3: Add a downstream example or test that verifies Shomei identity and Biscuit authorization locally.
-- [ ] M4: Document when downstream services must still call `en`.
-- [ ] M5: Update README or package docs to point to the Biscuit integration guide.
+- [x] M1: Update user docs to explain the Shomei authentication plus `en` authorization plus Biscuit delegation sequence. (2026-06-30) — new `docs/user/biscuit-decision-tokens.md` with the three-layer table, the text sequence diagram, and shipped-API code; plus a "Carrying a decision downstream with Biscuit" subsection in `docs/user/production-deployment-and-performance.md`.
+- [x] M2: Add an example or test that maps a verified Shomei principal to an `en` subject before minting. (2026-06-30) — `shomeiFlowTest` in `en-biscuit/test/Main.hs` uses a Shomei-shaped `AuthenticatedUser` stand-in and `subjectFromUserId` to map an identity to a `Subject`, then mints. (Placed in `en-biscuit` tests, not `en-example` — see Decision Log.)
+- [x] M3: Add a downstream example or test that verifies Shomei identity and Biscuit authorization locally. (2026-06-30) — `shomeiFlowTest` verifies the token for the same authenticated subject (success) and a different caller (`WrongSubject`, fail closed), demonstrating the two-token join.
+- [x] M4: Document when downstream services must still call `en`. (2026-06-30) — "When a downstream service must still call `en`" section in the guide (new decision, out of scope, expired/stale, revocation-sensitive, mutation, lookup beyond scope, expand/audit).
+- [x] M5: Update README or package docs to point to the Biscuit integration guide. (2026-06-30) — `docs/user/README.md` (Start here + package map), `README.md` (package table + pointer), and `docs/ideas/biscuit-integration.md` (shipped banner) all link the guide.
 
 
 ## Surprises & Discoveries
@@ -58,6 +58,15 @@ implementation. Provide concise evidence.
   local verification is useful, but it verifies a different claim type.
   Date: 2026-07-01
 
+- Implementation 2026-06-30: the guide is written entirely against the shipped
+  API names from EP-29/30/31 (`EnGrant`/`EnScopedGrant`, `MintConfig`,
+  `mintObjectGrant`/`mintScopedGrant`/`mintCheckedObjectGrant`, `verifyGrant`/
+  `VerifyRequest`/`VerifiedGrant`, `attenuateGrant`/`Attenuation`), including the
+  issuer-controlled-expiry rule and the `expectedSubject` (grant target) vs
+  `serviceName` (caller/attenuable) distinction, so the docs match the code that
+  actually shipped rather than the plan's pseudocode.
+  Date: 2026-06-30
+
 
 ## Decision Log
 
@@ -76,13 +85,58 @@ Record every decision made while working on the plan.
   `Authorization` header without guidance will confuse services and clients.
   Date: 2026-07-01
 
+- Decision (2026-06-30): Put the worked example in the `en-biscuit` test suite
+  (`shomeiFlowTest`) rather than in `en-example`. Rationale: the example needs the
+  real `mintObjectGrant`/`verifyGrant` API and a fail-closed assertion; the
+  `en-biscuit` test suite already has the deterministic key/clock harness, so the
+  example is a few lines there and runs under `cabal test en-biscuit`. `en-example`
+  is a Servant/WAI host demo and pulling the token flow into it would add setup
+  without strengthening the proof. The plan allowed "examples or tests"; this
+  keeps the proof close to the API and dependency-free (a Shomei-shaped stand-in,
+  no `shomei-*` import). Consequently `cabal test en-example` was not needed for
+  this plan.
+  Date: 2026-06-30
+
+- Decision (2026-06-30): Downstream must pass its own independently-authenticated
+  subject as `VerifyRequest.expectedSubject`, never trust the Biscuit's subject as
+  identity. Documented prominently. Rationale: the Biscuit proves "subject X was
+  allowed"; only the downstream's own Shomei check proves the caller *is* X. This
+  is the join that makes the two-token model safe, and `shomeiFlowTest` encodes it
+  (a different caller → `WrongSubject`).
+  Date: 2026-06-30
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Outcome (2026-06-30): the adoption flow is documented and demonstrated. All
+acceptance criteria hold:
+
+- The guide (`docs/user/biscuit-decision-tokens.md`) states plainly that Shomei
+  is authentication and `en-biscuit` is authorization delegation (a three-layer
+  table plus "A Biscuit is not a login").
+- It includes a text sequence diagram from Shomei authentication → `en.check`/
+  `en.lookup` → Biscuit minting → downstream local verification.
+- It lists the cases where downstream services must still call `en`.
+- `shomeiFlowTest` proves an authenticated principal is mapped to a `Subject`
+  (`subjectFromUserId`) before minting.
+- `shomeiFlowTest` proves a downstream request fails closed (`WrongSubject`) when
+  the downstream's authenticated caller differs from the token subject; the
+  broader verify/attenuation suite proves fail-closed for every other dimension.
+- `docs/ideas/biscuit-integration.md` is marked "shipped" and points to the guide.
+
+Files: new `docs/user/biscuit-decision-tokens.md`; edits to `docs/user/README.md`,
+`README.md`, `docs/user/production-deployment-and-performance.md`,
+`docs/ideas/biscuit-integration.md`, and `en-biscuit/test/Main.hs`
+(`shomeiFlowTest`). Deviation: the worked example lives in the `en-biscuit` test
+suite rather than `en-example` (see Decision Log), so `cabal test en-example` was
+not part of this plan; `cabal test en-biscuit` and `cabal build all` pass.
+
+This completes MasterPlan 5: an optional `en-biscuit` package that mints, verifies,
+and attenuates bounded Biscuit proofs of `en` decisions, with `en-core` unchanged
+and Shomei kept as the authentication layer.
 
 
 ## Context and Orientation

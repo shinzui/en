@@ -40,6 +40,7 @@ single-app service.
 | `en-servant` | Servant API + an `Authorize`/`RequirePermission` combinator |
 | `en-server` | Standalone authorization service (thin app over the libraries) |
 | `en-client` | Haskell client for the standalone service |
+| `en-biscuit` | Optional Biscuit decision-token layer: mint short-lived signed proofs of `en` decisions and verify/attenuate them locally downstream |
 
 ## Status
 
@@ -49,3 +50,5 @@ for the design, and the kikan contract **C13** (`shinzui/kikan` →
 requirements.
 
 User-facing integration docs start at [`docs/user/README.md`](docs/user/README.md).
+For the optional Biscuit decision-token layer, see
+[`docs/user/biscuit-decision-tokens.md`](docs/user/biscuit-decision-tokens.md).
