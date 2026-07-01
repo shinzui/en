@@ -35,11 +35,14 @@ library
   exposed-modules:
     En.Biscuit
     En.Biscuit.Grant
+    En.Biscuit.Mint
 
   build-depends:
     , base             >=4.19 && <5
     , biscuit-haskell
     , bytestring
+    , effectful
+    , effectful-core
     , en-core
     , text
     , time
@@ -53,6 +56,9 @@ test-suite en-biscuit-tests
     , base
     , biscuit-haskell
     , bytestring
+    , containers
+    , effectful
+    , effectful-core
     , en-biscuit
     , en-core
     , text

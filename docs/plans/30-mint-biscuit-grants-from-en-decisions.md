@@ -34,10 +34,10 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Define minting configuration, errors, and key handling in `En.Biscuit.Mint`.
-- [ ] M2: Implement object-grant minting from a `CheckDecision` or from a caller-supplied check action.
-- [ ] M3: Implement scoped-grant minting from bounded lookup/container results.
-- [ ] M4: Add tests proving allowed-only minting, expiry defaults, schema hash and consistency-token propagation, and fail-closed behavior.
+- [x] M1: Define minting configuration, errors, and key handling in `En.Biscuit.Mint`. (2026-06-30) — `MintConfig m { issuerSecretKey, defaultTtl, now }` and `EnBiscuitMintError` (`DecisionDenied`, `DecisionConditional [CaveatObligation]`, `EngineError EnError`, `EmptyLookupScope`, `LookupScopeTooLarge Int Int`, `GrantEncodingError EnBiscuitError`).
+- [x] M2: Implement object-grant minting from a `CheckDecision` or from a caller-supplied check action. (2026-06-30) — portable `MonadIO m` `mintObjectGrant`/`mintObjectGrantWithExpiry` (precomputed decision), plus the `Eff es` `mintCheckedObjectGrant` that runs `En.Check.check` and surfaces engine errors as `EngineError`.
+- [x] M3: Implement scoped-grant minting from bounded lookup/container results. (2026-06-30) — `mintScopedGrant`/`mintScopedGrantWithExpiry` reject empty (`EmptyLookupScope`) and oversized (`LookupScopeTooLarge`) container lists.
+- [x] M4: Add tests proving allowed-only minting, expiry defaults, schema hash and consistency-token propagation, and fail-closed behavior. (2026-06-30) — `cabal test en-biscuit` → `en-biscuit tests PASS`; covers Allowed-mints-en_right, Denied/Conditional/engine-error non-mints, `now + defaultTtl` expiry window, consistency-token/schema-hash propagation, and scoped bounds.
 
 
 ## Surprises & Discoveries
@@ -49,6 +49,42 @@ implementation. Provide concise evidence.
   with a `SecretKey`, and `serializeB64` emits the bearer-token form that
   `biscuit-servant` can later parse from an Authorization header.
   Date: 2026-07-01
+
+- Implementation 2026-06-30: `mkBiscuit :: SecretKey -> Block -> IO (Biscuit Open Verified)`
+  cannot fail with a value (it returns a `Biscuit`, not an `Either`), so the
+  planned `BiscuitBuildFailed Text` error constructor would be unconstructable
+  dead code. It was dropped; the only pre-sign failure is grant encoding, carried
+  by `GrantEncodingError EnBiscuitError` (e.g. a non-concrete subject from
+  EP-29). An empty scope needed its own constructor (`EmptyLookupScope`) since
+  "too large" does not describe zero containers.
+  Date: 2026-06-30
+
+- Implementation 2026-06-30: to test "engine errors are surfaced and do not
+  mint", the reliable trigger is an unknown relation: `En.Check.check` does
+  `either throwError pure =<< runCheck …` (`en-core/src/En/Check.hs:68`) and
+  `runCheck` returns `Left (UnknownRelation …)` for a relation absent from the
+  reachability graph (`En/Check.hs:187`). The in-memory `runConsistencyStoreInMemory`
+  never errors (it always resolves to `testRevision`), so consistency is not a
+  usable error source. `mintCheckedObjectGrant` checking permission
+  `"no-such-permission"` therefore yields `Left (EngineError (UnknownRelation …))`.
+  Date: 2026-06-30
+
+- Implementation 2026-06-30: `runErrorNoCallStack @EnError`
+  (`Effectful.Error.Static`) discharges the engine's `Error EnError` effect
+  locally inside `mintCheckedObjectGrant`, so its constraints are only
+  `(ConsistencyStore :> es, TupleStore :> es, IOE :> es)` — the caller does not
+  need `Error EnError`. This is what keeps the "runs a decision" convenience an
+  `Eff es` wrapper without leaking a `MonadIO`-only or Biscuit surface back into
+  `en-core`, exactly as the MasterPlan requires.
+  Date: 2026-06-30
+
+- Implementation 2026-06-30: record /update/ on `expiresAt`
+  (`grant{expiresAt = …}`) triggers GHC's `-Wambiguous-fields` because that
+  field is shared by `EnGrant` and `EnScopedGrant` under `DuplicateRecordFields`
+  (a mechanism GHC warns it will drop). Record /construction/ is unambiguous, so
+  `withObjectExpiry`/`withScopedExpiry` rebuild the record explicitly. Relevant
+  for EP-31 if it needs to attenuate/rewrite grant fields.
+  Date: 2026-06-30
 
 - Validation 2026-06-30: `En.Check.check`/`checkMany` and `En.Lookup.lookup` are
   `effectful` functions, e.g.
@@ -81,13 +117,64 @@ Record every decision made while working on the plan.
   satisfied. A portable downstream grant must not erase that uncertainty.
   Date: 2026-07-01
 
+- Decision (2026-06-30): The issuer controls token lifetime. `mintObjectGrant`/
+  `mintScopedGrant` stamp expiry as `now + defaultTtl` (from `MintConfig`),
+  overwriting whatever `EnGrant.expiresAt` the caller supplied; explicit expiry
+  goes through the `…WithExpiry` variants. Rationale: a grant builder must not be
+  able to forge a long-lived token by setting a far-future `expiresAt`; the
+  minting service's configured TTL is authoritative. This satisfies the
+  acceptance rule "expiry is now + defaultTtl unless an explicit expiry is
+  supplied" while keeping `EnGrant.expiresAt` (a required EP-29 field) meaningful
+  as the value the token actually carries.
+  Date: 2026-06-30
+
+- Decision (2026-06-30): `mintScopedGrant` takes no `CheckDecision`. Rationale:
+  the caller derives the bounded container list from `en.lookup` (which is itself
+  a set of allowed containers); scoped minting records that bounded scope and
+  enforces its size, it does not re-run a per-object decision. Object minting,
+  which corresponds to a single `en.check`, is the path gated on `Allowed`.
+  Date: 2026-06-30
+
+- Decision (2026-06-30): Dropped the planned `BiscuitBuildFailed Text` error
+  constructor. Rationale: `mkBiscuit` returns `IO Biscuit`, not `IO (Either …)`,
+  so there is no build-failure value to carry; keeping the constructor would be
+  unconstructable. Grant-encoding failures use `GrantEncodingError`. (The plan's
+  Interfaces section permitted adjusting the error set.)
+  Date: 2026-06-30
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Outcome (2026-06-30): `En.Biscuit.Mint` turns successful `en` decisions into
+signed Biscuit tokens and fails closed on everything else. All acceptance
+criteria hold (proven by `cabal test en-biscuit`):
+
+- `Allowed` object decision mints a token containing `en_right` (and the
+  supplied `en_consistency_token`/`en_schema_hash`).
+- `Denied` → `Left DecisionDenied`; `mkBiscuit` is not called.
+- `Conditional` → `Left (DecisionConditional obligations)`; not minted.
+- Engine errors (via the `Eff es` `mintCheckedObjectGrant` path) → `Left
+  (EngineError …)`; not minted.
+- Token expiry is `now + defaultTtl` (asserted by an authorizer date window);
+  `…WithExpiry` variants allow an explicit expiry.
+- Scoped minting emits one `en_container_scope` per container and rejects empty
+  (`EmptyLookupScope`) and oversized (`LookupScopeTooLarge`) scopes.
+
+Deliverables: the portable `MonadIO m` "decision → token" API
+(`mintObjectGrant`, `mintScopedGrant`, `…WithExpiry`) is the required target;
+`mintCheckedObjectGrant` is the `Eff es` convenience that runs `En.Check.check`.
+`en-core` gained no Biscuit or `MonadIO`-only surface. New file:
+`en-biscuit/src/En/Biscuit/Mint.hs`; `En.Biscuit` re-exports it; `en-biscuit`
+gained `effectful`/`effectful-core` deps (library) and `containers`/`effectful`/
+`effectful-core` (test).
+
+For EP-31: verify against the exact facts minted here — `en_right`,
+`en_scoped_right`, `en_container_scope`, `en_audience`, `en_expires_at`,
+`en_consistency_token`, `en_schema_hash`, and (when present) `en_request_id`/
+`en_revocation_id` — and treat token expiry as issuer-authoritative.
 
 
 ## Context and Orientation

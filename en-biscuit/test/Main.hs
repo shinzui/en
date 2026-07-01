@@ -1,6 +1,6 @@
 {-# LANGUAGE QuasiQuotes #-}
 
-{- | Tests for en-biscuit. Two groups:
+{- | Tests for en-biscuit. Three groups:
 
   1. A dependency smoke test proving @biscuit-haskell@ is wired correctly
      (mint, serialize, re-parse, authorize a Biscuit).
@@ -9,17 +9,23 @@
      subject/schema-hash/consistency-token/audience/expiry metadata, fails
      closed on non-concrete subjects, and cannot be broken out of via
      punctuation in field values.
+  3. Minting tests proving 'En.Biscuit.Mint' mints only on 'Allowed', fails
+     closed on 'Denied'/'Conditional'/engine errors, stamps @now + defaultTtl@
+     expiry, propagates consistency token and schema hash, and bounds scoped
+     grants.
 -}
 module Main (main) where
 
 import Control.Monad (unless, when)
 import Data.ByteString qualified as BS
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import System.Exit (exitFailure)
 
 import Auth.Biscuit (
+    SecretKey,
     addBlock,
     authorizeBiscuit,
     authorizer,
@@ -27,9 +33,11 @@ import Auth.Biscuit (
     mkBiscuit,
     newSecret,
     parseB64,
+    parseSecretKeyHex,
     serializeB64,
     toPublic,
  )
+import Effectful (runEff)
 
 import En.Biscuit.Grant (
     Audience (..),
@@ -42,9 +50,23 @@ import En.Biscuit.Grant (
     grantBlock,
     grantFactsText,
  )
-import En.Revision (ConsistencyToken (..), SchemaHash (..))
-import En.Schema (ObjectType (..), RelationName (..))
-import En.Tuple (ObjectRef (..), Subject (..))
+import En.Biscuit.Mint (
+    EnBiscuitMintError (..),
+    MintConfig (..),
+    mintCheckedObjectGrant,
+    mintObjectGrant,
+    mintScopedGrant,
+ )
+import En.Conformance.Kikan (
+    fixtureTuples,
+    kikanGraph,
+    runConsistencyStoreInMemory,
+    runTupleStoreInMemory,
+ )
+import En.Decision (CaveatObligation (..), CheckDecision (..))
+import En.Revision (Consistency (..), ConsistencyToken (..), SchemaHash (..))
+import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
+import En.Tuple (CaveatContext (..), ObjectRef (..), Subject (..))
 
 main :: IO ()
 main = do
@@ -53,6 +75,10 @@ main = do
     scopedGrantTest
     unsupportedSubjectTest
     injectionSafetyTest
+    mintAllowedTest
+    mintFailClosedTest
+    mintScopedTest
+    mintCheckedTest
     putStrLn "en-biscuit tests PASS"
 
 -- | Wiring check for the biscuit-haskell dependency.
@@ -218,8 +244,180 @@ injectionSafetyTest = do
         Left _ -> pure ()
         Right _ -> die "injection: forged en_right fact was queryable — breakout!"
 
+{- | An 'Allowed' object decision mints a token carrying @en_right@, propagates
+the consistency token and schema hash, and stamps @now + defaultTtl@ expiry.
+-}
+mintAllowedTest :: IO ()
+mintAllowedTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+        config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+    result <- mintObjectGrant config Allowed sampleObjectGrant
+    bytes <- case result of
+        Right b -> pure b
+        Left e -> die ("mint allowed: expected a token, got " <> show e)
+    biscuit <- either (die . show) pure (parseB64 public bytes)
+    -- One authorization proves en_right + consistency token + schema hash are
+    -- present, and the expiry sits in (now+30m, now+90m) i.e. equals now+60m.
+    auth <-
+        authorizeBiscuit
+            biscuit
+            [authorizer|
+              allow if
+                en_right("document", "roadmap", "view"),
+                en_consistency_token("zk-123"),
+                en_schema_hash("sha-abc"),
+                en_expires_at($t), $t > 2026-07-01T00:30:00Z, $t < 2026-07-01T01:30:00Z;
+            |]
+    case auth of
+        Right _ -> pure ()
+        Left e -> die ("mint allowed: token missing expected facts or expiry: " <> show e)
+
+-- | 'Denied', 'Conditional', and (below) engine errors never mint a token.
+mintFailClosedTest :: IO ()
+mintFailClosedTest = do
+    secret <- loadSecret
+    let config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+    denied <- mintObjectGrant config Denied sampleObjectGrant
+    assertEqual "mint denied fails closed" (Left DecisionDenied) denied
+    let obligations = [CaveatObligation{caveat = CaveatName "within_hours", missingContext = ["now"]}]
+    conditional <- mintObjectGrant config (Conditional obligations) sampleObjectGrant
+    assertEqual "mint conditional fails closed" (Left (DecisionConditional obligations)) conditional
+
+-- | Scoped minting emits one container fact per container and bounds the scope.
+mintScopedTest :: IO ()
+mintScopedTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+        config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+        grant =
+            EnScopedGrant
+                { subject = SubjectId (ObjectRef (ObjectType "user") "bob")
+                , permission = RelationName "edit"
+                , objectType = ObjectType "document"
+                , containers =
+                    [ ObjectRef (ObjectType "folder") "f1"
+                    , ObjectRef (ObjectType "folder") "f2"
+                    ]
+                , consistencyToken = ConsistencyToken "zk-456"
+                , schemaHash = SchemaHash "sha-def"
+                , expiresAt = sampleExpiry
+                , audience = Audience "svc"
+                , requestId = Nothing
+                , revocationId = Nothing
+                }
+    ok <- mintScopedGrant config 5 grant
+    bytes <- case ok of
+        Right b -> pure b
+        Left e -> die ("mint scoped: expected a token, got " <> show e)
+    biscuit <- either (die . show) pure (parseB64 public bytes)
+    auth <-
+        authorizeBiscuit
+            biscuit
+            [authorizer|
+              allow if
+                en_scoped_right("document", "edit"),
+                en_container_scope("folder", "f1"),
+                en_container_scope("folder", "f2");
+            |]
+    case auth of
+        Right _ -> pure ()
+        Left e -> die ("mint scoped: token missing scope facts: " <> show e)
+
+    tooBig <- mintScopedGrant config 1 grant
+    assertEqual "mint scoped rejects oversized scope" (Left (LookupScopeTooLarge 1 2)) tooBig
+
+    emptyScope <- mintScopedGrant config 5 grant{containers = []}
+    assertEqual "mint scoped rejects empty scope" (Left EmptyLookupScope) emptyScope
+
+{- | The @effectful@ convenience runs @en.check@: it mints on 'Allowed' and
+surfaces engine errors as 'EngineError' without minting.
+-}
+mintCheckedTest :: IO ()
+mintCheckedTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+        emptyCtx = CaveatContext Map.empty
+        allowedGrant =
+            objectGrantFor
+                (SubjectId (ObjectRef (ObjectType "user") "alice"))
+                (RelationName "view")
+                (ObjectRef (ObjectType "space") "project-x")
+        unknownGrant =
+            objectGrantFor
+                (SubjectId (ObjectRef (ObjectType "user") "alice"))
+                (RelationName "no-such-permission")
+                (ObjectRef (ObjectType "space") "project-x")
+
+    allowed <-
+        runEff . runTupleStoreInMemory fixtureTuples . runConsistencyStoreInMemory $
+            mintCheckedObjectGrant
+                MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+                kikanGraph
+                MinimizeLatency
+                emptyCtx
+                allowedGrant
+    bytes <- case allowed of
+        Right b -> pure b
+        Left e -> die ("mint checked allowed: expected a token, got " <> show e)
+    biscuit <- either (die . show) pure (parseB64 public bytes)
+    auth <- authorizeBiscuit biscuit [authorizer|allow if en_right("space", "project-x", "view");|]
+    case auth of
+        Right _ -> pure ()
+        Left e -> die ("mint checked allowed: token missing en_right: " <> show e)
+
+    engineErr <-
+        runEff . runTupleStoreInMemory fixtureTuples . runConsistencyStoreInMemory $
+            mintCheckedObjectGrant
+                MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+                kikanGraph
+                MinimizeLatency
+                emptyCtx
+                unknownGrant
+    case engineErr of
+        Left (EngineError _) -> pure ()
+        other -> die ("mint checked: engine error should surface, got " <> showMintResult other)
+
 sampleExpiry :: UTCTime
 sampleExpiry = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 0)
+
+{- | The deterministic issuer key from @Auth.Biscuit.Example@, so tokens sign
+reproducibly across runs.
+-}
+loadSecret :: IO SecretKey
+loadSecret =
+    maybe
+        (die "could not parse the deterministic secret key")
+        pure
+        (parseSecretKeyHex "a2c4ead323536b925f3488ee83e0888b79c2761405ca7c0c9a018c7c1905eecc")
+
+{- | A default object grant; @consistencyToken@/@schemaHash@ match the mint
+authorizers above.
+-}
+objectGrantFor :: Subject -> RelationName -> ObjectRef -> EnGrant
+objectGrantFor subj perm obj =
+    EnGrant
+        { subject = subj
+        , permission = perm
+        , object = obj
+        , consistencyToken = ConsistencyToken "zk-123"
+        , schemaHash = SchemaHash "sha-abc"
+        , expiresAt = sampleExpiry
+        , audience = Audience "svc"
+        , requestId = Nothing
+        , revocationId = Nothing
+        }
+
+sampleObjectGrant :: EnGrant
+sampleObjectGrant =
+    objectGrantFor
+        (SubjectId (ObjectRef (ObjectType "user") "alice"))
+        (RelationName "view")
+        (ObjectRef (ObjectType "document") "roadmap")
+
+showMintResult :: Either EnBiscuitMintError a -> String
+showMintResult (Left err) = "Left " <> show err
+showMintResult (Right _) = "Right <token>"
 
 -- | Render a grant to fact text, failing the test if the grant is unencodable.
 expectFacts :: EnBiscuitGrant -> IO Text

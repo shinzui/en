@@ -85,7 +85,7 @@ decisions, not replace them.
 |---|-------|------|-----------|-----------|--------|
 | 28 | Add the en-biscuit package and dependency wiring | docs/plans/28-add-the-en-biscuit-package-and-dependency-wiring.md | None | None | Complete |
 | 29 | Define the en Biscuit grant vocabulary | docs/plans/29-define-the-en-biscuit-grant-vocabulary.md | EP-28 | None | Complete |
-| 30 | Mint Biscuit grants from en decisions | docs/plans/30-mint-biscuit-grants-from-en-decisions.md | EP-29 | None | Not Started |
+| 30 | Mint Biscuit grants from en decisions | docs/plans/30-mint-biscuit-grants-from-en-decisions.md | EP-29 | None | Complete |
 | 31 | Verify and attenuate en Biscuit grants locally | docs/plans/31-verify-and-attenuate-en-biscuit-grants-locally.md | EP-29 | EP-30 | Not Started |
 | 32 | Document Shomei-compatible Biscuit authorization flows | docs/plans/32-document-shomei-compatible-biscuit-authorization-flows.md | EP-30, EP-31 | None | Not Started |
 
@@ -168,8 +168,8 @@ and the milestone. This section provides an at-a-glance view of the entire initi
 - [x] EP-28: Biscuit dependency wiring is validated against the Mori-registered local source (2026-06-30)
 - [x] EP-29: Grant types and stable Biscuit predicate vocabulary are implemented and tested (2026-06-30)
 - [x] EP-29: Encoding tests prove object and container grants round-trip through Biscuit facts (2026-06-30)
-- [ ] EP-30: Minting helpers create tokens only after `Allowed` decisions
-- [ ] EP-30: Denied, conditional, and error decisions fail closed and do not mint tokens
+- [x] EP-30: Minting helpers create tokens only after `Allowed` decisions (2026-06-30)
+- [x] EP-30: Denied, conditional, and error decisions fail closed and do not mint tokens (2026-06-30)
 - [ ] EP-31: Local verification accepts in-scope tokens and rejects wrong audience, expired, wrong subject, and wrong resource cases
 - [ ] EP-31: Attenuation can narrow broad grants for a downstream service without contacting `en`
 - [ ] EP-32: User docs explain the Shomei authentication plus `en` authorization plus Biscuit delegation flow
@@ -250,6 +250,28 @@ interactions between child plans. Provide concise evidence.
   `biscuit-haskell/biscuit-wai` at the same (or a newer verified) commit rather
   than expecting Hackage to resolve. The `En.Biscuit` module is currently an
   empty placeholder awaiting EP-29's grant vocabulary.
+  Date: 2026-06-30
+
+- EP-30 outcome 2026-06-30: `en-biscuit/src/En/Biscuit/Mint.hs` mints tokens
+  from `en` decisions, re-exported from `En.Biscuit`. Two layers, as the
+  MasterPlan specified: (1) the portable `MonadIO m` "decision → token" API —
+  `mintObjectGrant`/`mintObjectGrantWithExpiry` (precomputed `CheckDecision`) and
+  `mintScopedGrant`/`mintScopedGrantWithExpiry` (bounded container list); (2) the
+  `Eff es` convenience `mintCheckedObjectGrant`, constrained by
+  `(ConsistencyStore :> es, TupleStore :> es, IOE :> es)`, which runs
+  `En.Check.check` and discharges `Error EnError` locally (via
+  `runErrorNoCallStack @EnError`) into `EngineError`. Mint fails closed on
+  `Denied`/`Conditional`/engine-error/`GrantEncodingError`; only `Allowed` (and
+  bounded, non-empty scopes) reach `mkBiscuit`. Issuer-authoritative expiry:
+  mint stamps `now + defaultTtl`, overwriting any caller-supplied `expiresAt`
+  (`…WithExpiry` for explicit). Consequences for **EP-31**: verify against the
+  exact minted facts (`en_right`, `en_scoped_right`, `en_container_scope`,
+  `en_audience`, `en_expires_at`, `en_consistency_token`, `en_schema_hash`,
+  optional `en_request_id`/`en_revocation_id`) and treat expiry as
+  issuer-controlled. `EnBiscuitMintError` dropped the planned
+  `BiscuitBuildFailed` (mkBiscuit can't fail with a value) and added
+  `EmptyLookupScope`/`GrantEncodingError`. `en-biscuit` now depends on
+  `effectful`/`effectful-core`; `en-core` still has no Biscuit surface.
   Date: 2026-06-30
 
 - EP-29 outcome 2026-06-30: the grant vocabulary is implemented in
