@@ -86,7 +86,7 @@ decisions, not replace them.
 | 28 | Add the en-biscuit package and dependency wiring | docs/plans/28-add-the-en-biscuit-package-and-dependency-wiring.md | None | None | Complete |
 | 29 | Define the en Biscuit grant vocabulary | docs/plans/29-define-the-en-biscuit-grant-vocabulary.md | EP-28 | None | Complete |
 | 30 | Mint Biscuit grants from en decisions | docs/plans/30-mint-biscuit-grants-from-en-decisions.md | EP-29 | None | Complete |
-| 31 | Verify and attenuate en Biscuit grants locally | docs/plans/31-verify-and-attenuate-en-biscuit-grants-locally.md | EP-29 | EP-30 | Not Started |
+| 31 | Verify and attenuate en Biscuit grants locally | docs/plans/31-verify-and-attenuate-en-biscuit-grants-locally.md | EP-29 | EP-30 | Complete |
 | 32 | Document Shomei-compatible Biscuit authorization flows | docs/plans/32-document-shomei-compatible-biscuit-authorization-flows.md | EP-30, EP-31 | None | Not Started |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
@@ -170,8 +170,8 @@ and the milestone. This section provides an at-a-glance view of the entire initi
 - [x] EP-29: Encoding tests prove object and container grants round-trip through Biscuit facts (2026-06-30)
 - [x] EP-30: Minting helpers create tokens only after `Allowed` decisions (2026-06-30)
 - [x] EP-30: Denied, conditional, and error decisions fail closed and do not mint tokens (2026-06-30)
-- [ ] EP-31: Local verification accepts in-scope tokens and rejects wrong audience, expired, wrong subject, and wrong resource cases
-- [ ] EP-31: Attenuation can narrow broad grants for a downstream service without contacting `en`
+- [x] EP-31: Local verification accepts in-scope tokens and rejects wrong audience, expired, wrong subject, and wrong resource cases (2026-06-30)
+- [x] EP-31: Attenuation can narrow broad grants for a downstream service without contacting `en` (2026-06-30)
 - [ ] EP-32: User docs explain the Shomei authentication plus `en` authorization plus Biscuit delegation flow
 - [ ] EP-32: Example or test demonstrates a downstream service verifying Shomei identity and Biscuit authorization locally
 
@@ -250,6 +250,28 @@ interactions between child plans. Provide concise evidence.
   `biscuit-haskell/biscuit-wai` at the same (or a newer verified) commit rather
   than expecting Hackage to resolve. The `En.Biscuit` module is currently an
   empty placeholder awaiting EP-29's grant vocabulary.
+  Date: 2026-06-30
+
+- EP-31 outcome 2026-06-30: `en-biscuit/src/En/Biscuit/Verify.hs` provides local,
+  fail-closed verification (`verifyGrant`) and attenuation (`attenuateGrant`),
+  re-exported from `En.Biscuit`, independent of Servant/WAI. Design (relevant to
+  `EP-32` docs): the token's authority-block `en_*` facts are extracted with
+  `queryRawBiscuitFacts` (authority-only by default, so attenuation-added blocks
+  cannot inject facts) and compared in Haskell to produce a distinct
+  `EnBiscuitVerifyError` per failure (`SignatureInvalid`, `Expired`,
+  `WrongSubject`, `WrongAudience`, `UnacceptedSchemaHash`, `OperationNotAuthorized`,
+  `ResourceNotInScope`, `Revoked`, `MalformedGrant`, `RestrictionFailed`);
+  attenuation restrictions are enforced by an authorizer that supplies *ambient
+  request facts* (`operation`, `resource`, `service`, `time`) plus `allow if
+  true`, so added `check if` blocks narrow which request the token accepts.
+  `VerifyRequest` distinguishes `expectedAudience` (matched to `en_audience`, the
+  grant target) from `serviceName` (the caller identity, the attenuable
+  dimension). Scoped verification enforces resource ∈ `en_container_scope` (no
+  graph traversal). Deviations from the plan sketch: `attenuateGrant` returns the
+  biscuit directly (no `Either`); the optional Servant module (M4) is deferred
+  (the plan permits leaving the pure verifier as the deliverable). `en-biscuit`
+  gained a `containers` dep. This is the delegated, local analog of
+  `En.Servant.Authorize.requirePermission` — `EP-32` should present it that way.
   Date: 2026-06-30
 
 - EP-30 outcome 2026-06-30: `en-biscuit/src/En/Biscuit/Mint.hs` mints tokens

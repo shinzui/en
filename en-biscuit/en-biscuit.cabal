@@ -36,11 +36,13 @@ library
     En.Biscuit
     En.Biscuit.Grant
     En.Biscuit.Mint
+    En.Biscuit.Verify
 
   build-depends:
     , base             >=4.19 && <5
     , biscuit-haskell
     , bytestring
+    , containers
     , effectful
     , effectful-core
     , en-core

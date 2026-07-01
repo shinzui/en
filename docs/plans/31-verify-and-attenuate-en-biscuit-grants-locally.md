@@ -35,11 +35,11 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Define verification request/context types and fail-closed error values.
-- [ ] M2: Implement pure/local verification over the shared `en_*` vocabulary.
-- [ ] M3: Implement attenuation helpers that add only narrowing restrictions.
-- [ ] M4: Add optional Servant/WAI helpers if they fit without making pure verification depend on web libraries.
-- [ ] M5: Add tests for success, failure, revocation, and attenuation cases.
+- [x] M1: Define verification request/context types and fail-closed error values. (2026-06-30) — `VerifyRequest m`, `VerifiedGrant`, `VerifiedScope`, and `EnBiscuitVerifyError` (`SignatureInvalid`, `MalformedGrant`, `Expired`, `WrongSubject`, `WrongAudience`, `UnacceptedSchemaHash`, `OperationNotAuthorized`, `ResourceNotInScope`, `Revoked`, `RestrictionFailed`) in `en-biscuit/src/En/Biscuit/Verify.hs`.
+- [x] M2: Implement pure/local verification over the shared `en_*` vocabulary. (2026-06-30) — `verifyGrant` extracts the authority-block `en_*` facts via `queryRawBiscuitFacts`/`getSingleVariableValue` and compares them in Haskell to yield precise errors; no `en-server` call.
+- [x] M3: Implement attenuation helpers that add only narrowing restrictions. (2026-06-30) — `attenuateGrant`/`Attenuation`/`noAttenuation` add a `check if` block over ambient request facts (`service`, `operation`, `resource`, `time`); Biscuit guarantees added blocks only narrow.
+- [~] M4: Add optional Servant/WAI helpers. (2026-06-30) — **Deferred** (allowed by the plan). Adding `biscuit-servant` needs another `source-repository-package` subdir + Servant deps for a thin adapter; the pure verifier is the deliverable and fully covers acceptance. See Decision Log.
+- [x] M5: Add tests for success, failure, revocation, and attenuation cases. (2026-06-30) — `cabal test en-biscuit` → `en-biscuit tests PASS`; covers valid object/scoped, wrong audience/subject/resource/schema, expired, revoked, scope-out, and attenuation narrowing (resource + service).
 
 
 ## Surprises & Discoveries
@@ -52,6 +52,48 @@ implementation. Provide concise evidence.
   helpers. Its auth handler checks signatures and parsing first; endpoint code
   still supplies an authorizer for request-specific Datalog checks.
   Date: 2026-07-01
+
+- Implementation 2026-06-30: fact extraction works via
+  `queryRawBiscuitFacts :: Biscuit -> Query -> Either String (Set Bindings)`
+  where `Bindings = Map Text Value` (from `Auth.Biscuit.Datalog.Executor`) and
+  `Query` from `Auth.Biscuit.Datalog.AST`. `getSingleVariableValue` pulls a
+  single typed value (via `FromValue`, incl. `UTCTime` for `en_expires_at`).
+  Crucially, **`queryRawBiscuitFacts` reads only the authority block by
+  default** (confirmed by the library's own `ScopedExecutor` test: a
+  `trusting`-less query ignores facts added in later blocks). Since minting puts
+  all `en_*` facts in the authority block and attenuation only adds `check if`
+  blocks, the verifier reads the immutable grant facts and cannot be fooled by an
+  attenuation block that adds facts. This is what makes the "Haskell compares
+  extracted facts" design sound.
+  Date: 2026-06-30
+
+- Implementation 2026-06-30: two distinct fact layers are needed. The @en_*@
+  authority facts are checked in Haskell (for precise error values). Attenuation
+  restrictions are enforced by running `authorizeBiscuit` with an authorizer that
+  supplies *ambient request facts* — `operation(...)`, `resource(t,i)`,
+  `service(...)`, `time(...)` — plus `allow if true`. An added `check if` block
+  constrains those ambient facts, so Biscuit enforces the narrowing. An
+  un-attenuated token has no block checks, so the authorizer step is a no-op that
+  returns `Right`.
+  Date: 2026-06-30
+
+- Implementation 2026-06-30: for a scoped grant the verifier cannot traverse the
+  graph, so "resource in scope" is enforced as **resource ∈ the token's
+  `en_container_scope` set**, extracted as `(type,id)` pairs by iterating the
+  `Set Bindings` rows (per-row pairing; `getVariableValues` would lose the
+  type↔id pairing). This is the strongest sound local statement of a scoped
+  grant.
+  Date: 2026-06-30
+
+- Implementation 2026-06-30: `-Wall` under GHC 9.12 *does* flag
+  `-Wmissing-signatures` for top-level helpers whose types mention the biscuit
+  library's `Query`/`Bindings`. Fixed by importing `Query`
+  (`Auth.Biscuit.Datalog.AST`) and `Bindings` (`Auth.Biscuit.Datalog.Executor`)
+  and giving explicit signatures. Also, record-dot on `VerifiedGrant` in tests
+  needs its fields in scope (`import … (VerifiedGrant (..))`) because the field
+  names are shared with `VerifyRequest` under `DuplicateRecordFields`; a record
+  pattern is clearest.
+  Date: 2026-06-30
 
 
 ## Decision Log
@@ -70,13 +112,73 @@ Record every decision made while working on the plan.
   fail-closed error that makes the reason explicit.
   Date: 2026-07-01
 
+- Decision (2026-06-30): Verify base-grant facts in Haskell (extracted from the
+  authority block) for precise per-condition errors, and enforce attenuation via
+  a Biscuit authorizer that supplies ambient request facts. Rationale: a single
+  monolithic authorizer allow/deny cannot say *which* condition failed
+  (wrong-audience vs expired vs wrong-subject …), which the acceptance criteria
+  require; extracting facts and comparing in Haskell gives typed errors.
+  Attenuation, by contrast, is naturally a Biscuit block-check over request
+  facts, so it is enforced by the engine.
+  Date: 2026-06-30
+
+- Decision (2026-06-30): `VerifyRequest` keeps both `expectedAudience` and
+  `serviceName`. `expectedAudience` is matched against the grant's `en_audience`
+  (who the token was minted for); `serviceName` is this verifier's own identity,
+  supplied as the authorizer `service` fact and the dimension attenuation can
+  narrow. They are distinct: audience is the grant's target, service is the
+  concrete caller. Attenuation's `narrowedService` narrows which service may use
+  the token; audience (an authority fact) is not attenuable because Biscuit
+  cannot change an authority fact — a genuine audience change means minting a new
+  grant. This is the sound subset of the plan's "narrow audience/operation/
+  resource"; the "audience" narrowing is realized as service narrowing.
+  Date: 2026-06-30
+
+- Decision (2026-06-30): `attenuateGrant` returns `m (Biscuit Open Verified)`
+  (not `m (Either EnBiscuitVerifyError …)` as sketched). Rationale: `addBlock`
+  cannot fail with a value, so an `Either` would always be `Right`; the plan's
+  Interfaces section permitted signature refinement.
+  Date: 2026-06-30
+
+- Decision (2026-06-30): Defer the optional Servant/WAI module (M4). Rationale:
+  the plan explicitly allows leaving pure verification as the deliverable if the
+  web dependency adds drag. `biscuit-servant` would require a second
+  `source-repository-package` subdir and Servant deps for a thin adapter over
+  `verifyGrant`, and adds nothing to the acceptance criteria (all of which are
+  about the pure verifier + attenuation). A host application can wrap `verifyGrant`
+  in its own `Handler` in a few lines.
+  Date: 2026-06-30
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Outcome (2026-06-30): `En.Biscuit.Verify` lets a downstream service verify a
+token locally and attenuate it before forwarding — no `en-server` round trip.
+All acceptance criteria hold (proven by `cabal test en-biscuit`):
+
+- Valid object grant (right subject/operation/resource/audience/schema, before
+  expiry) → `Right VerifiedGrant`.
+- Wrong audience → `WrongAudience`; expired → `Expired`; wrong subject →
+  `WrongSubject`; wrong resource → `ResourceNotInScope`; unaccepted schema →
+  `UnacceptedSchemaHash`; revoked → `Revoked` (all distinct, fail-closed).
+- Scoped grant: request for an in-scope container succeeds; a resource outside
+  the scope → `ResourceNotInScope`.
+- Attenuated token: narrowed request (narrowed resource + service) verifies; the
+  other in-scope resource and a different service both → `RestrictionFailed`,
+  i.e. the token verifies for the narrowed request but not the broader original.
+
+Deliverables: `en-biscuit/src/En/Biscuit/Verify.hs` (verification + attenuation),
+re-exported from `En.Biscuit`; `en-biscuit` gained a `containers` dep. The pure
+verifier is independent of Servant/WAI. Deviations (see Decision Log):
+`attenuateGrant` returns the biscuit directly (no `Either`); `VerifyRequest`
+keeps `expectedAudience` (grant target) and `serviceName` (caller identity, the
+attenuable dimension); the optional Servant module (M4) is deferred.
+
+This closes the core initiative: mint (EP-30) → verify/attenuate (EP-31) both
+over the EP-29 vocabulary. EP-32 documents the end-to-end Shomei→en→Biscuit flow.
 
 
 ## Context and Orientation

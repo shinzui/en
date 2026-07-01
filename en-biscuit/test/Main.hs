@@ -19,6 +19,8 @@ module Main (main) where
 import Control.Monad (unless, when)
 import Data.ByteString qualified as BS
 import Data.Map.Strict qualified as Map
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
@@ -57,6 +59,15 @@ import En.Biscuit.Mint (
     mintObjectGrant,
     mintScopedGrant,
  )
+import En.Biscuit.Verify (
+    Attenuation (..),
+    EnBiscuitVerifyError (..),
+    VerifiedGrant (..),
+    VerifyRequest (..),
+    attenuateGrant,
+    noAttenuation,
+    verifyGrant,
+ )
 import En.Conformance.Kikan (
     fixtureTuples,
     kikanGraph,
@@ -79,6 +90,9 @@ main = do
     mintFailClosedTest
     mintScopedTest
     mintCheckedTest
+    verifyObjectTests
+    verifyScopedTests
+    attenuationTests
     putStrLn "en-biscuit tests PASS"
 
 -- | Wiring check for the biscuit-haskell dependency.
@@ -377,6 +391,252 @@ mintCheckedTest = do
     case engineErr of
         Left (EngineError _) -> pure ()
         other -> die ("mint checked: engine error should surface, got " <> showMintResult other)
+
+{- | Verify an object token: accept the in-scope request; reject wrong audience,
+expired, wrong subject, wrong resource, unaccepted schema, and revoked.
+-}
+verifyObjectTests :: IO ()
+verifyObjectTests = do
+    secret <- loadSecret
+    let public = toPublic secret
+        config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+        grant =
+            EnGrant
+                { subject = aliceSubject
+                , permission = RelationName "view"
+                , object = ObjectRef (ObjectType "document") "roadmap"
+                , consistencyToken = ConsistencyToken "zk-123"
+                , schemaHash = SchemaHash "sha-abc"
+                , expiresAt = sampleExpiry
+                , audience = Audience "billing-service"
+                , requestId = Just (RequestId "req-1")
+                , revocationId = Just (RevocationId "rev-1")
+                }
+    token <- either (die . show) pure =<< mintObjectGrant config Allowed grant
+
+    let ok =
+            mkVerifyRequest
+                aliceSubject
+                (Audience "billing-service")
+                (RelationName "view")
+                (ObjectRef (ObjectType "document") "roadmap")
+                (Audience "billing-service")
+                acceptedSchemas
+                verifyNow
+                (const (pure False))
+
+    valid <- verifyGrant public token ok
+    case valid of
+        Right VerifiedGrant{subject = s, operation = op} -> do
+            assertEqual "verify: recovered subject" aliceSubject s
+            assertEqual "verify: recovered operation" (RelationName "view") op
+        Left e -> die ("verify valid: expected success, got " <> show e)
+
+    assertVerifyError "wrong audience" WrongAudience
+        =<< verifyGrant public token ok{expectedAudience = Audience "other-service"}
+    assertVerifyError "wrong subject" WrongSubject
+        =<< verifyGrant public token ok{expectedSubject = SubjectId (ObjectRef (ObjectType "user") "bob")}
+    assertVerifyError "wrong resource" ResourceNotInScope
+        =<< verifyGrant public token ok{resource = ObjectRef (ObjectType "document") "other"}
+    assertVerifyError "unaccepted schema" UnacceptedSchemaHash
+        =<< verifyGrant public token ok{acceptedSchemaHashes = Set.singleton (SchemaHash "sha-zzz")}
+    assertVerifyError "revoked" Revoked
+        =<< verifyGrant public token ok{revoked = \r -> pure (r == RevocationId "rev-1")}
+
+    -- Expired needs a request clock after expiry (now + defaultTtl = 01:00Z).
+    let expiredReq =
+            mkVerifyRequest
+                aliceSubject
+                (Audience "billing-service")
+                (RelationName "view")
+                (ObjectRef (ObjectType "document") "roadmap")
+                (Audience "billing-service")
+                acceptedSchemas
+                afterExpiry
+                (const (pure False))
+    assertVerifyError "expired" Expired =<< verifyGrant public token expiredReq
+
+{- | Verify a scoped token: a request for a container in scope succeeds; a
+resource outside the scope fails.
+-}
+verifyScopedTests :: IO ()
+verifyScopedTests = do
+    secret <- loadSecret
+    let public = toPublic secret
+        config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+        grant =
+            EnScopedGrant
+                { subject = aliceSubject
+                , permission = RelationName "view"
+                , objectType = ObjectType "document"
+                , containers =
+                    [ ObjectRef (ObjectType "folder") "f1"
+                    , ObjectRef (ObjectType "folder") "f2"
+                    ]
+                , consistencyToken = ConsistencyToken "zk-456"
+                , schemaHash = SchemaHash "sha-abc"
+                , expiresAt = sampleExpiry
+                , audience = Audience "billing-service"
+                , requestId = Nothing
+                , revocationId = Nothing
+                }
+    token <- either (die . show) pure =<< mintScopedGrant config 5 grant
+
+    inScope <-
+        verifyGrant public token $
+            mkVerifyRequest
+                aliceSubject
+                (Audience "billing-service")
+                (RelationName "view")
+                (ObjectRef (ObjectType "folder") "f1")
+                (Audience "billing-service")
+                acceptedSchemas
+                verifyNow
+                (const (pure False))
+    case inScope of
+        Right _ -> pure ()
+        Left e -> die ("verify scoped in-scope: expected success, got " <> show e)
+
+    outOfScope <-
+        verifyGrant public token $
+            mkVerifyRequest
+                aliceSubject
+                (Audience "billing-service")
+                (RelationName "view")
+                (ObjectRef (ObjectType "folder") "f9")
+                (Audience "billing-service")
+                acceptedSchemas
+                verifyNow
+                (const (pure False))
+    assertVerifyError "scoped resource outside scope" ResourceNotInScope outOfScope
+
+{- | Attenuate a scoped token to one resource and one service; the narrowed
+request still verifies, but the original broader requests do not.
+-}
+attenuationTests :: IO ()
+attenuationTests = do
+    secret <- loadSecret
+    let public = toPublic secret
+        grant =
+            EnScopedGrant
+                { subject = aliceSubject
+                , permission = RelationName "view"
+                , objectType = ObjectType "document"
+                , containers =
+                    [ ObjectRef (ObjectType "folder") "f1"
+                    , ObjectRef (ObjectType "folder") "f2"
+                    ]
+                , consistencyToken = ConsistencyToken "zk-456"
+                , schemaHash = SchemaHash "sha-abc"
+                , expiresAt = laterExpiry
+                , audience = Audience "billing-service"
+                , requestId = Nothing
+                , revocationId = Nothing
+                }
+    grantBlk <- either (die . show) pure (grantBlock (ScopedGrant grant))
+    biscuit <- mkBiscuit secret grantBlk
+    narrowed <-
+        attenuateGrant
+            noAttenuation
+                { narrowedResource = Just (ObjectRef (ObjectType "folder") "f1")
+                , narrowedService = Just (Audience "document-service")
+                }
+            biscuit
+    let token = serializeB64 narrowed
+
+    narrowedOk <-
+        verifyGrant public token $
+            mkVerifyRequest
+                aliceSubject
+                (Audience "billing-service")
+                (RelationName "view")
+                (ObjectRef (ObjectType "folder") "f1")
+                (Audience "document-service")
+                acceptedSchemas
+                verifyNow
+                (const (pure False))
+    case narrowedOk of
+        Right _ -> pure ()
+        Left e -> die ("attenuation: narrowed request should verify, got " <> show e)
+
+    otherResource <-
+        verifyGrant public token $
+            mkVerifyRequest
+                aliceSubject
+                (Audience "billing-service")
+                (RelationName "view")
+                (ObjectRef (ObjectType "folder") "f2")
+                (Audience "document-service")
+                acceptedSchemas
+                verifyNow
+                (const (pure False))
+    assertRestrictionFailed "attenuation blocks the other in-scope resource" otherResource
+
+    otherService <-
+        verifyGrant public token $
+            mkVerifyRequest
+                aliceSubject
+                (Audience "billing-service")
+                (RelationName "view")
+                (ObjectRef (ObjectType "folder") "f1")
+                (Audience "thumbnail-service")
+                acceptedSchemas
+                verifyNow
+                (const (pure False))
+    assertRestrictionFailed "attenuation blocks a different service" otherService
+
+verifyNow :: UTCTime
+verifyNow = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 1800)
+
+afterExpiry :: UTCTime
+afterExpiry = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 7200)
+
+laterExpiry :: UTCTime
+laterExpiry = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 3600)
+
+aliceSubject :: Subject
+aliceSubject = SubjectId (ObjectRef (ObjectType "user") "alice")
+
+acceptedSchemas :: Set SchemaHash
+acceptedSchemas = Set.singleton (SchemaHash "sha-abc")
+
+mkVerifyRequest ::
+    Subject ->
+    Audience ->
+    RelationName ->
+    ObjectRef ->
+    Audience ->
+    Set SchemaHash ->
+    UTCTime ->
+    (RevocationId -> IO Bool) ->
+    VerifyRequest IO
+mkVerifyRequest subj aud op res svc schemas nowT rev =
+    VerifyRequest
+        { expectedSubject = subj
+        , expectedAudience = aud
+        , operation = op
+        , resource = res
+        , serviceName = svc
+        , acceptedSchemaHashes = schemas
+        , now = nowT
+        , revoked = rev
+        }
+
+assertVerifyError :: String -> EnBiscuitVerifyError -> Either EnBiscuitVerifyError VerifiedGrant -> IO ()
+assertVerifyError label expected result =
+    case result of
+        Left err | err == expected -> pure ()
+        other -> die ("verify " <> label <> ": expected Left " <> show expected <> ", got " <> showVerify other)
+
+assertRestrictionFailed :: String -> Either EnBiscuitVerifyError VerifiedGrant -> IO ()
+assertRestrictionFailed label result =
+    case result of
+        Left (RestrictionFailed _) -> pure ()
+        other -> die (label <> ": expected RestrictionFailed, got " <> showVerify other)
+
+showVerify :: Either EnBiscuitVerifyError VerifiedGrant -> String
+showVerify (Left err) = "Left " <> show err
+showVerify (Right _) = "Right <verified grant>"
 
 sampleExpiry :: UTCTime
 sampleExpiry = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 0)

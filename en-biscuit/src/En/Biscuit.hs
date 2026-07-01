@@ -10,14 +10,15 @@ into scope:
     predicate vocabulary.
   * "En.Biscuit.Mint" — minting helpers that turn successful en decisions into
     signed Biscuit tokens.
-  * ExecPlan 31 adds local verification and attenuation ("En.Biscuit.Verify").
-
-Those later modules are re-exported here as they land.
+  * "En.Biscuit.Verify" — local, fail-closed verification and attenuation of
+    those tokens in a downstream service.
 -}
 module En.Biscuit (
     module En.Biscuit.Grant,
     module En.Biscuit.Mint,
+    module En.Biscuit.Verify,
 ) where
 
 import En.Biscuit.Grant
 import En.Biscuit.Mint
+import En.Biscuit.Verify
