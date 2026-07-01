@@ -84,7 +84,7 @@ decisions, not replace them.
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | 28 | Add the en-biscuit package and dependency wiring | docs/plans/28-add-the-en-biscuit-package-and-dependency-wiring.md | None | None | Complete |
-| 29 | Define the en Biscuit grant vocabulary | docs/plans/29-define-the-en-biscuit-grant-vocabulary.md | EP-28 | None | Not Started |
+| 29 | Define the en Biscuit grant vocabulary | docs/plans/29-define-the-en-biscuit-grant-vocabulary.md | EP-28 | None | Complete |
 | 30 | Mint Biscuit grants from en decisions | docs/plans/30-mint-biscuit-grants-from-en-decisions.md | EP-29 | None | Not Started |
 | 31 | Verify and attenuate en Biscuit grants locally | docs/plans/31-verify-and-attenuate-en-biscuit-grants-locally.md | EP-29 | EP-30 | Not Started |
 | 32 | Document Shomei-compatible Biscuit authorization flows | docs/plans/32-document-shomei-compatible-biscuit-authorization-flows.md | EP-30, EP-31 | None | Not Started |
@@ -166,8 +166,8 @@ and the milestone. This section provides an at-a-glance view of the entire initi
 
 - [x] EP-28: `en-biscuit` package builds as an optional target without changing `en-core` (2026-06-30)
 - [x] EP-28: Biscuit dependency wiring is validated against the Mori-registered local source (2026-06-30)
-- [ ] EP-29: Grant types and stable Biscuit predicate vocabulary are implemented and tested
-- [ ] EP-29: Encoding tests prove object and container grants round-trip through Biscuit facts
+- [x] EP-29: Grant types and stable Biscuit predicate vocabulary are implemented and tested (2026-06-30)
+- [x] EP-29: Encoding tests prove object and container grants round-trip through Biscuit facts (2026-06-30)
 - [ ] EP-30: Minting helpers create tokens only after `Allowed` decisions
 - [ ] EP-30: Denied, conditional, and error decisions fail closed and do not mint tokens
 - [ ] EP-31: Local verification accepts in-scope tokens and rejects wrong audience, expired, wrong subject, and wrong resource cases
@@ -250,6 +250,27 @@ interactions between child plans. Provide concise evidence.
   `biscuit-haskell/biscuit-wai` at the same (or a newer verified) commit rather
   than expecting Hackage to resolve. The `En.Biscuit` module is currently an
   empty placeholder awaiting EP-29's grant vocabulary.
+  Date: 2026-06-30
+
+- EP-29 outcome 2026-06-30: the grant vocabulary is implemented in
+  `en-biscuit/src/En/Biscuit/Grant.hs` and re-exported from `En.Biscuit`. Two
+  contracts later plans (`EP-30` mint, `EP-31` verify) must consume as-is:
+  (1) **API** — `EnGrant`, `EnScopedGrant`, `EnBiscuitGrant(ObjectGrant|ScopedGrant)`,
+  the token-local newtypes `Audience`/`RequestId`/`RevocationId`,
+  `EnBiscuitError(UnsupportedSubject)`, and
+  `grantBlock :: EnBiscuitGrant -> Either EnBiscuitError Block` (the single fact
+  builder) plus `grantFactsText :: EnBiscuitGrant -> Either EnBiscuitError Text`.
+  Note `grantFactsText` returns `Either` (refined from the plan's `Text`).
+  (2) **Vocabulary** — `en_subject`, `en_right`, `en_scoped_right`,
+  `en_container_scope`, `en_schema_hash`, `en_consistency_token`, `en_audience`,
+  `en_expires_at`, `en_request_id`, `en_revocation_id`. Facts are built via the
+  `[block|…|]` quasiquoter (`ToTerm` escaping; `Block` is a `Monoid`, so
+  per-container facts `mconcat`), and a non-concrete subject (`SubjectSet`/
+  `SubjectWildcard`) fails closed with `UnsupportedSubject` — `EP-30` minting
+  must propagate that as a non-mint, consistent with mint-only-`Allowed`.
+  `EP-31` should verify against these exact predicate names/arities. Injection
+  safety is proven semantically (mint + authorizer query of a forged fact), not
+  by substring counting.
   Date: 2026-06-30
 
 - Validation 2026-06-30: the grant vocabulary types all exist as `EP-29` assumes.

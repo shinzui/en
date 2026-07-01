@@ -32,7 +32,10 @@ common shared
 library
   import:          warnings, shared
   hs-source-dirs:  src
-  exposed-modules: En.Biscuit
+  exposed-modules:
+    En.Biscuit
+    En.Biscuit.Grant
+
   build-depends:
     , base             >=4.19 && <5
     , biscuit-haskell
@@ -51,3 +54,6 @@ test-suite en-biscuit-tests
     , biscuit-haskell
     , bytestring
     , en-biscuit
+    , en-core
+    , text
+    , time

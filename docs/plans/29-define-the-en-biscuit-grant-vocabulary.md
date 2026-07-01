@@ -34,10 +34,10 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Define `En.Biscuit.Grant` with object grants, scoped/container grants, audiences, expiry, and request metadata.
-- [ ] M2: Define the stable Biscuit predicate vocabulary and rendering helpers.
-- [ ] M3: Add pure tests for object grants, scoped grants, schema hash, consistency token, audience, expiry, and subject encoding.
-- [ ] M4: Update `En.Biscuit` top-level exports.
+- [x] M1: Define `En.Biscuit.Grant` with object grants, scoped/container grants, audiences, expiry, and request metadata. (2026-06-30) — `EnGrant`, `EnScopedGrant`, `EnBiscuitGrant`, and token-local newtypes `Audience`/`RequestId`/`RevocationId` in `en-biscuit/src/En/Biscuit/Grant.hs`, built from `En.Tuple`/`En.Schema`/`En.Revision` types.
+- [x] M2: Define the stable Biscuit predicate vocabulary and rendering helpers. (2026-06-30) — `grantBlock :: EnBiscuitGrant -> Either EnBiscuitError Block` builds facts via the `[block|…|]` quasiquoter with `{var}` antiquotation (all escaping handled by `ToTerm`); `grantFactsText` renders the same `Block` with `renderBlock`. Vocabulary: `en_subject`, `en_right`, `en_scoped_right`, `en_container_scope`, `en_schema_hash`, `en_consistency_token`, `en_audience`, `en_expires_at`, `en_request_id`, `en_revocation_id`.
+- [x] M3: Add pure tests for object grants, scoped grants, schema hash, consistency token, audience, expiry, and subject encoding. (2026-06-30) — `en-biscuit/test/Main.hs` covers object/scoped grants, per-container fact count, absent optional facts, fail-closed on `SubjectWildcard`/`SubjectSet`, and a semantic injection-safety test. `cabal test en-biscuit` → `en-biscuit tests PASS`.
+- [x] M4: Update `En.Biscuit` top-level exports. (2026-06-30) — `En.Biscuit` now `re-exports module En.Biscuit.Grant`; `En.Biscuit.Grant` added to the cabal `exposed-modules`.
 
 
 ## Surprises & Discoveries
@@ -51,6 +51,39 @@ implementation. Provide concise evidence.
   follow that style but avoid ambiguous generic names where `en_`-prefixed
   names make provenance clearer.
   Date: 2026-07-01
+
+- Implementation 2026-06-30: `Block` (from `Auth.Biscuit`, alias of
+  `Auth.Biscuit.Datalog.AST.Block'`) is a `Monoid` (Semigroup/Monoid instances
+  at `Auth/Biscuit/Datalog/AST.hs:980,992`). This is what makes a variable
+  number of `en_container_scope` facts easy: build one `[block|…|]` per
+  container and `mconcat` them. `renderBlock :: Block -> Text` is exported from
+  the (exposed) `Auth.Biscuit.Datalog.AST` module and is what `Show Block` uses,
+  so `grantFactsText` is just `fmap renderBlock . grantBlock` — a single source
+  of truth for the fact text.
+  Date: 2026-06-30
+
+- Implementation 2026-06-30: the `[block|…|]` quasiquoter's `{name}`
+  antiquotation resolves *in-scope Haskell identifiers at runtime* (via a `Lift`
+  instance that emits `toTerm name`), including identifiers bound in `let`,
+  function arguments, and list-comprehension binders. `ToTerm` instances exist
+  for `Text`, `Int`, `Integer`, `Bool`, `ByteString`, and `UTCTime`
+  (`Auth/Biscuit/Datalog/AST.hs:300-343`), so `en_expires_at({expiresAt})` with
+  `expiresAt :: UTCTime` renders as a Datalog date term. No manual escaping is
+  written anywhere in `En.Biscuit.Grant`.
+  Date: 2026-06-30
+
+- Testing gotcha 2026-06-30: proving injection-safety by *counting substrings*
+  of the rendered fact text is wrong. `renderBlock` renders a string term with
+  `show`, which escapes quotes/backslashes but leaves `en_right(` /`;` characters
+  literally inside the quoted string. An object id crafted to look like a forged
+  `en_right(...)` fact therefore makes `T.count "en_right(" facts == 2` even
+  though there is only one real fact. The correct proof is *semantic*: mint the
+  grant into a real Biscuit and run an authorizer that queries the forged fact —
+  it must fail to match (the injected text is one opaque string term, not a
+  fact). The test keeps a positive control (`allow if en_subject("user","alice")`
+  passes) so a `Left` from the exploit query can't be mistaken for a broken
+  token.
+  Date: 2026-06-30
 
 
 ## Decision Log
@@ -71,13 +104,63 @@ Record every decision made while working on the plan.
   `AuthUser` or `AuthClaims` to `Subject`.
   Date: 2026-07-01
 
+- Decision (2026-06-30): Build facts by constructing `Block` values through the
+  `[block|…|]` quasiquoter + `{var}` antiquotation and `mconcat`, rather than
+  rendering Datalog text and re-parsing it. `grantFactsText` derives text from
+  the `Block` via `renderBlock`. Rationale: the quasiquoter routes every dynamic
+  value through `ToTerm`, so all escaping lives in the library and injection is
+  impossible at the AST level; deriving text from the block keeps a single
+  source of truth. `EP-30` and `EP-31` must consume `grantBlock`/the same
+  vocabulary — do not hand-render Datalog strings.
+  Date: 2026-06-30
+
+- Decision (2026-06-30): `grantFactsText` returns
+  `Either EnBiscuitError Text`, not the `Text` shown in the plan's Interfaces
+  sketch. Rationale: rendering derives from `grantBlock`, which can fail
+  (`UnsupportedSubject`); threading that `Either` through is more honest than
+  swallowing errors into an empty/placeholder string. (The plan's Interfaces
+  section explicitly permitted refining the signature.)
+  Date: 2026-06-30
+
+- Decision (2026-06-30): A non-concrete subject (`SubjectSet` userset or
+  `SubjectWildcard`) makes `grantBlock` return `Left (UnsupportedSubject …)`
+  rather than emitting any subject fact. Rationale: only `SubjectId` maps to
+  `en_subject($type,$id)`; wildcard grants are deferred and a userset is not a
+  single principal. Failing closed matches the initiative's mint-only-`Allowed`
+  posture and prevents accidental authorization widening. `en_subject_wildcard()`
+  is intentionally not emitted.
+  Date: 2026-06-30
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Outcome (2026-06-30): `En.Biscuit.Grant` gives one canonical, type-checked way
+to represent an `en` decision as Biscuit facts, and the top-level `En.Biscuit`
+re-exports it. All acceptance criteria hold:
+
+- `cabal test en-biscuit` passes (`en-biscuit tests PASS`).
+- The object-grant test proves `en_subject`, `en_right`, `en_schema_hash`,
+  `en_consistency_token`, `en_audience`, and `en_expires_at` all appear (plus
+  `en_request_id`/`en_revocation_id` when present).
+- The scoped-grant test proves `en_scoped_right` and exactly one
+  `en_container_scope` per container, and that optional facts are omitted when
+  absent.
+- `En.Biscuit.Grant` imports only `en-core` (`En.Tuple`, `En.Schema`,
+  `En.Revision`) and Biscuit/base/text/time — no `en-servant`, `en-server`, or
+  Shomei.
+- The top-level `En.Biscuit` re-exports the grant API.
+
+New file: `en-biscuit/src/En/Biscuit/Grant.hs`. Modified: `en-biscuit.cabal`
+(exposed module + `en-core`/`text`/`time` test deps), `En/Biscuit.hs`
+(re-export), `en-biscuit/test/Main.hs` (grant tests).
+
+Deviation vs. the plan's Interfaces sketch: `grantFactsText` returns
+`Either EnBiscuitError Text` (see Decision Log). The vocabulary and grant types
+otherwise match the plan exactly, so `EP-30` (mint) and `EP-31` (verify) can
+build on `grantBlock`/`EnBiscuitGrant`/`EnBiscuitError` as designed.
 
 
 ## Context and Orientation
