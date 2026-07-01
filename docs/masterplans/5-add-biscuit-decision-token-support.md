@@ -1,0 +1,249 @@
+---
+id: 5
+slug: add-biscuit-decision-token-support
+title: "Add Biscuit decision-token support"
+kind: master-plan
+created_at: 2026-07-01T04:50:28Z
+---
+
+# Add Biscuit decision-token support
+
+This MasterPlan is a living document. The sections Progress, Surprises & Discoveries,
+Decision Log, and Outcomes & Retrospective must be kept up to date as work proceeds.
+
+
+## Vision & Scope
+
+`en` is the relationship-based authorization engine and source of truth for
+decisions. Today a gateway or resource-owning service can call `/check`,
+`/batch-check`, or `/lookup`, but there is no first-class way to carry the
+result of that decision through a microservice request chain. This initiative
+adds an optional `en-biscuit` package that turns a successful `en` decision into
+a short-lived Biscuit token: a signed, attenuable bearer credential that
+downstream services can verify locally without calling `en-server` again for
+the same user/object/scope decision.
+
+After the initiative, a service can authenticate a caller with Shomei, convert
+the authenticated Shomei principal into an `En.Tuple.Subject`, call `en.check`
+or `en.lookup`, mint a Biscuit only when the decision is `Allowed`, and pass
+that token to downstream services. The downstream service verifies the Biscuit
+signature and Datalog policy locally, checks audience, expiry, subject, service,
+operation, resource or container scope, schema hash, and consistency-token
+metadata, and calls `en` only when it owns a new protected decision or requires
+fresh graph state.
+
+The initiative is intentionally optional. `en-core` remains free of Biscuit,
+Servant, WAI, Shomei, and HTTP dependencies. `en-servant`, `en-server`, and
+existing clients continue to work unchanged unless they opt into the new
+package. Shomei remains the authentication system: it verifies login/session
+JWTs, publishes JWKS, and produces the user principal. Biscuit does not replace
+Shomei, does not authenticate browsers by itself, and must not become a
+long-lived permission store. Biscuit tokens carry bounded authorization grants
+derived from `en`, not copies of the relationship graph.
+
+In scope: package scaffolding for `en-biscuit`, a typed grant model, a stable
+Biscuit fact vocabulary for `en` decisions, minting helpers over `en` decisions,
+local verification and attenuation helpers, Servant/WAI integration points where
+they fit, and documentation/examples that show Shomei authentication followed by
+`en` authorization and Biscuit delegation. Out of scope: reimplementing group
+membership or inheritance in Biscuit Datalog, replacing `/lookup` or `/expand`,
+changing the existing `/check` wire API, storing raw tuple writes in browsers,
+or moving Shomei JWT/session concerns into `en-biscuit`.
+
+
+## Decomposition Strategy
+
+The work is split by functional boundary. `EP-28` creates the optional package
+and dependency wiring so later plans have a real compilation target but
+`en-core` stays dependency-light. `EP-29` defines the typed grant model and the
+Biscuit fact vocabulary; every later plan consumes that vocabulary, so it is the
+integration spine. `EP-30` mints grants from successful `en` decisions. `EP-31`
+verifies and attenuates those grants locally in downstream services. `EP-32`
+documents and demonstrates the complete adoption shape, especially the
+compatibility rule that Shomei authenticates and `en-biscuit` authorizes.
+
+This ordering keeps speculative service integration from blocking the stable
+core vocabulary. It also lets a contributor validate Biscuit independently:
+after `EP-29`, pure encode/decode tests prove the facts are stable; after
+`EP-30`, minting tests prove `Denied` and `Conditional` fail closed; after
+`EP-31`, local verification tests prove downstream services can avoid repeated
+`en-server` calls inside token scope.
+
+Rejected alternatives: putting Biscuit support in `en-core` would force every
+embedded user to take a token-format dependency. Adding only documentation would
+not provide a reusable, type-checked way to keep facts, audiences, and expiry
+consistent across services. Making Biscuit the primary authorization model was
+rejected because `en` already owns graph traversal, consistency tokens,
+`lookup`, and `expand`; Biscuit should carry bounded proofs derived from those
+decisions, not replace them.
+
+
+## Exec-Plan Registry
+
+| # | Title | Path | Hard Deps | Soft Deps | Status |
+|---|-------|------|-----------|-----------|--------|
+| 28 | Add the en-biscuit package and dependency wiring | docs/plans/28-add-the-en-biscuit-package-and-dependency-wiring.md | None | None | Not Started |
+| 29 | Define the en Biscuit grant vocabulary | docs/plans/29-define-the-en-biscuit-grant-vocabulary.md | EP-28 | None | Not Started |
+| 30 | Mint Biscuit grants from en decisions | docs/plans/30-mint-biscuit-grants-from-en-decisions.md | EP-29 | None | Not Started |
+| 31 | Verify and attenuate en Biscuit grants locally | docs/plans/31-verify-and-attenuate-en-biscuit-grants-locally.md | EP-29 | EP-30 | Not Started |
+| 32 | Document Shomei-compatible Biscuit authorization flows | docs/plans/32-document-shomei-compatible-biscuit-authorization-flows.md | EP-30, EP-31 | None | Not Started |
+
+Status values: Not Started, In Progress, Complete, Cancelled.
+Hard Deps and Soft Deps reference other rows by their # prefix (e.g., EP-1, EP-3).
+
+
+## Dependency Graph
+
+`EP-28` is first because every other plan needs an `en-biscuit` package target
+with dependencies on `en-core`, `biscuit-haskell`, `time`, `text`, and test
+libraries. It also records any Cabal or Nix wiring needed to make the local Mori
+registered dependency build under this repository's GHC.
+
+`EP-29` depends hard on `EP-28` because the grant modules must live in a real
+package. It defines the shared types and Datalog vocabulary. `EP-30` depends
+hard on `EP-29` because minting must emit the vocabulary exactly. `EP-31`
+depends hard on `EP-29` because verification must consume the same vocabulary;
+it has only a soft dependency on `EP-30` because verifier tests can construct
+test tokens directly, but integration tests become stronger once minting exists.
+`EP-32` depends hard on `EP-30` and `EP-31` because the adoption docs and
+examples should show the real minted and verified path, not pseudocode.
+
+Parallelism: after `EP-29` lands, `EP-30` and `EP-31` can proceed in parallel
+if they both respect the vocabulary and error types defined by `EP-29`. `EP-32`
+should wait until both are complete so it documents shipped names and behavior.
+
+
+## Integration Points
+
+`en-biscuit/en-biscuit.cabal` and `cabal.project` are shared by all child plans.
+`EP-28` owns the initial package stanza and package list. Later plans add
+exposed modules and dependencies only when their code requires them.
+
+`En.Biscuit.Grant` is the central shared API. `EP-29` owns the grant types,
+including object grants, scoped/container grants, audiences, expiry,
+schema-hash and consistency-token fields, and the subject encoding. `EP-30`
+constructs those types from `en` decisions. `EP-31` consumes them during local
+verification and attenuation. `EP-32` documents them.
+
+The Biscuit Datalog vocabulary is shared by `EP-29`, `EP-30`, and `EP-31`.
+`EP-29` owns predicate names and arity, for example `en_subject`, `en_right`,
+`en_container_scope`, `en_schema_hash`, `en_consistency_token`,
+`en_audience`, `en_request_id`, `operation`, `resource`, `service`, and
+`time`. Later plans must not invent alternate predicate names for the same
+concept.
+
+`En.Biscuit.Mint` is owned by `EP-30`. It must call `en.check`, `en.checkMany`,
+or `en.lookup` through existing `en-core` functions or through caller-provided
+decision inputs. It must mint only on `Allowed` and fail closed on `Denied`,
+`Conditional`, and engine errors.
+
+`En.Biscuit.Verify` is owned by `EP-31`. It must verify a trusted issuer key,
+audience, expiry, subject, operation, resource/container coverage, schema hash,
+consistency-token metadata, and optional revocation identifier. It may wrap
+`biscuit-servant` or `biscuit-wai`, but the pure verifier remains usable without
+Servant.
+
+Shomei compatibility is an integration rule, not a package dependency.
+`EP-32` owns the documentation and example flow. `en-biscuit` should not depend
+on `shomei-core`, `shomei-jwt`, or `shomei-servant`; host applications adapt a
+verified `Shomei.Servant.Auth.AuthUser` or `Shomei.Domain.Claims.AuthClaims`
+into an `En.Tuple.Subject` before minting or verification.
+
+
+## Progress
+
+Track milestone-level progress across all child plans. Each entry names the child plan
+and the milestone. This section provides an at-a-glance view of the entire initiative.
+
+- [ ] EP-28: `en-biscuit` package builds as an optional target without changing `en-core`
+- [ ] EP-28: Biscuit dependency wiring is validated against the Mori-registered local source
+- [ ] EP-29: Grant types and stable Biscuit predicate vocabulary are implemented and tested
+- [ ] EP-29: Encoding tests prove object and container grants round-trip through Biscuit facts
+- [ ] EP-30: Minting helpers create tokens only after `Allowed` decisions
+- [ ] EP-30: Denied, conditional, and error decisions fail closed and do not mint tokens
+- [ ] EP-31: Local verification accepts in-scope tokens and rejects wrong audience, expired, wrong subject, and wrong resource cases
+- [ ] EP-31: Attenuation can narrow broad grants for a downstream service without contacting `en`
+- [ ] EP-32: User docs explain the Shomei authentication plus `en` authorization plus Biscuit delegation flow
+- [ ] EP-32: Example or test demonstrates a downstream service verifying Shomei identity and Biscuit authorization locally
+
+
+## Surprises & Discoveries
+
+Document cross-plan insights, dependency changes, scope adjustments, or unexpected
+interactions between child plans. Provide concise evidence.
+
+- Discovery during decomposition: `eclipse-biscuit/biscuit-haskell` is already
+  registered in Mori at `/Users/shinzui/Keikaku/hub/haskell/biscuit-haskell-project`
+  with packages `biscuit-haskell`, `biscuit-servant`, and `biscuit-wai`.
+  `mori registry docs eclipse-biscuit/biscuit-haskell` reports no curated docs,
+  so child plans must read the local source and READMEs directly.
+  Date: 2026-07-01
+
+- Discovery during decomposition: Shomei is authentication, not authorization.
+  `Shomei.Servant.Auth.Authenticated` verifies a Bearer JWT or session cookie
+  and produces `AuthUser`; the microservice example verifies Shomei JWTs
+  locally against a TTL-cached JWKS. That does not conflict with `en-biscuit`;
+  it is the identity precondition for minting or verifying authorization
+  grants.
+  Date: 2026-07-01
+
+- Discovery during decomposition: the existing `en-servant` cabal description
+  already says route protection is based on an `en.check` decision against a
+  caller's verified Shomei identity. The Biscuit work should preserve that
+  ordering and make downstream delegation explicit.
+  Date: 2026-07-01
+
+
+## Decision Log
+
+Record every decomposition or coordination decision made while working on the master
+plan.
+
+- Decision: Add Biscuit support as a new optional `en-biscuit` package rather
+  than adding Biscuit dependencies to `en-core`.
+  Rationale: `en-core` is the transport- and database-agnostic engine. Keeping
+  Biscuit optional preserves embedded users who want plain `check`, `lookup`,
+  and `expand` without a token format dependency.
+  Date: 2026-07-01
+
+- Decision: Treat Shomei as authentication only and keep it out of
+  `en-biscuit` dependencies.
+  Rationale: Shomei verifies identity and session state through JWT/JWKS and
+  produces a principal. `en` decides whether that principal can perform an
+  action. Biscuit carries a bounded proof of that authorization decision.
+  Mixing these layers would make ownership unclear and could let an
+  authorization token be mistaken for login/session proof.
+  Date: 2026-07-01
+
+- Decision: Tokens are short-lived decision grants, not long-lived permission
+  state.
+  Rationale: Revocation and graph traversal remain in `en`. A Biscuit can safely
+  reduce repeated downstream checks only while its audience, expiry, and scope
+  are narrow enough that stale authorization is acceptable.
+  Date: 2026-07-01
+
+- Decision: Use the Mori-registered `eclipse-biscuit/biscuit-haskell` source,
+  including `biscuit-servant` and `biscuit-wai` where useful, after validating
+  the actual APIs in local source.
+  Rationale: The repository already has the dependency indexed locally, and the
+  API surface includes `mkBiscuit`, `addBlock`, `parseB64`, `parseWith`,
+  `authorizeBiscuit`, `authorizer`, `block`, `defaultBiscuitConfig`,
+  `authHandlerWith`, and `checkBiscuitM`, which match the needed mint, verify,
+  and Servant integration shapes.
+  Date: 2026-07-01
+
+- Decision: Public `en-biscuit` minting and verification helpers should be
+  polymorphic over `MonadIO m` rather than returning concrete `IO`.
+  Rationale: Biscuit's Haskell APIs perform `IO`, but host applications will
+  call the helpers from `Handler`, `ReaderT`, or another application monad.
+  `MonadIO m` keeps the reusable package easy to embed while still allowing
+  thin `IO` convenience wrappers where useful.
+  Date: 2026-07-01
+
+
+## Outcomes & Retrospective
+
+Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
+Compare the result against the original vision.
+
+(To be filled during and after implementation.)
