@@ -5,6 +5,7 @@ title: "Document Shomei-compatible Biscuit authorization flows"
 kind: exec-plan
 created_at: 2026-07-01T04:50:46Z
 master_plan: "docs/masterplans/5-add-biscuit-decision-token-support.md"
+intention: intention_01kwe136p1expbzvj08bqwtz08
 ---
 
 # Document Shomei-compatible Biscuit authorization flows

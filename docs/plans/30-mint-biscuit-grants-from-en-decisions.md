@@ -5,6 +5,7 @@ title: "Mint Biscuit grants from en decisions"
 kind: exec-plan
 created_at: 2026-07-01T04:50:38Z
 master_plan: "docs/masterplans/5-add-biscuit-decision-token-support.md"
+intention: intention_01kwe136p1expbzvj08bqwtz08
 ---
 
 # Mint Biscuit grants from en decisions
@@ -48,6 +49,20 @@ implementation. Provide concise evidence.
   with a `SecretKey`, and `serializeB64` emits the bearer-token form that
   `biscuit-servant` can later parse from an Authorization header.
   Date: 2026-07-01
+
+- Validation 2026-06-30: `En.Check.check`/`checkMany` and `En.Lookup.lookup` are
+  `effectful` functions, e.g.
+  `check :: (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) => ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckDecision`
+  (`en-core/src/En/Check.hs`). `CheckDecision(Allowed | Denied | Conditional [CaveatObligation])`
+  is defined in `En.Decision` and re-exported by `En.Check`. Consequence for the
+  M2 "higher-level helper that runs a caller-provided check action": that helper
+  must run in `Eff es` with the engine effect constraints above — it is NOT
+  `MonadIO m`. The `MonadIO m` signatures in "Interfaces and Dependencies"
+  (`mintObjectGrant`/`mintScopedGrant`) remain correct precisely because they
+  take a precomputed `CheckDecision` and only perform Biscuit signing; keep that
+  low-level "decision → token" API as the required deliverable and expose any
+  check-running convenience as a separate `Eff es` wrapper.
+  Date: 2026-06-30
 
 
 ## Decision Log

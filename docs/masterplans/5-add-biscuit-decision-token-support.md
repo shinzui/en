@@ -4,6 +4,7 @@ slug: add-biscuit-decision-token-support
 title: "Add Biscuit decision-token support"
 kind: master-plan
 created_at: 2026-07-01T04:50:28Z
+intention: intention_01kwe136p1expbzvj08bqwtz08
 ---
 
 # Add Biscuit decision-token support
@@ -132,10 +133,18 @@ The Biscuit Datalog vocabulary is shared by `EP-29`, `EP-30`, and `EP-31`.
 `time`. Later plans must not invent alternate predicate names for the same
 concept.
 
-`En.Biscuit.Mint` is owned by `EP-30`. It must call `en.check`, `en.checkMany`,
-or `en.lookup` through existing `en-core` functions or through caller-provided
-decision inputs. It must mint only on `Allowed` and fail closed on `Denied`,
-`Conditional`, and engine errors.
+`En.Biscuit.Mint` is owned by `EP-30`. Its primary, portable deliverable mints
+from a *precomputed* `En.Decision.CheckDecision` (re-exported by `En.Check`), so
+the reusable signing helper stays `MonadIO m` and does not entangle the engine.
+Any convenience helper that *runs* a decision must call the real engine
+functions `En.Check.check`, `En.Check.checkMany`, or `En.Lookup.lookup`, which
+are `effectful` computations of shape
+`(ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) => ... -> Eff es CheckDecision`
+(not `IO`, and not plain `MonadIO m` — see the Surprises & Discoveries note on
+the effectful engine). Such a helper therefore runs in `Eff es` and carries
+those effect constraints. Either path must mint only on `Allowed` and fail
+closed on `Denied`, `Conditional`, and engine errors — the same fail-closed rule
+`En.Servant.Authorize.requirePermission` already applies for route guards.
 
 `En.Biscuit.Verify` is owned by `EP-31`. It must verify a trusted issuer key,
 audience, expiry, subject, operation, resource/container coverage, schema hash,
@@ -193,6 +202,49 @@ interactions between child plans. Provide concise evidence.
   ordering and make downstream delegation explicit.
   Date: 2026-07-01
 
+- Validation 2026-06-30: the `en-core` engine is `effectful`, not `IO`. `check`,
+  `checkMany`, and `checkCached` (`en-core/src/En/Check.hs`) and `lookup`,
+  `lookupWithDeadline` (`en-core/src/En/Lookup.hs`) are `Eff es` functions
+  constrained by `(ConsistencyStore :> es, TupleStore :> es, Error EnError :> es)`.
+  There is no `en` record or namespace value; the prose shorthand `en.check`
+  means the module-qualified function `En.Check.check`. Consequence for `EP-30`:
+  a helper that *runs* a decision cannot be `MonadIO m`; it must run in `Eff es`
+  with the engine effect constraints. The `MonadIO m` surface is correct only for
+  helpers that take a precomputed `CheckDecision` and do Biscuit signing/parsing
+  (which works because `Eff es` is a `MonadIO` when `IOE :> es`). The migration
+  to `effectful` is already landed (see the `en effectful migration` ExecPlan 25;
+  commits `d30ba63`, `d03f599`, `f047f58`).
+  Date: 2026-06-30
+
+- Validation 2026-06-30: `En.Servant.Authorize.requirePermission`
+  (`en-servant/src/En/Servant/Authorize.hs`) already gates a route on a decision
+  and fails closed on **both** `Denied` and `Conditional` (each throws `err403`).
+  The `en-biscuit` mint rule ("mint only `Allowed`; `Conditional` is not
+  mintable") and the `EP-31` verifier are the downstream-local analog of this
+  guard and share exactly that semantics. `EP-32` docs should present the Biscuit
+  verifier as the delegated, local counterpart of `requirePermission`, not a new
+  policy.
+  Date: 2026-06-30
+
+- Validation 2026-06-30: the Shomei→`en` route guard is currently aspirational.
+  `en-servant`'s cabal description references a "verified shomei identity
+  (kikan C11)", but no Shomei import, JWT/JWKS handling, or header-to-`Subject`
+  extraction exists in `en-servant` today; `requirePermission` takes an
+  already-built `Subject`. This reinforces the initiative's decision to keep
+  `shomei-*` out of `en-biscuit` deps and leave the `AuthUser`/`AuthClaims` →
+  `En.Tuple.Subject` mapping to host applications (`EP-32`).
+  Date: 2026-06-30
+
+- Validation 2026-06-30: the grant vocabulary types all exist as `EP-29` assumes.
+  `Subject = SubjectId ObjectRef | SubjectSet ObjectRef RelationName | SubjectWildcard ObjectType`
+  (`en-core/src/En/Tuple.hs`); `ObjectRef` is `{ objectType :: ObjectType, objectId :: Text }`;
+  `ObjectType`/`RelationName` live in `En.Schema.Types`; `SchemaHash`,
+  `ConsistencyToken`, and `DatastoreId` are `newtype … Text` in
+  `en-core/src/En/Revision.hs`. `Subject` includes a third `SubjectWildcard`
+  constructor — `EP-29` correctly defers `en_subject_wildcard()` rather than
+  emitting wildcard grants.
+  Date: 2026-06-30
+
 
 ## Decision Log
 
@@ -235,10 +287,24 @@ plan.
 - Decision: Public `en-biscuit` minting and verification helpers should be
   polymorphic over `MonadIO m` rather than returning concrete `IO`.
   Rationale: Biscuit's Haskell APIs perform `IO`, but host applications will
-  call the helpers from `Handler`, `ReaderT`, or another application monad.
-  `MonadIO m` keeps the reusable package easy to embed while still allowing
-  thin `IO` convenience wrappers where useful.
+  call the helpers from `Handler`, `ReaderT`, `Eff es`, or another application
+  monad. `MonadIO m` keeps the reusable package easy to embed while still
+  allowing thin `IO` convenience wrappers where useful. This applies to the
+  helpers that take a precomputed `CheckDecision` and only do Biscuit
+  signing/parsing.
   Date: 2026-07-01
+
+- Decision (refinement 2026-06-30): a helper that *runs* an `en` decision (rather
+  than accepting a precomputed one) must run in `effectful`'s `Eff es`, not
+  `MonadIO m`. `En.Check.check`/`checkMany` and `En.Lookup.lookup` are
+  `(ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) => … -> Eff es _`.
+  The `MonadIO m` "decision → token" API is therefore the required, portable
+  deliverable in `EP-30`; any check-running convenience is an `Eff es` wrapper
+  layered on top, so `en-core` never gains a Biscuit or `MonadIO`-only surface.
+  Rationale: keeps the token layer embeddable by both `Eff`-based hosts (this
+  repo's `en-server`, which interprets `Eff` down to Servant `Handler`) and any
+  future non-`effectful` caller.
+  Date: 2026-06-30
 
 
 ## Outcomes & Retrospective
@@ -247,3 +313,27 @@ Summarize outcomes, gaps, and lessons learned at major milestones or at completi
 Compare the result against the original vision.
 
 (To be filled during and after implementation.)
+
+
+## Revision Notes
+
+- 2026-06-30 — Validation pass against the current `en` tree (requested: "is the
+  plan correct and does it fit the vision and architecture of en?"). Verdict:
+  the decomposition, ordering, dependency graph, and the optional-package
+  boundary are sound, and every referenced type/function exists as the child
+  plans assume. Corrections applied to reflect the codebase as it stands after
+  the `effectful` migration (ExecPlan 25):
+  - Integration Points (`En.Biscuit.Mint`): clarified that `check`/`checkMany`/
+    `lookup` are `Eff es` engine functions, that the portable deliverable mints
+    from a precomputed `CheckDecision`, and that a decision-running helper runs
+    in `Eff es` with engine effect constraints.
+  - Decision Log: refined the `MonadIO m` decision and added a follow-up decision
+    separating the portable `MonadIO m` "decision → token" API from any `Eff es`
+    check-running convenience.
+  - Surprises & Discoveries: recorded the effectful engine shape, the
+    `requirePermission` fail-closed analog (Denied and Conditional both 403), the
+    currently-aspirational Shomei guard in `en-servant`, and confirmation of the
+    `EP-29` grant vocabulary types (including the deferred `SubjectWildcard`).
+  No child plans were restructured; `EP-30` already hedged toward the low-level
+  "decision → token" API as its required deliverable, which this pass confirms as
+  the correct primary target.

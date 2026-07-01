@@ -5,6 +5,7 @@ title: "Define the en Biscuit grant vocabulary"
 kind: exec-plan
 created_at: 2026-07-01T04:50:38Z
 master_plan: "docs/masterplans/5-add-biscuit-decision-token-support.md"
+intention: intention_01kwe136p1expbzvj08bqwtz08
 ---
 
 # Define the en Biscuit grant vocabulary
