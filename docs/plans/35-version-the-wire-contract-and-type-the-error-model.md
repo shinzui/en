@@ -1,0 +1,610 @@
+---
+id: 35
+slug: version-the-wire-contract-and-type-the-error-model
+title: "Version the wire contract and type the error model"
+kind: exec-plan
+created_at: 2026-07-07T15:24:43Z
+master_plan: "docs/masterplans/6-production-harden-the-en-service.md"
+---
+
+# Version the wire contract and type the error model
+
+This ExecPlan is a living document. The sections Progress, Surprises & Discoveries,
+Decision Log, and Outcomes & Retrospective must be kept up to date as work proceeds.
+
+
+## Purpose / Big Picture
+
+en-server's JSON wire format today is an accident of Haskell internals. The wire types in
+`en-servant/src/En/Servant/API.hs` derive their JSON instances generically, so sum types
+serialize with constructor tags: a client literally sends
+`{"tag":"AtLeastAsFreshWire","contents":"en1.…"}` and matches decisions against
+`"AllowedWire"` — the internal `Wire` suffix and aeson's default sum encoding are frozen
+into the public API. There is no version prefix, so none of this can ever be fixed
+compatibly. Errors are worse: every engine error becomes HTTP 500 with the `Show` output
+of `EnError` as the message (`en-servant/src/En/Servant/Seam.hs`), so a client cannot
+distinguish "your consistency token is stale" (its fault, don't retry) from "the database
+is down" (retry later), and malformed request bodies get Servant's plain-text 400, so
+even the error *content type* is inconsistent. `DELETE /tuples` carries a request body,
+which HTTP intermediaries are allowed to drop. These are findings A3 (HIGH) and A5 (MED)
+of `docs/reviews/2026-07-07-architecture-performance-review.md`; the missing
+machine-readable API description is gap E11 there.
+
+After this change, the API lives under a `/v1` path prefix with hand-written, stable,
+tag-free JSON encodings; every error — engine, validation, or body-decode — arrives as
+one JSON envelope `{"code": …, "message": …, "retryable": …}` with a status code that
+separates client faults (4xx) from server faults (5xx); tuple deletion is
+`POST /v1/relationships/delete` (no DELETE-with-body); and `GET /v1/openapi.json` serves
+a generated OpenAPI document describing all of it. **This is a deliberate,
+one-time breaking change to every wire consumer** — the Haskell client
+(`en-client/src/En/Client.hs`) and the Justfile smoke tests are updated in the same
+commit series, and the `/v1` prefix exists precisely so the *next* break can be staged
+instead of forced. This plan is child EP-35 of
+`docs/masterplans/6-production-harden-the-en-service.md` and owns the error envelope
+that EP-33 and EP-36 emit.
+
+
+## Progress
+
+Use a checklist to summarize granular steps. Every stopping point must be documented here,
+even if it requires splitting a partially completed task into two ("done" vs. "remaining").
+This section must always reflect the actual current state of the work.
+
+- [ ] M1: hand-written `ToJSON`/`FromJSON` instances for every wire type in
+  `en-servant/src/En/Servant/API.hs` per the JSON grammar in this plan; generic
+  derivations removed.
+- [ ] M1: golden encoding tests and decode round-trip tests added to
+  `en-servant/test/Main.hs`.
+- [ ] M2: routes moved under `/v1`; `DELETE /tuples` replaced by
+  `POST /v1/relationships/delete`; writes at `POST /v1/relationships`.
+- [ ] M2: `en-client/src/En/Client.hs` and `Justfile` (`test-server`) updated; user docs
+  under `docs/user/` swept for old shapes.
+- [ ] M3: typed error envelope (`ErrorEnvelopeWire`) in Seam.hs with the
+  `EnError -> (status, code, retryable)` mapping; `requirePermission` and handler 400s
+  migrated onto it.
+- [ ] M3: uniform JSON errors for body-decode/404/405 via Servant `ErrorFormatters` and
+  `serveWithContext`.
+- [ ] M4: OpenAPI document generated with servant-openapi-hs and served at
+  `GET /v1/openapi.json`; `ToSchema` instances hand-written to match the JSON grammar.
+- [ ] Final: full curl transcript reproduced; `cabal test en-servant` and
+  `just start-and-test` green; breaking change called out in
+  `docs/user/service-and-operations.md`.
+
+
+## Surprises & Discoveries
+
+Document unexpected behaviors, bugs, optimizations, or insights discovered during
+implementation. Provide concise evidence.
+
+(None yet.)
+
+
+## Decision Log
+
+Record every decision made while working on the plan.
+
+- Decision: Make this one deliberate breaking cut — replace the unversioned paths and
+  generic encodings outright rather than serving old and new side by side.
+  Rationale: en-server is not yet deployable as a service (its API is unauthenticated
+  until EP-33 lands, per the review's verdict), so there are no external wire consumers
+  to migrate; the only in-repo consumers are en-client and the Justfile smoke test,
+  both updated here. Carrying a compatibility shim for a format with constructor-tag
+  leakage would enshrine exactly what this plan removes. The `/v1` prefix is the
+  mechanism that makes *future* breaks stageable.
+  Date: 2026-07-07
+- Decision: Group wire versioning, error typing, and OpenAPI generation in one plan.
+  Rationale: Restated from the master plan's Decision Log
+  (`docs/masterplans/6-production-harden-the-en-service.md`): all three are breaking
+  changes to the same JSON surface; clients should migrate once, not three times.
+  Date: 2026-07-07
+- Decision: Keep the Haskell-side type names (`CheckRequestWire` etc.) unchanged; only
+  the JSON representation changes, via hand-written instances with a discriminator
+  field per sum type (`kind` for subjects and expand nodes, `mode` for consistency,
+  `result` for decisions, `status` for page states, `type` for caveat values).
+  Rationale: The `Wire` suffix is a useful internal convention; the review's complaint
+  is that it *leaks onto the wire*, not that it exists. Hand-written instances make the
+  wire shape a reviewed artifact instead of a derivation side effect, and the named
+  discriminators read naturally in every consumer language. `type` is kept for caveat
+  values specifically because the storage layer already encodes payloads as
+  `{"type": …, "value": …}` (see `caveatValueToJson` in
+  `en-postgres/src/En/Postgres/TupleStore.hs`), so wire and storage agree.
+  Date: 2026-07-07
+- Decision: Replace `DELETE /tuples` with `POST /v1/relationships/delete`, and rename
+  the write route to `POST /v1/relationships`.
+  Rationale: DELETE with a request body is explicitly undefined-ish in HTTP semantics
+  and dropped by real proxies (finding A5). Delete-as-POST-verb-suffix is the pattern
+  the reference systems use (SpiceDB `DeleteRelationships`, OpenFGA `write` with
+  deletes). Renaming `tuples` to `relationships` at the same time aligns the path with
+  the domain vocabulary used across the docs, and costs nothing extra since every path
+  moves under `/v1` anyway. New endpoints added by
+  `docs/masterplans/9-complete-the-en-api-surface.md` must live under the same `/v1`
+  prefix and envelope.
+  Date: 2026-07-07
+- Decision: Error envelope is `{"code": <stable snake_case string>, "message": <human
+  text>, "retryable": <bool>}`; the `EnError -> (status, code, retryable)` mapping is
+  the table in Milestone 3, with `StoreError` details logged server-side but replaced by
+  a generic message on the wire.
+  Rationale: `code` gives machines a stable contract that `Show` output never was;
+  `retryable` lets clients implement retry policy without parsing prose (store outages
+  are retryable, token/schema faults are not). Raw `StoreError` text contains SQL and
+  parameter details (`Hasql.toDetailedText`) — an information leak flagged by A3 — so
+  it must not cross the trust boundary.
+  Date: 2026-07-07
+- Decision: Generate the OpenAPI document with `servant-openapi-hs` (the mori-registered
+  fork of `servant-openapi3` at
+  `/Users/shinzui/Keikaku/bokuno/openapi-hs-project/servant-openapi-hs`, GitHub
+  `shinzui/servant-openapi-hs`, together with its `openapi-hs` data-model dependency,
+  GitHub `shinzui/openapi-hs`) pinned via `source-repository-package` in
+  `cabal.project`, rather than Hackage `servant-openapi3`.
+  Rationale: Hackage `servant-openapi3`/`openapi3` do not build against this project's
+  GHC 9.12.4 / servant 0.20.3 without patches; the fork targets exactly this toolchain
+  (its cabal file requires `base >=4.21`) and emits OpenAPI 3.1. The pin follows the
+  existing precedent in `cabal.project` (the biscuit-haskell pin). Hand-written
+  `ToSchema` instances are required so the document matches the hand-written JSON —
+  and the golden tests in M1 are what keep both honest.
+  Date: 2026-07-07
+- Decision: `checkMany`'s per-pair behavior (errors collapse to `Denied`,
+  finding B5) is out of scope; the batch response stays a positional `decisions` array.
+  Rationale: Changing batch semantics is an engine-behavior change owned by the
+  evaluation master plan (`docs/masterplans/7-fix-the-en-evaluation-engine.md`). This
+  plan changes representation only; the array is already wrapped in an object
+  (`{"decisions": […]}`), so enriching entries later is non-breaking.
+  Date: 2026-07-07
+
+
+## Outcomes & Retrospective
+
+Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
+Compare the result against the original purpose.
+
+(To be filled during and after implementation.)
+
+
+## Context and Orientation
+
+en is a Haskell workspace at `/Users/shinzui/Keikaku/bokuno/en` built with `cabal`
+(GHC 9.12.4). The HTTP layer is the `en-servant` package:
+
+- `en-servant/src/En/Servant/API.hs` defines the Servant API type `EnAPI` (six routes:
+  `POST /tuples`, `DELETE /tuples` with a JSON body, `POST /check`, `POST /batch-check`,
+  `POST /lookup`, `POST /expand`), all the `*Wire` request/response types, the handlers,
+  and pure `…ToWire`/`…FromWire` converters between wire types and engine types. Every
+  wire type currently ends with `deriving anyclass (FromJSON, ToJSON)` — aeson's
+  *generic* encoding, which for record types produces plain objects (fine) but for sum
+  types produces `{"tag": "<ConstructorName>", "contents": …}` (the leak).
+- `en-servant/src/En/Servant/Seam.hs` holds `Env` (the record of engine operations),
+  `runEngine` (runs an effectful action and converts `Left EnError` into a Servant
+  `ServerError`), `enErrorToServerError = jsonError err500 . Text.pack . show` (the A3
+  collapse), and `jsonError` (wraps a `Text` message as `{"error": <text>}` via the
+  `ErrorWire` newtype).
+- `en-servant/src/En/Servant/Authorize.hs` (`requirePermission`) throws
+  `jsonError err403 …` — it must move onto the new envelope too.
+- `en-servant/test/Main.hs` is a hand-rolled test executable (no tasty/hspec; local
+  `assertEqual`/`assertBool` helpers) that exercises handlers through
+  `Servant.runHandler` against in-memory stores from `En.Conformance.Kikan`.
+- `en-client/src/En/Client.hs` derives a client record from `apiProxy` with
+  `Servant.Client.client`; because it is generated from the API *type*, path and wire
+  changes propagate automatically once it recompiles.
+- `en-core/src/En/Error.hs` defines the closed engine error sum:
+  `UnknownRelation Text | SchemaViolation Text | MissingCaveatContext [Text] |
+  InvalidConsistencyToken Text | ResolutionLimitExceeded | StoreError Text`.
+
+The current wire shapes are easiest to see in the `Justfile` `test-server` recipe, which
+this plan rewrites; today it posts bodies like
+`{"subject":{"tag":"SubjectIdWire","contents":{…}}}` and asserts
+`.decision.tag == "AllowedWire"`.
+
+Terms of art: a **wire type** is a Haskell record/sum that exists only to define the
+JSON contract (as opposed to engine types in en-core); a **discriminator field** is a
+JSON property (like `"mode"`) whose string value selects which variant of a sum an
+object encodes; **OpenAPI** is the standard machine-readable HTTP API description format
+(a JSON document listing paths, request/response schemas, and errors) that client
+generators and API explorers consume; a **golden test** asserts that encoding a known
+value produces an exact expected byte string, freezing the format.
+
+Integration points restated from the master plan
+(`docs/masterplans/6-production-harden-the-en-service.md`): this plan owns the typed
+error envelope; EP-33 (`docs/plans/33-add-caller-authentication-and-rate-limiting-to-en-server.md`)
+emits a minimal `{"error", "code"}` object for 401/403/429 until this plan lands, and
+whichever lands second reconciles EP-33's middleware bodies to the full envelope
+(add `retryable: false` to all three). EP-33's write-route predicate
+(`pathInfo == ["tuples"]`) must be updated to the new `/v1` paths by whichever plan
+lands second. EP-36 uses this envelope for error responses of its endpoints where
+applicable. New endpoints from `docs/masterplans/9-complete-the-en-api-surface.md`
+extend this same `/v1` surface.
+
+
+## Plan of Work
+
+Four milestones: stabilize the JSON encodings (M1), move and rename the routes (M2),
+type the error model (M3), and describe it all with OpenAPI (M4). M1 and M2 could land
+together, but M1 is independently verifiable through the test suite alone, which keeps
+review tractable.
+
+
+### Milestone 1: Hand-written, tag-free JSON encodings
+
+Scope: every wire type in `en-servant/src/En/Servant/API.hs` gets explicit
+`ToJSON`/`FromJSON` instances implementing the grammar below; the
+`deriving anyclass (FromJSON, ToJSON)` clauses are deleted. Record types whose generic
+encoding is already a plain object (e.g. `ObjectRefWire`, `TupleWire`,
+`CheckRequestWire`) may keep semantically identical hand-written instances or generic
+ones — but write them by hand anyway so the whole surface is explicit and future field
+renames are deliberate. At the end, `cabal test en-servant` passes with new golden
+tests.
+
+The JSON grammar (this is the contract; write it into the instances verbatim):
+
+```json
+{"comment": "SubjectWire — discriminator: kind",
+ "id":       {"kind":"id","objectType":"user","objectId":"alice"},
+ "set":      {"kind":"set","objectType":"group","objectId":"eng","relation":"member"},
+ "wildcard": {"kind":"wildcard","objectType":"user"}}
+```
+
+```json
+{"comment": "ConsistencyWire — discriminator: mode",
+ "minimizeLatency": {"mode":"minimizeLatency"},
+ "fullyConsistent": {"mode":"fullyConsistent"},
+ "atLeastAsFresh":  {"mode":"atLeastAsFresh","token":"en1.…"},
+ "atExactSnapshot": {"mode":"atExactSnapshot","token":"en1.…"}}
+```
+
+```json
+{"comment": "CheckDecisionWire — discriminator: result",
+ "allowed":     {"result":"allowed"},
+ "denied":      {"result":"denied"},
+ "conditional": {"result":"conditional",
+                 "obligations":[{"caveat":"business_hours","missingContext":["now"]}]}}
+```
+
+```json
+{"comment": "CaveatValueWire — discriminator: type (matches storage encoding)",
+ "text":      {"type":"text","value":"hello"},
+ "bool":      {"type":"bool","value":true},
+ "integer":   {"type":"integer","value":42},
+ "timestamp": {"type":"timestamp","value":"2026-07-07T12:00:00Z"},
+ "enum":      {"type":"enum","value":"read"}}
+```
+
+```json
+{"comment": "LookupStateWire / ExpandStateWire — discriminator: status",
+ "exhausted": {"status":"exhausted"},
+ "hasMore":   {"status":"hasMore","cursor":"…"},
+ "truncated": {"status":"truncated","cursor":"…"}}
+```
+
+```json
+{"comment": "ExpandNodeWire — discriminator: kind",
+ "subject":  {"kind":"subject","subject":{"kind":"id","objectType":"user","objectId":"alice"}},
+ "userset":  {"kind":"userset","object":{"objectType":"group","objectId":"eng"},
+              "relation":"member","children":[]},
+ "caveated": {"kind":"caveated","caveat":"business_hours","children":[]}}
+```
+
+Record types keep their current field names as JSON keys (`objectType`, `objectId`,
+`relation`, `subject`, `caveat`, `payload`, `values`, `consistency`, `context`,
+`permission`, `object`, `pairs`, `decisions`, `objects`, `state`, `root`, `children`,
+`tuples`, `token`, `limit`, `cursor`, `deadlineMillis`). `CheckResponseWire` therefore
+becomes `{"decision":{"result":"allowed"}}`; `LookupObjectWire` becomes
+`{"object":{…},"decision":{"result":…}}`; `WriteTuplesResponseWire` stays
+`{"token":"…"}`. `null` caveats remain `"caveat":null` (encode `Maybe` as the field with
+`null`, and accept an absent field on decode — use `.:?` — so clients may omit it).
+
+Write the instances with `Data.Aeson.withObject`/`withText`, `object`/`(.=)`, and
+explicit `parseJSON` matching on the discriminator; unknown discriminator values must
+fail with a message naming the field and the allowed values (e.g.
+`unknown consistency mode "freshest"; expected minimizeLatency, fullyConsistent,
+atLeastAsFresh, atExactSnapshot`).
+
+Add golden tests to `en-servant/test/Main.hs` in its existing hand-rolled style: for a
+representative value of every wire type, assert
+`Data.Aeson.encode value == expectedBytes` (exact `ByteString` — this freezes field
+order via `toJSON`'s object construction; if key ordering proves unstable, compare
+`decode (encode value) == decode expectedBytes` on `Data.Aeson.Value` instead, and note
+it in Surprises & Discoveries), and assert `decode (encode value) == Just value` for
+round-tripping, plus one negative decode per sum type (unknown discriminator ⇒
+`Nothing`). Add `aeson` and `bytestring` to the test suite's `build-depends` in
+`en-servant/en-servant.cabal`.
+
+Acceptance: `cabal test en-servant` passes; `rg '"tag"' en-servant/src` finds nothing;
+a grep for `AllowedWire` in encoded output of the tests finds nothing.
+
+
+### Milestone 2: The /v1 surface and POST-based delete
+
+Scope: routes move under `/v1`; delete loses its body-carrying DELETE. At the end the
+server answers only on the new paths and every in-repo consumer uses them.
+
+In `en-servant/src/En/Servant/API.hs`, redefine:
+
+```haskell
+type EnAPI =
+    "v1" :> ( "relationships" :> ReqBody '[JSON] WriteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
+        :<|> "relationships" :> "delete" :> ReqBody '[JSON] DeleteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
+        :<|> "check" :> ReqBody '[JSON] CheckRequestWire :> Post '[JSON] CheckResponseWire
+        :<|> "batch-check" :> ReqBody '[JSON] BatchCheckRequestWire :> Post '[JSON] BatchCheckResponseWire
+        :<|> "lookup" :> ReqBody '[JSON] LookupRequestWire :> Post '[JSON] LookupPageWire
+        :<|> "expand" :> ReqBody '[JSON] ExpandRequestWire :> Post '[JSON] ExpandTreeWire )
+```
+
+The `Delete` import from Servant goes away; handler order in `server` is unchanged
+(write, delete, check, batch, lookup, expand), so `en-servant/test/Main.hs`'s positional
+pattern matches (`_write :<|> _delete :<|> …`) still line up — verify, don't assume.
+`en-client/src/En/Client.hs` needs no code change beyond recompilation (the record is
+derived from `apiProxy`), but update its module comment to note the `/v1` base and that
+`ClientEnv`'s `BaseUrl` should point at the host root (the `/v1` prefix is in the API
+type, not the `BaseUrl`).
+
+Rewrite the `Justfile` `test-server` recipe to the new paths and shapes:
+
+```bash
+curl -sS -X POST "$url/v1/relationships/delete" -H 'content-type: application/json' \
+  -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}]}'
+# write: POST "$url/v1/relationships" with the same tuple body -> {"token":"en1.…"}
+# check: consistency {"mode":"atLeastAsFresh","token":"…"}; assert .decision.result == "allowed"
+```
+
+(Keep the recipe's existing structure — delete, write capturing `.token`, check
+asserting the decision — changing only paths, bodies, and the final
+`jq -r '.decision.result'` / `test "$decision" = "allowed"` assertion. Also update the
+echoed success message.) Sweep `docs/user/` for old shapes
+(`rg -l '"tag"|AllowedWire|/tuples|/check' docs/user Justfile`) and update every hit —
+`docs/user/service-and-operations.md`, `docs/user/queries-and-writes.md`, and
+`docs/user/getting-started.md` contain curl examples. Add a short "API versioning"
+paragraph to `docs/user/service-and-operations.md` stating: the wire contract is
+versioned by path; `/v1` is current; this change was breaking and one-time; future
+breaking changes ship as `/v2` alongside `/v1`.
+
+Acceptance: `just start-and-test` passes against the new surface; hitting an old path
+returns 404 (in the M3 envelope once M3 lands); `cabal build en-client` succeeds.
+
+
+### Milestone 3: The typed error envelope
+
+Scope: one error shape everywhere, with correct status codes. At the end no handler
+path can produce a non-JSON or un-coded error.
+
+In `en-servant/src/En/Servant/Seam.hs`, replace `ErrorWire` with:
+
+```haskell
+data ErrorEnvelopeWire = ErrorEnvelopeWire
+    { code :: !Text
+    , message :: !Text
+    , retryable :: !Bool
+    }
+```
+
+with hand-written instances (`{"code":…,"message":…,"retryable":…}`). Change `jsonError`
+to `jsonError :: ServerError -> Text -> Text -> Bool -> ServerError` (status, code,
+message, retryable — or introduce a small record; keep one canonical constructor) and
+re-export it. Replace `enErrorToServerError` with the mapping (statuses via servant's
+`err400`/`err422`/`err503`):
+
+```haskell
+enErrorToServerError :: EnError -> ServerError
+-- UnknownRelation t          -> 400 "unknown_relation"           retryable=False, message names t
+-- SchemaViolation t          -> 400 "schema_violation"           retryable=False
+-- MissingCaveatContext names -> 400 "missing_caveat_context"     retryable=False, message lists names
+-- InvalidConsistencyToken t  -> 400 "invalid_consistency_token"  retryable=False
+-- ResolutionLimitExceeded    -> 422 "resolution_limit_exceeded"  retryable=False
+-- StoreError _detail         -> 503 "store_error"                retryable=True,
+--                               message = "the tuple store failed; retry later"
+```
+
+For `StoreError`, print the detailed text to stderr (`Text.hPutStrLn stderr`) before
+returning the generic envelope — the operator needs the SQL context, the caller must not
+see it (EP-36's structured logging later formalizes this). Update the callers of the old
+`jsonError`: `either400` and the batch-size check in `API.hs` (code
+`"invalid_request"`, and `"batch_too_large"` for the size check, both retryable=false),
+and `requirePermission` in `en-servant/src/En/Servant/Authorize.hs` (403, code
+`"permission_denied"`, retryable=false, distinct messages for `Denied` vs
+`Conditional`).
+
+Make framework errors uniform. In `API.hs`, change `app` to use `serveWithContext` with
+custom `ErrorFormatters` (from `Servant.Server`):
+
+```haskell
+app env = serveWithContext apiProxy (customFormatters :. EmptyContext) (server env)
+```
+
+where `customFormatters` overrides `bodyParserErrorFormatter` and `urlParseErrorFormatter`
+(400, code `"malformed_request_body"`, message = the aeson/parse error text,
+retryable=false) and `notFoundErrorFormatter` (404, code `"not_found"`,
+retryable=false). Content-type mismatches (415) and method errors (405) fall outside
+`ErrorFormatters`; verify their behavior with curl and record the result in Surprises &
+Discoveries — if they emit non-JSON bodies, add a small outermost WAI middleware in
+`app` that rewrites bodyless 4xx responses into the envelope (keep it inside en-servant
+so embedded users get it too).
+
+Add tests to `en-servant/test/Main.hs`: run a handler that produces each `EnError`
+variant (the in-memory conformance store can be wrapped to inject `StoreError`; an
+unknown permission produces `UnknownRelation` naturally) and assert on
+`errHTTPCode`/`errBody` — 400 vs 422 vs 503 and the exact `code` strings.
+
+Acceptance: `cabal test en-servant` passes; the curl transcript in Concrete Steps shows
+a 400 with `invalid_consistency_token` for a garbage token, a 400 with
+`malformed_request_body` for `{`-truncated JSON, and 404s in the envelope.
+
+
+### Milestone 4: OpenAPI document at /v1/openapi.json
+
+Scope: a generated, served API description that provably matches the encodings. At the
+end `GET /v1/openapi.json` returns an OpenAPI 3.1 document.
+
+Pin the two packages in `cabal.project` following the biscuit precedent — add
+`source-repository-package` stanzas for `https://github.com/shinzui/openapi-hs.git` and
+`https://github.com/shinzui/servant-openapi-hs.git` at the commits current when you
+implement (resolve with `git ls-remote <url> HEAD`; record the chosen tags in the
+Decision Log). Add `openapi-hs` and `servant-openapi-hs` to
+`en-servant/en-servant.cabal`'s library `build-depends`.
+
+Write hand-written `Data.OpenApi.ToSchema` instances for every wire type in a new module
+`en-servant/src/En/Servant/OpenApi.hs` (added to `exposed-modules`), mirroring the M1
+grammar — sum types as `oneOf` with the discriminator property enumerated (openapi-hs
+exposes the schema-construction API under `Data.OpenApi`; build schemas explicitly
+rather than deriving generically, since generic derivation would resurrect the `tag`
+shapes M1 deleted). In the same module define:
+
+```haskell
+enOpenApi :: Data.OpenApi.OpenApi
+enOpenApi = toOpenApi (Proxy :: Proxy EnAPI)
+    -- then set info.title = "en authorization API", info.version = "v1",
+    -- and attach the ErrorEnvelopeWire schema as the default error response.
+```
+
+Extend the served API (server-only — keep `EnAPI` as the client-facing six operations so
+`en-client` is unaffected):
+
+```haskell
+type ServedAPI = EnAPI :<|> ("v1" :> "openapi.json" :> Get '[JSON] Data.OpenApi.OpenApi)
+
+app env = serveWithContext servedProxy (customFormatters :. EmptyContext)
+    (server env :<|> pure enOpenApi)
+```
+
+Acceptance: `curl -s localhost:8080/v1/openapi.json | jq '.openapi, (.paths | keys)'`
+lists the six `/v1/…` paths; the document's `SubjectWire` schema shows the three `kind`
+variants; feeding the document to any OpenAPI validator (e.g.
+`jq empty` for JSON well-formedness plus a spot check of `components.schemas`) succeeds.
+
+
+## Concrete Steps
+
+All commands run from the repository root `/Users/shinzui/Keikaku/bokuno/en`, inside the
+nix dev shell.
+
+After each milestone:
+
+```bash
+cabal build en-servant en-client en-server
+cabal test en-servant
+```
+
+Expected: clean builds; the test executable prints its assertions and exits zero.
+
+End-to-end against the dev database (after M2; bodies below are final M1–M3 shapes):
+
+```bash
+just process-up
+just run-migrations
+EN_DATABASE_URL="$PG_CONNECTION_STRING" cabal run en-server &
+
+# write
+curl -s -X POST localhost:8080/v1/relationships -H 'content-type: application/json' \
+  -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}]}'
+# -> {"token":"en1.…"}
+
+# check with the returned token
+curl -s -X POST localhost:8080/v1/check -H 'content-type: application/json' \
+  -d '{"consistency":{"mode":"atLeastAsFresh","token":"<paste>"},"context":{"values":{}},"subject":{"kind":"id","objectType":"user","objectId":"alice"},"permission":"view","object":{"objectType":"space","objectId":"project-x"}}'
+# -> {"decision":{"result":"allowed"}}
+
+# error model: garbage token -> 400, typed
+curl -si -X POST localhost:8080/v1/check -H 'content-type: application/json' \
+  -d '{"consistency":{"mode":"atLeastAsFresh","token":"garbage"},"context":{"values":{}},"subject":{"kind":"id","objectType":"user","objectId":"alice"},"permission":"view","object":{"objectType":"space","objectId":"project-x"}}' | head -1
+curl -s  -X POST localhost:8080/v1/check -H 'content-type: application/json' -d '{"consistency"' 
+# -> HTTP/1.1 400 …; {"code":"invalid_consistency_token", …}
+# -> {"code":"malformed_request_body","message":"…","retryable":false}
+
+# old path is gone
+curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/check -d '{}' -H 'content-type: application/json'
+# -> 404
+
+# openapi (after M4)
+curl -s localhost:8080/v1/openapi.json | jq -r '.paths | keys[]'
+# -> /v1/batch-check … /v1/relationships … /v1/relationships/delete …
+```
+
+Then the maintained smoke test:
+
+```bash
+just start-and-test
+```
+
+Expected final line (message updated in M2): `server smoke test passed: allowed`.
+
+If EP-33 has landed, export its dev key and add the `Authorization` header to the curls
+above; the Justfile recipe already carries it in that case.
+
+
+## Validation and Acceptance
+
+Acceptance is observable behavior:
+
+1. Encodings: the golden tests in `en-servant/test/Main.hs` pin every wire shape in
+   this plan's grammar; `rg '"tag"' en-servant/src Justfile docs/user` finds no wire
+   examples with constructor tags.
+2. Versioned surface: all six operations answer under `/v1/…`; the unversioned paths
+   return 404 in the error envelope; deletion is `POST /v1/relationships/delete` and
+   `DELETE` anywhere returns 404/405 (never consuming a body).
+3. Error typing: a stale/garbage consistency token yields status 400 with code
+   `invalid_consistency_token`; an unknown permission yields 400 `unknown_relation`;
+   stopping PostgreSQL (`pg_ctl stop -D "$PGDATA"`) and issuing a check yields 503 with
+   code `store_error` and `"retryable":true`, with no SQL text in the body (restart
+   PostgreSQL afterwards); truncated JSON yields 400 `malformed_request_body`. Every
+   one of these bodies has exactly the keys `code`, `message`, `retryable` and
+   `Content-Type: application/json`.
+4. OpenAPI: `GET /v1/openapi.json` returns a document whose `paths` set equals the
+   served operations and whose schemas use the discriminators from M1.
+5. Consumers: `cabal build en-client` succeeds; `just start-and-test` passes;
+   `cabal test en-servant` passes; `cabal build all` passes.
+
+The breaking change is accepted as complete only when the docs sweep (M2) leaves no
+example of the old format anywhere under `docs/user/` or in the `Justfile`.
+
+
+## Idempotence and Recovery
+
+All steps are compile-and-test cycles — safe to repeat arbitrarily. The wire change
+itself carries no data migration: consistency tokens, cursors, and stored tuples are
+unaffected (tokens are opaque `Text` on the wire in both formats). The one coordination
+hazard is in-repo: this plan edits `en-servant/src/En/Servant/API.hs`, `Seam.hs`, and
+the `Justfile`, which EP-33/EP-36/EP-38 also touch — land whole milestones and rebase
+siblings rather than interleaving. If M4's `source-repository-package` pins fail to
+build, M1–M3 stand alone and must be landed anyway; record the failure in Surprises &
+Discoveries and open the OpenAPI milestone as a follow-up rather than blocking the error
+model on it. Reverting any milestone is a clean `git revert` since no state outlives the
+process.
+
+
+## Interfaces and Dependencies
+
+Changed interfaces (all full module paths):
+
+- `En.Servant.API` (`en-servant/src/En/Servant/API.hs`): `EnAPI` re-rooted under `/v1`
+  with `relationships`/`relationships/delete`; hand-written aeson instances for
+  `ObjectRefWire`, `SubjectWire`, `CaveatValueWire`, `CaveatPayloadWire`,
+  `CaveatContextWire`, `TupleCaveatWire`, `TupleWire`, `ConsistencyWire`,
+  `CheckRequestWire`, `CheckDecisionWire`, `CaveatObligationWire`, `CheckResponseWire`,
+  `BatchCheckPairWire`, `BatchCheckRequestWire`, `BatchCheckResponseWire`,
+  `LookupRequestWire`, `LookupObjectWire`, `LookupStateWire`, `LookupPageWire`,
+  `ExpandRequestWire`, `ExpandNodeWire`, `ExpandStateWire`, `ExpandTreeWire`,
+  `WriteTuplesRequestWire`, `DeleteTuplesRequestWire`, `WriteTuplesResponseWire`;
+  `app` switches to `serveWithContext` with `ErrorFormatters`.
+- `En.Servant.Seam` (`en-servant/src/En/Servant/Seam.hs`): `ErrorWire` replaced by
+  `ErrorEnvelopeWire { code :: Text, message :: Text, retryable :: Bool }`; `jsonError`
+  re-signatured; `enErrorToServerError :: EnError -> ServerError` implements the M3
+  mapping table.
+- `En.Servant.Authorize` (`en-servant/src/En/Servant/Authorize.hs`): 403s emitted in
+  the envelope with code `permission_denied`.
+- New module `En.Servant.OpenApi` (`en-servant/src/En/Servant/OpenApi.hs`):
+  `enOpenApi :: OpenApi` plus `ToSchema` instances; `exposed-modules` updated in
+  `en-servant/en-servant.cabal`.
+- `En.Client` (`en-client/src/En/Client.hs`): unchanged code, recompiled against the
+  new API type; documentation comment updated.
+
+Dependencies: `en-servant/en-servant.cabal` library gains `openapi-hs` and
+`servant-openapi-hs` (M4); its test suite gains `aeson` and `bytestring` (M1).
+`cabal.project` gains two `source-repository-package` pins (GitHub `shinzui/openapi-hs`
+and `shinzui/servant-openapi-hs`, commits recorded at implementation time). No changes
+to `en-core`, `en-postgres`, or `en-biscuit`.
+
+Wire contract at the end (the artifact other plans and
+`docs/masterplans/9-complete-the-en-api-surface.md` build on): six operations under
+`/v1`, the M1 JSON grammar, the `{code, message, retryable}` envelope with codes
+`unknown_relation`, `schema_violation`, `missing_caveat_context`,
+`invalid_consistency_token`, `resolution_limit_exceeded`, `store_error`,
+`invalid_request`, `batch_too_large`, `malformed_request_body`, `not_found`,
+`permission_denied` (plus EP-33's `unauthenticated` and `rate_limited`), and
+`GET /v1/openapi.json`.
