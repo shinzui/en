@@ -5,6 +5,7 @@ title: "Add caller authentication and rate limiting to en-server"
 kind: exec-plan
 created_at: 2026-07-07T15:24:43Z
 master_plan: "docs/masterplans/6-production-harden-the-en-service.md"
+intention: intention_01kx21nk4kemtt6pjnb5tr76nk
 ---
 
 # Add caller authentication and rate limiting to en-server
@@ -47,12 +48,12 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: `AuthConfig` parsing (`EN_API_KEYS_READ_WRITE`, `EN_API_KEYS_READ_ONLY`,
+- [x] M1: `AuthConfig` parsing (`EN_API_KEYS_READ_WRITE`, `EN_API_KEYS_READ_ONLY`,
   `EN_AUTH_DISABLED`) and the bearer-token authentication middleware in
   `en-server/app/Middleware.hs`; every endpoint returns 401 without a valid key.
-- [ ] M1: `en-server/en-server.cabal` gains `other-modules: Middleware` and the new
-  `wai`, `http-types`, `bytestring`, `aeson`, and `memory` dependencies.
-- [ ] M1: Justfile `start-and-test` / `test-server` updated to configure and send a
+- [x] M1: `en-server/en-server.cabal` gains `other-modules: Middleware` and the new
+  `wai`, `http-types`, `bytestring`, `aeson`, and `ram` dependencies.
+- [x] M1: Justfile `start-and-test` / `test-server` updated to configure and send a
   dev API key.
 - [ ] M2: write/read authorization split; read-only keys get 403 on `POST /tuples` and
   `DELETE /tuples`, 200 on query endpoints.
@@ -71,7 +72,32 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- The `memory` package named throughout the original plan is deprecated. Implementation
+  switched to `ram`, its maintained fork, which exposes the same `Data.ByteArray`
+  module and `constEq`. No import changed; only `build-depends`. Verified building
+  against `ram-0.22.0` on GHC 9.12.4. Recorded in the Decision Log; the plan's prose was
+  updated in place.
+
+- `en-server`'s startup logs vanish when stdout is not a TTY. Running the binary with
+  output redirected to a file produced a zero-byte log even though the server was live
+  and answering (`ps` reported the process alive, `curl` got `HTTP/1.1 401`, and
+  `wc -c < server.log` was `0`). The cause is GHC's default block buffering on a
+  non-TTY stdout: `Main.hs` never calls `hSetBuffering`. This is not a bug introduced by
+  this plan and it did not block acceptance, but it will silently swallow the WARNING
+  line that `EN_AUTH_DISABLED=true` prints — precisely the line an operator must not
+  miss — whenever en-server runs under a supervisor. EP-36
+  (`docs/plans/36-add-health-endpoints-graceful-shutdown-and-observability.md`) owns
+  structured logging and should set `hSetBuffering stdout LineBuffering` at the top of
+  `main` as part of that work.
+
+- The startup failure path renders as an uncaught `IOException` (`en-server: Uncaught
+  exception … user error (No API keys configured; …)`) because it goes through `fail`.
+  The message is intact and the exit code is 1 with no port bound, so acceptance
+  criterion 1 holds, but the framing is noisy. This matches the pre-existing style of
+  `requiredEnv` and `optionalNonNegativeIntEnv` in `Main.hs`, so it was left alone; EP-38
+  (`docs/plans/38-validate-configuration-and-persist-datastore-identity.md`), which
+  centralizes configuration parsing, should render config errors and exit cleanly rather
+  than throwing.
 
 
 ## Decision Log
@@ -118,12 +144,20 @@ Record every decision made while working on the plan.
   here so a later operator can revisit if distributed limiting is ever needed.
   Date: 2026-07-07
 - Decision: Compare API keys in constant time using `Data.ByteArray.constEq` from the
-  `memory` package.
+  `ram` package.
   Rationale: A plain `==` on `ByteString` short-circuits at the first differing byte,
-  which leaks key prefixes through response timing. `memory` is already in the build
-  closure (via the biscuit/crypton dependency chain) and `constEq` is its documented
+  which leaks key prefixes through response timing. `constEq` is the documented
   constant-time equality.
   Date: 2026-07-07
+- Decision: Depend on `ram`, not `memory`, for `Data.ByteArray.constEq` (revision to the
+  decision above, made during implementation).
+  Rationale: `memory` (vincenthz/hs-memory) is deprecated and unmaintained; `ram`
+  (jappeace/ram) is the maintained fork with an identical module and API surface, so the
+  import (`import Data.ByteArray (constEq)`) is unchanged. Verified: `en-server` builds
+  against `ram-0.22.0` under GHC 9.12.4 with no `Data.ByteArray` module clash, because
+  `en-server` does not depend on the biscuit/crypton chain that would also supply the
+  module.
+  Date: 2026-07-08
 - Decision: Error bodies use the minimal envelope `{"error": <message>, "code": <code>}`
   until EP-35 lands.
   Rationale: The master plan's Integration Points section assigns ownership of the typed
@@ -132,6 +166,14 @@ Record every decision made while working on the plan.
   EP-33 to emit a minimal `{"error": …, "code": …}` object that EP-35 later reconciles.
   This plan follows that instruction so the two plans stay landable in either order.
   Date: 2026-07-07
+- Decision: When API keys are configured *and* `EN_AUTH_DISABLED=true` is set, keep
+  authentication enabled and print a warning that the flag was ignored.
+  Rationale: The plan specified `EN_AUTH_DISABLED` only for the no-keys case, leaving the
+  overlap undefined. Honouring the flag would let a stray environment variable silently
+  disable authentication on a deployment that correctly configured keys — a fail-open
+  path, and a re-run of finding A1. Keys therefore win, and the ignored flag is announced
+  rather than tolerated in silence.
+  Date: 2026-07-08
 - Decision: The authentication middleware exempts the exact paths `/healthz` and
   `/readyz` (and nothing else).
   Rationale: EP-36 (`docs/plans/36-add-health-endpoints-graceful-shutdown-and-observability.md`)
@@ -228,7 +270,7 @@ security. Each milestone leaves `cabal build all` green and the smoke test passi
 
 Scope: a new module `en-server/app/Middleware.hs` (registered under `other-modules` in
 the `executable en-server` stanza of `en-server/en-server.cabal`, with `wai`,
-`http-types`, `bytestring`, `aeson`, and `memory` added to `build-depends`), plus wiring
+`http-types`, `bytestring`, `aeson`, and `ram` added to `build-depends`), plus wiring
 in `en-server/app/Main.hs`. At the end of this milestone every endpoint requires a valid
 key and the server fails closed at startup when no keys are configured.
 
@@ -272,7 +314,7 @@ For `AuthDisabled` it is `id`. Otherwise, for each request: if `pathInfo` is exa
 `["healthz"]` or `["readyz"]`, pass through untouched (probe exemption; see Decision
 Log). Otherwise read the `Authorization` header, require the form `Bearer <secret>`
 (case-insensitive scheme per RFC 7235), and compare `<secret>` against each configured
-key's secret with `Data.ByteArray.constEq` (from the `memory` package; both sides as
+key's secret with `Data.ByteArray.constEq` (from the `ram` package; both sides as
 `ByteString`). On failure — missing header, wrong scheme, unknown secret — respond
 immediately with 401, headers `Content-Type: application/json` and
 `WWW-Authenticate: Bearer`, and body:
@@ -571,12 +613,13 @@ rateLimitMiddleware :: RateLimitConfig -> IO Network.Wai.Middleware
 ```
 
 New `build-depends` for `en-server`: `wai` (middleware types), `http-types` (statuses,
-methods, header names), `bytestring`, `aeson` (error bodies), `memory`
+methods, header names), `bytestring`, `aeson` (error bodies), `ram`
 (`Data.ByteArray.constEq`), and — in M4 — `warp-tls`
 (`Network.Wai.Handler.WarpTLS.runTLS`, `tlsSettings`). All are on Hackage and already in
-or adjacent to the existing build closure (`wai`, `http-types`, `bytestring`, `aeson`,
-and `memory` are transitive dependencies today; `warp-tls` is new but is the standard
-Warp companion). No changes to `en-core`, `en-postgres`, or `en-servant`.
+or adjacent to the existing build closure (`wai`, `http-types`, `bytestring`, and `aeson`
+are transitive dependencies today; `ram` and `warp-tls` are new, `ram` being the
+maintained fork of the deprecated `memory` and `warp-tls` the standard Warp companion).
+No changes to `en-core`, `en-postgres`, or `en-servant`.
 
 New runtime contract (environment variables): `EN_API_KEYS_READ_WRITE`,
 `EN_API_KEYS_READ_ONLY` (comma-separated `name:secret` lists), `EN_AUTH_DISABLED`

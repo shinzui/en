@@ -22,6 +22,11 @@ process-down:
   process-compose --unix-socket {{processComposeSocket}} down || true
 
 # Start the standalone en server against the configured database
+#
+# Authentication is required unless EN_AUTH_DISABLED=true. Configure callers with
+# EN_API_KEYS_READ_WRITE / EN_API_KEYS_READ_ONLY (comma-separated name:secret entries,
+# secrets at least 16 bytes); throttle them with EN_RATE_LIMIT_RPS / EN_RATE_LIMIT_BURST.
+# All are inherited from the calling environment.
 [group("services")]
 start-server: run-migrations
   EN_DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" cabal run en-server
@@ -31,7 +36,9 @@ start-server: run-migrations
 start-and-test: process-up run-migrations
   @set -eu; \
     url="${EN_SERVER_URL:-http://localhost:${EN_PORT:-8080}}"; \
-    EN_DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" cabal run en-server > {{serverLog}} 2>&1 & \
+    EN_DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" \
+    EN_API_KEYS_READ_WRITE="dev:${EN_API_KEY:-dev-secret-0123456789}" \
+      cabal run en-server > {{serverLog}} 2>&1 & \
     pid=$!; \
     trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT; \
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
@@ -69,14 +76,18 @@ run-migrations: create-database
 test-server:
   @set -eu; \
     url="${EN_SERVER_URL:-http://localhost:${EN_PORT:-8080}}"; \
+    auth="Authorization: Bearer ${EN_API_KEY:-dev-secret-0123456789}"; \
     curl -sS -X DELETE "$url/tuples" \
+      -H "$auth" \
       -H 'content-type: application/json' \
       -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"tag":"SubjectIdWire","contents":{"objectType":"user","objectId":"alice"}},"caveat":null}]}' >/dev/null; \
     token=$(curl -sS -X POST "$url/tuples" \
+      -H "$auth" \
       -H 'content-type: application/json' \
       -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"tag":"SubjectIdWire","contents":{"objectType":"user","objectId":"alice"}},"caveat":null}]}' \
       | jq -r '.token'); \
     decision=$(curl -sS -X POST "$url/check" \
+      -H "$auth" \
       -H 'content-type: application/json' \
       -d "{\"consistency\":{\"tag\":\"AtLeastAsFreshWire\",\"contents\":\"$token\"},\"context\":{\"values\":{}},\"subject\":{\"tag\":\"SubjectIdWire\",\"contents\":{\"objectType\":\"user\",\"objectId\":\"alice\"}},\"permission\":\"view\",\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"}}" \
       | jq -r '.decision.tag'); \

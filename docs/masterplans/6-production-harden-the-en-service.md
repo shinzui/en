@@ -4,6 +4,7 @@ slug: production-harden-the-en-service
 title: "Production-harden the en service"
 kind: master-plan
 created_at: 2026-07-07T15:24:21Z
+intention: intention_01kx21nk4kemtt6pjnb5tr76nk
 ---
 
 # Production-harden the en service
@@ -69,7 +70,7 @@ merely because they touch the same lines, not because of real artifact dependenc
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-33 | Add caller authentication and rate limiting to en-server | docs/plans/33-add-caller-authentication-and-rate-limiting-to-en-server.md | None | None | Not Started |
+| EP-33 | Add caller authentication and rate limiting to en-server | docs/plans/33-add-caller-authentication-and-rate-limiting-to-en-server.md | None | None | In Progress |
 | EP-34 | Pool database connections in en-server | docs/plans/34-pool-database-connections-in-en-server.md | None | None | Not Started |
 | EP-35 | Version the wire contract and type the error model | docs/plans/35-version-the-wire-contract-and-type-the-error-model.md | None | None | Not Started |
 | EP-36 | Add health endpoints, graceful shutdown, and observability | docs/plans/36-add-health-endpoints-graceful-shutdown-and-observability.md | None | EP-34, EP-35 | Not Started |
