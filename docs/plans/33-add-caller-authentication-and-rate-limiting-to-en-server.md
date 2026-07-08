@@ -57,7 +57,7 @@ This section must always reflect the actual current state of the work.
   dev API key.
 - [x] M2: write/read authorization split; read-only keys get 403 on `POST /tuples` and
   `DELETE /tuples`, 200 on query endpoints.
-- [ ] M3: per-caller token-bucket rate limiting middleware with
+- [x] M3: per-caller token-bucket rate limiting middleware with
   `EN_RATE_LIMIT_RPS` / `EN_RATE_LIMIT_BURST`; over-budget requests get 429 with
   `Retry-After`.
 - [ ] M4: optional direct TLS via `warp-tls` (`EN_TLS_CERT_FILE` / `EN_TLS_KEY_FILE`)
@@ -173,6 +173,13 @@ Record every decision made while working on the plan.
   disable authentication on a deployment that correctly configured keys — a fail-open
   path, and a re-run of finding A1. Keys therefore win, and the ignored flag is announced
   rather than tolerated in silence.
+  Date: 2026-07-08
+- Decision: Reject a bucket capacity below 1 at startup when rate limiting is enabled.
+  Rationale: The plan defaults `EN_RATE_LIMIT_BURST` to the `EN_RATE_LIMIT_RPS` value
+  when unset. For a fractional rate (say `EN_RATE_LIMIT_RPS=0.5`) that yields a bucket
+  that can never hold a whole token, so *every* request would 429 forever — a total
+  outage produced by a plausible configuration. Startup now fails with a message telling
+  the operator to set `EN_RATE_LIMIT_BURST` to at least 1.
   Date: 2026-07-08
 - Decision: The authentication middleware exempts the exact paths `/healthz` and
   `/readyz` (and nothing else).

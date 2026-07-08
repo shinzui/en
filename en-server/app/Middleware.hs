@@ -12,8 +12,12 @@ module Middleware (
     KeyRole (..),
     ApiKey (..),
     AuthConfig (..),
+    RateLimitConfig (..),
     loadAuthConfig,
+    loadRateLimitConfig,
     authMiddleware,
+    rateLimitMiddleware,
+    describeRateLimit,
 ) where
 
 import Data.Aeson (encode, object, (.=))
@@ -22,15 +26,21 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as Char8
 import Data.ByteString.Lazy qualified as Lazy
 import Data.Char (toLower)
+import Data.IORef (atomicModifyIORef', newIORef)
 import Data.List (find)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO qualified as Text
-import Network.HTTP.Types (HeaderName, hAuthorization, hContentType, methodDelete, methodPost, status401, status403)
+import Data.Word (Word64)
+import GHC.Clock (getMonotonicTimeNSec)
+import Network.HTTP.Types (HeaderName, hAuthorization, hContentType, methodDelete, methodPost, status401, status403, status429)
 import Network.Wai (Middleware, Request (..), Response, responseLBS)
 import System.Environment (lookupEnv)
+import Text.Read (readMaybe)
 
 -- | What a key is allowed to do. 'ReadOnly' keys are rejected on write routes.
 data KeyRole = ReadOnly | ReadWrite
@@ -54,6 +64,12 @@ handlers. Any client-supplied value is stripped before this is set.
 -}
 callerHeaderName :: HeaderName
 callerHeaderName = "X-En-Caller"
+
+{- | Bucket shared by every request that reached the limiter without an
+authenticated identity: probes, and all traffic under 'AuthDisabled'.
+-}
+anonymousCaller :: Text
+anonymousCaller = "anonymous"
 
 {- | Paths that never require a key: orchestrator liveness and readiness probes
 cannot conveniently carry credentials. @/metrics@ is deliberately not exempt.
@@ -234,6 +250,106 @@ readOnlyKey =
         status403
         [(hContentType, "application/json")]
         (errorBody "this API key is read-only" "permission_denied")
+
+-- * Rate limiting
+
+{- | A token bucket per caller: 'burst' is the bucket capacity, 'ratePerSecond'
+the refill rate. A 'ratePerSecond' of zero disables limiting entirely.
+-}
+data RateLimitConfig = RateLimitConfig
+    { ratePerSecond :: !Double
+    , burst :: !Double
+    }
+
+{- | Token count and the monotonic timestamp it was last computed at. Never a
+wall-clock time: wall clocks jump backwards and would mint free tokens.
+-}
+data Bucket = Bucket
+    { tokens :: !Double
+    , lastRefillNs :: !Word64
+    }
+
+-- | Read @EN_RATE_LIMIT_RPS@ and @EN_RATE_LIMIT_BURST@. Both default to 0 (off).
+loadRateLimitConfig :: IO RateLimitConfig
+loadRateLimitConfig = do
+    rps <- optionalNonNegativeDoubleEnv "EN_RATE_LIMIT_RPS"
+    configuredBurst <- optionalNonNegativeDoubleEnv "EN_RATE_LIMIT_BURST"
+    let effectiveBurst = if configuredBurst > 0 then configuredBurst else rps
+    if rps > 0 && effectiveBurst < 1
+        then
+            fail $
+                "Invalid EN_RATE_LIMIT_BURST: a bucket capacity of "
+                    <> show effectiveBurst
+                    <> " can never admit a request. Set EN_RATE_LIMIT_BURST to at least 1."
+        else pure RateLimitConfig{ratePerSecond = rps, burst = effectiveBurst}
+
+optionalNonNegativeDoubleEnv :: String -> IO Double
+optionalNonNegativeDoubleEnv name =
+    lookupEnv name >>= \case
+        Nothing -> pure 0
+        Just value ->
+            case readMaybe value of
+                Just parsed | parsed >= 0 -> pure parsed
+                _ -> fail ("Invalid " <> name <> ": expected a non-negative number")
+
+describeRateLimit :: RateLimitConfig -> Text
+describeRateLimit config
+    | config.ratePerSecond <= 0 = "disabled"
+    | otherwise =
+        "enabled, rps="
+            <> Text.pack (show config.ratePerSecond)
+            <> ", burst="
+            <> Text.pack (show config.burst)
+
+{- | Throttle each caller independently. Runs inside 'authMiddleware' so it can
+read the verified identity from 'callerHeaderName'.
+
+Allocates the shared bucket map, hence the 'IO' wrapper.
+-}
+rateLimitMiddleware :: RateLimitConfig -> IO Middleware
+rateLimitMiddleware config
+    | config.ratePerSecond <= 0 = pure id
+    | otherwise = do
+        buckets <- newIORef Map.empty
+        pure \application request respond ->
+            if isExemptPath request
+                then application request respond
+                else do
+                    now <- getMonotonicTimeNSec
+                    admitted <-
+                        atomicModifyIORef' buckets (admit config (callerOf request) now)
+                    if admitted
+                        then application request respond
+                        else respond rateLimited
+
+{- | Refill the caller's bucket for the elapsed time, then spend one token if
+one is available.
+-}
+admit :: RateLimitConfig -> Text -> Word64 -> Map Text Bucket -> (Map Text Bucket, Bool)
+admit config caller now buckets =
+    if refilled >= 1
+        then (Map.insert caller (Bucket (refilled - 1) now) buckets, True)
+        else (Map.insert caller (Bucket refilled now) buckets, False)
+  where
+    bucket = Map.findWithDefault (Bucket config.burst now) caller buckets
+    elapsedSeconds = fromIntegral (now - bucket.lastRefillNs) / 1e9
+    refilled = min config.burst (bucket.tokens + elapsedSeconds * config.ratePerSecond)
+
+callerOf :: Request -> Text
+callerOf request =
+    maybe
+        anonymousCaller
+        Text.decodeUtf8Lenient
+        (lookup callerHeaderName (requestHeaders request))
+
+rateLimited :: Response
+rateLimited =
+    responseLBS
+        status429
+        [ (hContentType, "application/json")
+        , ("Retry-After", "1")
+        ]
+        (errorBody "rate limit exceeded" "rate_limited")
 
 {- | The minimal error envelope. EP-35
 (@docs/plans/35-version-the-wire-contract-and-type-the-error-model.md@)

@@ -29,12 +29,13 @@ import En.Servant.API (app)
 import En.Servant.Seam (AppEffects, Env (..))
 import Hasql.Connection qualified as Connection
 import Hasql.Connection.Settings qualified as Settings
-import Middleware (authMiddleware, loadAuthConfig)
+import Middleware (authMiddleware, describeRateLimit, loadAuthConfig, loadRateLimitConfig, rateLimitMiddleware)
 
 main :: IO ()
 main = do
     databaseUrl <- requiredEnv "EN_DATABASE_URL"
     authConfig <- loadAuthConfig
+    rateLimitConfig <- loadRateLimitConfig
     port <- maybe 8080 parsePort <$> lookupEnv "EN_PORT"
     gcWindow <- maybe "24 hours" Text.pack <$> lookupEnv "EN_GC_WINDOW"
     optimizedRevisionTtlMs <- optionalNonNegativeIntEnv "EN_OPTIMIZED_REVISION_CACHE_TTL_MS"
@@ -135,8 +136,10 @@ main = do
     Text.putStrLn ("Optimized revision cache: " <> describeMillisCache optimizedRevisionTtlMs)
     Text.putStrLn ("Tuple-read cache: " <> describeEntryCache tupleReadMaxEntries)
     Text.putStrLn ("Decision cache: " <> describeEntryCache decisionMaxEntries)
+    Text.putStrLn ("Rate limit: " <> describeRateLimit rateLimitConfig)
+    rateLimit <- rateLimitMiddleware rateLimitConfig
     bracket (pure connection) Connection.release \_ ->
-        Warp.run port (authMiddleware authConfig (app serverEnv))
+        Warp.run port (authMiddleware authConfig (rateLimit (app serverEnv)))
 
 data SchemaSource
     = BuiltInDemoSchema
