@@ -55,7 +55,7 @@ This section must always reflect the actual current state of the work.
   `wai`, `http-types`, `bytestring`, `aeson`, and `ram` dependencies.
 - [x] M1: Justfile `start-and-test` / `test-server` updated to configure and send a
   dev API key.
-- [ ] M2: write/read authorization split; read-only keys get 403 on `POST /tuples` and
+- [x] M2: write/read authorization split; read-only keys get 403 on `POST /tuples` and
   `DELETE /tuples`, 200 on query endpoints.
 - [ ] M3: per-caller token-bucket rate limiting middleware with
   `EN_RATE_LIMIT_RPS` / `EN_RATE_LIMIT_BURST`; over-budget requests get 429 with

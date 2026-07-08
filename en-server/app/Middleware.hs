@@ -28,7 +28,7 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO qualified as Text
-import Network.HTTP.Types (HeaderName, hAuthorization, hContentType, status401)
+import Network.HTTP.Types (HeaderName, hAuthorization, hContentType, methodDelete, methodPost, status401, status403)
 import Network.Wai (Middleware, Request (..), Response, responseLBS)
 import System.Environment (lookupEnv)
 
@@ -61,6 +61,17 @@ cannot conveniently carry credentials. @/metrics@ is deliberately not exempt.
 isExemptPath :: Request -> Bool
 isExemptPath request =
     pathInfo request `elem` [["healthz"], ["readyz"]]
+
+{- | Routes that mutate the relationship graph, and so require a 'ReadWrite' key.
+
+EP-35 (@docs/plans/35-version-the-wire-contract-and-type-the-error-model.md@)
+moves these to @POST \/v1\/relationships@ and @POST \/v1\/relationships\/delete@;
+whichever plan lands second updates this predicate.
+-}
+isWriteRequest :: Request -> Bool
+isWriteRequest request =
+    pathInfo request == ["tuples"]
+        && requestMethod request `elem` [methodPost, methodDelete]
 
 {- | Read @EN_API_KEYS_READ_WRITE@, @EN_API_KEYS_READ_ONLY@, and
 @EN_AUTH_DISABLED@. Fails closed: with no keys and no explicit opt-out this
@@ -166,7 +177,8 @@ rejectDuplicateNames keys =
         | Set.member key.keyName seen = (seen, key.keyName : dups)
         | otherwise = (Set.insert key.keyName seen, dups)
 
-{- | Reject every request that does not present a configured bearer key.
+{- | Reject every request that does not present a configured bearer key, and
+every write attempted with a 'ReadOnly' key.
 
 On success the request is passed inward with 'callerHeaderName' rewritten to
 the verified key name; any client-supplied value is removed first so it
@@ -179,7 +191,11 @@ authMiddleware (AuthKeys keys) = \application request respond ->
         then application request respond
         else case authenticate keys request of
             Nothing -> respond unauthenticated
-            Just key -> application (withCaller key.keyName request) respond
+            Just key
+                | key.keyRole == ReadOnly && isWriteRequest request ->
+                    respond readOnlyKey
+                | otherwise ->
+                    application (withCaller key.keyName request) respond
 
 -- | Constant-time credential check. Returns the matching key, if any.
 authenticate :: [ApiKey] -> Request -> Maybe ApiKey
@@ -211,6 +227,13 @@ unauthenticated =
         , ("WWW-Authenticate", "Bearer")
         ]
         (errorBody "missing or invalid API key" "unauthenticated")
+
+readOnlyKey :: Response
+readOnlyKey =
+    responseLBS
+        status403
+        [(hContentType, "application/json")]
+        (errorBody "this API key is read-only" "permission_denied")
 
 {- | The minimal error envelope. EP-35
 (@docs/plans/35-version-the-wire-contract-and-type-the-error-model.md@)
