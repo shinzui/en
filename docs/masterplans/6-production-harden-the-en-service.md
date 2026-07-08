@@ -70,7 +70,7 @@ merely because they touch the same lines, not because of real artifact dependenc
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-33 | Add caller authentication and rate limiting to en-server | docs/plans/33-add-caller-authentication-and-rate-limiting-to-en-server.md | None | None | In Progress |
+| EP-33 | Add caller authentication and rate limiting to en-server | docs/plans/33-add-caller-authentication-and-rate-limiting-to-en-server.md | None | None | Complete |
 | EP-34 | Pool database connections in en-server | docs/plans/34-pool-database-connections-in-en-server.md | None | None | Not Started |
 | EP-35 | Version the wire contract and type the error model | docs/plans/35-version-the-wire-contract-and-type-the-error-model.md | None | None | Not Started |
 | EP-36 | Add health endpoints, graceful shutdown, and observability | docs/plans/36-add-health-endpoints-graceful-shutdown-and-observability.md | None | EP-34, EP-35 | Not Started |
@@ -134,8 +134,8 @@ recovery by the same horizon.
 
 ## Progress
 
-- [ ] EP-33: authentication required on every endpoint; unauthenticated requests get 401
-- [ ] EP-33: write endpoints separately authorizable; rate limiting active
+- [x] EP-33: authentication required on every endpoint; unauthenticated requests get 401
+- [x] EP-33: write endpoints separately authorizable; rate limiting active
 - [ ] EP-34: en-server serves concurrent requests through hasql-pool and survives a PostgreSQL restart
 - [ ] EP-35: versioned path prefix and stable field names on all endpoints; constructor tags gone
 - [ ] EP-35: typed error envelope with machine-readable codes; 4xx/5xx split correct; OpenAPI document served
@@ -149,7 +149,56 @@ recovery by the same horizon.
 
 ## Surprises & Discoveries
 
-(None yet.)
+From EP-33 (2026-07-08), affecting sibling plans:
+
+- **The `memory` package is deprecated; use `ram`.** EP-33's plan text specified `memory`
+  for `Data.ByteArray.constEq`. `ram` (jappeace/ram) is the maintained fork with an
+  identical module and API surface, so only `build-depends` changes. Verified against
+  `ram-0.22.0` on GHC 9.12.4. Any sibling plan reaching for constant-time comparison or
+  byte-array primitives — notably EP-38 when it mints a datastore identity, and the
+  Biscuit hardening in `docs/masterplans/10-harden-the-biscuit-decision-token-layer.md` —
+  should depend on `ram`. Watch for a `Data.ByteArray` module clash in any component that
+  also pulls the crypton/biscuit chain, which may still supply `memory`.
+
+- **`en-server` block-buffers stdout, so startup logs vanish under a supervisor.**
+  Running the binary with stdout redirected to a file produced a zero-byte log while the
+  server was demonstrably live and answering requests. `Main.hs` never calls
+  `hSetBuffering`. This silently swallows the `WARNING: authentication is DISABLED` line
+  that EP-33 prints — exactly the line an operator must not miss. **EP-36 owns the fix**
+  (`hSetBuffering stdout LineBuffering` at the top of `main`) and must do it before its
+  structured request logging is trustworthy, since that logging will otherwise be
+  invisible in production too.
+
+- **Configuration failures surface as uncaught `IOException`s.** Every config error in
+  `Main.hs` goes through `fail`, so the operator sees
+  `en-server: Uncaught exception … user error (…)` wrapped around an otherwise good
+  message. Exit code is 1 and no port is bound, so behavior is correct. **EP-38 owns the
+  fix** when it centralizes parsing into `ServerConfig`: render the message and exit
+  cleanly rather than throwing.
+
+- **The middleware composition order is now established**, as the master plan's
+  Integration Points required: `authMiddleware` outermost, then `rateLimitMiddleware`,
+  then `app serverEnv`, in `en-server/app/Main.hs`. Authentication writes the verified
+  caller name to an `X-En-Caller` request header (stripping any client-supplied value
+  first), and the rate limiter reads it to key its per-caller buckets. **EP-36's request
+  logging should read the same header** to attribute a request to a caller, and must be
+  composed inside authentication to see it.
+
+- **`/healthz` and `/readyz` are already exempt** from both authentication and rate
+  limiting; they currently return Servant's 404. EP-36 need only add the routes — no
+  middleware change. `/metrics` is deliberately *not* exempt, so a scraper must present
+  a bearer key.
+
+- **EP-35 must update one predicate.** `isWriteRequest` in `en-server/app/Middleware.hs`
+  matches `pathInfo == ["tuples"]` with `POST`/`DELETE`. When EP-35 moves writes to
+  `POST /v1/relationships` and `POST /v1/relationships/delete`, that predicate must move
+  with them, or read-only keys silently regain write access. EP-35 also reconciles the
+  interim `{"error", "code"}` envelope that EP-33's 401/403/429 bodies use.
+
+- **Rate-limit buckets are keyed by API key name and never evicted.** Safe today (the key
+  set is bounded by configuration, plus one shared `"anonymous"` bucket). If any later
+  plan re-keys buckets by client IP, it must add eviction or it becomes an unbounded
+  memory leak.
 
 
 ## Decision Log

@@ -7,6 +7,7 @@ import Data.Time (getCurrentTime)
 import Effectful (Eff, IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Network.Wai.Handler.Warp qualified as Warp
+import Network.Wai.Handler.WarpTLS qualified as WarpTLS
 import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
 
@@ -36,6 +37,7 @@ main = do
     databaseUrl <- requiredEnv "EN_DATABASE_URL"
     authConfig <- loadAuthConfig
     rateLimitConfig <- loadRateLimitConfig
+    tlsConfig <- loadTlsConfig
     port <- maybe 8080 parsePort <$> lookupEnv "EN_PORT"
     gcWindow <- maybe "24 hours" Text.pack <$> lookupEnv "EN_GC_WINDOW"
     optimizedRevisionTtlMs <- optionalNonNegativeIntEnv "EN_OPTIMIZED_REVISION_CACHE_TTL_MS"
@@ -138,8 +140,42 @@ main = do
     Text.putStrLn ("Decision cache: " <> describeEntryCache decisionMaxEntries)
     Text.putStrLn ("Rate limit: " <> describeRateLimit rateLimitConfig)
     rateLimit <- rateLimitMiddleware rateLimitConfig
+    let wrappedApp = authMiddleware authConfig (rateLimit (app serverEnv))
     bracket (pure connection) Connection.release \_ ->
-        Warp.run port (authMiddleware authConfig (rateLimit (app serverEnv)))
+        case tlsConfig of
+            Just tls -> do
+                Text.putStrLn ("Serving TLS directly (EN_TLS_CERT_FILE=" <> Text.pack tls.certFile <> ")")
+                WarpTLS.runTLS
+                    (WarpTLS.tlsSettings tls.certFile tls.keyFile)
+                    (Warp.setPort port Warp.defaultSettings)
+                    wrappedApp
+            Nothing -> do
+                Text.putStrLn "Serving plaintext HTTP; terminate TLS at a reverse proxy or set EN_TLS_CERT_FILE/EN_TLS_KEY_FILE."
+                Warp.run port wrappedApp
+
+data TlsConfig = TlsConfig
+    { certFile :: FilePath
+    , keyFile :: FilePath
+    }
+
+-- | Both variables or neither; setting exactly one is a startup failure.
+loadTlsConfig :: IO (Maybe TlsConfig)
+loadTlsConfig = do
+    cert <- nonEmptyEnv "EN_TLS_CERT_FILE"
+    key <- nonEmptyEnv "EN_TLS_KEY_FILE"
+    case (cert, key) of
+        (Nothing, Nothing) -> pure Nothing
+        (Just certFile, Just keyFile) -> pure (Just TlsConfig{certFile, keyFile})
+        _ ->
+            fail
+                "Invalid TLS configuration: set both EN_TLS_CERT_FILE and EN_TLS_KEY_FILE, or neither."
+
+nonEmptyEnv :: String -> IO (Maybe String)
+nonEmptyEnv name =
+    lookupEnv name >>= \case
+        Nothing -> pure Nothing
+        Just "" -> fail ("Invalid " <> name <> ": expected a non-empty file path")
+        Just value -> pure (Just value)
 
 data SchemaSource
     = BuiltInDemoSchema

@@ -60,10 +60,10 @@ This section must always reflect the actual current state of the work.
 - [x] M3: per-caller token-bucket rate limiting middleware with
   `EN_RATE_LIMIT_RPS` / `EN_RATE_LIMIT_BURST`; over-budget requests get 429 with
   `Retry-After`.
-- [ ] M4: optional direct TLS via `warp-tls` (`EN_TLS_CERT_FILE` / `EN_TLS_KEY_FILE`)
+- [x] M4: optional direct TLS via `warp-tls` (`EN_TLS_CERT_FILE` / `EN_TLS_KEY_FILE`)
   and the documented reverse-proxy TLS posture in
   `docs/user/service-and-operations.md`.
-- [ ] Final validation: full curl transcript (401 / 403 / 429 / 200) reproduced against
+- [x] Final validation: full curl transcript (401 / 403 / 429 / 200) reproduced against
   a locally running server; `just start-and-test` passes.
 
 
@@ -203,7 +203,62 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Complete. All four milestones landed, and all seven acceptance criteria in Validation and
+Acceptance were reproduced against a locally running server on 2026-07-08. Finding A1
+(CRITICAL) of `docs/reviews/2026-07-07-architecture-performance-review.md` is closed:
+`en-server` can no longer be started in an anonymous-write configuration by accident.
+
+What exists now that did not before:
+
+- `en-server/app/Middleware.hs` (~230 lines), holding bearer-key authentication, the
+  read/write role split, and a per-caller token-bucket rate limiter.
+- Fail-closed startup. `cabal run en-server` with no `EN_API_KEYS_*` variables exits 1
+  naming all three variables, and binds no port.
+- Seven new environment variables, documented in `docs/user/service-and-operations.md`
+  under "Authentication, rate limiting, and TLS".
+- Direct TLS through `warp-tls-3.4.14`, which builds clean on GHC 9.12.4.
+
+Verified behavior (abridged from the acceptance run):
+
+```text
+POST /check   no key                -> 401 {"code":"unauthenticated",...} + WWW-Authenticate: Bearer
+POST /check   Bearer wrong          -> 401
+POST /tuples  read-only key         -> 403 {"code":"permission_denied",...}
+POST /check   read-only key         -> 200 {"decision":{"tag":"AllowedWire"}}
+POST /tuples  read-write key        -> 200 {"token":"en1...."}
+3x POST /check, rps=1 burst=2       -> 200, 200, 429 (Retry-After: 1)
+   other key, same instant          -> 200          (buckets are per-caller)
+   first key, after sleep 2         -> 200          (bucket refilled)
+GET  /healthz no key                -> 404          (exempt; 200 once EP-36 lands)
+https:// with cert+key              -> serves TLS; plain http:// on that port -> 426
+cabal build all / cabal test en-servant / just start-and-test -> pass
+```
+
+Gaps and deliberate non-goals, left for the plans that own them:
+
+- The limiter's bucket map is never pruned. Keys are bounded by the configured key list
+  plus `"anonymous"`, so this is bounded in practice — but if a future plan keys buckets
+  by client IP instead of key name, it becomes an unbounded-growth memory leak and needs
+  eviction.
+- Rate limiting is per process. Replicas multiply the effective limit. Documented, and
+  the Decision Log names `wai-rate-limit` and `wai-middleware-throttle` for whoever
+  needs distributed limiting.
+- The error envelope is the interim `{"error", "code"}` shape. EP-35
+  (`docs/plans/35-version-the-wire-contract-and-type-the-error-model.md`) reconciles it,
+  and must also update `isWriteRequest` in `Middleware.hs` when it moves the write routes
+  under `/v1`.
+- Two operability defects were found but not fixed here, because sibling plans own the
+  code that must change: block-buffered stdout hides startup warnings under a supervisor
+  (EP-36), and configuration errors surface as uncaught `IOException`s (EP-38). Both are
+  written up in Surprises & Discoveries.
+
+Lesson worth carrying forward: the plan's two under-specified corners were both fail-open
+hazards, and both surfaced only by asking "what does a plausible misconfiguration do?"
+rather than by testing the happy path. `EN_AUTH_DISABLED=true` set alongside real keys
+would have silently disabled authentication on a correctly-configured deployment; a
+fractional `EN_RATE_LIMIT_RPS` with a defaulted burst would have 429'd every request
+forever. Both are now startup-time failures or loud warnings. A plan that specifies each
+knob in isolation should still be read for what the knobs do in combination.
 
 
 ## Context and Orientation

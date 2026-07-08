@@ -50,3 +50,4 @@ executable en-server
     , time
     , wai
     , warp
+    , warp-tls
