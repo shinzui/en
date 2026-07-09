@@ -134,6 +134,22 @@ runTupleStoreScenario connection = do
                 }
         )
         lookupSecondPage
+    {- Cursor validation against the real PostgreSQL validator, not a test double.
+    Flipping one character inside the cursor's token field preserves the field's
+    length prefix, so the cursor still parses -- and is then refused by `decodeToken`,
+    which is the only thing standing between a client and a read at a revision of its
+    choosing. A retired v1 cursor is refused at the parse step, before any token is
+    consulted, because its revision field was exactly that. -}
+    let LookupCursor projectXCursorText = projectXCursor
+        corruptedTokenCursor = LookupCursor (Text.replace ":en1." ":xn1." projectXCursorText)
+    assertEqual
+        "postgres-backed lookup rejects a cursor whose token was tampered with"
+        (Left (InvalidConsistencyToken "TokenBadPrefix"))
+        =<< runPg connection config (Lookup.lookup graph (AtLeastAsFresh writeToken) (lookupRequest (Just corruptedTokenCursor)))
+    assertEqual
+        "postgres-backed lookup rejects a retired v1 cursor"
+        (Left (InvalidConsistencyToken "lookup cursor"))
+        =<< runPg connection config (Lookup.lookup graph (AtLeastAsFresh writeToken) (lookupRequest (Just (LookupCursor "lookup-v1|13:test-revision|0:|0:"))))
     deleteToken <- runPgOrFail connection config (TupleStore.deleteTuples [tuple, tuple2])
     TokenMetadata{revision = deleteRevision} <- either (fail . show) pure (tokenMetadataFromPayload deleteToken)
     TuplePage{rows = rowsAtOldRevision} <- runPgOrFail connection config (TupleStore.readStartingWithUser writeRevision query)

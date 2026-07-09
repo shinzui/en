@@ -142,8 +142,37 @@ data LookupPage = LookupPage
 
 {- | List the objects of @objectType@ on which @subject@ has @permission@:
 reverse expansion (subject → resource) plus reach-then-check for conditional
-entrypoints (intersection / exclusion / caveats), streamed and cursorable.
-This is the read-filter primitive (e.g. kawa filtering the activity stream).
+entrypoints (intersection / exclusion / caveats). This is the read-filter
+primitive (e.g. kawa filtering the activity stream).
+
+Cursor-resumable at a pinned snapshot, not streamed. Precisely:
+
+A lookup resolves consistency /once/ and every page of it, including the forward
+checks that confirm intersection and exclusion candidates, reads the same snapshot.
+The cursor carries a 'En.Revision.ConsistencyToken' pinning that snapshot, and a
+continuation is validated exactly as any token presented on a read -- datastore
+identity, schema hash, garbage-collection window. A tampered, foreign, or expired
+cursor is refused with @InvalidConsistencyToken "lookup cursor"@. Cursors from the
+retired @lookup-v1@ format are refused for the same reason: they carried a raw
+revision that a client could choose. A refused cursor is recoverable by restarting
+the lookup without one, and cursors expire with the GC window, so a client that
+sits on one for a day should expect to.
+
+Results are ordered by object key and a cursor records the last one emitted, which
+is what keeps pages free of duplicates and gaps. Continuation pages do /not/ resume
+the reverse walk where it stopped: the walk is recomputed and its output filtered
+against that watermark. What a continuation does avoid is re-confirming candidates
+earlier pages already emitted, and confirmation -- a forward check per candidate --
+is the expensive half. Confirmation is bounded to the page: it stops once enough
+candidates have been allowed to fill it.
+
+The deadline interrupts the walk rather than labelling its result. It is polled
+between store pages, before each branch, and before each round of recursive arrow
+expansion. A lookup that runs out of budget returns 'LookupTruncated' with /no
+objects/ and an unmoved watermark, because the objects found before the interruption
+are an arbitrary subset of the answer rather than its smallest members -- emitting
+them would advance the watermark past results not yet discovered. Retry with a
+budget sufficient for one page.
 -}
 lookup ::
     (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>

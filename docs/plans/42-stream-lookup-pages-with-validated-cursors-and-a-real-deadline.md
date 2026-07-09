@@ -91,10 +91,15 @@ completion.
   objects with an unmoved watermark; a budget of one poll completes the traversal and
   returns its full page as `LookupTruncated`. The existing deadline test was **inverted**:
   it fed a budget of zero polls and still demanded a 500-object page.
-- [ ] M5: documentation and wire pass — fix the `En.Lookup` haddock (lines 105–108),
-  en-servant handler unchanged (cursor stays opaque `Text`), en-postgres integration
-  test for cursor validation against a real store.
-- [ ] Final: full suite green; Outcomes filled; master plan progress rows updated.
+- [x] M5 (2026-07-08): `En.Lookup`'s haddock now states the contract it actually keeps —
+  cursor-resumable at a validated pinned snapshot, *not* streamed; the walk is recomputed
+  and filtered behind the watermark; confirmation is bounded to the page; the deadline
+  interrupts and an interrupted lookup emits nothing. `en-servant` needed no code change:
+  two handler tests prove a retired v1 cursor and an unparsable cursor surface as
+  400 `invalid_consistency_token`. `en-postgres` integration: a cursor whose token has one
+  character flipped is refused by the *real* validator (`TokenBadPrefix`), as is a v1 cursor.
+- [x] Final (2026-07-08): `cabal build all && cabal test all` green across all seven suites.
+  Outcomes filled; master plan updated.
 
 
 ## Surprises & Discoveries
@@ -375,6 +380,24 @@ outcome, not an error. The alternative, threading a `TraversalOutcome` return ty
 every evaluator, would have bought nothing: on interruption there are no partial results worth
 carrying back.
 
+**EP-35 already landed, so `InvalidConsistencyToken` is a 400 today (2026-07-08).** The
+plan's M5 step 2 expects a cursor rejection to surface "via the generic 500 mapping" and
+leaves the 4xx mapping to docs/plans/35. That is stale: `enErrorToFault` in
+`en-servant/src/En/Servant/Seam.hs` already maps `InvalidConsistencyToken` to
+`BadRequestFault (envelope "invalid_consistency_token" detail)`. The two new handler tests
+assert the 400 and its code directly rather than leaving a comment pointing at a plan that
+has already shipped. This vindicates the Decision Log's choice to reuse the existing
+constructor rather than add one: there was nothing left to wire up.
+
+**The PostgreSQL tamper test does real work (2026-07-08).** It takes the cursor the first
+page actually returned, flips one character inside the token field
+(`":en1." -> ":xn1."`, preserving the field's length prefix so the cursor still parses), and
+asserts the lookup fails with `InvalidConsistencyToken "TokenBadPrefix"` — the error text the
+*real* `En.Postgres.Revision.decodeToken` produces. Had the corruption missed, or had the
+token not been consulted, the lookup would have succeeded and the assertion would have failed.
+The existing multi-page integration coverage already exercised mint → encode → decode →
+validate against a live database; this closes the negative case.
+
 **Confirmation is bounded by the page, not by the clock (2026-07-08).** The deadline does not
 interrupt `confirmCandidates`, because its store reads go through `checkAtRevision` rather
 than `readRowsForSubjects`. It is not unbounded, though: M3's `confirmBudget` caps it at
@@ -510,7 +533,69 @@ than `readRowsForSubjects`. It is not unbounded, though: M3's `confirmBudget` ca
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Two of the three findings are fixed outright, and the third is fixed in the half where its
+cost lives — with the other half shown to be unfixable in this layer.
+
+**B9 is closed, and closed structurally.** A lookup cursor now carries a `ConsistencyToken`
+minted by the datastore, and `resolveCursor` decodes and validates it exactly as any token
+presented on a read: datastore identity, schema hash, garbage-collection window. Forged v1
+cursors, malformed v2 cursors, cursors minted by another datastore, and cursors carrying an
+unmintable token are all refused with `InvalidConsistencyToken`, in unit tests against a
+strict in-memory validator and in the integration suite against a live PostgreSQL. The old
+behavior is worth restating: a hand-written cursor naming any revision the client liked was
+*obeyed*, and no validator could refuse it, because the cursor path never called one.
+
+The guarantee is not maintained by review. `En.Lookup` imports `Revision` without its
+constructor, so the module cannot build a revision from client text; an edit that tries does
+not compile.
+
+**B7 is closed, also structurally.** `checkAtRevision` takes an already-resolved revision, so
+a lookup resolves consistency once — three times before, on an intersection with two
+candidates — and every confirmation reads the snapshot the traversal read. Deleting the
+`consistency` parameter from the internal evaluators removed `ConsistencyStore` from their
+constraint sets entirely: the traversal *cannot* re-resolve consistency. Confirmations also
+share one memo, which on a shared-subtree fixture costs 17 store reads instead of 19.
+
+**B8 splits.** Its deadline half is fixed: polls now sit between store pages, before each
+branch, and before each round of the recursive fixpoint, and an exhausted budget interrupts
+the walk. A zero-budget lookup reads one store page instead of two.
+
+Its paging half is fixed only for confirmation, and that is the honest result rather than a
+shortfall of effort. Confirmation — a forward check per over-generated candidate — is the
+expensive stage, and it is now filtered by the watermark and bounded to the page: 15/12/7
+store reads across three pages where every page previously cost 17. But the *traversal* is
+still recomputed per page, and the plan's mechanism for fixing that (per-branch `StoreCursor`
+resumption) is unsound against both of en's stores. They scan `ORDER BY id ASC` with a keyset
+cursor on `id`, and row id bears no relation to object key, so no prefix of a branch scan is
+safe to skip: rows consumed but not emitted, because they fell beyond the page limit, would be
+lost. The fix is a storage change — order scans by `(object_type, object_id, id)`, with a
+keyset cursor and index to match — and belongs in its own plan.
+
+That same ordering fact, met from the other side, decided what an interrupted lookup may
+return: nothing. Objects found before an interruption are an arbitrary subset of the answer,
+not its smallest members, so emitting them would advance the watermark past results not yet
+discovered. An interrupted lookup reports `LookupTruncated` with no objects and an unmoved
+watermark.
+
+Two tests had to be inverted, and both inversions are the same lesson. One asserted that a
+lookup with a budget of *zero polls* returned a full 500-object page — B8 written down as a
+requirement, since the deadline could only relabel a result it had already computed in full.
+The other, the cursor round-trip, encoded the v1 format whose revision field is the forgery.
+A test that pins current behavior pins current bugs, and the only way to notice is to ask what
+the assertion would say if the bug were fixed.
+
+The plan was right to hedge. Its Idempotence section pre-authorized the retreat that M3 in
+fact had to take, and its M2 step 1 anticipated that EP-41 would make the internal result a
+residual. What it could not anticipate was that the two structural wins — a module that cannot
+construct a `Revision`, a traversal that cannot reach `ConsistencyStore` — would come free
+from deletions it had asked for on other grounds. Both findings were, at bottom, about an
+engine reaching for a capability it should never have had.
+
+What remains, for whoever picks it up: object-ordered store scans would let the traversal
+resume rather than recompute, and would also let an interrupted lookup emit a true prefix
+instead of nothing. Both of this plan's honest retreats dissolve at once if that lands. The
+cursor's `frontier` field is encoded, round-trip tested, and empty, reserving the format space
+for exactly that.
 
 
 ## Context and Orientation
@@ -891,9 +976,10 @@ transcripts as you go.
    returns its full 500-object page, still labelled `LookupTruncated`, whose cursor resumes
    the remainder. The pre-existing truncate-and-resume test was **inverted**: it asserted a
    zero-budget lookup returned 500 objects, which is the bug.
-5. **Docs match behavior**: the `En.Lookup` module haddock states the validated-cursor,
-   staged-resumption, interruptible-deadline contract; no claim of full streaming
-   remains.
+5. **Docs match behavior**: the `En.Lookup` haddock states the validated-cursor,
+   watermark-filtered, interruptible-deadline contract; the claim of streaming is gone, and
+   it says plainly that the walk is recomputed per page and that an interrupted lookup emits
+   nothing. It also documents cursor lifetime: cursors expire with the GC window.
 6. **No regressions**: `cabal test all` green, including en-servant handler tests (wire
    contract unchanged: cursor remains opaque `Text` in `LookupRequestWire.cursor` /
    `LookupStateWire`).
@@ -945,3 +1031,35 @@ wraps machinery EP-39 reshapes; if docs/plans/41 landed, apply context at the
 `checkAtRevision` boundary). Consumed by: docs/plans/52 (cursor discipline),
 docs/plans/51 (`MintToken`), docs/plans/35 (`InvalidConsistencyToken` → 4xx envelope),
 docs/plans/44 (deadline/budget configuration and loop tuning).
+
+
+---
+
+Revision note (2026-07-08): EP-42 is implemented. All milestones are complete; the living
+sections record what happened rather than what was planned. Four substantive departures, each
+with a Decision Log entry.
+
+M3's central mechanism was abandoned on soundness grounds, not deferred for effort. Per-branch
+`StoreCursor` resumption cannot work against a store whose scans are ordered by row id, which
+both of en's are; the four-row counterexample is in Surprises & Discoveries. M3 kept the
+watermark filter the plan's own Idempotence section named as the fallback, and extended it with
+a page-sized confirmation budget — which is where B8's cost actually lives. Acceptance criterion
+3 is amended to say what is now true, including that a lookup needing no confirmation gains
+nothing until object-ordered scans land.
+
+M4's contract changed with it. The plan says an interrupted traversal emits "the watermark-safe
+prefix of what was merged"; there is no such prefix, for the same ordering reason. An
+interrupted lookup emits nothing and leaves the watermark alone. This inverted an existing test
+that fed a zero-poll budget and demanded a full page. Acceptance criterion 4 is amended and now
+measures the halt directly: one store page read instead of two.
+
+M2 removed more than the plan asked. Deleting `consistency` from the internal evaluators also
+deleted their `ConsistencyStore` constraint, so B7 cannot recur — the traversal has no way to
+resolve consistency. M1 gained the same kind of guarantee for B9 by importing `Revision`
+without its constructor. Both are recorded as decisions, because a later plan that reintroduces
+either capability would silently reopen a fixed finding.
+
+M5 found one stale assumption: `enErrorToFault` already maps `InvalidConsistencyToken` to a 400,
+because docs/plans/35 has landed. The handler tests assert the status and code directly rather
+than leaving a forward reference. No wire change was needed anywhere; cursors remain opaque
+`Text`.

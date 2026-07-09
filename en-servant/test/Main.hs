@@ -194,6 +194,20 @@ main = do
     lookupStatsAfterSecond <- cacheStats cachedLookupEnv.cacheDecisions
     assertBool "cached lookup endpoint uses decision cache for confirmations" (lookupStatsAfterSecond.hits > lookupStatsAfterFirst.hits)
 
+    {- The wire carries a cursor as opaque text and hands it to the engine unread, so
+    the engine's cursor validation is what protects the endpoint. A retired v1 cursor
+    -- whose revision field a client could choose freely -- and an unparsable one both
+    surface as a 400 rather than a 500, because `enErrorToFault` maps
+    `InvalidConsistencyToken` to a client fault. -}
+    assertEqual
+        "a retired v1 lookup cursor is a client error"
+        (Just "invalid_consistency_token")
+        =<< clientErrorCodeOf (lookupEndpoint lookupRequest{cursor = Just "lookup-v1|13:test-revision|0:|0:"})
+    assertEqual
+        "an unparsable lookup cursor is a client error"
+        (Just "invalid_consistency_token")
+        =<< clientErrorCodeOf (lookupEndpoint lookupRequest{cursor = Just "not-a-cursor"})
+
     -- The server owns the lookup budget, not the caller. A `deadlineMaxMillis` of zero
     -- is an already-expired budget, so if the clamp reaches the engine the page reports
     -- `truncated` no matter how much time the client asked for.
