@@ -1,11 +1,12 @@
 module Main (main) where
 
-import Control.Exception (IOException, bracket, try)
+import Control.Exception (IOException, finally, try)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
-import Data.Time (getCurrentTime)
+import Data.Time (DiffTime, getCurrentTime)
 import Effectful (Eff, IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
+import Network.Wai qualified as Wai
 import Network.Wai.Handler.Warp qualified as Warp
 import Network.Wai.Handler.WarpTLS qualified as WarpTLS
 import System.Environment (lookupEnv)
@@ -18,7 +19,7 @@ import En.Effect.TupleStore (TuplePage, TupleStore)
 import En.Error (EnError)
 import En.Lookup qualified as Lookup
 import En.Migrations (migrationsDir)
-import En.Postgres.Database (Database, runDatabaseConnection)
+import En.Postgres.Database (Database, runDatabasePool)
 import En.Postgres.Revision (ConsistencyConfig (..), OptimizedRevisionCache, OptimizedRevisionConfig (..), newOptimizedRevisionCache, runConsistencyStorePostgres)
 import En.Postgres.TupleStore (runTupleStorePostgres, runTupleStorePostgresWithOptimizedRevisionCacheHandle)
 import En.Reachability (compile)
@@ -28,8 +29,10 @@ import En.Schema.Builder qualified as Schema
 import En.Schema.Parse (parseSchema)
 import En.Servant.API (app)
 import En.Servant.Seam (AppEffects, Env (..))
-import Hasql.Connection qualified as Connection
 import Hasql.Connection.Settings qualified as Settings
+import Hasql.Pool qualified as Pool
+import Hasql.Pool.Config qualified as Pool.Config
+import Hasql.Session qualified as Session
 import Middleware (authMiddleware, describeRateLimit, loadAuthConfig, loadRateLimitConfig, rateLimitMiddleware)
 
 main :: IO ()
@@ -43,22 +46,37 @@ main = do
     optimizedRevisionTtlMs <- optionalNonNegativeIntEnv "EN_OPTIMIZED_REVISION_CACHE_TTL_MS"
     tupleReadMaxEntries <- optionalNonNegativeIntEnv "EN_TUPLE_READ_CACHE_MAX_ENTRIES"
     decisionMaxEntries <- optionalNonNegativeIntEnv "EN_DECISION_CACHE_MAX_ENTRIES"
+    poolSize <- optionalPositiveIntEnv "EN_POOL_SIZE" 10
+    acquisitionTimeoutMs <- optionalPositiveIntEnv "EN_POOL_ACQUISITION_TIMEOUT_MS" 10000
+    idlenessTimeoutMs <- optionalPositiveIntEnv "EN_POOL_IDLENESS_TIMEOUT_MS" 600000
+    maxLifetimeMs <- optionalPositiveIntEnv "EN_POOL_MAX_LIFETIME_MS" 3600000
     (schemaSource, rawSchema) <- loadSchema
     validSchema <- either (fail . ("Invalid schema: " <>) . show) pure (validateSchema rawSchema)
     let activeSchemaHash = schemaHash validSchema
         graph = compile validSchema
     logSchemaSource schemaSource
     Text.putStrLn ("Schema hash: " <> renderSchemaHash activeSchemaHash)
-    connection <-
-        Connection.acquire (Settings.connectionString (Text.pack databaseUrl)) >>= \case
-            Right value -> pure value
-            Left err ->
-                fail $
-                    "Could not connect to PostgreSQL with EN_DATABASE_URL. "
-                        <> show err
-                        <> "\nRun the codd migrations in "
-                        <> migrationsDir
-                        <> " before starting en-server."
+    pool <-
+        Pool.acquire $
+            Pool.Config.settings
+                [ Pool.Config.size poolSize
+                , Pool.Config.acquisitionTimeout (millisToDiffTime acquisitionTimeoutMs)
+                , Pool.Config.idlenessTimeout (millisToDiffTime idlenessTimeoutMs)
+                , Pool.Config.agingTimeout (millisToDiffTime maxLifetimeMs)
+                , Pool.Config.staticConnectionSettings
+                    (Settings.connectionString (Text.pack databaseUrl))
+                ]
+    -- Pool connections are established lazily, so a bad EN_DATABASE_URL would
+    -- otherwise surface only on the first request rather than at startup.
+    Pool.use pool (Session.script "SELECT 1") >>= \case
+        Right () -> pure ()
+        Left err ->
+            fail $
+                "Could not reach PostgreSQL through EN_DATABASE_URL. "
+                    <> show err
+                    <> "\nRun the codd migrations in "
+                    <> migrationsDir
+                    <> " before starting en-server."
     let config =
             ConsistencyConfig
                 { datastoreId = DatastoreId "en-server"
@@ -91,8 +109,8 @@ main = do
         runAppIO :: Eff AppEffects a -> IO (Either EnError a)
         runAppIO action =
             runEff
-                ( runDatabaseConnection
-                    connection
+                ( runDatabasePool
+                    pool
                     ( runErrorNoCallStack
                         ( runTupleStoreLayer
                             optimizedRevisionCache
@@ -135,23 +153,36 @@ main = do
                 , maxBatchSize = 1000
                 }
     Text.putStrLn ("en-server listening on :" <> Text.pack (show port))
+    Text.putStrLn
+        ( "Connection pool: size="
+            <> Text.pack (show poolSize)
+            <> ", acquisitionTimeoutMs="
+            <> Text.pack (show acquisitionTimeoutMs)
+            <> ", idlenessTimeoutMs="
+            <> Text.pack (show idlenessTimeoutMs)
+            <> ", maxLifetimeMs="
+            <> Text.pack (show maxLifetimeMs)
+        )
     Text.putStrLn ("Optimized revision cache: " <> describeMillisCache optimizedRevisionTtlMs)
     Text.putStrLn ("Tuple-read cache: " <> describeEntryCache tupleReadMaxEntries)
     Text.putStrLn ("Decision cache: " <> describeEntryCache decisionMaxEntries)
     Text.putStrLn ("Rate limit: " <> describeRateLimit rateLimitConfig)
     rateLimit <- rateLimitMiddleware rateLimitConfig
     let wrappedApp = authMiddleware authConfig (rateLimit (app serverEnv))
-    bracket (pure connection) Connection.release \_ ->
-        case tlsConfig of
-            Just tls -> do
-                Text.putStrLn ("Serving TLS directly (EN_TLS_CERT_FILE=" <> Text.pack tls.certFile <> ")")
-                WarpTLS.runTLS
-                    (WarpTLS.tlsSettings tls.certFile tls.keyFile)
-                    (Warp.setPort port Warp.defaultSettings)
-                    wrappedApp
-            Nothing -> do
-                Text.putStrLn "Serving plaintext HTTP; terminate TLS at a reverse proxy or set EN_TLS_CERT_FILE/EN_TLS_KEY_FILE."
-                Warp.run port wrappedApp
+    serve tlsConfig port wrappedApp `finally` Pool.release pool
+
+serve :: Maybe TlsConfig -> Int -> Wai.Application -> IO ()
+serve tlsConfig port wrappedApp =
+    case tlsConfig of
+        Just tls -> do
+            Text.putStrLn ("Serving TLS directly (EN_TLS_CERT_FILE=" <> Text.pack tls.certFile <> ")")
+            WarpTLS.runTLS
+                (WarpTLS.tlsSettings tls.certFile tls.keyFile)
+                (Warp.setPort port Warp.defaultSettings)
+                wrappedApp
+        Nothing -> do
+            Text.putStrLn "Serving plaintext HTTP; terminate TLS at a reverse proxy or set EN_TLS_CERT_FILE/EN_TLS_KEY_FILE."
+            Warp.run port wrappedApp
 
 data TlsConfig = TlsConfig
     { certFile :: FilePath
@@ -245,6 +276,24 @@ optionalNonNegativeIntEnv name =
             case readMaybe value of
                 Just parsed | parsed >= 0 -> pure parsed
                 _ -> fail ("Invalid " <> name <> ": expected a non-negative integer")
+
+{- | Like 'optionalNonNegativeIntEnv' but falls back to a default and rejects zero.
+Every pool knob it parses is meaningless at zero: a zero-size pool serves nothing,
+and a zero timeout expires before it can be waited on.
+-}
+optionalPositiveIntEnv :: String -> Int -> IO Int
+optionalPositiveIntEnv name fallback =
+    lookupEnv name >>= \case
+        Nothing -> pure fallback
+        Just "" -> fail ("Invalid " <> name <> ": expected a positive integer")
+        Just value ->
+            case readMaybe value of
+                Just parsed | parsed >= 1 -> pure parsed
+                _ -> fail ("Invalid " <> name <> ": expected a positive integer")
+
+millisToDiffTime :: Int -> DiffTime
+millisToDiffTime ms =
+    fromRational (toRational ms / 1000)
 
 describeMillisCache :: Int -> Text.Text
 describeMillisCache ttlMs

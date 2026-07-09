@@ -44,6 +44,7 @@ executable en-server
     , en-postgres
     , en-servant
     , hasql
+    , hasql-pool      ^>=1.4
     , http-types
     , ram
     , text

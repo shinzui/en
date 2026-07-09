@@ -47,12 +47,18 @@ This section must always reflect the actual current state of the work.
   `hasql-pool-1.4.2` from Hackage against the pinned `hasql-1.10.3.5`, no
   `cabal.project` constraint needed). `cabal test en-postgres` passes both suites
   (`en-postgres-revision-tests`, `en-postgres-integration-tests`).
-- [ ] M2: `en-server/app/Main.hs` acquires a `Pool` from env-configured settings,
-  performs a fail-fast startup ping, removes the inert bracket, and releases the pool
-  on exit; `en-server/en-server.cabal` gains `hasql-pool`.
-- [ ] M2: pool settings documented in `docs/user/service-and-operations.md`
+- [x] M2 (2026-07-08): `en-server/app/Main.hs` acquires a `Pool` from env-configured
+  settings, performs a fail-fast startup ping, replaces the inert bracket with a
+  reachable `finally`, and releases the pool on exit; `en-server/en-server.cabal` gains
+  `hasql-pool ^>=1.4`. `cabal build all` green.
+- [x] M2 (2026-07-08): pool settings documented in `docs/user/service-and-operations.md`
   (`EN_POOL_SIZE`, `EN_POOL_ACQUISITION_TIMEOUT_MS`, `EN_POOL_IDLENESS_TIMEOUT_MS`,
-  `EN_POOL_MAX_LIFETIME_MS`).
+  `EN_POOL_MAX_LIFETIME_MS`), plus a "Connection pooling" section covering sizing and
+  restart behavior.
+- [x] M2 (2026-07-08): acceptance 1 (`just start-and-test` → `server smoke test passed:
+  AllowedWire`), acceptance 2 (bogus `EN_DATABASE_URL` exits 1 with the migrations hint,
+  port never bound), acceptance 5 (`EN_POOL_SIZE=0` exits 1; `EN_POOL_SIZE=25` logs the
+  pool line) all verified.
 - [ ] M3: reconnect-after-restart validated: smoke test passes, PostgreSQL restarted via
   `pg_ctl`, smoke test passes again against the same server process; transcript
   recorded in Outcomes.
@@ -64,7 +70,45 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- **`hasql-pool` needed no `cabal.project` constraint.** The plan hedged that
+  `hasql-pool` 1.4.2 requires `hasql >=1.10 && <1.11`; cabal resolved it from Hackage
+  against the existing `hasql-1.10.3.5` with no pin and no other closure change:
+
+  ```text
+   - hasql-pool-1.4.2 (lib) (requires build)
+  ```
+
+- **The pool startup log confirms the block-buffered-stdout bug that EP-33 recorded.**
+  Running with `EN_POOL_SIZE=25` and stdout redirected to a file, then killed by
+  `timeout`'s SIGTERM, produced a log with no `Connection pool:` line at all. The same
+  invocation under a pty (`script -q /dev/null`) prints it:
+
+  ```text
+  en-server listening on :8098
+  Connection pool: size=25, acquisitionTimeoutMs=10000, idlenessTimeoutMs=600000, maxLifetimeMs=3600000
+  ```
+
+  This is the `hSetBuffering stdout LineBuffering` fix that the master plan assigns to
+  EP-36. It affects *this* plan's operator story too: an operator who redirects
+  `en-server`'s stdout cannot see the pool configuration they just set. Nothing to fix
+  here — recording that M2's log line is correct and merely invisible under redirection
+  until EP-36 lands.
+
+- **`optionalNonNegativeIntEnv`'s shape did not fit the pool knobs.** The plan said to
+  add "a variant taking a default value". Every pool knob additionally rejects `0`
+  (a zero-size pool serves nothing; a zero acquisition timeout expires before it can be
+  waited on), whereas the existing cache variables *use* `0` as their disable switch. So
+  the new helper is `optionalPositiveIntEnv :: String -> Int -> IO Int` — default **and**
+  a `>= 1` floor — rather than a defaulting variant of the non-negative parser. Both
+  helpers now coexist in `Main.hs`.
+
+- **Warp's TLS/plaintext branch had to be lifted out of `main`.** Attaching
+  `` `finally` Pool.release pool `` to a multi-line `case tlsConfig of` inside the
+  `bracket`'s lambda made the precedence unreadable. The branch is now a top-level
+  `serve :: Maybe TlsConfig -> Int -> Wai.Application -> IO ()`, and `main` ends with the
+  single line `serve tlsConfig port wrappedApp \`finally\` Pool.release pool`. This adds
+  `import Network.Wai qualified as Wai` to `Main.hs`. **EP-36 takes note**: graceful
+  shutdown replaces `Warp.run`/`WarpTLS.runTLS` inside `serve`, not in `main`.
 
 
 ## Decision Log
@@ -124,6 +168,18 @@ Record every decision made while working on the plan.
   errors as `retryable` in the typed error envelope so clients can retry safely at
   their layer. Validation below encodes this honestly.
   Date: 2026-07-07
+- Decision: Add `optionalPositiveIntEnv :: String -> Int -> IO Int` (default plus a
+  `>= 1` floor) rather than a defaulting variant of `optionalNonNegativeIntEnv`.
+  Rationale: The plan called for "a variant taking a default value", but all four pool
+  knobs must also reject `0`, which the existing cache variables use as their disable
+  switch. One helper cannot serve both meanings of zero. The error text is
+  `Invalid EN_POOL_SIZE: expected a positive integer`, matching the surrounding style.
+  Date: 2026-07-08
+- Decision: Extract the TLS/plaintext branch from `main` into a top-level `serve`.
+  Rationale: `finally` binding over a multi-line `case` inside `main` obscured what the
+  release attaches to. `serve` makes `main`'s last line read exactly as intended, and
+  gives EP-36 one obvious place to add graceful shutdown.
+  Date: 2026-07-08
 - Decision: Pool sizing default is 10 connections.
   Rationale: `hasql-pool`'s default of 3 is too small for a Warp server running with
   `-N`; 10 matches the "match your concurrent database-touching threads" guidance in the

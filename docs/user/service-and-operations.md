@@ -66,10 +66,35 @@ Environment variables:
 | `EN_OPTIMIZED_REVISION_CACHE_TTL_MS` | no | Positive TTL in milliseconds for the optimized-revision cache; missing or `0` disables it |
 | `EN_TUPLE_READ_CACHE_MAX_ENTRIES` | no | Positive maximum tuple-read cache entries; missing or `0` disables it |
 | `EN_DECISION_CACHE_MAX_ENTRIES` | no | Positive maximum decision/subproblem cache entries; missing or `0` disables it |
+| `EN_POOL_SIZE` | no | Maximum pooled PostgreSQL connections, default `10`. Must be at least `1` |
+| `EN_POOL_ACQUISITION_TIMEOUT_MS` | no | How long a request waits for a free connection before failing, default `10000` |
+| `EN_POOL_IDLENESS_TIMEOUT_MS` | no | Close a connection unused for this long, default `600000` (10 minutes) |
+| `EN_POOL_MAX_LIFETIME_MS` | no | Close a connection older than this regardless of use, default `3600000` (1 hour) |
 
 Authentication, rate limiting, and TLS add seven more variables, documented under
 [Authentication, rate limiting, and TLS](#authentication-rate-limiting-and-tls).
 At least one API key is required for startup.
+
+### Connection pooling
+
+`en-server` serves every request from a pool of PostgreSQL connections, so
+concurrent requests do not serialize on a single socket. Connections are
+established lazily, but the server runs one `SELECT 1` through the pool before it
+binds the port, so an unreachable `EN_DATABASE_URL` fails startup rather than the
+first request.
+
+Size the pool to the concurrent database-touching work you expect, and keep
+`EN_POOL_SIZE` times your replica count comfortably under PostgreSQL's
+`max_connections` (default `100`). `EN_POOL_MAX_LIFETIME_MS` defaults to one hour
+so connections cycle through server-side configuration changes.
+
+A PostgreSQL restart no longer requires restarting `en-server`. Sessions that land
+on a connection killed by the restart fail once with a `500`, the pool discards
+that connection, and the next request establishes a fresh one — so up to
+`EN_POOL_SIZE` requests may fail while stale connections are flushed. Failures
+carry the detail `pool connection failure` or `timed out acquiring a pooled
+database connection`; transient occurrences right after a restart are expected,
+sustained ones are not. Clients should retry `5xx` responses.
 
 With `EN_SCHEMA_PATH` set, startup logs the loaded path and the active schema
 hash:
