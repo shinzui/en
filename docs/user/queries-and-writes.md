@@ -53,6 +53,50 @@ unconditional grant silently outliving the caveated one meant to replace it.
 Deletes work on the same identity and ignore the `caveat` field of the tuple you
 pass, so you never need to know a grant's current caveat in order to revoke it.
 
+### Preconditions and atomic mixed writes
+
+`writeTuples` and `deleteTuples` are shorthands for the one real write operation,
+`applyTupleWrites`, which takes preconditions, deletes, and writes together:
+
+```haskell
+token <-
+    applyTupleWrites
+        TupleWriteRequest
+            { preconditions = [TupleMustExist (exactTupleFilter aliceIsMember)]
+            , deletes = [oldGrant]
+            , writes = [newGrant]
+            }
+```
+
+Everything happens in one transaction, under one token. Preconditions are checked
+first, then deletes are applied, then writes — so replacing a grant is a single
+request with no intermediate state for anyone to observe.
+
+A precondition is a fact the write transaction re-verifies before applying
+anything. `TupleMustExist` and `TupleMustNotExist` take a `TupleFilter`, whose
+`objectType` is required and whose other fields narrow the match. If any
+precondition does not hold, the write is refused with `WritePreconditionFailed`,
+nothing is written, and no token is minted.
+
+This is what stops two administrators from racing. Suppose you read that alice is
+a member, and on that basis grant her something. Between your read and your write,
+another administrator revokes her membership. Without a precondition both writes
+succeed and the system lands in a state neither of you intended. Guard the write
+with `TupleMustExist (exactTupleFilter aliceIsMember)` and exactly one of you
+wins; the loser gets `WritePreconditionFailed`.
+
+A precondition failure is an arbitration loss, not an outage. Retrying the same
+request without re-reading the state it was guarded on will fail identically —
+re-read, re-decide, then re-issue.
+
+`exactTupleFilter` builds the filter matching one tuple's identity and nothing
+else. When writing a filter by hand, note that `subjectRelation` is three-valued:
+`AnySubjectRelation` matches concrete subjects and usersets alike,
+`NoSubjectRelation` matches only a subject carrying no relation, and
+`ExactSubjectRelation` matches one userset relation. `space:x#member@user:alice`
+and `space:x#member@user:alice#admin` are different grants that can both be live,
+so "any" is rarely what you want when naming a specific grant.
+
 ## Consistency modes
 
 Every read takes a `Consistency`:

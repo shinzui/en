@@ -44,18 +44,20 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Verify the hard dependency: docs/plans/45-adopt-touch-semantics-for-tuple-writes.md is complete (its Progress items checked; `relation_tuple_live_unique` has no `caveat_name`; `touchReplaceStatement` exists in `en-postgres/src/En/Postgres/TupleStore.hs`).
-- [ ] Add `TupleFilter`, `Precondition`, `TupleWriteRequest` and the `ApplyTupleWrites` constructor to `en-core/src/En/Effect/TupleStore.hs`; re-express `writeTuples`/`deleteTuples` as wrappers; remove the old `WriteTuples`/`DeleteTuples` constructors.
-- [ ] Add `WritePreconditionFailed Text` to `en-core/src/En/Error.hs`.
-- [ ] Implement `applyTupleWritesSession` in `en-postgres/src/En/Postgres/TupleStore.hs` (preconditions with `FOR SHARE` locking, deletes-then-writes, explicit `ROLLBACK` on failure).
-- [ ] Implement `ApplyTupleWrites` in `en-core/src/En/Conformance/Kikan.hs` (pure filter matching over the State-held tuples; requires `Error EnError :> es`).
-- [ ] Confirm `en-core/src/En/Effect/CachedTupleStore.hs` still passes writes through (compile-only).
-- [ ] Extend the wire DTOs in `en-servant/src/En/Servant/API.hs` (`preconditions`, `deletes` as optional fields; `PreconditionWire`, `TupleFilterWire`) and the two handlers.
-- [ ] Map `WritePreconditionFailed` to HTTP 412 in `en-servant/src/En/Servant/Seam.hs`.
-- [ ] Verify `en-client/src/En/Client.hs` compiles unchanged (it re-exports the API DTOs).
-- [ ] Add integration scenarios: sequential grant/revoke race, concurrent two-thread race, atomic mixed write, failed precondition writes nothing.
-- [ ] Add an en-servant test exercising the new wire fields end-to-end against the in-memory store, including backward compatibility of a request without the new fields.
-- [ ] Run `cabal build all`, `cabal test all`, `just start-and-test`; record transcripts.
+All milestones are complete; the plan is delivered.
+
+- [x] Verify the hard dependency: docs/plans/45-adopt-touch-semantics-for-tuple-writes.md is complete (its Progress items checked; `relation_tuple_live_unique` has no `caveat_name`; `touchReplaceStatement` exists in `en-postgres/src/En/Postgres/TupleStore.hs`).
+- [x] Add `TupleFilter`, `Precondition`, `TupleWriteRequest` and the `ApplyTupleWrites` constructor to `en-core/src/En/Effect/TupleStore.hs`; re-express `writeTuples`/`deleteTuples` as wrappers; remove the old `WriteTuples`/`DeleteTuples` constructors. (Also added `SubjectRelationFilter`, `exactTupleFilter`, `renderPrecondition` — see the Decision Log.)
+- [x] Add `WritePreconditionFailed Text` to `en-core/src/En/Error.hs`.
+- [x] Implement `applyTupleWritesSession` in `en-postgres/src/En/Postgres/TupleStore.hs` (preconditions with **`FOR UPDATE`** locking — not `FOR SHARE`, see the Decision Log — deletes-then-writes, explicit `ROLLBACK` on failure).
+- [x] Implement `ApplyTupleWrites` in `en-core/src/En/Conformance/Kikan.hs` (pure filter matching over the State-held tuples; requires `Error EnError :> es`).
+- [x] Confirm `en-core/src/En/Effect/CachedTupleStore.hs` still passes writes through (compile-only; its catch-all `passthrough` needed no edit).
+- [x] Extend the wire DTOs in `en-servant/src/En/Servant/API.hs` (`preconditions`, `deletes` as optional fields; `PreconditionWire`, `TupleFilterWire`, `SubjectRelationFilterWire`) and the two handlers. Hand-written aeson instances and `ToSchema` instances, per the grammar EP-35 established.
+- [x] Map `WritePreconditionFailed` to HTTP 412 in `en-servant/src/En/Servant/Seam.hs` — as a new `PreconditionFailedFault` and a new `Respond 412` alternative in `EnResponses`, not the narrow `enErrorToServerError` special case the plan imagined (EP-35 had already landed).
+- [x] Verify `en-client/src/En/Client.hs` compiles unchanged (it re-exports the API DTOs).
+- [x] Add integration scenarios: sequential guarded revoke, concurrent two-thread race, atomic mixed write, failed precondition writes nothing, must-not-exist guards against clobbering.
+- [x] Add an en-servant test exercising the new wire fields end-to-end against the in-memory store, including backward compatibility of a request without the new fields (decode *and* encode).
+- [x] Run `cabal build all`, `cabal test all`, `just start-and-test`; record transcripts. (See Surprises & Discoveries.)
 
 
 ## Surprises & Discoveries
@@ -63,7 +65,93 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+**`FOR SHARE` deadlocks two racing guarded revokes; the plan's central concurrency claim was
+wrong.** The plan reasoned that a share lock makes "the racing revoke (an `UPDATE` of
+`deleted_xid`) block until we commit". True — but the *racer* also holds a share lock, taken by
+*its* must-exist check, and share locks are mutually compatible. So both transactions pass their
+preconditions, and then each waits for the other's share lock before it can upgrade to the
+exclusive lock its `UPDATE` needs. PostgreSQL breaks the cycle:
+
+```text
+code: 40P01
+message: deadlock detected
+detail:
+  Process 26536 waits for ShareLock on transaction 768; blocked by process 26537.
+  Process 26537 waits for ShareLock on transaction 767; blocked by process 26536.
+```
+
+The losing administrator receives a `StoreError` — which the wire maps to `503 store_error,
+retryable: true` — instead of the `412 write_precondition_failed` that describes what actually
+happened. A client obeying `retryable` would spin. `FOR UPDATE` fixes it: the second transaction
+blocks at the `SELECT`, and when the first commits it re-evaluates the row under `READ COMMITTED`
+(EvalPlanQual), finds `deleted_xid` set, matches nothing, and fails its precondition. See the
+Decision Log.
+
+**The obvious race test does not race, and passed against the broken implementation.** Two
+`forkIO`'d guarded revokes complete sequentially: the first finishes its whole transaction before
+the second reaches the row, so no lock is ever contended. That test passed with `FOR SHARE` —
+evidence that a concurrency test which never establishes overlap certifies nothing. The scenario
+was rebuilt around a third connection that holds the row's lock, asserts (via `tryReadMVar`) that
+*both* racers are blocked on it, and only then releases it. Against `FOR SHARE` that scenario
+fails with the deadlock above; against `FOR UPDATE` it passes on three consecutive runs.
+
+The suite also needed `-threaded`. Without it the first racer's blocking libpq call parks the
+whole runtime and the second never reaches the lock.
+
+**`Maybe RelationName` cannot express a subject filter soundly.** The plan's `TupleFilter` had
+`subjectRelation :: Maybe RelationName` with "`Nothing` matches anything". But
+`space:x#member@user:alice` and `space:x#member@user:alice#admin` are different grants that can be
+live simultaneously (the uniqueness key includes `coalesce(subject_relation,'')`), so the exact
+filter for the first — which has no subject relation, hence `Nothing` — would also match the
+second. A must-exist precondition would then pass while the grant it names was gone: precisely the
+failure preconditions exist to prevent. Replaced with a three-valued `SubjectRelationFilter`,
+which is the shape SpiceDB's `optionalRelation` wrapper encodes.
+
+**EP-35 had fully landed, which relocated most of Milestone 2.** The plan says EP-35 "has not
+landed at authoring time (its file is an unfilled skeleton)" and instructs the implementer to
+re-check. Its Progress shows M1–M4 and Final all complete as of 2026-07-08. Consequences:
+
+- The endpoints are `POST /v1/relationships` and `POST /v1/relationships/delete`, not
+  `POST /tuples` / `DELETE /tuples`. The plan's curl example uses the retired path *and* the
+  Generic `{"tag":…,"contents":…}` sum encoding, which the hand-written instances removed.
+- `enErrorToServerError` is no longer the error path. Errors flow through `EnFault` →
+  `faultToResult` → a `MultiVerb` response alternative. Adding 412 therefore meant a new
+  `PreconditionFailedFault`, a new `Respond 412` in the shared `EnResponses` list, a new
+  `EnResult` constructor, an extended hand-written `AsUnion` instance, and an updated OpenAPI
+  assertion — not a one-line `jsonError err412`.
+- Wire types need hand-written `ToJSON`/`FromJSON` *and* hand-written `ToSchema` instances.
+  Generic derivation would resurrect the shapes EP-35 removed.
+- The `EnError` table test in `en-servant/test/Main.hs` pins every constructor, so the new one had
+  to be added there. `envelopeOf` in the same file and `faultToServerError` in `Seam.hs` are total
+  case matches over `EnFault` and both needed the new alternative.
+
+**Optional wire fields are omitted, not nulled.** Encoding `deletes`/`preconditions` as `null`
+when absent would have changed the bytes of every legacy request body and broken the golden
+tests. `foldMap (\v -> ["deletes" .= v])` omits the key entirely, so a body carrying only `tuples`
+round-trips byte-identically. `partialObjectSchema` in `En.Servant.OpenApi` describes them as
+non-required rather than required-and-nullable.
+
+**`cabal test all` hid two build failures.** `en-core-interface-tests` and `en-biscuit-tests`
+failed to *compile* against the new effect constructor, and greping the output for `FAIL` reported
+"no failures" because a suite that never builds never prints one. Only the exit code shows it.
+Both were then fixed: the en-core test has its own inline `TupleStore` interpreter, and both
+suites' effect stacks needed the `Error EnError` handler `runTupleStoreInMemory` now demands.
+
+**Final transcripts.** `cabal test all` exits `0` with all seven suites passing:
+`en-biscuit-tests`, `en-core-conformance`, `en-core-interface-tests`, `en-example-tests`,
+`en-postgres-integration-tests`, `en-postgres-revision-tests`, `en-servant-tests`.
+`just start-and-test` prints `server smoke test passed: allowed`. Against the running dev server:
+
+```text
+$ curl -sS -w '\nstatus=%{http_code}\n' -X POST localhost:8080/v1/relationships -H "$AUTH" \
+    -d '{"tuples":[],"preconditions":[{"kind":"mustExist","filter":{"objectType":"space","objectId":"nope","relation":"viewer","subjectType":"user","subjectId":"nobody","subjectRelation":{"match":"none"}}}]}'
+{"code":"write_precondition_failed","message":"write precondition did not hold: must-exist: space:nope#viewer@user:nobody","retryable":false}
+status=412
+```
+
+A legacy body with no new fields returns `200` with a token; a holding precondition returns `200`;
+an atomic `tuples` + `deletes` request returns one token. `GET /v1/openapi.json` reports
+`['200','400','412','422','503']` for `/v1/relationships`.
 
 
 ## Decision Log
@@ -125,13 +213,121 @@ Record every decision made while working on the plan.
   `enErrorToServerError` is recorded here so EP-35 subsumes rather than duplicates it.
   Date: 2026-07-07
 
+Decisions made during implementation:
+
+- Decision: A must-exist precondition locks its row with `FOR UPDATE`, not `FOR SHARE` as
+  Milestone 1 specified.
+  Rationale: Share locks are mutually compatible, so two racing guarded writes both pass their
+  must-exist checks and then deadlock, each waiting for the other's share lock in order to
+  upgrade to the exclusive lock its `UPDATE` needs. PostgreSQL aborts one with
+  `deadlock_detected`, which surfaces as `StoreError` → `503 store_error, retryable: true` — an
+  outage report for an arbitration loss, and one a retry-on-retryable client would spin on.
+  `FOR UPDATE` blocks the second transaction at the `SELECT`; when the first commits, the second
+  re-evaluates the row under `READ COMMITTED`, finds it retired, and fails its precondition.
+  The cost is that a filter matching several rows locks only the first (`LIMIT 1`) and can report
+  a spurious failure if that row is concurrently retired while another match survives. That is
+  fail-closed, which is the right direction for a safety guard.
+  Date: 2026-07-09
+- Decision: `TupleFilter.subjectRelation` is a three-valued `SubjectRelationFilter`
+  (`AnySubjectRelation` / `NoSubjectRelation` / `ExactSubjectRelation`), not
+  `Maybe RelationName`.
+  Rationale: "Match any relation" and "match no relation" are different questions, and the
+  uniqueness key includes `coalesce(subject_relation,'')`, so a concrete subject and a userset
+  over it can be live at once. With `Nothing`-means-any, `exactTupleFilter` for
+  `space:x#member@user:alice` also matches `space:x#member@user:alice#admin`, and a must-exist
+  precondition would pass while the grant it names was gone. SpiceDB encodes the same
+  three-valuedness with its `optionalRelation` wrapper message.
+  Date: 2026-07-09
+- Decision: 412 is a new `PreconditionFailedFault` constructor with its own `Respond 412`
+  alternative in the shared `EnResponses` list, rather than a special case in
+  `enErrorToServerError`.
+  Rationale: EP-35 landed before this plan started (see Surprises), and its design routes every
+  handler failure through `EnFault` → `faultToResult` → a `MultiVerb` response alternative, so
+  that every status an operation can return is visible in the API type and the generated OpenAPI
+  document. A 412 reachable only through a thrown `ServerError` would be invisible to both. The
+  status joins the list shared by all six operations, which the existing Haddock already defends
+  as "a total conversion is worth a slightly over-broad document".
+  Date: 2026-07-09
+- Decision: Absent optional wire fields are omitted from the encoding rather than serialized as
+  `null`, and described in OpenAPI as non-required rather than required-and-nullable.
+  Rationale: A legacy request body carrying only `tuples` must round-trip byte-identically, which
+  the golden tests pin. It also makes the JSON say what the types mean: an omitted
+  `subjectRelation` is "any relation", whereas `null` would read as "the relation must be null" —
+  a claim `NoSubjectRelation` already makes.
+  Date: 2026-07-09
+- Decision: The two precondition statements each spell out the filter predicate rather than
+  splicing a shared `tupleFilterPredicate` fragment.
+  Rationale: The first attempt spliced multiline string literals, which drop their trailing
+  newline, producing `WHEREobject_type` and `NULLLIMIT` and a `42601 syntax error`. Beyond the
+  bug: the two statements must agree, and a reader checking that they do would rather read two
+  whole statements than reassemble them from fragments.
+  Date: 2026-07-09
+- Decision: `en-postgres-integration-tests` gains `-threaded`.
+  Rationale: The write-race scenario runs two guarded revokes on two connections concurrently.
+  Under the non-threaded runtime the first thread's blocking libpq call parks the whole RTS and
+  the second never reaches the lock it is meant to contend for.
+  Date: 2026-07-09
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+**Delivered, and the headline behavior is proven.** Gap E1 is closed: two administrators issuing
+the same must-exist-guarded revoke on separate connections serialize, exactly one receives a
+token, and the other receives `WritePreconditionFailed` rather than a success token for work it
+did not do. Callers can attach preconditions to any write, mix writes and deletes in one atomic
+request under one token, and a refused request provably writes nothing and leaves its connection
+healthy for the next one.
+
+Every acceptance criterion was checked:
+
+- The concurrent-race scenario passes on three consecutive runs, and — the part that matters —
+  *fails* against the implementation the plan specified. It is a discriminating test, not a
+  decorative one.
+- A failed precondition returns no token and leaves no row (`runPreconditionScenario`, cases 2
+  and 4).
+- HTTP: a failing precondition returns `412` with the stable code `write_precondition_failed` and
+  `retryable: false`; a legacy body without the new fields returns `200` and writes. Both were
+  exercised against the running dev server, not only through handlers.
+- `cabal test all` exits `0`; all seven suites pass. The constructor consolidation and the new
+  `Error EnError` constraint broke two suites at compile time, which were fixed, not worked
+  around.
+
+**The two lessons worth carrying forward, both about evidence rather than code.**
+
+First: a concurrency test that does not establish overlap proves nothing. The natural
+two-`forkIO` race passed against a `FOR SHARE` implementation that deadlocks in production,
+because the threads never actually contended. The fix was to make the contention observable — a
+third connection holds the lock, and the test *asserts both racers are blocked on it* before
+releasing. Any future concurrency scenario in this repository should be written the same way, and
+should be run once against the bug it claims to catch.
+
+Second: `cabal test all | grep FAIL` is not a test result. Two suites failed to compile and the
+grep reported "no failures", because a suite that never builds never prints one. Check the exit
+code.
+
+**Gaps and boundaries, all intentional.**
+
+- A must-exist filter matching several rows locks only the first (`LIMIT 1`). If that row is
+  concurrently retired while another match survives, the precondition reports a spurious failure.
+  Fail-closed, and documented on `preconditionHolds`. A set-oriented lock would be the fix if this
+  ever bites.
+- Must-not-exist preconditions take no lock, because absent rows cannot be locked. Two writers
+  racing to create the same identity are arbitrated by `relation_tuple_live_unique`: the loser
+  gets a unique-violation `StoreError`, not a `WritePreconditionFailed`. This asymmetry is
+  inherent without predicate locks or `SERIALIZABLE`; it is fail-closed either way.
+- `ApplyTupleWrites` is the final write signature, as the master plan assigns.
+  docs/plans/48-batch-tuple-writes-and-add-bulk-import-and-export.md must reimplement
+  `applyTupleWritesSession` with `unnest` batches *without* altering the constructor, and must
+  carry forward EP-45's constraint (recorded in the master plan) that a batched touch cannot infer
+  idempotence from zero-row counts.
+- `writeVisibleSnapshot` and `tokenFromAnchor` were not touched (docs/plans/47 owns them);
+  `applyTupleWritesSession` mints its token exactly as the sessions it replaced did.
+- Preconditions are not evaluated against a caveat. `TupleFilter` deliberately has no caveat
+  field: a precondition asks whether a grant exists, not what condition it carries. If a caller
+  needs "the grant exists *and* its caveat is X", that is a read followed by a guarded write.
 
 
 ## Context and Orientation

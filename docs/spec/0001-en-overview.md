@@ -224,6 +224,15 @@ PostgreSQL datastore, this is **mostly Postgres MVCC + a codec**, not a consiste
   still sees the grant it was minted against. A byte-identical rewrite is a no-op that leaves the
   row's `created_xid` alone. A delete targets the identity and ignores the caveat the caller
   supplies.
+- **One write operation, optionally guarded**: `ApplyTupleWrites` carries preconditions, deletes,
+  and writes, applied in that order inside one transaction minting one token. A precondition is a
+  filter the transaction re-verifies before applying anything — Zanzibar's *lock tuple*. A
+  must-exist precondition locks the row it matches with `FOR UPDATE`, so two administrators
+  guarding conflicting writes on the same grant serialize and exactly one wins; the other's
+  transaction rolls back with `WritePreconditionFailed` having written nothing. (`FOR SHARE`
+  would let both pass the check and then deadlock upgrading to the exclusive lock their update
+  needs.) A must-not-exist precondition takes no lock — absent rows cannot be locked — and relies
+  on `relation_tuple_live_unique` to turn a racing insert into a unique-violation.
 - **Read at revision `R`** is one predicate:
   `pg_visible_in_snapshot(created_xid, R) AND NOT pg_visible_in_snapshot(deleted_xid, R)`.
   Postgres decides visibility; `en` does not build a consistency protocol.

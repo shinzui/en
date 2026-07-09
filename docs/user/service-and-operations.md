@@ -584,7 +584,8 @@ Every error — engine, validation, body-decode, or authentication — is one JS
 ```
 
 Branch on `code`, which is stable. Never branch on `message`, which is prose and may
-change. `retryable` is the whole retry policy: it is `true` only for `store_error`.
+change. `retryable` is the whole retry policy: it is `true` only for `store_error` and
+`rate_limited`.
 
 | Status | `code` | Meaning |
 | --- | --- | --- |
@@ -598,9 +599,48 @@ change. `retryable` is the whole retry policy: it is `true` only for `store_erro
 | `401` | `unauthenticated` | Missing, malformed, or unknown bearer key |
 | `403` | `permission_denied` | A read-only key attempted a write |
 | `404` | `not_found` | No such endpoint |
+| `412` | `write_precondition_failed` | A write precondition did not hold; nothing was written |
 | `422` | `resolution_limit_exceeded` | The traversal exceeded its depth or breadth bound |
 | `429` | `rate_limited` | The caller exhausted its token bucket. **Retryable** |
 | `503` | `store_error` | The tuple store failed. **Retryable** |
+
+`412` is not retryable as-is. The caller read some state, decided on it, and by the time
+the write ran that state was gone; re-issuing the identical request fails identically.
+Re-read, re-decide, then re-issue.
+
+### Write preconditions
+
+`POST /v1/relationships` and `POST /v1/relationships/delete` both accept an optional
+`preconditions` array. `POST /v1/relationships` also accepts an optional `deletes`
+array, so one request can remove grants and add grants atomically under one token.
+Omitting these fields behaves exactly as before they existed.
+
+```json
+{
+  "tuples": [ ... ],
+  "deletes": [ ... ],
+  "preconditions": [
+    { "kind": "mustExist",
+      "filter": {
+        "objectType": "space", "objectId": "project-x",
+        "relation": "member",
+        "subjectType": "user", "subjectId": "alice",
+        "subjectRelation": {"match": "none"}
+      } }
+  ]
+}
+```
+
+`kind` is `mustExist` or `mustNotExist`. In `filter`, only `objectType` is required;
+each omitted field matches anything. `subjectRelation` is `{"match":"any"}` (the
+default when omitted), `{"match":"none"}` for a subject carrying no relation, or
+`{"match":"exact","relation":"..."}` for a userset. Naming one specific grant means
+`none` or `exact` — `space:x#member@user:alice` and `space:x#member@user:alice#admin`
+are different grants that can both be live.
+
+Preconditions are checked inside the write transaction, before any change is applied,
+and must-exist locks the row it matches. Two administrators issuing conflicting guarded
+writes therefore serialize: exactly one succeeds, and the other receives `412`.
 
 A `503 store_error` never carries the underlying SQL or bound parameters; those go to
 the server's stderr for the operator. A PostgreSQL restart surfaces as a short burst of

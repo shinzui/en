@@ -70,7 +70,7 @@ that en-core consumers embed against).
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | EP-45 | Adopt touch semantics for tuple writes | docs/plans/45-adopt-touch-semantics-for-tuple-writes.md | None | None | Complete |
-| EP-46 | Add write preconditions and atomic mixed writes | docs/plans/46-add-write-preconditions-and-atomic-mixed-writes.md | EP-45 | None | In Progress |
+| EP-46 | Add write preconditions and atomic mixed writes | docs/plans/46-add-write-preconditions-and-atomic-mixed-writes.md | EP-45 | None | Complete |
 | EP-47 | Fail loudly on storage decode errors and tighten write snapshots | docs/plans/47-fail-loudly-on-storage-decode-errors-and-tighten-write-snapshots.md | None | None | Not Started |
 | EP-48 | Batch tuple writes and add bulk import and export | docs/plans/48-batch-tuple-writes-and-add-bulk-import-and-export.md | EP-45 | EP-46 | Not Started |
 | EP-49 | Trim dead indexes and resolve consistency lazily | docs/plans/49-trim-dead-indexes-and-resolve-consistency-lazily.md | None | None | Not Started |
@@ -121,20 +121,23 @@ in `en-postgres/src/En/Postgres/TupleStore.hs`) are modified by EP-47 (tightened
 snapshot construction, loud parse failures) and exercised by every other plan's tests.
 EP-47 owns the snapshot definition; EP-46 and EP-48 must not adjust it.
 
-The wire surface for existing write endpoints (`POST /tuples`, `DELETE /tuples` in
-`en-servant/src/En/Servant/API.hs`) is extended by EP-46 (precondition fields, mixed
-write request) — this must be coordinated with the versioned wire contract from
-docs/plans/35-version-the-wire-contract-and-type-the-error-model.md (master plan 6):
-if EP-35 has landed, new fields go into the v1 envelope; if not, EP-46 adds fields to
-the current DTOs and EP-35 absorbs them.
+The wire surface for the write endpoints in `en-servant/src/En/Servant/API.hs` was extended
+by EP-46 (precondition fields, mixed write request). **Resolved 2026-07-09:**
+docs/plans/35-version-the-wire-contract-and-type-the-error-model.md (master plan 6) had
+already landed, so the endpoints are `POST /v1/relationships` and
+`POST /v1/relationships/delete` — not the `POST /tuples` / `DELETE /tuples` this section
+originally named — and the new fields went into the v1 DTOs. EP-35's design also means new
+statuses are `MultiVerb` response alternatives rather than thrown `ServerError`s: EP-46's 412
+is a `PreconditionFailedFault` with a `Respond 412` in the shared `EnResponses` list, visible
+in the generated OpenAPI document. Any later plan adding a status must do the same.
 
 
 ## Progress
 
 - [x] EP-45: uniqueness keyed on object/relation/subject; caveat changes replace atomically
 - [x] EP-45: integration tests prove payload updates and caveat additions take effect (no silent no-op, no duplicate live rows)
-- [ ] EP-46: preconditions enforced transactionally; precondition failure is a typed error
-- [ ] EP-46: atomic mixed write-and-delete in one request/token
+- [x] EP-46: preconditions enforced transactionally; precondition failure is a typed error
+- [x] EP-46: atomic mixed write-and-delete in one request/token
 - [ ] EP-47: undecodable caveat payloads and malformed cursors are errors, not defaults
 - [ ] EP-47: write tokens denote exact snapshots (gap marked in-progress); GC TOCTOU invariant documented
 - [ ] EP-48: N-tuple writes are O(1) round trips; bulk import/export commands exist
@@ -179,6 +182,39 @@ two are distinguishable by callers. Discovered while implementing EP-45, 2026-07
 EP-45 appended its guard as the fourth. EP-47 and EP-49, which also add migrations, should
 expect to append rather than assume the plan-time stanza count.
 
+**A must-exist precondition must lock `FOR UPDATE`, never `FOR SHARE` (affects EP-48).** EP-46's
+plan specified `FOR SHARE`, reasoning that a racing revoke's `UPDATE` would have to wait for the
+share lock. It would — but the racer's own must-exist check also holds a share lock, and share
+locks are compatible, so both transactions pass their preconditions and then deadlock upgrading
+to the exclusive lock their `UPDATE` needs. PostgreSQL returns `40P01 deadlock detected`, which
+surfaces as `503 store_error, retryable: true` — an outage report for an arbitration loss, and one
+a retry-on-retryable client spins on. `FOR UPDATE` blocks the second transaction at the `SELECT`;
+when the first commits, the second re-evaluates the row under `READ COMMITTED` and fails its
+precondition. **EP-48 must preserve this** when it rewrites `applyTupleWritesSession` with
+`unnest` batches: a batched precondition check still has to take exclusive row locks, and a
+set-oriented lock is the natural generalization of the current `LIMIT 1 … FOR UPDATE`.
+Discovered while implementing EP-46, 2026-07-09.
+
+**A concurrency test that never establishes overlap certifies nothing.** EP-46's two-`forkIO`
+race scenario passed against the broken `FOR SHARE` implementation, because the first thread
+completed its whole transaction before the second reached the row. The working shape: a third
+connection holds the contended row's lock, the test *asserts both racers are blocked on it*, and
+only then releases it. Any concurrency scenario added by EP-47, EP-48, or EP-49 should be written
+this way, and should be run once against the bug it claims to catch. The integration suite now
+needs `-threaded` for this reason. Discovered while implementing EP-46, 2026-07-09.
+
+**`cabal test all | grep FAIL` is not a test result.** Two suites failed to *compile* against
+EP-46's effect-constructor change and the grep reported no failures, because a suite that never
+builds never prints one. Check the exit code. Discovered while implementing EP-46, 2026-07-09.
+
+**The final write signature is `ApplyTupleWrites :: TupleWriteRequest -> TupleStore m
+ConsistencyToken` (binds EP-48).** `writeTuples` and `deleteTuples` survive as helper functions
+building degenerate requests, so call sites did not churn. `TupleFilter` carries a three-valued
+`SubjectRelationFilter` rather than a `Maybe RelationName` — "any relation" and "no relation" are
+different questions, and conflating them lets a must-exist precondition be satisfied by a
+different grant than the one it names. EP-48 extends this effect (bulk export) without altering
+the constructor. Discovered while implementing EP-46, 2026-07-09.
+
 
 ## Decision Log
 
@@ -196,6 +232,12 @@ expect to append rather than assume the plan-time stanza count.
   Date: 2026-07-09
 - Decision: EP-45 left the TupleStore effect signature untouched, as planned; EP-46 still owns the final write signature.
   Rationale: Touch semantics are observable through reads, so no created-vs-replaced result was needed; changing the signature twice in consecutive plans would churn every interpreter for no behavioral gain.
+  Date: 2026-07-09
+- Decision: Must-exist preconditions lock FOR UPDATE, not FOR SHARE; EP-48's batched checks inherit this.
+  Rationale: Share locks are compatible, so two racing guarded writes both pass their checks and then deadlock upgrading to the exclusive lock their UPDATE needs. The loser gets a retryable-looking 503 for what is actually an arbitration loss.
+  Date: 2026-07-09
+- Decision: The wire-coordination conditional with docs/plans/35 is resolved in the affirmative; new statuses ship as MultiVerb response alternatives.
+  Rationale: EP-35 landed on 2026-07-08, before EP-46 began. Its typed error model routes every handler failure through EnFault into a declared response alternative, so a status reachable only via a thrown ServerError would be absent from the API type and the OpenAPI document.
   Date: 2026-07-09
 
 
