@@ -107,6 +107,23 @@ main = do
         (Right (EnOk BatchCheckResponseWire{decisions = [AllowedWire, DeniedWire]}))
         =<< runHandler (batch request)
 
+    -- checkMany now hands the transport an Either per pair. The wire contract is
+    -- unchanged: a pair the engine could not evaluate is reported as a denial,
+    -- and it does not take the healthy pairs down with it. A per-pair error
+    -- channel is docs/plans/35's to design.
+    let failingPairRequest =
+            request
+                { pairs =
+                    [ pair "alice" "view" "project-x"
+                    , pair "alice" "no-such-permission" "project-x"
+                    , pair "bob" "view" "project-x"
+                    ]
+                }
+    assertEqual
+        "an unevaluable pair fails closed without affecting the others"
+        (Right (EnOk BatchCheckResponseWire{decisions = [AllowedWire, DeniedWire, DeniedWire]}))
+        =<< runHandler (batch failingPairRequest)
+
     -- The oversized batch is a returned value, not a thrown ServerError: that is the
     -- point of the MultiVerb response list.
     let smallEnv = env{maxBatchSize = 1}

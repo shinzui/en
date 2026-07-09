@@ -343,9 +343,9 @@ main = do
             , BatchPair (SubjectId user) (RelationName "audit") space
             , BatchPair (SubjectId memberOwner) (RelationName "member_not_owner") exclusionSpace
             ]
-    assertEqual "batch agrees with single checks in input order" (Right [Allowed, Denied, Denied, Denied]) =<< checkMany consistencyStore tupleStore graph MinimizeLatency requestContext mixedBatch
+    assertEqual "batch agrees with single checks in input order" (Right [Right Allowed, Right Denied, Right Denied, Right Denied]) =<< checkMany consistencyStore tupleStore graph MinimizeLatency requestContext mixedBatch
     resolveCount <- newIORef 0
-    assertEqual "batch with counted consistency still returns decisions" (Right [Allowed, Denied, Denied, Denied]) =<< checkMany (countingConsistencyStore resolveCount consistencyStore) tupleStore graph MinimizeLatency requestContext mixedBatch
+    assertEqual "batch with counted consistency still returns decisions" (Right [Right Allowed, Right Denied, Right Denied, Right Denied]) =<< checkMany (countingConsistencyStore resolveCount consistencyStore) tupleStore graph MinimizeLatency requestContext mixedBatch
     assertEqual "batch resolves consistency once" 1 =<< readIORef resolveCount
     let overlappingBatch =
             [ BatchPair (SubjectId user) (RelationName "view") space
@@ -353,7 +353,7 @@ main = do
             , BatchPair (SubjectId user) (RelationName "member") space
             ]
     batchReadCount <- newIORef 0
-    assertEqual "overlapping batch returns decisions" (Right [Allowed, Allowed, Denied]) =<< checkMany consistencyStore (countingTupleStore batchReadCount tupleStore) graph MinimizeLatency requestContext overlappingBatch
+    assertEqual "overlapping batch returns decisions" (Right [Right Allowed, Right Allowed, Right Denied]) =<< checkMany consistencyStore (countingTupleStore batchReadCount tupleStore) graph MinimizeLatency requestContext overlappingBatch
     batchReads <- readIORef batchReadCount
     independentReadCount <- newIORef 0
     let independentStore :: TupleInterpreter
@@ -373,7 +373,7 @@ main = do
             , BatchPair (SubjectId user) (RelationName "view") badReadSpace
             , BatchPair (SubjectId bob) (RelationName "view") space
             ]
-    assertEqual "batch fails closed per pair" (Right [Allowed, Denied, Denied]) =<< checkMany consistencyStore (erroringTupleStore badReadSpace tupleStore) graph MinimizeLatency requestContext badReadBatch
+    assertEqual "batch surfaces the failing pair and leaves the others intact" (Right [Right Allowed, Left (UnknownRelation "space#injected-missing-relation"), Right Denied]) =<< checkMany consistencyStore (erroringTupleStore badReadSpace tupleStore) graph MinimizeLatency requestContext badReadBatch
     assertEqual "delegation caveat allows matching autonomy and time" (Right Allowed) =<< check consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") intention
     assertEqual "delegation caveat denies higher autonomy" (Right Denied) =<< check consistencyStore tupleStore graph MinimizeLatency adminContext (SubjectId user) (RelationName "view") intention
     assertEqual "delegation caveat is conditional with missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}])) =<< check consistencyStore tupleStore graph MinimizeLatency missingAutonomyContext (SubjectId user) (RelationName "view") intention
@@ -444,7 +444,7 @@ main = do
     assertEqual "acyclic chain deeper than the depth budget still errors" (Left ResolutionLimitExceeded) =<< check consistencyStore (runTupleStoreInMemory deepChainTuples) deepChainGraph MinimizeLatency requestContext (SubjectId user) (RelationName "view") (deepSpace 1)
     assertEqual "expand reports a cycle rather than hiding the branch" (Left (CycleDetected "space:recursive-space#view")) =<< expandEngine consistencyStore recursiveTupleStore graph MinimizeLatency (expandRequest recursiveSpace (RelationName "view") requestContext (ExpandLimit 10) Nothing)
     taintGraph <- either (fail . show) pure (compileSchema taintSchema)
-    assertEqual "a cycle-tainted decision is not memoized across batch pairs" (Right [Allowed, Allowed]) =<< checkMany consistencyStore (runTupleStoreInMemory taintTuples) taintGraph MinimizeLatency requestContext [BatchPair (SubjectId carol) (RelationName "x") taintNode, BatchPair (SubjectId carol) (RelationName "y") taintNode]
+    assertEqual "a cycle-tainted decision is not memoized across batch pairs" (Right [Right Allowed, Right Allowed]) =<< checkMany consistencyStore (runTupleStoreInMemory taintTuples) taintGraph MinimizeLatency requestContext [BatchPair (SubjectId carol) (RelationName "x") taintNode, BatchPair (SubjectId carol) (RelationName "y") taintNode]
     unionShortCircuitReads <- newIORef 0
     assertEqual "owner check is Allowed" (Right Allowed) =<< check consistencyStore (countingTupleStore unionShortCircuitReads tupleStore) graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
     shortCircuitReads <- readIORef unionShortCircuitReads
@@ -971,7 +971,7 @@ checkMany ::
     Consistency ->
     CaveatContext ->
     [BatchPair] ->
-    IO (Either EnError [CheckDecision])
+    IO (Either EnError [Either EnError CheckDecision])
 checkMany cStore tStore graph consistency context pairs =
     runEngine cStore tStore (Check.checkMany graph consistency context pairs)
 

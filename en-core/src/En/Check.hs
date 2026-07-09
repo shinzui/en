@@ -89,10 +89,23 @@ checkCached cacheEnv graph consistency context subject permission object = do
 {- | Evaluate many checks against one resolved consistency snapshot.
 
 The engine resolves consistency once, evaluates distinct pairs sequentially
-through a within-call memo, and returns decisions in the same order as the
-input. Errors after consistency resolution fail closed for only that pair by
-returning 'Denied'. Transport-layer handlers remain responsible for bounding
-batch size and adding any IO-specific concurrency.
+through a within-call memo, and returns one result per input pair, in input
+order.
+
+The two ways a batch can fail are kept apart. Resolving consistency is a
+request-level step: if it fails, no pair has an answer, and the failure escapes
+through whatever error effect the 'ConsistencyStore' interpreter raises, aborting
+the batch. Evaluating a pair is pair-level: its failure is returned as a 'Left'
+beside the pairs that succeeded, so a caller can tell "denied" from "this one
+broke" and decide what to do. The engine deliberately does not decide for them; a
+transport that must answer with a decision should fail closed and report 'Denied'.
+
+This function therefore needs no @Error EnError@ capability of its own -- it
+raises nothing that is not already raised by the interpreters it runs under, and
+reports everything else as a value.
+
+Transport-layer handlers remain responsible for bounding batch size and adding
+any IO-specific concurrency.
 -}
 checkMany ::
     (ConsistencyStore :> es, TupleStore :> es) =>
@@ -100,22 +113,20 @@ checkMany ::
     Consistency ->
     CaveatContext ->
     [BatchPair] ->
-    Eff es [CheckDecision]
+    Eff es [Either EnError CheckDecision]
 checkMany graph consistency context pairs = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
-    (decisionsByPair, _memo) <-
+    (resultsByPair, _memo) <-
         foldM
             (evaluateDistinct revision)
             (Map.empty, Map.empty)
             (dedupePairs pairs)
-    pure [Map.findWithDefault Denied pair decisionsByPair | pair <- pairs]
+    pure [Map.findWithDefault (Right Denied) pair resultsByPair | pair <- pairs]
   where
-    evaluateDistinct revision (decisionsByPair, memo) pair = do
+    evaluateDistinct revision (resultsByPair, memo) pair = do
         (result, memo') <-
             runCheckMemo graph context revision pair.subject pair.permission pair.object memo
-        let decision =
-                either (const Denied) id result
-        pure (Map.insert pair decision decisionsByPair, memo')
+        pure (Map.insert pair result resultsByPair, memo')
 
 dedupePairs :: [BatchPair] -> [BatchPair]
 dedupePairs =

@@ -941,7 +941,11 @@ batchCheckHandler env request = enHandler do
                 context
                 batchPairs
             )
-    pure BatchCheckResponseWire{decisions = decisionToWire <$> decisions}
+    -- Fail closed on the wire: a pair the engine could not evaluate is reported
+    -- as a denial. The engine now preserves the error, so
+    -- docs/plans/35-version-the-wire-contract-and-type-the-error-model.md can
+    -- add a per-pair error channel without touching evaluation.
+    pure BatchCheckResponseWire{decisions = either (const DeniedWire) decisionToWire <$> decisions}
   where
     pairFromWire :: BatchCheckPairWire -> Either Text BatchPair
     pairFromWire wire =
