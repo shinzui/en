@@ -1,0 +1,12 @@
+Name,Mean (ps),2*Stdev (ps)
+All.check.shallow-owner,589721,30308
+All.check.nested-parent,1325125,109698
+All.check.deep-nested,33928613,1832144
+All.checkMany.overlapping,1634090,116160
+All.checkMany.wide-overlapping,4660454687,257126854
+All.lookup.reachable-spaces,2145680,209828
+All.lookup.wide-fanout,463574023,26878234
+All.expand.deep-nested,19151342,1705656
+All.check-wide.direct-member,65035351,4599442
+All.check-wide.non-member,6028756250,534713730
+All.cache.evict-churn,1003107031,64089550

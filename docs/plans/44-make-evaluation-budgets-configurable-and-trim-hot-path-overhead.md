@@ -60,16 +60,20 @@ recompiling anything but the test.
 - [x] M3 (2026-07-09): `en-servant` `Env` carries a budget; `en-server` reads
   `EN_MAX_DEPTH` / `EN_PAGE_LIMIT` / `EN_RESULT_CAP` into `ServerConfig`; `maxBatchSize`
   stays a transport bound on `Env`.
-- [ ] M4: hot-path fixes in `En.Check`/`En.Lookup`/`En.Expand`/`En.Decision`/
-  `En.Caveat` — strict accumulation, Set-based visited, Set/Map dedupe, single
-  top-level lookup merge.
-- [ ] M5: cache mechanics in `En.Cache` — no stat writes when disabled, O(log n)
-  eviction; test updates with Decision Log entries.
-- [ ] M6: `EntryPoint` relocation to the render layer; `ReachabilityGraph` slims down;
-  tests moved.
-- [ ] M7: after-numbers recorded; before/after table in this plan; regression guard
-  notes.
-- [ ] Final: full suite green; Outcomes filled; master plan progress rows updated.
+- [x] M4 (2026-07-09): four hot-path fixes, one commit each — reversed accumulation in
+  the drains and folds; `Set`-based `visited` in all three engines; `Set`-based
+  order-preserving dedupe; the lookup traversal carries a map, and the redundant
+  per-union-node sort is deleted.
+- [x] M5 (2026-07-09): disabled caches perform no `IORef` write; eviction finds its
+  victim with `Map.lookupMin` over a sequence index. `cache/evict-churn` 2.05 ms →
+  1.00 ms.
+- [x] M6 (2026-07-09): `entries` off `ReachabilityGraph`; `entryPoints :: ValidSchema ->
+  Map RelationRef [EntryPoint]`; renderer takes the schema; golden test written first.
+- [x] M7 (2026-07-09): before/after table below. Two of eleven benchmarks moved
+  reproducibly; the millisecond ones proved unmeasurable on this hardware, and that is
+  recorded rather than papered over.
+- [x] Final (2026-07-09): `cabal build all` clean (no warnings), `cabal test all` green
+  across all eight suites; Outcomes filled; master plan updated.
 
 
 ## Surprises & Discoveries
@@ -218,6 +222,75 @@ All
 rows and recurses into 64 groups, where before it read 2,000 rows and recursed into none.
 That is not a regression; it is the first honest measurement of that path.
 
+### M7 — before/after, and what the numbers can and cannot say
+
+Both columns are the **minimum of five full-suite runs**, alternating before/after within
+one session (`cabal bench en-core:en-core-bench`, darwin/aarch64, GHC 9.12.4, `-O1`).
+"Before" is the engine at `57a9fdc` — every benchmark fixture and the store-paging fix
+already in place, none of the optimizations. Raw CSVs: `en-core/bench/before-ep44.csv`,
+`en-core/bench/after-ep44.csv`.
+
+| Benchmark | Before | After | Δ | Verdict |
+|---|---|---|---|---|
+| `check/shallow-owner` | 536 ns | 590 ns | +10% | regression (M4 item 2) |
+| `check/nested-parent` | 1.17 µs | 1.33 µs | +13% | regression (M4 item 2) |
+| `check/deep-nested` | 34.6 µs | 33.9 µs | −2% | neutral |
+| `checkMany/overlapping` | 1.52 µs | 1.63 µs | +8% | regression (M4 item 2) |
+| `checkMany/wide-overlapping` | 6.30 ms | 4.66 ms | −26% | **not measurable** — see below |
+| `lookup/reachable-spaces` | 2.20 µs | 2.15 µs | −2% | neutral |
+| `lookup/wide-fanout` | 448 µs | 464 µs | +3% | neutral |
+| `expand/deep-nested` | 18.9 µs | 19.2 µs | +1% | neutral |
+| `check-wide/direct-member` | 62.4 µs | 65.0 µs | +4% | regression (M4 item 2) |
+| `check-wide/non-member` | 6.08 ms | 6.03 ms | −1% | **not measurable** — see below |
+| `cache/evict-churn` | 2.05 ms | 1.00 ms | **−51%** | confirmed |
+
+Only two rows are trustworthy, and only one is an improvement.
+
+**`cache/evict-churn` −51% is real.** It reproduced in every configuration tried: one
+benchmark per process, the full suite in one process, and with a 64 MB nursery. It is the
+one algorithmic change in this plan (an O(n) victim scan became `Map.lookupMin`), and it
+behaves like one.
+
+**The four small regressions are real, and they are the price of `Set`-based `visited`.**
+Also stable everywhere, spreads ≤ 1.05×. They cost 54 ns on a 536 ns check. Every one of
+these fixtures runs against an in-memory list with no storage behind it; a single
+PostgreSQL read is three orders of magnitude larger, so the trade — a bounded, now
+operator-raisable depth guard that does not degrade — is the right one. It is recorded
+rather than hidden because it is a real cost on the hottest path in the system.
+
+**The two millisecond benchmarks cannot be measured on this machine, and the plan does not
+claim them.** They are bimodal: the same binary, run by the same command, lands near
+4.7 ms or near 6.3 ms, a ratio of 1.35. Within one shell session the mode is *stable* —
+five alternating rounds gave spreads of 1.01×–1.05× — which makes each session look like
+clean evidence. Across sessions the mode flips, and it flips *per configuration*:
+
+- One session, min of five alternating rounds: `checkMany/wide-overlapping` before
+  **4.68 ms**, after **6.26 ms** (+34%).
+- Another session, identical method and identical commits: before **6.30 ms**, after
+  **4.66 ms** (−26%).
+
+Bisecting the second result attributed the whole swing to **M6** — deleting the unused
+`entries` field from `ReachabilityGraph`, in a module `checkMany` never calls at runtime.
+Three alternating rounds put `f7b8d85` and `632881e` at 4.6–4.7 ms and `db0b42d` at
+6.2–6.3 ms, reproducibly. A record field that no engine reads cannot slow an engine down
+by a third; what changes is code and data layout, and these fixtures are sensitive to it
+at a magnitude that swamps everything this plan did to them. `-fproc-alignment=64` is
+already set, and a 64 MB nursery did not help.
+
+Two consequences. Validation criterion 3 of this plan — "the M7 before/after table shows
+improvements on `check/wide-*`, `check/deep-nested`, `lookup/wide-fanout`,
+`expand/deep-nested`, and `cache/evict-churn`" — is **not met, and cannot be met by
+measurement on this hardware**. Only `cache/evict-churn` moved. The rest are neutral or
+regressed slightly, and the two that appear to have improved by 26% appear, on a different
+day, to have regressed by 34%. And the millisecond benchmarks must never be added to
+`en-core/bench/baseline.csv`: CI gates at `--fail-if-slower 25`, and these swing ±35% on
+the code's identity alone. The gate would flake forever, and an operator would learn to
+ignore it.
+
+The hot-path changes stand on their asymptotics — a quadratic drain is quadratic whether
+or not this laptop can see it, and `EN_PAGE_LIMIT=10` turns the 5,064-row fixture from 6
+pages into 507 — not on a number this plan could not honestly produce.
+
 **The strict `budget` field on `Env` is a compiler-maintained invariant — but the config
 plumbing next to it is not (M3, 2026-07-09).** Adding `budget :: !EvaluationBudget` to
 `En.Servant.Seam.Env` produced a hard `GHC-95909` error at every construction site
@@ -299,6 +372,37 @@ exhaustiveness test is a real gap this plan did not close.
   Master-plan condition honored: no other child plan adopted `entries` (EP-39–EP-43
   confirmed at M0).
   Date: 2026-07-07
+- Decision: `Set`-based `visited` ships despite costing 8–13% on the small check
+  benchmarks, and the cost is published rather than buried.
+  Rationale: the guard is a correctness mechanism (cycle detection), and M2 just turned
+  the bound that caps its size into an operator knob. `EN_MAX_DEPTH=200` makes a
+  200-level traversal's guard 40,000 list comparisons or 1,600 tree ones. The measured
+  price is 54 ns on a 536 ns check over an in-memory fixture with no storage behind it;
+  one PostgreSQL read is three orders of magnitude larger. A correctness guard should not
+  degrade with a bound operators can raise.
+  Date: 2026-07-09
+- Decision: This plan does not claim a performance improvement on
+  `checkMany/wide-overlapping`, `check-wide/non-member`, or `lookup/wide-fanout`, and
+  those benchmarks must never enter `en-core/bench/baseline.csv`.
+  Rationale: they are bimodal at a ratio of 1.35 and the mode is stable within a shell
+  session and flips across sessions, so any single session reads as clean evidence.
+  Two sessions of five alternating rounds each, same commits, same command, gave
+  `checkMany/wide-overlapping` at +34% and at −26%. Bisecting the second attributed the
+  entire swing to M6, which deletes an unused record field from a module the benchmark
+  never calls — that is code layout, not engine behavior. `-fproc-alignment=64` is on and
+  a 64 MB nursery changed nothing. CI gates at `--fail-if-slower 25`; a ±35% benchmark
+  behind that gate is a flake generator, and a gate people learn to ignore is worse than
+  no gate. The hot-path fixes are justified by their asymptotics, which the machine's
+  inability to see does not repeal.
+  Date: 2026-07-09
+- Decision: `mergeLookupObjects`'s `sortOn` is deleted rather than kept "in case".
+  Rationale: it sorted the output of `Map.elems`, which is already ascending by object
+  key — the same key the sort used. GHC confirmed the redundancy: removing it made
+  `Data.List`'s import unused. B12 calls this "a per-union-node re-sort of the lookup
+  result map", and the code was real, but `sortOn` over an already-ascending list is
+  linear, so removing it bought nothing measurable. The map-valued traversal that replaced
+  it is justified by stating the invariant in the type, not by a number.
+  Date: 2026-07-09
 - Decision: The FNV-1a schema-hash concern (review B12's last item) is out of scope.
   Rationale: changing the schema fingerprint invalidates every persisted consistency
   token (the hash is embedded in tokens); that blast radius belongs with the
@@ -371,7 +475,62 @@ exhaustiveness test is a real gap this plan did not close.
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+B11 and B12 are addressed. The three magic numbers are one `En.Budget.EvaluationBudget`
+threaded through all three engines and read from `EN_MAX_DEPTH`, `EN_PAGE_LIMIT`, and
+`EN_RESULT_CAP`; the nine constant definitions are gone. The hot-path list of B12 is
+worked through item by item, one commit each. The disabled cache no longer writes to a
+shared `IORef` on every read, and eviction is `Map.lookupMin` instead of a full scan. The
+`EntryPoint` machinery is off the structure every engine carries, and lives behind
+`entryPoints :: ValidSchema -> Map RelationRef [EntryPoint]` where the one thing that
+reads it can find it.
+
+**What the benchmarks proved, and what they refused to.** One measured win:
+`cache/evict-churn`, 2.05 ms → 1.00 ms, reproducible in every configuration. Four measured
+regressions, all from `Set`-based `visited`, all ≤ 13%, all on sub-microsecond in-memory
+fixtures where a real store read would dwarf them. Everything else is neutral — including
+the two millisecond benchmarks this plan built specifically to see B12's quadratic
+accumulation. Those turned out to be bimodal at 1.35×, stable within a shell session and
+flipping across sessions, and a bisect attributed a 34% swing to deleting an unused record
+field from a module the benchmark never calls. The plan claims none of it.
+
+That is the plan's most useful outcome, and it is not the one it set out to produce. EP-44
+was written on the premise that "record before/after numbers as acceptance evidence" is a
+sufficient discipline. It is not, on this hardware: two honest sessions produce opposite
+signs, and either one, reported alone, would have read as proof. The safeguard that caught
+it was refusing to accept a favourable result whose methodology was chosen after seeing it.
+
+**Three defects found by writing the fixtures, not by running them.**
+
+The in-memory conformance store skipped rows on any relation wider than two pages —
+`pageTuples` resumed by dropping from an already-zipped list, so the cursor doubled instead
+of advancing. Every engine drains through it. It was caught because M1's benchmark
+*asserted its answer*: `checkMany/wide-overlapping` denied on a 5,064-row folder and
+allowed on 64-row folders carrying the same groups. Without the assertion the benchmark
+would have reported a plausible time for the wrong computation, and EP-39's wide-relation
+evidence — measured against a store that stopped reading at 2,000 rows — would have stayed
+unexamined.
+
+`lookup/wide-fanout` first reported **2.29 ns**, because `\() -> action` is a constant
+expression and GHC floats it out of the lambda. Every benchmark in the file now applies its
+call to an argument.
+
+`renderReachabilityMermaid` had no caller anywhere in the workspace, so M6's acceptance
+("renderer output tests still produce byte-identical output") was unsatisfiable as written.
+A golden fixture was captured from the pre-refactor renderer first; it passes unchanged
+after.
+
+**What later work inherits.** `En.Budget` grows additively. The `…WithBudget` entry points
+are the real ones; the old names are `defaultEvaluationBudget` wrappers, so no call site
+had to change. `Env.budget` is a strict field and the compiler finds every construction
+site — unlike `Config.knownVariables`, where omitting a name silently ignores an operator's
+environment variable and nothing warns. There is no `en-server` test suite; the config
+wiring was verified by hand in `cabal repl`. A `knownVariables`-versus-documentation
+exhaustiveness test is a gap this plan leaves open.
+
+`en-core/bench/baseline.csv` is untouched and still describes four benchmarks recorded on
+CI hardware. The seven added since EP-39 are ungated. Regenerating it is a maintainer
+action on the gating machine, and the millisecond benchmarks must be excluded when it
+happens.
 
 
 ## Context and Orientation
