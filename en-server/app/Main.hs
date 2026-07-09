@@ -2,27 +2,35 @@ module Main (main) where
 
 import Control.Concurrent.Async (withAsync)
 import Control.Exception (IOException, finally, try)
+import Control.Monad (foldM, guard)
+import Data.Aeson qualified as Aeson
+import Data.ByteString.Lazy qualified as LazyByteString
+import Data.ByteString.Lazy.Char8 qualified as LazyChar8
+import Data.Char (isSpace)
 import Data.Foldable (traverse_)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Data.Time (DiffTime, getCurrentTime)
 import Data.UUID qualified as UUID
 import Data.UUID.V4 qualified as UUID.V4
-import Effectful (Eff, IOE, runEff)
+import Effectful (Eff, IOE, liftIO, runEff, (:>))
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Network.Wai qualified as Wai
 import Network.Wai.Handler.Warp qualified as Warp
 import Network.Wai.Handler.WarpTLS qualified as WarpTLS
-import System.Exit (exitFailure)
-import System.IO (BufferMode (LineBuffering), hSetBuffering, stderr, stdout)
+import System.Environment (getArgs)
+import System.Exit (ExitCode (ExitFailure), exitFailure, exitWith)
+import System.IO (BufferMode (BlockBuffering, LineBuffering), hSetBuffering, stderr, stdout)
 import System.Posix.Signals (Handler (Catch), installHandler, sigINT, sigTERM)
+import Text.Read (readMaybe)
 
-import Config (PoolConfig (..), ServerConfig (..), TlsConfig (..), loadServerConfig, validateGcWindow)
+import Config (PoolConfig (..), ServerConfig (..), StoreConfig (..), TlsConfig (..), loadServerConfig, loadStoreConfig, validateGcWindow)
 import En.Cache (Cache, CacheConfig (..), SubproblemKey, TupleReadKey, cacheStats, newCache)
 import En.Check (CheckCacheEnv (..), checkCachedWithBudget, checkWithBudget)
 import En.Decision (ResidualDecision)
 import En.Effect.CachedTupleStore (cachedTupleStore)
-import En.Effect.TupleStore (TuplePage, TupleStore)
+import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore)
+import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError)
 import En.Lookup qualified as Lookup
 import En.Migrations (migrationsDir)
@@ -31,12 +39,14 @@ import En.Postgres.Datastore (resolveDatastoreIdSession)
 import En.Postgres.Revision (ConsistencyConfig (..), OptimizedRevisionCache, OptimizedRevisionConfig (..), newOptimizedRevisionCache, runConsistencyStorePostgres)
 import En.Postgres.TupleStore (runTupleStorePostgres, runTupleStorePostgresWithOptimizedRevisionCacheHandle)
 import En.Reachability (compile)
-import En.Revision (DatastoreId (..), SchemaHash (..))
-import En.Schema (Schema, schemaHash, validateSchema)
+import En.Revision (ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
+import En.Schema (Schema, ValidSchema, schemaHash, validateSchema)
 import En.Schema.Builder qualified as Schema
 import En.Schema.Parse (parseSchema)
+import En.Servant.API (tupleFromWire, tupleToWire)
 import En.Servant.OpenApi (appWithOpenApi)
 import En.Servant.Seam (AppEffects, Env (..))
+import En.Tuple (Tuple)
 import Hasql.Connection.Settings qualified as Settings
 import Hasql.Errors qualified as Hasql
 import Hasql.Pool qualified as Pool
@@ -49,28 +59,101 @@ import Metrics (metricsMiddleware, metricsRoute, newMetrics)
 import Middleware (authMiddleware, describeRateLimit, rateLimitMiddleware)
 import Observability (newRequestLogger, requestIdMiddleware)
 
+{- | The three ways to run this binary.
+
+Bulk import and export are subcommands rather than HTTP endpoints. The API is
+unauthenticated today, so a bulk-write endpoint would widen that exposure,
+whereas a subcommand runs with database credentials the operator already holds,
+needs no new wire contract, and composes with @gzip@, @pv@, and redirects.
+-}
+data Command
+    = Serve
+    | Import FilePath Int
+    | Export
+
+-- | Tuples per import transaction when @--batch-size@ is not given.
+defaultBatchSize :: Int
+defaultBatchSize = 5000
+
 main :: IO ()
 main = do
     -- stdout is a pipe under every supervisor, and GHC block-buffers pipes. Without
     -- this, startup lines -- including the "authentication is DISABLED" warning --
     -- sit in a buffer that SIGTERM discards, and every request log line is delayed.
     hSetBuffering stdout LineBuffering
-    -- Every variable is read and validated before anything else happens: no port bound,
-    -- no connection opened, no schema loaded. A rejected value exits 1 with its own
-    -- name and value in the message, rather than as an uncaught IOException.
-    (serverConfig, warnings) <- loadServerConfig >>= either configFailure pure
-    traverse_ Text.putStrLn warnings
-    (schemaSource, rawSchema) <- loadSchema serverConfig.schemaPath
+    args <- getArgs
+    case parseCommand args of
+        Nothing -> usage
+        Just Serve -> do
+            (serverConfig, warnings) <- loadServerConfig >>= either configFailure pure
+            traverse_ toStdout warnings
+            withStore toStdout serverConfig.store (runServe serverConfig)
+        -- A subcommand's stdout carries data -- the export stream, the import's
+        -- token line -- so every diagnostic the shared prologue emits goes to stderr.
+        Just (Import path batchSize) -> withSubcommandStore (runImport path batchSize)
+        Just Export -> withSubcommandStore runExport
+
+{- | The shared prologue of the bulk subcommands.
+
+Reads 'loadStoreConfig' rather than 'loadServerConfig': a command that binds no
+port has no API keys, rate limit, or TLS material to configure, and
+'loadServerConfig' fails closed without them -- correctly, for a server.
+-}
+withSubcommandStore :: (ValidSchema -> Pool.Pool -> ConsistencyConfig -> IO ()) -> IO ()
+withSubcommandStore action = do
+    (storeConfig, warnings) <- loadStoreConfig >>= either configFailure pure
+    traverse_ toStderr warnings
+    withStore toStderr storeConfig action
+
+parseCommand :: [String] -> Maybe Command
+parseCommand = \case
+    [] -> Just Serve
+    ["export"] -> Just Export
+    ("import" : rest) -> parseImport Nothing defaultBatchSize rest
+    _ -> Nothing
+  where
+    parseImport path batchSize = \case
+        [] -> Import <$> path <*> Just batchSize
+        ("--file" : value : rest) -> parseImport (Just value) batchSize rest
+        ("--batch-size" : value : rest) -> do
+            parsed <- readMaybe value
+            guard (parsed > 0)
+            parseImport path parsed rest
+        _ -> Nothing
+
+usage :: IO a
+usage = do
+    traverse_
+        (Text.hPutStrLn stderr)
+        [ "usage:"
+        , "  en-server                                     serve the HTTP API"
+        , "  en-server import --file PATH [--batch-size N] import newline-delimited-JSON tuples"
+        , "  en-server export                              write every live tuple as newline-delimited JSON"
+        , ""
+        , "All three read EN_DATABASE_URL and the optional EN_SCHEMA_PATH."
+        ]
+    exitWith (ExitFailure 2)
+
+toStdout :: Text.Text -> IO ()
+toStdout = Text.putStrLn
+
+toStderr :: Text.Text -> IO ()
+toStderr = Text.hPutStrLn stderr
+
+{- | Validate the schema, open the pool, and resolve this database's identity --
+everything all three commands need and none of them should do differently.
+
+Diagnostics travel through @say@ rather than 'Text.putStrLn' so that a command
+whose stdout is a data stream can route them to stderr.
+-}
+withStore :: (Text.Text -> IO ()) -> StoreConfig -> (ValidSchema -> Pool.Pool -> ConsistencyConfig -> IO ()) -> IO ()
+withStore say storeConfig action = do
+    (schemaSource, rawSchema) <- loadSchema storeConfig.schemaPath
     validSchema <-
         either (configFailure . ("Invalid schema: " <>) . Text.pack . show) pure (validateSchema rawSchema)
-    let activeSchemaHash = schemaHash validSchema
-        graph = compile validSchema
-        poolConfig = serverConfig.pool
-        optimizedRevisionTtlMs = serverConfig.optimizedRevisionTtlMs
-        tupleReadMaxEntries = serverConfig.tupleReadMaxEntries
-        decisionMaxEntries = serverConfig.decisionMaxEntries
-    logSchemaSource schemaSource
-    Text.putStrLn ("Schema hash: " <> renderSchemaHash activeSchemaHash)
+    say (describeSchemaSource schemaSource)
+    say ("Schema hash: " <> renderSchemaHash (schemaHash validSchema))
+    let poolConfig = storeConfig.pool
     pool <-
         Pool.acquire $
             Pool.Config.settings
@@ -79,7 +162,7 @@ main = do
                 , Pool.Config.idlenessTimeout (millisToDiffTime poolConfig.idlenessTimeoutMs)
                 , Pool.Config.agingTimeout (millisToDiffTime poolConfig.maxLifetimeMs)
                 , Pool.Config.staticConnectionSettings
-                    (Settings.connectionString serverConfig.databaseUrl)
+                    (Settings.connectionString storeConfig.databaseUrl)
                 ]
     let runDbSession :: Session a -> IO (Either Text.Text a)
         runDbSession session =
@@ -97,15 +180,24 @@ main = do
                     <> " before starting en-server."
     -- Only PostgreSQL can adjudicate its own interval grammar, so this waits for a
     -- reachable database -- but it still runs before the port binds.
-    validateGcWindow runDbSession serverConfig.gcWindow >>= either configFailure pure
+    validateGcWindow runDbSession storeConfig.gcWindow >>= either configFailure pure
     datastoreIdText <- resolveDatastoreId runDbSession
-    Text.putStrLn ("Datastore id: " <> datastoreIdText)
+    say ("Datastore id: " <> datastoreIdText)
     let config =
             ConsistencyConfig
                 { datastoreId = DatastoreId datastoreIdText
-                , schemaHash = activeSchemaHash
-                , gcWindow = serverConfig.gcWindow
+                , schemaHash = schemaHash validSchema
+                , gcWindow = storeConfig.gcWindow
                 }
+    action validSchema pool config `finally` Pool.release pool
+
+runServe :: ServerConfig -> ValidSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
+runServe serverConfig validSchema pool config = do
+    let graph = compile validSchema
+        poolConfig = serverConfig.store.pool
+        optimizedRevisionTtlMs = serverConfig.optimizedRevisionTtlMs
+        tupleReadMaxEntries = serverConfig.tupleReadMaxEntries
+        decisionMaxEntries = serverConfig.decisionMaxEntries
         optimizedRevisionConfig =
             OptimizedRevisionConfig
                 { enabled = optimizedRevisionTtlMs > 0
@@ -247,11 +339,122 @@ main = do
                     ]
                 $ appWithOpenApi serverEnv
     -- `serve` returns when SIGTERM drains the server, at which point `withAsync`
-    -- cancels the maintenance thread and `finally` releases the pool. Every
-    -- maintenance batch is its own committed transaction, so cancelling mid-pass
+    -- cancels the maintenance thread and `withStore`'s `finally` releases the pool.
+    -- Every maintenance batch is its own committed transaction, so cancelling mid-pass
     -- loses only the batch in flight; the next start resumes from what was committed.
     withAsync (runMaintenanceLoop serverConfig.maintenance runAppIO) \_maintenance ->
-        serve serverConfig.tls serverConfig.port wrappedApp `finally` Pool.release pool
+        serve serverConfig.tls serverConfig.port wrappedApp
+
+{- | Run a store action against the pool: the effect stack a subcommand needs.
+
+Neither cache layer appears. An import writes and a caching interposer would only
+hold pages nothing will read again; an export reads each page exactly once.
+-}
+runStoreIO :: Pool.Pool -> ConsistencyConfig -> Eff '[TupleStore, Error EnError, Database, IOE] a -> IO (Either EnError a)
+runStoreIO pool config action =
+    runEff (runDatabasePool pool (runErrorNoCallStack (runTupleStorePostgres config action)))
+
+{- | Stream newline-delimited-JSON tuples from a file into the store.
+
+Each batch is one ordinary write: one transaction, one anchor, one consistency
+token. A reader presenting a batch's token sees that batch whole or not at all,
+and the final token -- printed to stdout as the machine-readable last line -- sees
+the entire import.
+
+The whole operation is idempotent. Touch semantics make re-writing an existing
+tuple a no-op, so a crashed import is resumed by re-running it from the start:
+the batches already applied cost a round trip and change nothing. This is why
+import needs no checkpoint file.
+
+The file is read lazily and consumed one batch at a time, so memory tracks the
+batch size rather than the file size. That streaming is why a malformed line
+aborts the import with the batches before it already committed: the alternative,
+validating the whole file first, would hold every tuple in memory and forfeit the
+point of streaming. The line is named in the error, and the prefix is harmless --
+re-running the corrected file re-applies it as a no-op.
+-}
+runImport :: FilePath -> Int -> ValidSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
+runImport path batchSize _validSchema pool config = do
+    contents <- LazyByteString.readFile path
+    let numbered = zip [1 :: Int ..] (LazyChar8.lines contents)
+        populated = [line | line <- numbered, not (LazyChar8.all isSpace (snd line))]
+        -- An empty file still mints a token, so `token:` is always the last line.
+        batches = case chunksOf batchSize populated of
+            [] -> [[]]
+            chunked -> chunked
+    (imported, finalToken) <- foldM importBatch (0 :: Int, Nothing) batches
+    toStderr ("imported " <> showText imported <> " tuples")
+    case finalToken of
+        Nothing -> configFailure "import produced no consistency token"
+        Just (ConsistencyToken token) -> Text.putStrLn ("token: " <> token)
+  where
+    importBatch (imported, _) batch = do
+        tuples <- traverse decodeLine batch
+        outcome <- runStoreIO pool config (TupleStore.writeTuples tuples)
+        token <- either (storeFailure "import") pure outcome
+        let importedNow = imported + length tuples
+        toStderr ("imported " <> showText importedNow)
+        pure (importedNow, Just token)
+
+    decodeLine :: (Int, LazyByteString.ByteString) -> IO Tuple
+    decodeLine (lineNumber, line) =
+        case Aeson.eitherDecode line of
+            Left err -> lineFailure lineNumber (Text.pack err)
+            Right wire -> either (lineFailure lineNumber) pure (tupleFromWire wire)
+
+    lineFailure :: Int -> Text.Text -> IO a
+    lineFailure lineNumber reason =
+        configFailure (Text.pack path <> ":" <> showText lineNumber <> ": " <> reason)
+
+{- | Write every live tuple to stdout as newline-delimited JSON.
+
+The head revision is resolved once, and every page is read at it, so writers may
+proceed throughout and the output is the graph as it stood when the export began
+rather than a smear across the run. Feeding the result to 'runImport' reproduces
+that graph.
+
+stdout is switched to block buffering: it is a redirect or a pipe here, never a
+terminal a human is watching line by line, and the line buffering the serving
+path needs would cost a write syscall per tuple.
+-}
+runExport :: ValidSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
+runExport _validSchema pool config = do
+    hSetBuffering stdout (BlockBuffering Nothing)
+    outcome <- runStoreIO pool config do
+        revision <- TupleStore.headRevision
+        liftIO (toStderr ("exporting at revision " <> revision.revisionEncoding))
+        drainFrom revision Nothing 0
+    exported <- either (storeFailure "export") pure outcome
+    toStderr ("exported " <> showText exported <> " tuples")
+  where
+    drainFrom :: (TupleStore :> es, IOE :> es) => Revision -> Maybe StoreCursor -> Int -> Eff es Int
+    drainFrom revision cursor exported = do
+        TuplePage{rows, state} <- TupleStore.readAllTuples revision exportPageSize cursor
+        liftIO (traverse_ (LazyChar8.putStrLn . Aeson.encode . tupleToWire . (.tuple)) rows)
+        let exportedNow = exported + length rows
+        case state of
+            Exhausted -> pure exportedNow
+            HasMore next -> drainFrom revision (Just next) exportedNow
+            Truncated next -> drainFrom revision (Just next) exportedNow
+
+    exportPageSize = 5000
+
+storeFailure :: Text.Text -> EnError -> IO a
+storeFailure command err =
+    configFailure (command <> " failed: " <> Text.pack (show err))
+
+{- | Split a list into runs of at most @size@, lazily.
+
+Laziness is the point: the import's batches are produced as the file is read, so
+a file larger than memory still imports.
+-}
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf size = \case
+    [] -> []
+    items -> let (chunk, rest) = splitAt size items in chunk : chunksOf size rest
+
+showText :: (Show a) => a -> Text.Text
+showText = Text.pack . show
 
 {- | Mint a candidate identity and let the database decide.
 
@@ -362,13 +565,13 @@ loadSchema =
                 Right parsed ->
                     pure (SchemaFile path, parsed)
 
-logSchemaSource :: SchemaSource -> IO ()
-logSchemaSource =
+describeSchemaSource :: SchemaSource -> Text.Text
+describeSchemaSource =
     \case
         BuiltInDemoSchema ->
-            Text.putStrLn ("Using built-in demo schema; run migrations from " <> Text.pack migrationsDir <> " before writes.")
+            "Using built-in demo schema; run migrations from " <> Text.pack migrationsDir <> " before writes."
         SchemaFile path ->
-            Text.putStrLn ("Loaded schema from " <> Text.pack path)
+            "Loaded schema from " <> Text.pack path
 
 millisToDiffTime :: Int -> DiffTime
 millisToDiffTime ms =

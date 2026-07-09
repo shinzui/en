@@ -17,16 +17,20 @@ setting that will never take effect.
 -}
 module Config (
     ServerConfig (..),
+    StoreConfig (..),
     PoolConfig (..),
     TlsConfig (..),
     loadServerConfig,
+    loadStoreConfig,
     validateGcWindow,
     knownVariables,
+    storeVariables,
 ) where
 
 import Data.Bifunctor (first)
 import Data.ByteString qualified as ByteString
 import Data.Char (toLower)
+import Data.List (isPrefixOf)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes)
@@ -59,13 +63,26 @@ data TlsConfig = TlsConfig
     , keyFile :: !FilePath
     }
 
-data ServerConfig = ServerConfig
+{- | What it takes to open the store and speak to it correctly.
+
+Split out of 'ServerConfig' because @en-server import@ and @en-server export@ bind
+no port and serve no request: demanding API keys, a rate limit, or TLS material
+from an operator running a bulk load would be configuration theatre, and refusing
+to start without them -- which 'loadServerConfig' rightly does -- would refuse a
+command that has nothing to authenticate.
+-}
+data StoreConfig = StoreConfig
     { databaseUrl :: !Text
-    , port :: !Int
     , gcWindow :: !Text
     -- ^ A PostgreSQL interval. Only PostgreSQL can validate it; see 'validateGcWindow'.
     , schemaPath :: !(Maybe FilePath)
     -- ^ Reading and parsing the file stays in @Main@; this is only the path.
+    , pool :: !PoolConfig
+    }
+
+data ServerConfig = ServerConfig
+    { store :: !StoreConfig
+    , port :: !Int
     , optimizedRevisionTtlMs :: !Int
     , tupleReadMaxEntries :: !Int
     , decisionMaxEntries :: !Int
@@ -77,7 +94,6 @@ data ServerConfig = ServerConfig
     deadline above, which is a clock rather than a bound: raising the depth budget
     buys a slow lookup no more time.
     -}
-    , pool :: !PoolConfig
     , auth :: !AuthConfig
     , rateLimit :: !RateLimitConfig
     , maintenance :: !MaintenanceConfig
@@ -117,6 +133,20 @@ knownVariables =
     , "EN_TUPLE_READ_CACHE_MAX_ENTRIES"
     ]
 
+{- | The subset of 'knownVariables' the store itself reads.
+
+Everything a bulk import or export needs, and nothing a request-serving process
+adds. Kept as a projection of 'knownVariables' rather than a second list so a new
+store variable cannot be added to one and forgotten in the other.
+-}
+storeVariables :: [String]
+storeVariables =
+    filter isStoreVariable knownVariables
+  where
+    isStoreVariable name =
+        name `elem` ["EN_DATABASE_URL", "EN_GC_WINDOW", "EN_SCHEMA_PATH"]
+            || "EN_POOL_" `isPrefixOf` name
+
 -- | Snapshot the environment, then parse it. Returns the config and any warnings.
 loadServerConfig :: IO (Either Text (ServerConfig, [Text]))
 loadServerConfig = do
@@ -125,45 +155,33 @@ loadServerConfig = do
   where
     readVariable name = fmap ((,) name) <$> lookupEnv name
 
-parseServerConfig :: Map String String -> Either Text (ServerConfig, [Text])
-parseServerConfig environment = do
+{- | As 'loadServerConfig', but reading only what the store needs.
+
+The serving variables are not merely ignored, they are never read: an operator
+running @en-server import@ against a production database should not have to
+supply the API keys of a server they are not starting.
+-}
+loadStoreConfig :: IO (Either Text (StoreConfig, [Text]))
+loadStoreConfig = do
+    present <- catMaybes <$> traverse readVariable storeVariables
+    pure (parseStoreConfig (Map.fromList present))
+  where
+    readVariable name = fmap ((,) name) <$> lookupEnv name
+
+parseStoreConfig :: Map String String -> Either Text (StoreConfig, [Text])
+parseStoreConfig environment = do
     databaseUrl <- required "EN_DATABASE_URL" databaseUrlHint
-    port <- withDefault "EN_PORT" 8080 (bounded 1 65535)
     gcWindow <- Text.pack <$> withDefault "EN_GC_WINDOW" "24 hours" nonEmptyString
     schemaPath <- optional "EN_SCHEMA_PATH" nonEmptyString
-    optimizedRevisionTtlMs <- withDefault "EN_OPTIMIZED_REVISION_CACHE_TTL_MS" 0 nonNegative
-    tupleReadMaxEntries <- withDefault "EN_TUPLE_READ_CACHE_MAX_ENTRIES" 0 nonNegative
-    decisionMaxEntries <- withDefault "EN_DECISION_CACHE_MAX_ENTRIES" 0 nonNegative
-    maxBatchSize <- withDefault "EN_MAX_BATCH_SIZE" 1000 positive
-    deadlineDefaultMillis <- withDefault "EN_LOOKUP_DEADLINE_DEFAULT_MS" 3000 positive
-    deadlineMaxMillis <- withDefault "EN_LOOKUP_DEADLINE_MAX_MS" 30000 positive
-    checkDeadlineOrdering deadlineDefaultMillis deadlineMaxMillis
-    budget <- parseBudget environment
     pool <- parsePool environment
-    tls <- parseTls environment
-    rateLimit <- parseRateLimit environment
-    maintenance <- parseMaintenance environment
-    (auth, authWarnings) <- parseAuth environment
     pure
-        ( ServerConfig
+        ( StoreConfig
             { databaseUrl = Text.pack databaseUrl
-            , port
             , gcWindow
             , schemaPath
-            , optimizedRevisionTtlMs
-            , tupleReadMaxEntries
-            , decisionMaxEntries
-            , maxBatchSize
-            , deadlineDefaultMillis
-            , deadlineMaxMillis
-            , budget
             , pool
-            , auth
-            , rateLimit
-            , maintenance
-            , tls
             }
-        , authWarnings <> schemaWarnings schemaPath
+        , schemaWarnings schemaPath
         )
   where
     required :: String -> Text -> Either Text String
@@ -172,6 +190,44 @@ parseServerConfig environment = do
     optional :: forall a. String -> Parser a -> Either Text (Maybe a)
     optional = optionalIn environment
 
+    withDefault :: forall a. String -> a -> Parser a -> Either Text a
+    withDefault = withDefaultIn environment
+
+parseServerConfig :: Map String String -> Either Text (ServerConfig, [Text])
+parseServerConfig environment = do
+    (store, storeWarnings) <- parseStoreConfig environment
+    port <- withDefault "EN_PORT" 8080 (bounded 1 65535)
+    optimizedRevisionTtlMs <- withDefault "EN_OPTIMIZED_REVISION_CACHE_TTL_MS" 0 nonNegative
+    tupleReadMaxEntries <- withDefault "EN_TUPLE_READ_CACHE_MAX_ENTRIES" 0 nonNegative
+    decisionMaxEntries <- withDefault "EN_DECISION_CACHE_MAX_ENTRIES" 0 nonNegative
+    maxBatchSize <- withDefault "EN_MAX_BATCH_SIZE" 1000 positive
+    deadlineDefaultMillis <- withDefault "EN_LOOKUP_DEADLINE_DEFAULT_MS" 3000 positive
+    deadlineMaxMillis <- withDefault "EN_LOOKUP_DEADLINE_MAX_MS" 30000 positive
+    checkDeadlineOrdering deadlineDefaultMillis deadlineMaxMillis
+    budget <- parseBudget environment
+    tls <- parseTls environment
+    rateLimit <- parseRateLimit environment
+    maintenance <- parseMaintenance environment
+    (auth, authWarnings) <- parseAuth environment
+    pure
+        ( ServerConfig
+            { store
+            , port
+            , optimizedRevisionTtlMs
+            , tupleReadMaxEntries
+            , decisionMaxEntries
+            , maxBatchSize
+            , deadlineDefaultMillis
+            , deadlineMaxMillis
+            , budget
+            , auth
+            , rateLimit
+            , maintenance
+            , tls
+            }
+        , authWarnings <> storeWarnings
+        )
+  where
     withDefault :: forall a. String -> a -> Parser a -> Either Text a
     withDefault = withDefaultIn environment
 

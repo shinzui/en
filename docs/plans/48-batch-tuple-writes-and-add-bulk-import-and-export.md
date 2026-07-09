@@ -47,11 +47,13 @@ This section must always reflect the actual current state of the work.
 - [x] Prove batched-vs-sequential equivalence in `en-postgres/integration-test/Main.hs` (docs/plans/45's five touch scenarios rerun unchanged through the batched path, plus `runBatchWriteScenario` and `runBatchTouchRaceScenario`). — 2026-07-09
 - [x] Each new scenario run once against the bug it claims to catch (see Surprises & Discoveries). — 2026-07-09
 - [x] Add the `ReadAllTuples` effect operation to `en-core/src/En/Effect/TupleStore.hs`, implement it in the PostgreSQL and in-memory interpreters, and confirm the cached interposer passes it through. — 2026-07-09. `runReadAllTuplesScenario` proves the drain is complete and snapshot-isolated; the write constructors are byte-identical to their pre-plan state (`git diff bf9cd88 -- en-core/src/En/Effect/TupleStore.hs`).
-- [ ] Add subcommand dispatch to `en-server/app/Main.hs` and implement `import` (NDJSON in, anchored batches, final token printed) and `export` (NDJSON out at a single revision).
-- [ ] Round-trip test: export a seeded dev database, import into a fresh database, compare sorted NDJSON.
-- [ ] Measure: statement-log counts for a 100-tuple write before/after; 100k-tuple import wall-clock and rate; record both in Outcomes & Retrospective.
-- [ ] Update `docs/user/service-and-operations.md` with the two subcommands.
-- [ ] Run `cabal build all`, `cabal test all`, `just start-and-test`; record transcripts.
+- [x] Add subcommand dispatch to `en-server/app/Main.hs` and implement `import` (NDJSON in, anchored batches, final token printed) and `export` (NDJSON out at a single revision). — 2026-07-09
+- [x] Split `StoreConfig` out of `ServerConfig` in `en-server/app/Config.hs` so the subcommands need no API keys, rate limit, or TLS material. — 2026-07-09. Not in the plan; see Surprises.
+- [x] Fix the planner regression the batched statements introduced: all three drive from the unnested batch through a `LATERAL` probe of `relation_tuple_live_unique`. — 2026-07-09. See Surprises; this is the plan's most consequential finding.
+- [x] Round-trip test: export a seeded dev database, import into a fresh database, compare sorted NDJSON. — 2026-07-09. Also round-tripped caveats, usersets, and wildcards, and confirmed export is a fixed point.
+- [x] Measure: statement-log counts for a 100-tuple write before/after; 100k-tuple import wall-clock and rate; record both in Outcomes & Retrospective. — 2026-07-09
+- [x] Update `docs/user/service-and-operations.md` with the two subcommands. — 2026-07-09
+- [x] Run `cabal build all`, `cabal test all`, `just start-and-test`; record transcripts. — 2026-07-09. All seven suites pass; `just start-and-test` prints `server smoke test passed: allowed`.
 
 
 ## Surprises & Discoveries
@@ -120,6 +122,89 @@ three encoders over one `BatchParams` — `batchColumnsEncoder` (`$1`–`$8`),
 `batchWriteEncoder` (plus the xid at `$9`), and `batchDeleteEncoder` (the six identity
 arrays plus the xid at `$7`) — rather than one shared encoder as the per-row statements
 had.
+
+**Batching a statement changes its plan, and `unnest` has no statistics. This was the
+plan's real hazard, and it is not in finding C6.** Replacing N indexed single-row
+statements with one N-row join hands the planner a `Function Scan` it cannot estimate.
+Below roughly a thousand entries it nested-loops over `relation_tuple_live_unique`, which
+is what the per-row statements did. Above that it switches to a merge join over whatever
+index it can scan in order — `relation_tuple_subject_hist_idx`, whose columns are the
+subject plus the object *type*, and **not** the object id. So `object_id`, the only
+discriminating column in a bulk import, is demoted from the merge condition to a join
+filter, and the merge produces the cross product:
+
+```text
+Update on relation_tuple t (actual rows=0 loops=1)
+->  Merge Join (actual rows=0 loops=1)
+      Merge Cond: ((t.subject_type = w.subject_type) AND (t.subject_id = w.subject_id) AND ...
+                   AND (t.object_type = w.object_type) AND (t.relation = w.relation))
+      Join Filter: ((w.object_id = t.object_id) AND ((t.caveat_name IS DISTINCT FROM ...)))
+      Rows Removed by Join Filter: 500000000
+      ->  Index Scan using relation_tuple_subject_hist_idx on relation_tuple t (actual rows=100000)
+      ->  Sort (actual rows=499900001 loops=1)
+Execution Time: 55791.728 ms
+```
+
+One 5,000-tuple retire statement against a 100,000-row table: **55.8 seconds**, 500
+million discarded pairs. Measured crossover, same table:
+
+| batch | plan | execution |
+| --- | --- | --- |
+| 1 | Nested Loop over `relation_tuple_live_unique` | 0.4 ms |
+| 1,000 | Nested Loop | 3.6 ms |
+| 2,000 | Merge Join | 22,322 ms |
+| 5,000 | Merge Join | 55,792 ms |
+
+`EN_MAX_BATCH_SIZE` defaults to **1,000**. An operator raising it to 2,000 would have
+turned an ordinary HTTP write into a 22-second table scan, with no code change and no
+warning. The default import batch size of 5,000 sat well past the cliff.
+
+It surfaced as a 100,000-tuple re-import taking **272 seconds** where the first import of
+the same file took **3.12 seconds** — and then, damningly, the *first* import of a fresh
+database timed at 54 seconds on a later run. Same file, same code: autoanalyze had fired
+partway through, the planner learned the table's true size, and flipped to the merge join
+mid-import. A performance property that depends on when autovacuum last ran is not a
+property.
+
+The fix removes the choice rather than tuning it. Every batch statement now drives from
+the unnested batch through a `CROSS JOIN LATERAL` (or `LEFT JOIN LATERAL`, for the
+convergence check) that probes `relation_tuple_live_unique` once per entry. `LIMIT 1`
+inside the lateral is exact — the unique index admits one live row per identity — and it
+is also what stops the planner flattening the subquery back into the join. The batch is
+always the outer relation:
+
+```text
+Update on relation_tuple t
+->  Nested Loop
+      ->  Function Scan on w (actual rows=5000 loops=1)
+      ->  Limit (actual rows=0 loops=5000)
+            ->  Index Scan using relation_tuple_live_unique on relation_tuple r
+Execution Time: 14.355 ms
+```
+
+55,792 ms → 14.4 ms, and the plan no longer depends on the batch size, the table size, or
+`work_mem`. The convergence check went from a hash anti join that hashed every live row
+in the table (38.6 ms at 100k rows, and unbounded above that) to 10.3 ms of index probes.
+End to end, the 100k re-import went from 272 s to **3.57 s**.
+
+**A stale binary reports the old numbers.** `cabal build en-postgres` does not relink the
+`en-server` executable. The first "post-fix" measurement showed no improvement because
+`cabal list-bin en-server` still pointed at a binary linking the pre-fix library. Build
+the executable, not the library, before measuring it.
+
+**`loadServerConfig` refuses to start without API keys — correctly, and it was refusing
+the subcommands too.** `en-server import` bound no port and served no request, yet
+demanded `EN_API_KEYS_READ_WRITE`. `StoreConfig` is now split out of `ServerConfig` and
+read by `loadStoreConfig`, which reads only `EN_DATABASE_URL`, `EN_SCHEMA_PATH`,
+`EN_GC_WINDOW`, and `EN_POOL_*`. `parseServerConfig` builds on `parseStoreConfig` rather
+than duplicating it, so the two cannot drift.
+
+**Hand-written NDJSON is a bad oracle, and the importer said so.** Three attempts at a
+caveated test line were rejected in turn — `payload` needs a `values` wrapper, and each
+value is a tagged `{"type": …, "value": …}` object. The importer named the file, the line,
+and the JSON path each time (`caveated.ndjson:1: Error in $.caveat.payload.values.ok:
+parsing CaveatValueWire failed, expected Object, but encountered Boolean`), which is
+exactly the behavior the plan asked for, arrived at by being on the receiving end of it.
 
 
 ## Decision Log
@@ -197,15 +282,110 @@ Record every decision made while working on the plan.
   loudly rather than being dropped. It also forces `dedupeWrites`: without it a four-way
   duplicate reaches the fallback with two same-identity rows and the strict insert raises.
   Date: 2026-07-09
+- Decision: Every batch statement reaches `relation_tuple` through a `LATERAL` probe driven
+  by the unnested batch, never as a bare join, and never via `NOT EXISTS`.
+  Rationale: A `Function Scan` has no statistics. Left to choose, the planner abandons the
+  nested loop over `relation_tuple_live_unique` somewhere between 1,000 and 2,000 entries and
+  picks a merge join on an index without `object_id`, producing the cross product — 55.8
+  seconds and 500M discarded pairs for one 5,000-tuple statement. `EN_MAX_BATCH_SIZE` defaults
+  to 1,000, one step from the cliff, and autoanalyze can move the cliff under a running
+  import. The `LATERAL` is not an optimization; it is what makes the plan a property of the
+  statement rather than of the planner's current beliefs. Verified with EXPLAIN ANALYZE at
+  batch sizes 1 through 5,000. This constraint binds any future batched statement over
+  `relation_tuple`, including docs/plans/49's index work.
+  Date: 2026-07-09
+- Decision: `StoreConfig` is split out of `ServerConfig`, and the subcommands read only it.
+  Rationale: `loadServerConfig` fails closed without API keys — right for a server, absurd for
+  a bulk load that binds no port. `parseServerConfig` is defined in terms of `parseStoreConfig`
+  so the store variables cannot diverge between the two loaders.
+  Date: 2026-07-09
+- Decision: `--batch-size 5000` stays the import default despite the planner finding.
+  Rationale: With the `LATERAL` probes the plan is index-driven at every batch size, so the
+  cliff no longer exists and the batch size trades only transaction size against round trips.
+  Measured at 100k tuples in 3.6 seconds either way.
+  Date: 2026-07-09
+- Decision: A malformed line aborts the import with earlier batches committed, rather than
+  validating the whole file first.
+  Rationale: Validating first means holding every tuple in memory, forfeiting the streaming
+  that lets a file larger than memory import at all. Touch semantics make the committed prefix
+  a no-op on re-run, so the failure costs nothing but the operator's second invocation. The
+  error names the file, the line, and the JSON path.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective
 
-Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
-Compare the result against the original purpose. Record here: the before/after statement
-counts for the 100-tuple write, and the 100k-import wall-clock time and tuples/second rate.
+Both of the plan's promises hold, and the work turned up a defect graver than the finding
+it was chartered to fix.
 
-(To be filled during and after implementation.)
+**Round trips (finding C6).** Measured with PostgreSQL's own statement log
+(`log_statement = 'all'`), counting the lines a single 100-tuple `POST /v1/relationships`
+produced between two marker statements, against `bf9cd88` (pre-plan) and `HEAD`:
+
+| | statements | shape |
+| --- | --- | --- |
+| before | **203** | `BEGIN`, anchor, then `UPDATE` + `INSERT` per tuple, `COMMIT` — 2N+3 |
+| after | **6** | `BEGIN`, anchor, retire, insert, converge, `COMMIT` — constant in N |
+
+The predicted 2N+3 and 6 exactly. A delete costs 4. The contended retry costs 8, and no
+scenario outside the deliberate race provoked one.
+
+**Bulk import and export (gap E9).** 100,000 synthetic relationships (a 15.8 MB NDJSON
+file), dev PostgreSQL on an Apple-silicon laptop, `--batch-size 5000`:
+
+| | wall clock | rate |
+| --- | --- | --- |
+| import into an empty database | 3.17 s | ~31,500 tuples/s |
+| re-import the same file (all rows present) | 2.13 s | ~47,000 tuples/s |
+| export 100,000 rows | 1.10 s | ~91,000 tuples/s |
+
+(Timings vary a few tenths of a second run to run; a separate run of the same three
+commands read 3.75 s / 3.57 s / —. The figures above are one consistent set.)
+
+`psql -tAc "SELECT count(*) …"` returns `100000` after the first import and `100000` after
+the second, with no retired rows: touch semantics make re-import a true no-op, so a crashed
+import is resumed by re-running it. `export | wc -l` equals the live count. Sorted
+`export → import → export` is byte-identical (`100K-ROUND-TRIP-OK`), including caveated
+tuples, usersets, and wildcards, and export is a fixed point of import.
+
+Against the pre-plan per-tuple path the sanity floor was "an order of magnitude". The
+round-trip ratio is 203/6 ≈ 34×, and the measured import rate is ~31k tuples/s where the
+per-tuple path would issue 200,000 statements to do the same work.
+
+**The gap the plan did not anticipate.** Finding C6 is about round trips, and this plan
+delivered on it in Milestone 1. But collapsing N indexed single-row statements into one
+N-row join is not a neutral transformation: it replaces a plan the planner cannot get
+wrong with one it estimates, and `unnest` gives it nothing to estimate from. Past ~1,000
+entries it chose a merge join on an index lacking `object_id` and computed the cross
+product — 55.8 seconds for one statement, 500 million discarded pairs. `EN_MAX_BATCH_SIZE`
+defaults to 1,000, one doubling from that cliff. The bug was invisible in the integration
+suite (whose tables are small), invisible in the 100-tuple statement-count measurement,
+and invisible in the *first* 100k import — it only appeared on the second, after
+autoanalyze had taught the planner the table's size. Pinning all three statements to
+`LATERAL` probes of `relation_tuple_live_unique` made the plan a property of the statement:
+55,792 ms → 14.4 ms, and the 100k re-import 272 s → 3.57 s.
+
+The lesson generalizes past this plan: **a batched statement's cost must be argued from its
+plan, not from its round-trip count.** Any future batched statement over `relation_tuple`
+— docs/plans/49's index work included — should be EXPLAINed at a batch size well above
+`EN_MAX_BATCH_SIZE` against a table large enough to have statistics.
+
+**Test-quality lessons, both learned the hard way.** The first duplicate-key scenario used
+two copies of an identity and passed against the un-deduplicated code, because the retry
+ladder walks a two-copy batch down to last-wins by accident; four copies are needed to
+reach the failure. And within one transaction the batch always converges on its first
+attempt, so `batchUnconvergedStatement`, the second attempt, the fallback, and the ordinal
+mapping were *entirely unreachable* from a single-connection suite — an injected off-by-one
+in `selectOrdinals` left the whole suite green. `runBatchTouchRaceScenario` forces the
+overlap and now catches it, in exactly the silent-drop shape finding C1 describes. Both
+scenarios were run once against the bug they claim to catch, as the master plan requires.
+
+**Scope taken on beyond the plan.** `StoreConfig` was split out of `ServerConfig` because
+`en-server import` was refusing to run without API keys for a server it does not start. The
+`LATERAL` rewrite was not planned. Neither changed the `TupleStore` effect's write
+constructors, which are byte-identical to their pre-plan state
+(`git diff bf9cd88 -- en-core/src/En/Effect/TupleStore.hs` shows only the `ReadAllTuples`
+addition), so the master plan's extension budget for this plan was respected.
 
 
 ## Context and Orientation

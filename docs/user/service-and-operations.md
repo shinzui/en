@@ -83,6 +83,10 @@ Authentication, rate limiting, and TLS add seven more variables, documented unde
 [Authentication, rate limiting, and TLS](#authentication-rate-limiting-and-tls).
 At least one API key is required for startup.
 
+The `en-server import` and `en-server export` subcommands read a strict subset of this
+table — `EN_DATABASE_URL`, `EN_SCHEMA_PATH`, `EN_GC_WINDOW`, and `EN_POOL_*` — and none
+of the serving variables. See [Bulk import and export](#bulk-import-and-export).
+
 ### Configuration is validated at startup
 
 Every variable is read and checked before the server binds its port, opens a connection,
@@ -179,6 +183,72 @@ binary; `just run-migrations` applies each file with a `to_regclass`-guarded `ps
 invocation, so re-running it is a no-op. `en-server` does not verify migration state at
 startup in general — but it does read `en_datastore_metadata`, so a database missing the
 most recent migration fails loudly rather than serving.
+
+### Bulk import and export
+
+The `en-server` binary carries two subcommands for moving the relationship graph into
+and out of en. Both speak newline-delimited JSON: one relationship per line, in exactly
+the shape the `POST /v1/relationships` request body uses for each element of its
+`tuples` array.
+
+```shell
+# Write every live relationship to stdout, one JSON object per line.
+EN_DATABASE_URL='postgresql://user@localhost:5432/en' \
+  en-server export > graph.ndjson
+
+# Read them back, in transactions of 5000 relationships.
+EN_DATABASE_URL='postgresql://user@localhost:5432/en' \
+  en-server import --file graph.ndjson [--batch-size 5000]
+```
+
+Both are CLI subcommands rather than HTTP endpoints deliberately: they run with the
+database credentials the operator already holds, add nothing to the authenticated wire
+surface, and compose with the shell. Neither reads `EN_PORT`, the API keys, the rate
+limit, or the TLS variables — only `EN_DATABASE_URL`, `EN_SCHEMA_PATH`, `EN_GC_WINDOW`,
+and the `EN_POOL_*` group. Nothing is exported to stdout but relationship data, so
+`en-server export | gzip > graph.ndjson.gz` is safe; progress and the resolved revision
+go to stderr.
+
+**Export is a snapshot.** The head revision is resolved once, before the first page, and
+every page is read at it. Writers may proceed throughout: none of their relationships
+appear in the output, and the result is the graph as it stood when the export began
+rather than a smear across the run. A revision only stays readable for `EN_GC_WINDOW`,
+so an export must finish well inside it.
+
+**Import is idempotent and atomic per batch.** Each batch of `--batch-size`
+relationships is one ordinary write — one transaction, one consistency token — so a
+reader presenting a batch's token sees that batch whole or not at all. Because writes
+have touch semantics, re-writing a relationship that already exists is a no-op: a
+crashed or interrupted import is resumed by re-running it from the start, and the
+batches already applied cost a round trip and change nothing. There is no checkpoint
+file. The last line of stdout is the final token:
+
+```text
+token: en1.…
+```
+
+A read at that token sees the entire import.
+
+Because the file is streamed rather than read whole, a malformed line aborts the import
+with the batches before it already committed. The error names the file and line:
+
+```text
+en-server: graph.ndjson:41732: Error in $.caveat.payload: key "values" not found
+```
+
+Correct the line and re-run; the committed prefix re-applies as a no-op.
+
+`en-server import` of an `en-server export` reproduces the graph exactly, which makes
+the pair a migration path between databases:
+
+```shell
+EN_DATABASE_URL="$OLD" en-server export > graph.ndjson
+EN_DATABASE_URL="$NEW" en-server import --file graph.ndjson
+```
+
+Note that the two databases have different datastore identities, so tokens minted by one
+are rejected by the other — see [Datastore identity](#datastore-identity). Relationship
+data transfers; consistency tokens do not.
 
 ### Connection pooling
 
