@@ -44,6 +44,16 @@ instead of forced. This plan is child EP-35 of
 `docs/masterplans/6-production-harden-the-en-service.md` and owns the error envelope
 that EP-33 and EP-36 emit.
 
+Handler-produced errors are not merely *shaped* consistently — they are part of the
+API type. Each of the six operations is a Servant `MultiVerb` whose response
+alternatives enumerate the statuses it can return (200, 400, 422, 503), so a handler
+returns an ordinary Haskell value rather than throwing an untyped `ServerError`, the
+OpenAPI document in M4 lists every error response per operation with its schema, and
+`en-client` hands callers a typed `EnResult` instead of an opaque `ClientError`. Errors
+raised *before* a handler runs — a malformed request body, an unmatched route — cannot
+be expressed this way, since they come from Servant's routing layer; those are
+normalized into the same envelope by `ErrorFormatters`.
+
 
 ## Progress
 
@@ -71,12 +81,18 @@ This section must always reflect the actual current state of the work.
   `docs/user/production-deployment-and-performance.md` swept for old shapes; an "API
   versioning" section added documenting the discriminators and the one-time break.
 - [ ] M3: typed error envelope (`ErrorEnvelopeWire`) in Seam.hs with the
-  `EnError -> (status, code, retryable)` mapping; `requirePermission` and handler 400s
-  migrated onto it.
-- [ ] M3: uniform JSON errors for body-decode/404/405 via Servant `ErrorFormatters` and
-  `serveWithContext`.
+  `EnError -> EnFault` mapping (`status`, `code`, `retryable`); `requirePermission` and
+  handler 400s migrated onto it.
+- [ ] M3: uniform JSON errors for body-decode/404 via Servant `ErrorFormatters` and
+  `serveWithContext`; 405/415 behavior observed and recorded.
+- [ ] M3b: the six operations become `MultiVerb` endpoints over the shared response list
+  `EnResponses`; handlers return `EnResult` instead of throwing; `AsUnion` instance
+  written by hand.
+- [ ] M3b: `en-client/src/En/Client.hs` operations re-typed to `ClientM (EnResult …)`;
+  `en-servant/test/Main.hs` assertions moved onto `EnResult`.
 - [ ] M4: OpenAPI document generated with servant-openapi-hs and served at
-  `GET /v1/openapi.json`; `ToSchema` instances hand-written to match the JSON grammar.
+  `GET /v1/openapi.json`; `ToSchema` instances hand-written to match the JSON grammar;
+  every operation documents its 400/422/503 responses.
 - [ ] Final: full curl transcript reproduced; `cabal test en-servant` and
   `just start-and-test` green; breaking change called out in
   `docs/user/service-and-operations.md`.
@@ -179,6 +195,50 @@ Record every decision made while working on the plan.
   parameter details (`Hasql.toDetailedText`) — an information leak flagged by A3 — so
   it must not cross the trust boundary.
   Date: 2026-07-07
+- Decision: Adopt Servant's `MultiVerb` for the six operations, so handler-produced
+  errors are alternatives of the API type rather than thrown `ServerError`s. Added to
+  this plan as milestone M3b rather than deferred to a follow-up.
+  Rationale: `MultiVerb` changes the *Haskell* types, not a single JSON byte — the
+  statuses and `{code, message, retryable}` bodies are identical either way — so
+  adopting it is not a second break of the `/v1` wire contract, only of `en-client`'s
+  Haskell shape. en currently has no API consumers, which makes that break free now and
+  expensive later; that is the whole reason to do it before anyone depends on the
+  client. The payoff is that M4's OpenAPI document lists each operation's real error
+  responses instead of one hand-attached "default error response", and callers of
+  `en-client` pattern-match a typed result instead of inspecting an opaque
+  `ClientError`. Verified beforehand that the toolchain supports it: servant 0.20.3
+  ships `Servant.API.MultiVerb` with a `HasServer` instance;
+  `servant-client-core` defines `Client m (MultiVerb method cs as r) = m r`; and the
+  pinned `shinzui/servant-openapi-hs` fork carries a dedicated MultiVerb `HasOpenApi`
+  port (`MultiVerbStatus`, `IsSwaggerResponseList`) that keys responses by status and
+  merges alternatives sharing one.
+  Date: 2026-07-08
+- Decision: Give all six operations one uniform response list `EnResponses`
+  (200/400/422/503) rather than a narrower list for the two write routes.
+  Rationale: `ResolutionLimitExceeded` (422) arises from graph traversal, so a write
+  cannot in practice emit it — but `EnError` is a single closed sum shared by every
+  operation, and the type system cannot prove the write path never produces that
+  constructor. A write-specific response list would make `EnError -> WriteResult` a
+  partial function, which is a real defect traded for a cosmetic gain. One total
+  conversion and a slightly over-broad OpenAPI document is the better trade; the
+  response descriptions say what each status means.
+  Date: 2026-07-08
+- Decision: Keep `MultiVerb` for handler errors and `ErrorFormatters` for framework
+  errors, rather than trying to express everything one way.
+  Rationale: `malformed_request_body`, `not_found`, the 405 on a wrong method, and 415
+  content-type mismatches are raised by Servant's routing layer before any handler runs,
+  so no response type on the endpoint can describe them. EP-33's `unauthenticated`,
+  `permission_denied`, and `rate_limited` come from WAI middleware, outside Servant
+  entirely. `MultiVerb` therefore complements the envelope rather than replacing it;
+  both paths emit `ErrorEnvelopeWire`.
+  Date: 2026-07-08
+- Decision: Retain the throwing `runEngine` and `enErrorToServerError` alongside the new
+  value-returning `runEngineEither`.
+  Rationale: `requirePermission` in `En.Servant.Authorize` is a helper for *embedded*
+  host applications' own Servant routes, not an operation of `EnAPI`. It has no
+  `MultiVerb` response list to return into, so it must keep throwing a `ServerError` —
+  now carrying the envelope with code `permission_denied`.
+  Date: 2026-07-08
 - Decision: Generate the OpenAPI document with `servant-openapi-hs` (the mori-registered
   fork of `servant-openapi3` at
   `/Users/shinzui/Keikaku/bokuno/openapi-hs-project/servant-openapi-hs`, GitHub
@@ -287,10 +347,14 @@ extend this same `/v1` surface.
 
 ## Plan of Work
 
-Four milestones: stabilize the JSON encodings (M1), move and rename the routes (M2),
-type the error model (M3), and describe it all with OpenAPI (M4). M1 and M2 could land
-together, but M1 is independently verifiable through the test suite alone, which keeps
-review tractable.
+Five milestones: stabilize the JSON encodings (M1), move and rename the routes (M2),
+type the error model (M3), lift handler errors into the API type with `MultiVerb` (M3b),
+and describe it all with OpenAPI (M4). M1 and M2 could land together, but M1 is
+independently verifiable through the test suite alone, which keeps review tractable.
+M3 and M3b are separated because M3 alone already fixes the wire-visible defect
+(finding A3) and is verifiable with curl; M3b then changes only Haskell types, leaving
+every byte on the wire identical. Landing them apart makes that claim reviewable — the
+curl transcript captured after M3 must reproduce byte-for-byte after M3b.
 
 
 ### Milestone 1: Hand-written, tag-free JSON encodings
@@ -446,14 +510,22 @@ data ErrorEnvelopeWire = ErrorEnvelopeWire
     }
 ```
 
-with hand-written instances (`{"code":…,"message":…,"retryable":…}`). Change `jsonError`
-to `jsonError :: ServerError -> Text -> Text -> Bool -> ServerError` (status, code,
-message, retryable — or introduce a small record; keep one canonical constructor) and
-re-export it. Replace `enErrorToServerError` with the mapping (statuses via servant's
-`err400`/`err422`/`err503`):
+with hand-written instances (`{"code":…,"message":…,"retryable":…}`). Introduce the
+fault type that names the status without committing to a transport:
 
 ```haskell
-enErrorToServerError :: EnError -> ServerError
+-- | A handler-producible failure. The constructor selects the HTTP status.
+data EnFault
+    = BadRequestFault !ErrorEnvelopeWire     -- ^ 400
+    | UnprocessableFault !ErrorEnvelopeWire  -- ^ 422
+    | UnavailableFault !ErrorEnvelopeWire    -- ^ 503
+```
+
+`EnFault` exists so that M3b's `MultiVerb` alternatives and M3's thrown `ServerError`s
+are built from one source of truth. Implement the mapping:
+
+```haskell
+enErrorToFault :: EnError -> EnFault
 -- UnknownRelation t          -> 400 "unknown_relation"           retryable=False, message names t
 -- SchemaViolation t          -> 400 "schema_violation"           retryable=False
 -- MissingCaveatContext names -> 400 "missing_caveat_context"     retryable=False, message lists names
@@ -463,14 +535,33 @@ enErrorToServerError :: EnError -> ServerError
 --                               message = "the tuple store failed; retry later"
 ```
 
+plus `invalidRequest :: Text -> EnFault` (code `invalid_request`) and
+`batchTooLarge :: Text -> EnFault` (code `batch_too_large`), both 400/retryable=false,
+for the validation failures that are not `EnError`s.
+
 For `StoreError`, print the detailed text to stderr (`Text.hPutStrLn stderr`) before
 returning the generic envelope — the operator needs the SQL context, the caller must not
-see it (EP-36's structured logging later formalizes this). Update the callers of the old
-`jsonError`: `either400` and the batch-size check in `API.hs` (code
-`"invalid_request"`, and `"batch_too_large"` for the size check, both retryable=false),
-and `requirePermission` in `en-servant/src/En/Servant/Authorize.hs` (403, code
-`"permission_denied"`, retryable=false, distinct messages for `Denied` vs
-`Conditional`).
+see it (EP-36's structured logging later formalizes this). Do this in one place,
+`logEnError :: EnError -> IO ()`, called from the engine runners; the mapping function
+itself stays pure.
+
+Keep two engine runners, because they serve different callers:
+
+```haskell
+-- Throws; used by requirePermission and any embedded host route.
+runEngine :: Env es -> Eff es a -> Handler a
+enErrorToServerError :: EnError -> ServerError  -- faultToServerError . enErrorToFault
+
+-- Returns; used by every EnAPI handler once M3b lands.
+runEngineEither :: Env es -> Eff es a -> Handler (Either EnFault a)
+```
+
+`faultToServerError` attaches the envelope as the body and
+`Content-Type: application/json` at the status the constructor names, replacing the old
+`jsonError`. Update `requirePermission` in `en-servant/src/En/Servant/Authorize.hs` to
+throw a 403 envelope with code `permission_denied` (retryable=false, distinct messages
+for `Denied` vs `Conditional`); it has no `MultiVerb` response list to return into, so
+it keeps throwing.
 
 Make framework errors uniform. In `API.hs`, change `app` to use `serveWithContext` with
 custom `ErrorFormatters` (from `Servant.Server`):
@@ -488,14 +579,109 @@ Discoveries — if they emit non-JSON bodies, add a small outermost WAI middlewa
 `app` that rewrites bodyless 4xx responses into the envelope (keep it inside en-servant
 so embedded users get it too).
 
-Add tests to `en-servant/test/Main.hs`: run a handler that produces each `EnError`
-variant (the in-memory conformance store can be wrapped to inject `StoreError`; an
-unknown permission produces `UnknownRelation` naturally) and assert on
-`errHTTPCode`/`errBody` — 400 vs 422 vs 503 and the exact `code` strings.
+Add tests to `en-servant/test/Main.hs`: assert `enErrorToFault` maps each of the six
+`EnError` constructors to the right status, `code`, and `retryable` (it is pure, so this
+is a table test), and that an unknown permission through the real `check` handler
+produces `unknown_relation` (the in-memory conformance store yields it naturally).
 
 Acceptance: `cabal test en-servant` passes; the curl transcript in Concrete Steps shows
 a 400 with `invalid_consistency_token` for a garbage token, a 400 with
-`malformed_request_body` for `{`-truncated JSON, and 404s in the envelope.
+`malformed_request_body` for `{`-truncated JSON, and 404s in the envelope. **Capture
+that transcript verbatim — M3b must reproduce it byte for byte.**
+
+
+### Milestone 3b: Handler errors as MultiVerb response alternatives
+
+Scope: the six operations stop throwing and start returning. At the end every
+handler-producible status is a member of the API type, and no byte on the wire has
+changed from M3.
+
+In `en-servant/src/En/Servant/API.hs`, define one response list shared by all six
+operations, parameterized by the success description and payload:
+
+```haskell
+type EnResponses (desc :: Symbol) a =
+    '[ Respond 200 desc a
+     , Respond 400 "Invalid request" ErrorEnvelopeWire
+     , Respond 422 "Resolution limit exceeded" ErrorEnvelopeWire
+     , Respond 503 "Tuple store unavailable" ErrorEnvelopeWire
+     ]
+
+-- | What a handler returns. 'AsUnion' maps it onto 'EnResponses' positionally.
+data EnResult a
+    = EnOk a
+    | EnClientError !ErrorEnvelopeWire     -- ^ 400
+    | EnUnprocessable !ErrorEnvelopeWire   -- ^ 422
+    | EnUnavailable !ErrorEnvelopeWire     -- ^ 503
+    deriving stock (Eq, Show)
+```
+
+Write the `AsUnion` instance by hand rather than deriving it via `GenericAsUnion`: the
+generic route needs `Generics.SOP.Generic` and ties constructor order to the response
+list implicitly, whereas the hand-written instance states the correspondence in four
+lines and fails loudly if the list changes. The final `fromUnion` equation
+(`S (S (S (S x))) -> case x of {}`) satisfies the pattern checker; it needs `EmptyCase`,
+which `GHC2024` already implies.
+
+```haskell
+instance
+    AsUnion
+        '[ Respond 200 desc a
+         , Respond 400 "Invalid request" ErrorEnvelopeWire
+         , Respond 422 "Resolution limit exceeded" ErrorEnvelopeWire
+         , Respond 503 "Tuple store unavailable" ErrorEnvelopeWire
+         ]
+        (EnResult a)
+```
+
+`Union` is `Data.SOP.NS I`, so the instance body uses `Z`, `S`, and `I` from
+`Data.SOP` — add `sop-core` to `en-servant`'s library `build-depends`.
+
+Each route becomes a `MultiVerb`, replacing `Post '[JSON] X`:
+
+```haskell
+type EnAPI =
+    "v1"
+        :> ( "relationships"
+                :> ReqBody '[JSON] WriteTuplesRequestWire
+                :> MultiVerb 'POST '[JSON]
+                    (EnResponses "Consistency token for the write" WriteTuplesResponseWire)
+                    (EnResult WriteTuplesResponseWire)
+             :<|> …
+           )
+```
+
+Handlers change from `Handler X` to `Handler (EnResult X)`. The validation helpers that
+threw (`either400`, `traverseOr400`) become value-returning; the natural shape is to run
+the body in `ExceptT EnFault Handler` and finish with
+`either faultToResult EnOk <$> runExceptT …`, where
+
+```haskell
+faultToResult :: EnFault -> EnResult a
+faultToResult = \case
+    BadRequestFault envelope -> EnClientError envelope
+    UnprocessableFault envelope -> EnUnprocessable envelope
+    UnavailableFault envelope -> EnUnavailable envelope
+```
+
+is total — which is the reason all six operations share one response list (see the
+Decision Log).
+
+`en-client/src/En/Client.hs` needs a real change now: `Client m (MultiVerb …) = m r`, so
+each operation's type becomes `… -> ClientM (EnResult X)`. Update the `EnClient` record
+fields accordingly and note in the module comment that callers pattern-match `EnResult`
+rather than catching a `ClientError` for engine faults (transport and framework errors
+still surface as `ClientError`).
+
+`en-servant/test/Main.hs`: the positional `server env` destructuring is unchanged, but
+assertions move onto `EnResult`. The oversized-batch test asserts
+`EnClientError` with code `batch_too_large` instead of inspecting `errHTTPCode`, which
+is a strictly stronger check. Add a test that a check for an unknown permission returns
+`EnClientError` with code `unknown_relation`.
+
+Acceptance: `cabal build all` and `cabal test en-servant` pass; **the M3 curl transcript
+replays with identical status codes and identical response bodies** — this is the
+milestone's whole claim, so run it and diff, do not assume.
 
 
 ### Milestone 4: OpenAPI document at /v1/openapi.json
@@ -520,9 +706,14 @@ shapes M1 deleted). In the same module define:
 ```haskell
 enOpenApi :: Data.OpenApi.OpenApi
 enOpenApi = toOpenApi (Proxy :: Proxy EnAPI)
-    -- then set info.title = "en authorization API", info.version = "v1",
-    -- and attach the ErrorEnvelopeWire schema as the default error response.
+    -- then set info.title = "en authorization API", info.version = "v1".
 ```
+
+No hand-attached default error response is needed: because M3b made the error statuses
+`MultiVerb` alternatives, the fork's `IsSwaggerResponseList` instance emits a
+status-keyed `responses` map per operation, so 400/422/503 and their
+`ErrorEnvelopeWire` schema appear automatically. `ErrorEnvelopeWire` therefore needs a
+`ToSchema` instance alongside the request/response types.
 
 Extend the served API (server-only — keep `EnAPI` as the client-facing six operations so
 `en-client` is unaffected):
@@ -536,8 +727,9 @@ app env = serveWithContext servedProxy (customFormatters :. EmptyContext)
 
 Acceptance: `curl -s localhost:8080/v1/openapi.json | jq '.openapi, (.paths | keys)'`
 lists the six `/v1/…` paths; the document's `SubjectWire` schema shows the three `kind`
-variants; feeding the document to any OpenAPI validator (e.g.
-`jq empty` for JSON well-formedness plus a spot check of `components.schemas`) succeeds.
+variants; every operation's `responses` object has the keys `200`, `400`, `422`, `503`;
+feeding the document to any OpenAPI validator (e.g. `jq empty` for JSON
+well-formedness plus a spot check of `components.schemas`) succeeds.
 
 
 ## Concrete Steps
@@ -616,9 +808,15 @@ Acceptance is observable behavior:
    PostgreSQL afterwards); truncated JSON yields 400 `malformed_request_body`. Every
    one of these bodies has exactly the keys `code`, `message`, `retryable` and
    `Content-Type: application/json`.
-4. OpenAPI: `GET /v1/openapi.json` returns a document whose `paths` set equals the
-   served operations and whose schemas use the discriminators from M1.
-5. Consumers: `cabal build en-client` succeeds; `just start-and-test` passes;
+4. Typed errors: every handler-producible status is an alternative of the API type. In
+   `en-servant/test/Main.hs`, an oversized batch returns `EnClientError` with code
+   `batch_too_large` and an unknown permission returns `EnClientError` with code
+   `unknown_relation` — as values, not thrown `ServerError`s. `MultiVerb` changed no
+   byte on the wire: the M3 curl transcript replays identically after M3b.
+5. OpenAPI: `GET /v1/openapi.json` returns a document whose `paths` set equals the
+   served operations, whose schemas use the discriminators from M1, and each of whose
+   operations documents `200`, `400`, `422`, and `503` responses.
+6. Consumers: `cabal build en-client` succeeds; `just start-and-test` passes;
    `cabal test en-servant` passes; `cabal build all` passes.
 
 The breaking change is accepted as complete only when the docs sweep (M2) leaves no
@@ -652,21 +850,31 @@ Changed interfaces (all full module paths):
   `LookupRequestWire`, `LookupObjectWire`, `LookupStateWire`, `LookupPageWire`,
   `ExpandRequestWire`, `ExpandNodeWire`, `ExpandStateWire`, `ExpandTreeWire`,
   `WriteTuplesRequestWire`, `DeleteTuplesRequestWire`, `WriteTuplesResponseWire`;
-  `app` switches to `serveWithContext` with `ErrorFormatters`.
+  `app` switches to `serveWithContext` with `ErrorFormatters`; each route becomes a
+  `MultiVerb 'POST '[JSON] (EnResponses desc a) (EnResult a)` (M3b), and the module
+  gains `EnResponses`, `EnResult (..)`, and the hand-written `AsUnion` instance.
 - `En.Servant.Seam` (`en-servant/src/En/Servant/Seam.hs`): `ErrorWire` replaced by
-  `ErrorEnvelopeWire { code :: Text, message :: Text, retryable :: Bool }`; `jsonError`
-  re-signatured; `enErrorToServerError :: EnError -> ServerError` implements the M3
-  mapping table.
+  `ErrorEnvelopeWire { code :: Text, message :: Text, retryable :: Bool }`; new
+  `EnFault` with `enErrorToFault :: EnError -> EnFault` implementing the M3 mapping
+  table, plus `invalidRequest`, `batchTooLarge`, `faultToServerError`, and
+  `logEnError`; `jsonError` removed in favor of `faultToServerError`;
+  `enErrorToServerError :: EnError -> ServerError` retained for the throwing path;
+  new `runEngineEither :: Env es -> Eff es a -> Handler (Either EnFault a)` alongside
+  the existing `runEngine`.
 - `En.Servant.Authorize` (`en-servant/src/En/Servant/Authorize.hs`): 403s emitted in
-  the envelope with code `permission_denied`.
+  the envelope with code `permission_denied`. Still throws — it is an embedded-host
+  helper, not an `EnAPI` operation.
 - New module `En.Servant.OpenApi` (`en-servant/src/En/Servant/OpenApi.hs`):
-  `enOpenApi :: OpenApi` plus `ToSchema` instances; `exposed-modules` updated in
-  `en-servant/en-servant.cabal`.
-- `En.Client` (`en-client/src/En/Client.hs`): unchanged code, recompiled against the
-  new API type; documentation comment updated.
+  `enOpenApi :: OpenApi` plus `ToSchema` instances (including `ErrorEnvelopeWire`);
+  `exposed-modules` updated in `en-servant/en-servant.cabal`.
+- `En.Client` (`en-client/src/En/Client.hs`): **breaking Haskell-API change** — each
+  `EnClient` field is re-typed from `… -> ClientM X` to `… -> ClientM (EnResult X)`,
+  because `Client m (MultiVerb method cs as r) = m r`. The JSON on the wire is
+  unchanged. Module comment updated.
 
-Dependencies: `en-servant/en-servant.cabal` library gains `openapi-hs` and
-`servant-openapi-hs` (M4); its test suite gains `aeson` and `bytestring` (M1).
+Dependencies: `en-servant/en-servant.cabal` library gains `sop-core` (M3b) and
+`openapi-hs` + `servant-openapi-hs` (M4); its test suite gains `aeson` and `bytestring`
+(M1) and `time` (M1 goldens). `BlockArguments` added to its `default-extensions` (M1).
 `cabal.project` gains two `source-repository-package` pins (GitHub `shinzui/openapi-hs`
 and `shinzui/servant-openapi-hs`, commits recorded at implementation time). No changes
 to `en-core`, `en-postgres`, or `en-biscuit`.
@@ -678,4 +886,35 @@ Wire contract at the end (the artifact other plans and
 `invalid_consistency_token`, `resolution_limit_exceeded`, `store_error`,
 `invalid_request`, `batch_too_large`, `malformed_request_body`, `not_found`,
 `permission_denied` (plus EP-33's `unauthenticated` and `rate_limited`), and
-`GET /v1/openapi.json`.
+`GET /v1/openapi.json`. New endpoints added by
+`docs/masterplans/9-complete-the-en-api-surface.md` should be `MultiVerb` endpoints over
+`EnResponses` so their error responses are documented on the same terms.
+
+
+## Revision Note — 2026-07-08
+
+**What changed.** Added milestone M3b: the six operations become Servant `MultiVerb`
+endpoints whose response alternatives enumerate the statuses they can return, so
+handler-produced errors live in the API type rather than being thrown as untyped
+`ServerError`s. Restructured M3 around a new `EnFault` type shared by the throwing and
+returning paths. M4 no longer hand-attaches a default error response, because MultiVerb
+now supplies per-operation error responses to the OpenAPI generator. `en-client`'s six
+operations are re-typed to `ClientM (EnResult …)`, which the plan previously promised
+would not change.
+
+**Why.** The original plan made the error *bytes* consistent but left the error *types*
+invisible: the OpenAPI document would have listed only 200 responses, and `en-client`
+callers would still have inspected an opaque `ClientError`. MultiVerb fixes both.
+Crucially it changes no JSON: the statuses and envelope bodies are identical either way,
+so this is a break of `en-client`'s Haskell shape, not of the `/v1` wire contract. en
+has no API consumers today, which makes that break free now and costly once anyone
+depends on the client — the same reasoning that motivated the one-time wire break in the
+first place. Verified before committing to it that servant 0.20.3 ships
+`Servant.API.MultiVerb` with a `HasServer` instance, that `servant-client-core` defines
+`Client m (MultiVerb method cs as r) = m r`, and that the already-pinned
+`shinzui/servant-openapi-hs` fork carries a MultiVerb `HasOpenApi` port. See the four
+Decision Log entries dated 2026-07-08.
+
+Sections revised: Purpose / Big Picture, Progress, Decision Log, Plan of Work
+(overview, Milestone 3, new Milestone 3b, Milestone 4), Validation and Acceptance,
+Interfaces and Dependencies.

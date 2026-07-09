@@ -119,6 +119,18 @@ mapping in `en-servant/src/En/Servant/Seam.hs`) is defined by EP-35. EP-33 must 
 401/403/429 responses in the same envelope shape (if EP-35 has not landed yet, EP-33
 uses a minimal `{"error": …, "code": …}` object and EP-35 reconciles).
 
+EP-35 also makes each operation a Servant `MultiVerb` whose response alternatives
+enumerate its statuses (200/400/422/503), so handler errors are part of the API type
+and appear in the generated OpenAPI document. Two consequences for siblings. First,
+`en-client`'s operations return `ClientM (EnResult X)`; any plan calling the Haskell
+client pattern-matches `EnResult` rather than catching a `ClientError` for engine
+faults. Second, MultiVerb reaches only errors a *handler* produces: EP-33's
+middleware-level 401/403/429 and Servant's routing-level 404/405/415/malformed-body are
+outside it, and stay normalized into the same envelope by `ErrorFormatters` and by
+EP-33's own response builders. Any new endpoint added by
+`docs/masterplans/9-complete-the-en-api-surface.md` should be a `MultiVerb` endpoint
+over EP-35's shared `EnResponses` list.
+
 codd migrations under `en-migrations/db/migrations/` are added by EP-37 (index on
 `en_transaction (created_at, xid)`) and EP-38 (new datastore-metadata table). Timestamped
 filenames prevent collisions; each plan owns its own migration file and must not edit
@@ -137,8 +149,9 @@ recovery by the same horizon.
 - [x] EP-33: authentication required on every endpoint; unauthenticated requests get 401
 - [x] EP-33: write endpoints separately authorizable; rate limiting active
 - [x] EP-34: en-server serves concurrent requests through hasql-pool and survives a PostgreSQL restart
-- [ ] EP-35: versioned path prefix and stable field names on all endpoints; constructor tags gone
+- [x] EP-35: versioned path prefix and stable field names on all endpoints; constructor tags gone
 - [ ] EP-35: typed error envelope with machine-readable codes; 4xx/5xx split correct; OpenAPI document served
+- [ ] EP-35: handler errors are MultiVerb response alternatives, documented per operation in OpenAPI
 - [ ] EP-36: /healthz and /readyz respond correctly; SIGTERM drains in-flight requests
 - [ ] EP-36: structured request logs and a metrics endpoint (including cache stats) exposed
 - [ ] EP-37: reaper and en_transaction pruning run on a schedule with batched deletes
@@ -267,6 +280,24 @@ From EP-34 (2026-07-08), affecting sibling plans:
   recovers with no process restart, which is the property finding A2 demanded. The cost is
   now documented in `docs/user/service-and-operations.md` with both error strings, and
   EP-35's typed envelope will mark these errors retryable so clients retry at their layer.
+  Date: 2026-07-08
+
+
+- Decision: Expand EP-35 to adopt Servant `MultiVerb`, lifting handler-produced errors
+  into the API type, rather than deferring it to a follow-up plan.
+  Rationale: `MultiVerb` changes the Haskell types, not the JSON — the statuses and
+  envelope bodies are byte-identical either way — so it is a break of `en-client`'s
+  shape, not of the `/v1` wire contract. en has no API consumers today, which makes that
+  break free now and expensive once anything depends on the client; that is the same
+  argument that justified the one-time wire break EP-35 already carries. The payoff is a
+  generated OpenAPI document that lists each operation's real error responses, and a
+  typed client result instead of an opaque `ClientError`. Confirmed the toolchain
+  supports it before committing: servant 0.20.3 ships `Servant.API.MultiVerb` with a
+  `HasServer` instance, `servant-client-core` defines
+  `Client m (MultiVerb method cs as r) = m r`, and the fork EP-35 already pins
+  (`shinzui/servant-openapi-hs`) carries a MultiVerb `HasOpenApi` port. `MultiVerb` does
+  not subsume EP-33's middleware errors or Servant's routing errors, so the envelope and
+  `ErrorFormatters` remain load-bearing.
   Date: 2026-07-08
 
 
