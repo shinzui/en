@@ -5,6 +5,7 @@ title: "Make evaluation budgets configurable and trim hot-path overhead"
 kind: exec-plan
 created_at: 2026-07-07T15:24:51Z
 master_plan: "docs/masterplans/7-fix-the-en-evaluation-engine.md"
+intention: intention_01kx2cmexke9mv9aggb7jf7w5t
 ---
 
 # Make evaluation budgets configurable and trim hot-path overhead
@@ -47,9 +48,8 @@ recompiling anything but the test.
 
 ## Progress
 
-- [ ] M0: baseline — build/test; confirm which of docs/plans/39/40/41/42/43 landed
-  (this plan runs last by design and tunes their final shape); record the current
-  constant sites and bench numbers.
+- [x] M0 (2026-07-09): baseline — build/test green; EP-39…EP-43 all landed; constant
+  sites, `entries` consumers, and bench numbers recorded below.
 - [ ] M1: benchmark fixtures first — wide-relation and deep-nesting groups in
   `en-core/bench/Main.hs`; baseline numbers recorded in this plan.
 - [ ] M2: `En.Budget.EvaluationBudget` record; threaded through check/lookup/expand as
@@ -72,7 +72,70 @@ recompiling anything but the test.
 
 ## Surprises & Discoveries
 
-(None yet.)
+**M0 inventory (2026-07-09).** `cabal build all` and `cabal test all` are both green on
+the pre-EP-44 tree, so unlike EP-39 this plan starts from an honest baseline. All five
+sibling plans landed: EP-39 (`probeTuples`, `drainObjectRelation`), EP-40 (`CutTaint`,
+`CycleDetected`), EP-41 (`ResidualDecision`, `SubproblemKey`, `ProbeReadKey`), EP-42
+(`checkAtRevision`, `LookupCursorState` v2, `Deadline`), EP-43 (`ExpandUnion` /
+`ExpandIntersection` / `ExpandExclusion`).
+
+Constant sites confirmed, and there are **nine**, not the six the plan's Context section
+implies: `En/Check.hs` has `maxDepth`, `pageLimit`; `En/Lookup.hs` and `En/Expand.hs` each
+have all three. `En/Check.hs` has no `resultCap` because check returns one decision.
+
+**`renderReachabilityMermaid` has no callers at all — not even a test (2026-07-09).** The
+plan's Context section and the master plan's Integration Points both state that
+`graph.entries` is consumed by "`En.Schema.Render.renderReachabilityMermaid` and the
+`hasEntry` test assertions". The second half is true; the first is true only in the sense
+that the renderer *mentions* `entries`. `grep -rn renderReachabilityMermaid` over the whole
+workspace finds the definition, its export, and nothing else. `renderMarkdown` and
+`renderMermaid` are both pinned by golden tests; the reachability renderer is not.
+
+This does not change M6's decision — relocation still beats deletion, and the reasoning
+(the `EntryPoint.path` structure seeds a future explain/trace feature) never depended on
+the renderer having callers. But it does change M6's *acceptance*: "renderer output tests
+byte-identical" cannot be checked against tests that do not exist. M6 therefore captures
+the current output as a golden fixture first, then refactors, so the byte-identity claim
+has something to be true about. Without that, M6 would be a refactor of dead code verified
+by nothing — exactly the shape EP-43's Decision Log warns about.
+
+**`en-core/bench/baseline.csv` is already stale, and refreshing it locally would break CI
+(2026-07-09).** The file holds four rows — the `check`, `checkMany`, and `lookup` groups —
+and does not mention `check-wide`, which EP-39 added. So EP-39's benches have never been
+gated. `.github/workflows/bench.yml` runs
+`--baseline bench/baseline.csv --fail-if-slower 25` on `macos-latest`, and the committed
+numbers are consistently *slower* than this machine's (`shallow-owner` 660 ns committed vs
+527 ns measured, a 25% gap). Overwriting the file with local numbers would move the gate's
+floor down to hardware CI does not have, and the next CI run would fail every benchmark it
+currently passes. See the Decision Log: `baseline.csv` is left alone.
+
+### M0 baseline measurements
+
+`cabal bench en-core:en-core-bench`, this machine (darwin/aarch64, GHC 9.12.4, `-O1`):
+
+```text
+All
+  check
+    shallow-owner:    OK
+      527  ns ±  35 ns
+    nested-parent:    OK
+      1.15 μs ± 105 ns
+  checkMany
+    overlapping:      OK
+      1.51 μs ± 108 ns
+  lookup
+    reachable-spaces: OK
+      2.16 μs ± 213 ns
+  check-wide
+    direct-member:    OK
+      24.0 μs ± 1.9 μs
+    non-member:       OK
+      296  μs ±  26 μs
+```
+
+`check-wide/non-member` at 296 μs against `direct-member` at 24 μs is the shape to keep in
+view: a probe miss falls through to draining a 2048-row relation, and that drain is where
+the `acc <> page.rows` append and the `elem`-based `visited` list do their damage.
 
 
 ## Decision Log
@@ -142,6 +205,26 @@ recompiling anything but the test.
   schema-lifecycle work (docs/plans/54-manage-the-schema-lifecycle-at-runtime.md), not
   a hot-path sweep.
   Date: 2026-07-07
+- Decision: `en-core/bench/baseline.csv` is **not** refreshed by this plan. M7 records
+  before/after numbers in this document and leaves the committed gate file untouched.
+  Rationale: the committed numbers were recorded on `macos-latest` CI hardware and are
+  ~25% slower than this machine's. `--fail-if-slower 25` compares a CI run against the
+  committed floor, so replacing that floor with faster local numbers would make every
+  currently-passing benchmark fail on the next CI run. docs/plans/17's procedure says the
+  authoritative baseline is recorded on the gating hardware; a laptop is not it. The
+  consequence is that this plan's new benches — like EP-39's `check-wide` before them —
+  are ungated until someone regenerates the file on CI. That gap predates this plan and is
+  now written down rather than silently widened.
+  Date: 2026-07-09
+- Decision: M6 writes a golden test for `renderReachabilityMermaid` *before* relocating
+  `entries`, and the test pins the pre-refactor output.
+  Rationale: the function has no callers and no tests, so this plan's own acceptance
+  criterion ("renderer output tests still produce byte-identical output") was unsatisfiable
+  as written. Capturing the current bytes first turns the relocation from an unverified
+  refactor of dead code into a checked one. This is the same failure mode EP-43 recorded —
+  a consumer the compiler does not check — met one step earlier, at the point where the
+  consumer does not exist yet.
+  Date: 2026-07-09
 - Decision: Benchmarks land *first* (M1), before any optimization.
   Rationale: "record before/after numbers as acceptance evidence" is only honest if the
   before numbers exist on the unoptimized tree; tasty-bench makes the comparison cheap
