@@ -36,15 +36,22 @@ start-server: run-migrations
 start-and-test: process-up run-migrations
   @set -eu; \
     url="${EN_SERVER_URL:-http://localhost:${EN_PORT:-8080}}"; \
+    cabal build -v0 en-server; \
     EN_DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" \
     EN_API_KEYS_READ_WRITE="dev:${EN_API_KEY:-dev-secret-0123456789}" \
-      cabal run en-server > {{serverLog}} 2>&1 & \
+      cabal run -v0 en-server > {{serverLog}} 2>&1 & \
     pid=$!; \
     trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT; \
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-      if curl -sS -o /dev/null "$url/" 2>/dev/null; then break; fi; \
+    ready=0; \
+    for _ in $(seq 1 30); do \
+      if curl -fsS -o /dev/null "$url/healthz" 2>/dev/null; then ready=1; break; fi; \
       sleep 1; \
     done; \
+    if [ "$ready" -ne 1 ]; then \
+      echo "en-server never answered GET /healthz with 200; last log lines:" >&2; \
+      tail -n 20 {{serverLog}} >&2; \
+      exit 1; \
+    fi; \
     just test-server
 
 # Create new migration file with timestamp
@@ -77,11 +84,11 @@ test-server:
   @set -eu; \
     url="${EN_SERVER_URL:-http://localhost:${EN_PORT:-8080}}"; \
     auth="Authorization: Bearer ${EN_API_KEY:-dev-secret-0123456789}"; \
-    curl -sS -X POST "$url/v1/relationships/delete" \
+    curl -fsS -X POST "$url/v1/relationships/delete" \
       -H "$auth" \
       -H 'content-type: application/json' \
       -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}]}' >/dev/null; \
-    token=$(curl -sS -X POST "$url/v1/relationships" \
+    token=$(curl -fsS -X POST "$url/v1/relationships" \
       -H "$auth" \
       -H 'content-type: application/json' \
       -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}]}' \

@@ -10,16 +10,18 @@ import Network.Wai qualified as Wai
 import Network.Wai.Handler.Warp qualified as Warp
 import Network.Wai.Handler.WarpTLS qualified as WarpTLS
 import System.Environment (lookupEnv)
+import System.IO (BufferMode (LineBuffering), hSetBuffering, stdout)
+import System.Posix.Signals (Handler (Catch), installHandler, sigINT, sigTERM)
 import Text.Read (readMaybe)
 
-import En.Cache (Cache, CacheConfig (..), SubproblemKey, TupleReadKey, newCache)
+import En.Cache (Cache, CacheConfig (..), SubproblemKey, TupleReadKey, cacheStats, newCache)
 import En.Check (CheckCacheEnv (..), CheckDecision, check, checkCached)
 import En.Effect.CachedTupleStore (cachedTupleStore)
 import En.Effect.TupleStore (TuplePage, TupleStore)
 import En.Error (EnError)
 import En.Lookup qualified as Lookup
 import En.Migrations (migrationsDir)
-import En.Postgres.Database (Database, runDatabasePool)
+import En.Postgres.Database (Database, runDatabasePool, runSession)
 import En.Postgres.Revision (ConsistencyConfig (..), OptimizedRevisionCache, OptimizedRevisionConfig (..), newOptimizedRevisionCache, runConsistencyStorePostgres)
 import En.Postgres.TupleStore (runTupleStorePostgres, runTupleStorePostgresWithOptimizedRevisionCacheHandle)
 import En.Reachability (compile)
@@ -33,10 +35,17 @@ import Hasql.Connection.Settings qualified as Settings
 import Hasql.Pool qualified as Pool
 import Hasql.Pool.Config qualified as Pool.Config
 import Hasql.Session qualified as Session
+import Health (healthRoutes)
+import Metrics (metricsMiddleware, metricsRoute, newMetrics)
 import Middleware (authMiddleware, describeRateLimit, loadAuthConfig, loadRateLimitConfig, rateLimitMiddleware)
+import Observability (newRequestLogger, requestIdMiddleware)
 
 main :: IO ()
 main = do
+    -- stdout is a pipe under every supervisor, and GHC block-buffers pipes. Without
+    -- this, startup lines -- including the "authentication is DISABLED" warning --
+    -- sit in a buffer that SIGTERM discards, and every request log line is delayed.
+    hSetBuffering stdout LineBuffering
     databaseUrl <- requiredEnv "EN_DATABASE_URL"
     authConfig <- loadAuthConfig
     rateLimitConfig <- loadRateLimitConfig
@@ -152,6 +161,23 @@ main = do
                 , lookupWithDeadlineOperation
                 , maxBatchSize = 1000
                 }
+        ping :: IO Bool
+        ping = do
+            result <- runAppIO (runSession (Session.script "SELECT 1"))
+            pure (case result of Right (Right ()) -> True; _ -> False)
+        -- Readiness goes through the Database effect, so it exercises the pool a real
+        -- request would use rather than a connection held aside for probing.
+        --
+        -- It pings twice before reporting unready. After a PostgreSQL restart the
+        -- first session on a stale pooled connection fails at the *statement* level,
+        -- which hasql-pool does not treat as grounds to discard the connection; only a
+        -- connection-level failure retires it. A single-shot probe would therefore flap
+        -- to unready against a perfectly healthy database, and would spend the failure
+        -- that a real request could have absorbed instead.
+        checkReady :: IO Bool
+        checkReady = do
+            healthy <- ping
+            if healthy then pure True else ping
     Text.putStrLn ("en-server listening on :" <> Text.pack (show port))
     Text.putStrLn
         ( "Connection pool: size="
@@ -168,21 +194,66 @@ main = do
     Text.putStrLn ("Decision cache: " <> describeEntryCache decisionMaxEntries)
     Text.putStrLn ("Rate limit: " <> describeRateLimit rateLimitConfig)
     rateLimit <- rateLimitMiddleware rateLimitConfig
-    let wrappedApp = authMiddleware authConfig (rateLimit (appWithOpenApi serverEnv))
+    requestLogger <- newRequestLogger
+    metrics <- newMetrics
+    -- Outermost first. Authentication precedes logging so a log line can name a
+    -- verified caller, and precedes rate limiting so buckets are per-caller. Request
+    -- ids sit inside the limiter, so a throttled request costs no UUID. The metrics
+    -- layer wraps the health routes, so probes are counted; it cannot see the 401/403/429
+    -- the outer middlewares short-circuit, which stay countable at the proxy.
+    --
+    -- Serves `appWithOpenApi`, not `app`: the former adds GET /v1/openapi.json and the
+    -- ErrorFormatters that make body-parse and 404 errors speak the error envelope.
+    let wrappedApp =
+            authMiddleware authConfig
+                . rateLimit
+                . requestIdMiddleware
+                . requestLogger
+                . metricsMiddleware metrics
+                . healthRoutes checkReady
+                . metricsRoute
+                    metrics
+                    [ ("tuple_read", cacheStats tupleReadCache)
+                    , ("decision", cacheStats decisionCache)
+                    ]
+                $ appWithOpenApi serverEnv
     serve tlsConfig port wrappedApp `finally` Pool.release pool
 
+{- | Run Warp until SIGTERM or SIGINT, then drain.
+
+The shutdown handler receives Warp's @closeSocket@: on signal the listening socket
+closes, in-flight requests run to completion (capped at 30 seconds, comfortably above
+the lookup deadline), and 'Warp.runSettings' /returns/. That return is the contract
+the caller's @finally@ depends on to release the connection pool -- with @Warp.run@ it
+never happened, and a background maintenance thread would likewise never be cancelled.
+-}
 serve :: Maybe TlsConfig -> Int -> Wai.Application -> IO ()
-serve tlsConfig port wrappedApp =
+serve tlsConfig port wrappedApp = do
+    let settings =
+            Warp.setPort port
+                . Warp.setGracefulShutdownTimeout (Just 30)
+                . Warp.setInstallShutdownHandler installShutdownHandler
+                $ Warp.defaultSettings
     case tlsConfig of
         Just tls -> do
             Text.putStrLn ("Serving TLS directly (EN_TLS_CERT_FILE=" <> Text.pack tls.certFile <> ")")
             WarpTLS.runTLS
                 (WarpTLS.tlsSettings tls.certFile tls.keyFile)
-                (Warp.setPort port Warp.defaultSettings)
+                settings
                 wrappedApp
         Nothing -> do
             Text.putStrLn "Serving plaintext HTTP; terminate TLS at a reverse proxy or set EN_TLS_CERT_FILE/EN_TLS_KEY_FILE."
-            Warp.run port wrappedApp
+            Warp.runSettings settings wrappedApp
+    Text.putStrLn "en-server: drained in-flight requests; shutting down"
+
+{- | Replaces the RTS default for SIGINT, which throws to the main thread and aborts
+in-flight requests. Both signals now mean the same thing: stop listening, then drain.
+-}
+installShutdownHandler :: IO () -> IO ()
+installShutdownHandler closeSocket = do
+    _ <- installHandler sigTERM (Catch closeSocket) Nothing
+    _ <- installHandler sigINT (Catch closeSocket) Nothing
+    pure ()
 
 data TlsConfig = TlsConfig
     { certFile :: FilePath
