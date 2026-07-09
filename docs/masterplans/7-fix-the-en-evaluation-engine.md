@@ -74,7 +74,7 @@ store implementation, which is risky enough to deserve its own validation cycle.
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-39 | Add a point-membership probe and probe-first check evaluation | docs/plans/39-add-a-point-membership-probe-and-probe-first-check-evaluation.md | None | None | In Progress |
+| EP-39 | Add a point-membership probe and probe-first check evaluation | docs/plans/39-add-a-point-membership-probe-and-probe-first-check-evaluation.md | None | None | Complete |
 | EP-40 | Adopt Zanzibar cycle and exclusion semantics in check | docs/plans/40-adopt-zanzibar-cycle-and-exclusion-semantics-in-check.md | None | EP-39 | Not Started |
 | EP-41 | Cache context-free check subproblems | docs/plans/41-cache-context-free-check-subproblems.md | None | EP-39, EP-40 | Not Started |
 | EP-42 | Stream lookup pages with validated cursors and a real deadline | docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md | None | EP-39 | Not Started |
@@ -146,8 +146,8 @@ established by docs/plans/38-validate-configuration-and-persist-datastore-identi
 
 ## Progress
 
-- [ ] EP-39: point-membership probe on TupleStore with all three interpreters
-- [ ] EP-39: check answers direct membership without full-relation scans; wide-relation checks no longer error
+- [x] EP-39 (2026-07-08): point-membership probe on TupleStore with all three interpreters
+- [x] EP-39 (2026-07-08): check answers direct membership without full-relation scans; wide-relation checks no longer error
 - [ ] EP-40: data cycles yield empty results, not failures; union short-circuits on Allowed
 - [ ] EP-40: exclusion over a Conditional base evaluates the subtrahend; checkMany surfaces per-pair errors
 - [ ] EP-41: decision cache keyed without caveat context; caveats re-applied on hit; cross-request hit rate demonstrated
@@ -175,6 +175,49 @@ anyone noticing. Every child plan of this master plan must run the full workspac
 modules it edited. EP-39's Final milestone already specifies this; EP-40 through EP-44
 should be read as carrying the same requirement.
 
+**EP-39 changed the shape `En/Check.hs` presents to EP-40 and EP-41 (2026-07-08).** Three
+things the later plans assume about that file are no longer true, and each of them makes
+those plans *smaller*, not larger.
+
+The non-memoized evaluator family is gone. `check`, `checkCached`, and `checkMany` now all
+drive `evalRelationMemo`/`evalRewriteMemo`, so a semantics change written once takes
+effect everywhere. EP-40 was written against a tree where `evalRewrite` and
+`evalRewriteMemo` both existed and had to be edited in lockstep; it should now edit one.
+
+`ensureExhausted` is gone, and with it the collapse of "this relation is wider than a page"
+into `ResolutionLimitExceeded`. EP-40's error-taxonomy work (B3: distinguishing "cycle
+detected" from "depth exceeded") therefore has one fewer unrelated meaning to disentangle
+from that constructor: the only remaining producers of `ResolutionLimitExceeded` in
+`En/Check.hs` are the depth guard and the visited-set guard, which is exactly the pair
+EP-40 exists to split apart.
+
+The `This` case now short-circuits on an unconditional `Allowed` from the probe. This is a
+local union short-circuit, and EP-40 owns the general one across rewrite branches. One
+consequence needs EP-40's explicit blessing: a relation containing both an unconditional
+grant and a row whose caveat name is undefined in the schema now returns `Right Allowed`,
+where the old evaluator returned `Left (UnknownRelation "unknown caveat: …")` because
+`sequence` fails on the first `Left` anywhere in the decision list. No test exercises this
+today. EP-40 should decide whether "provably allowed by a path involving no caveat" beats
+"some other row of this relation is malformed", and record it.
+
+**A soundness rule EP-41 and EP-44 must not optimize away (2026-07-08).** EP-39's batched
+nested-group accelerator (`provenByDirectGroupMembership` in `En/Check.hs`) concludes
+`Allowed` from a stored membership tuple only when the group's relation reaches a bare
+`This` through unions — guarded by `relationUnionsThis`. A relation defined as
+`Intersection [This, active]` or `Exclusion This banned` is not satisfied by a stored
+tuple alone. EP-40 rewrites exclusion semantics and EP-44 tunes hot paths; both touch code
+adjacent to this guard, and removing it silently grants access. The same function also
+declines to accelerate any subproblem already on the `visited` stack or at the depth
+limit, precisely so that EP-40 — not EP-39 — decides what cycles and depth exhaustion
+mean.
+
+**EP-44's `EntryPoint` question has a partial answer already (2026-07-08).** EP-39 needed
+"does this relation union in its directly-stored tuples?" and answered it by walking the
+`Rewrite` tree (`relationUnionsThis`), not by consulting the reachability graph's unused
+`EntryPoint` machinery. That is one more consumer that could have adopted `EntryPoint` and
+did not, which is evidence for relocating or deleting it rather than wiring it up. EP-44
+should weigh that when it makes the call.
+
 
 ## Decision Log
 
@@ -187,6 +230,12 @@ should be read as carrying the same requirement.
 - Decision: Keep lookup-subjects out of this master plan.
   Rationale: It is a new feature with its own API surface, not a fix to existing behavior; it lives in docs/masterplans/9-complete-the-en-api-surface.md and benefits from EP-42's cursor discipline.
   Date: 2026-07-07
+- Decision: Every child plan runs the full workspace suite (`cabal build all && cabal test all`) at its Final milestone, not only the focused suites for the modules it edits.
+  Rationale: EP-39's baseline check found the workspace already red, in `en-example`, from a completed child of master plan 6 whose acceptance ran only its own suites. Focused-suite acceptance cannot catch a change that breaks a sibling package. Cost is a few minutes per plan.
+  Date: 2026-07-08
+- Decision: EP-39 fixed the unrelated `en-example` failure itself, in a separate commit, rather than reporting it back to master plan 6.
+  Rationale: A red baseline makes "these tests failed before and pass after" unverifiable, which is the entire acceptance argument of EP-39. The fix is a one-line stale assertion. Landing it separately keeps EP-39's diff honest and leaves it independently revertible.
+  Date: 2026-07-08
 
 
 ## Outcomes & Retrospective
@@ -195,6 +244,19 @@ should be read as carrying the same requirement.
 
 
 ---
+
+Revision note (2026-07-08): EP-39 is complete. The Exec-Plan Registry, Progress checklist,
+Surprises & Discoveries, and Decision Log are updated. Three of EP-39's discoveries change
+what later child plans should expect, and are recorded in Surprises & Discoveries rather
+than left in EP-39's own file: `En/Check.hs` now has a single evaluator (EP-40 and EP-41
+edit one code path, not two); `ensureExhausted` is gone, so `ResolutionLimitExceeded` is
+now produced only by the depth and cycle guards that EP-40 exists to separate; and EP-39's
+probe short-circuit changes one observable error outcome that EP-40 must bless or revert.
+A soundness guard in EP-39's batched accelerator (`relationUnionsThis`) is called out
+explicitly so EP-40 and EP-44 do not remove it while working nearby. No decomposition
+change: EP-40 through EP-44 keep their scopes, dependencies, and ordering. Two new Decision
+Log entries record the full-workspace-suite requirement and why EP-39 repaired an unrelated
+red test rather than routing it back to master plan 6.
 
 Revision note (2026-07-07): Two corrections found while authoring the child plans.
 First, EP-42 reuses `InvalidConsistencyToken` for cursor-validation failures instead of

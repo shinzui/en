@@ -59,7 +59,8 @@ number of store reads.
   `en-core/test/Main.hs` (commit `a6b7482`); captured the `Left ResolutionLimitExceeded`
   failure. The fixture shape this plan originally proposed did not reproduce B1; see
   Surprises & Discoveries for the corrected fixture.
-- [x] M4a (new, discovered in M1; done 2026-07-08 as part of M2): repaired
+- [x] M4a (new milestone, discovered during M1; landed 2026-07-08 inside M2's commit
+  `b0323d3`, because M2 had to touch the same interpreter anyway): repaired
   `erroringTupleStore` in `en-core/test/Main.hs` before deleting `ensureExhausted` — it
   injected errors by returning `HasMore` unconditionally, which would have turned M4's
   drain loop into an infinite loop. See Surprises & Discoveries.
@@ -68,8 +69,6 @@ number of store reads.
   store (`en-core/src/En/Conformance/Kikan.hs`); cached interposer left an explicit
   passthrough with a comment pointing at docs/plans/41. Unit assertions in
   `en-core/test/Main.hs` cover a present subject, an absent subject, and caveat carriage.
-- [x] M2a (2026-07-08): repaired `erroringTupleStore` (the M4a item, pulled forward because
-  M2 had to add a `ProbeTuples` case to the same interpreter anyway).
 - [x] M3 (2026-07-08): implemented the probe in the PostgreSQL store
   (`en-postgres/src/En/Postgres/TupleStore.hs`) as a prepared statement; verified index use
   with EXPLAIN; added the `runProbeScenario` integration test in
@@ -79,12 +78,13 @@ number of store reads.
   made `evalThisMemo` probe-first and replaced `ensureExhausted` with
   `drainObjectRelation` (commit `d3aecf5`). M1's two assertions are green and the full
   workspace suite passes.
-- [ ] M5: batch direct-membership discovery for the subject-set recursion frontier with
-  `readStartingWithUser`, mirroring `En.Lookup`.
-- [ ] M6: regression test green; add wide-relation benchmarks to `en-core/bench/Main.hs`
-  and record numbers.
-- [ ] Final: full suite green (`cabal build all && cabal test all`); Outcomes filled in;
-  master plan progress row updated.
+- [x] M5 (2026-07-08): batched direct-membership discovery for the subject-set recursion
+  frontier with `readStartingWithUser` (commit `4b4f52e`). A twenty-org fixture drops from
+  twenty-two store reads to three; caveat composition across both edges asserted.
+- [x] M6 (2026-07-08): regression test green; wide-relation benchmarks added to
+  `en-core/bench/Main.hs` and numbers recorded (commit `b7befe4`).
+- [x] Final (2026-07-08): full suite green (`cabal build all && cabal test all`, seven
+  suites); Outcomes filled in; master plan Progress rows and Registry updated.
 
 
 ## Surprises & Discoveries
@@ -113,6 +113,56 @@ child plan of another master plan left a sibling package red. Neither master pla
 acceptance ran `cabal test all` across the whole workspace after landing. Later plans in
 this master plan should run the *full* workspace suite at their Final milestone, not only
 the focused suites they touch.
+
+**M5 — the batched accelerator is only sound when the group's relation unions in its own
+stored tuples.** The plan's M5 states the correctness rule as "the batched query can only
+add `Allowed`/`Conditional` evidence early; it must never be used to conclude `Denied`
+without recursion." True, but insufficient — and the gap is a soundness hole, not a
+performance one. A stored tuple `org:acme#member@user:alice` proves that alice has
+`org:acme#member` *only if* the `member` relation's rewrite consults its directly-stored
+tuples in a position that unions into the result. If `org#member` were defined as
+`Intersection [This, active]`, or `Exclusion This banned`, then the stored tuple alone
+proves nothing, and the accelerator would report `Allowed` where recursion would correctly
+report `Denied`.
+
+The implementation therefore guards the fast path with `relationUnionsThis`, which admits
+only `This` and `Union` branches reaching a bare `This` (a `Caveated This` branch is
+excluded too, since its gate must be applied). Three further conditions are checked before
+a row is accelerated, each preserving an existing behavior: the attachment edge's caveat
+must evaluate to unconditional `Allowed` (otherwise only recursion composes the two gates
+correctly, via `Decision.applyGate`, which is intersection); the subproblem must not be on
+the `visited` stack; and `depth` must be below `maxDepth`. The last two mean the
+accelerator never sees a subproblem that recursion would have rejected with
+`ResolutionLimitExceeded`, so cycle and depth semantics are untouched — which matters
+because EP-40, not this plan, owns them.
+
+**M6 — the benchmark does not show what the plan said it would, and the plan was wrong.**
+M6's acceptance asks that `direct-member` be "on the order of a single store read
+(in-memory: microseconds, and crucially not proportional to 2,048)". The recorded numbers:
+
+```text
+check-wide
+  direct-member:    OK
+    24.8 μs ± 1.8 μs
+  non-member:       OK
+    300  μs ±  14 μs
+```
+
+`direct-member` *is* proportional to 2,048 — because the in-memory conformance store
+implements `ProbeTuples` as a list comprehension over its whole tuple list
+(`en-core/src/En/Conformance/Kikan.hs`), so every probe walks 2,048 tuples no matter how
+few match. That is a property of the test double, not of the engine.
+
+The claim the plan meant to make is about *store operations*, not wall-clock, and that
+claim holds and is now asserted directly rather than inferred from a timing: the
+counting-store assertion "wide relation member check costs one probe, not a scan" pins the
+count at exactly 1 (it was 1 read of a 1000-row page, then an error, before this plan).
+The nested-group assertion pins its count at exactly 3. Wall-clock evidence for the real
+store is the M3 EXPLAIN, which shows an index scan rather than a sequential one.
+
+What the 12× gap between `direct-member` and `non-member` does show is the probe
+short-circuit working: a member is answered without enumerating the relation; a non-member
+must drain all three pages. Both benchmarks simply errored on the pre-plan tree.
 
 **M4 — the probe-first path needed one rule the plan did not state: skip rows the probe
 already matched.** The plan's M4 step 3 says to keep "only the `SubjectSet` rows" during
@@ -296,6 +346,33 @@ M2 and M3 must land as one buildable unit.
   this); how probe results are cached is decided by docs/plans/41, which owns that
   integration point per the master plan.
   Date: 2026-07-07
+- Decision (2026-07-08, during M4): Enumeration recurses into a subject-set row only when
+  that row's subject is *not* among the probe candidates, rather than into every
+  subject-set row.
+  Rationale: a stored row may name the checked subject as a subject-set (for example
+  `space:x#member@org:acme#member` when the subject *is* `org:acme#member`). The probe
+  matches such a row, and the old evaluator's first guard short-circuited it without
+  recursing. Recursing into it as well would evaluate it twice and, when caveated,
+  contribute two `Conditional` decisions where one was contributed before. The filter
+  "subject-set and not a probe candidate" is the exact complement of the old guard.
+- Decision (2026-07-08, during M5): The batched membership query accelerates a row only
+  when the group relation's rewrite reaches a bare `This` through unions, the attachment
+  caveat evaluates to unconditional `Allowed`, and the subproblem clears the cycle and
+  depth guards. Otherwise the row falls back to recursion.
+  Rationale: soundness, not speed. A stored tuple on `org#member` proves membership only
+  if `member` unions in its own tuples; under `Intersection [This, active]` it proves
+  nothing. Requiring the attachment caveat to be unconditional keeps two-edge caveat
+  composition in the one place that does it correctly (`Decision.applyGate`, which
+  intersects). Deferring to recursion for visited or too-deep subproblems keeps cycle and
+  depth semantics byte-for-byte identical, which matters because
+  docs/plans/40-adopt-zanzibar-cycle-and-exclusion-semantics-in-check.md owns them.
+- Decision (2026-07-08, during M0): Fix `en-example`'s stale HTTP-status assertion in a
+  separate commit before starting this plan's work, rather than leaving `cabal test all`
+  red or folding the fix into an EP-39 commit.
+  Rationale: this plan's evidence is "these tests failed before and pass after". A
+  pre-existing unrelated failure in the workspace suite makes that claim unverifiable. The
+  fix belongs to master plan 6's EP-35, which introduced the change; landing it separately
+  keeps EP-39's diff honest and lets the fix be reverted independently.
 - Decision: Discovering *which* subject-set rows exist on a wide relation still drains
   full pages of `readObjectRelation` (O(relation width) in the worst case). A store-side
   "userset rows only" filter that would make nested-group discovery cheaper is deferred.
@@ -308,7 +385,65 @@ M2 and M3 must land as one buildable unit.
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+All six milestones landed on 2026-07-08, in seven commits on `master`, with the full
+workspace suite (seven test suites) green at the end. Findings B1 and B2 of
+`docs/reviews/2026-07-07-architecture-performance-review.md` are closed.
+
+What exists now that did not before. The `TupleStore` effect has a `ProbeTuples`
+operation, implemented by all three interpreters: the in-memory conformance store, the
+PostgreSQL store (a prepared statement, no `LIMIT`, served by an existing index — no
+migration), and the caching interposer (explicit passthrough, with a comment deferring
+caching policy to docs/plans/41). `En.Check` has one evaluator instead of two, and its
+`This` case probes before it enumerates. Enumeration drains pages instead of failing on
+the second one. Nested-group discovery issues one batched reverse query per (group type,
+group relation) bucket rather than one recursive descent per group.
+
+What that buys, measured rather than asserted. A check against a relation with 1,501
+direct members returns `Right Allowed` for a member and `Right Denied` for a non-member;
+on the pre-plan tree both returned `Left ResolutionLimitExceeded`, so a document with
+1,001 viewers could not be checked at all. That member check now costs exactly one store
+operation — pinned by a counting-store assertion, not inferred from a timing. Membership
+through one of twenty organisations costs three store operations rather than twenty-two.
+PostgreSQL answers the probe with `Index Scan using relation_tuple_subject_hist_idx`,
+asserted by the integration suite so a future statistics or schema change cannot silently
+turn it back into a sequential scan.
+
+What surprised us, in rough order of how much it mattered. The workspace baseline was
+already red, in a package neither this plan nor this master plan touches — a completed
+child of master plan 6 changed an HTTP status and left `en-example`'s assertion stale.
+Second, the test store injected read failures by returning `HasMore` forever, which
+"errored" only because `ensureExhausted` rejected unexhausted pages; deleting that
+function, as this plan requires, would have turned the drain loop into an infinite loop
+and hung the suite rather than failing it. That was found by reading the fixture before
+writing the code, and it is the single most valuable thing M1 produced. Third, this plan's
+own proposed regression fixture (`folder:fN#viewer@user:memberN`) would not have
+reproduced the bug, because it spreads tuples across distinct objects and `check` filters
+by object; the relation has to be wide, not the object count. Fourth, the M5 accelerator
+needed a soundness guard the plan did not mention: a stored membership tuple proves the
+relation holds only when that relation's rewrite unions in its own stored tuples.
+
+What remains, for the plans that follow. Two of this plan's decisions are handed forward
+deliberately. The probe-first early return means a relation containing both an
+unconditional grant and a row with an undefined caveat name now returns `Right Allowed`
+where the old evaluator returned `Left (UnknownRelation …)`; no test exercises this, and
+EP-40 owns error taxonomy and should confirm it wants that. And the union short-circuit
+implemented here is local to the `This` case only — general short-circuiting across
+rewrite branches is EP-40's, as the Decision Log said from the start.
+
+Two accumulations were left alone on purpose because
+docs/plans/44-make-evaluation-budgets-configurable-and-trim-hot-path-overhead.md owns
+them: `drainObjectRelation` builds its result with repeated `acc <> page.rows`, and
+`evalThisMemo` still folds decisions with `decisions <> [d]`. Likewise `pageLimit` and
+`maxDepth` remain module constants. The in-memory store's `ProbeTuples` is a linear scan;
+that is fine for a test double, but it is why the `check-wide/direct-member` benchmark is
+not constant-time, and anyone reading that number should read the M6 note above first.
+
+A process note worth keeping. Landing M2 and M3 as one commit was not a stylistic choice:
+adding a constructor to an exhaustively-matched GADT breaks every interpreter until each
+is handled, so the tree is unbuildable between them. The plan warned about this and the
+warning was correct. By contrast, splitting M4 into "unify the evaluators" and "rewrite
+the `This` case" as separate commits cost nothing and means a future bisect can tell a
+refactor from a behavior change.
 
 
 ## Context and Orientation
@@ -863,8 +998,56 @@ For M6:
 cabal bench en-core:en-core-bench
 ```
 
-Update this section with the real transcripts (red M1, green from M4, EXPLAIN plan,
-benchmark lines) as evidence while working.
+The real transcripts, recorded while working.
+
+M1, red, exactly as predicted (`cabal test en-core:en-core-interface-tests`):
+
+```text
+user error (wide relation: direct member checks Allowed
+expected: Right Allowed
+actual:   Left ResolutionLimitExceeded)
+```
+
+M4, green — and the whole workspace with it (`cabal test all`):
+
+```text
+Test suite en-core-conformance: PASS
+Test suite en-example-tests: PASS
+Test suite en-postgres-revision-tests: PASS
+Test suite en-servant-tests: PASS
+Test suite en-core-interface-tests: PASS
+Test suite en-biscuit-tests: PASS
+Test suite en-postgres-integration-tests: PASS
+```
+
+M3's EXPLAIN, captured from the `ephemeral-pg` database inside the integration suite after
+`ANALYZE relation_tuple` over 1,504 rows:
+
+```text
+Nested Loop
+  ->  HashAggregate
+        Group Key: unnest.unnest, unnest.unnest_1, unnest.unnest_2
+        ->  Function Scan on unnest
+  ->  Index Scan using relation_tuple_subject_hist_idx on relation_tuple
+        Index Cond: ((subject_type = unnest.unnest) AND (subject_id = unnest.unnest_1) AND (COALESCE(subject_relation, ''::text) = unnest.unnest_2) AND (object_type = 'folder'::text) AND (relation = 'viewer'::text))
+        Filter: (object_id = 'probe-wide'::text)
+```
+
+M6's benchmark lines (`cabal bench en-core:en-core-bench`) — read the M6 note in Surprises
+& Discoveries before drawing conclusions from `direct-member`'s absolute number:
+
+```text
+check-wide
+  direct-member:    OK
+    24.8 μs ± 1.8 μs
+  non-member:       OK
+    300  μs ±  14 μs
+```
+
+The store-operation counts, which are the claim this plan actually makes, are asserted in
+`en-core/test/Main.hs` rather than timed: a member check on the 1,501-row relation issues
+exactly 1 store operation, and membership through one of twenty organisations issues
+exactly 3 (a probe, a drain, one batched reverse query) rather than 22.
 
 
 ## Validation and Acceptance
@@ -937,3 +1120,39 @@ Downstream contracts: docs/plans/40 rebases its `En.Check` semantic changes onto
 plan's evaluator shape; docs/plans/41 consumes `ProbeTuples` for interposer caching and
 the reshaped memo for context-free keys; docs/plans/42 may treat `check` as a black box
 throughout.
+
+
+---
+
+Revision note (2026-07-08, written while implementing): Four corrections, each recorded in
+full in Surprises & Discoveries and, where they changed a design choice, in the Decision
+Log.
+
+First, M0's premise was false — the workspace suite was already red in `en-example`, from
+a completed child of master plan 6. Fixed in its own commit before starting, so this
+plan's before/after evidence means something.
+
+Second, the wide-relation fixture proposed in M1 (`folder:fN#viewer@user:memberN`) would
+not have reproduced finding B1, because it puts one viewer on each of many folders while
+`check` reads one object's relation. The fixture used instead puts 1,501 viewers on one
+folder and places the member past the first page, so a naive "stop erroring, use page one"
+fix cannot pass it.
+
+Third, M4's instruction to delete `ensureExhausted` would have hung the test suite rather
+than failing it: `erroringTupleStore` injected read failures by returning `HasMore`
+forever, and a page-draining evaluator follows that cursor without end. A new milestone
+(M4a, folded into M2's commit) rewrote the injection to yield an in-band
+`Left (UnknownRelation …)`, which is the value `checkMany` needs to fail a single pair
+closed. Any future plan that touches paging in `En.Check` should re-read that helper first.
+
+Fourth, M4's step 3 and M5's steps 3–4 were each slightly under-specified in ways that
+mattered: enumeration must skip subject-set rows the probe already matched, and the
+batched membership query must not accelerate a group whose relation does not union in its
+own stored tuples. Both are now Decision Log entries with their rationale, and both are
+covered by assertions.
+
+M6's stated acceptance ("not proportional to 2,048") was also wrong as written, though it
+required no code change: the in-memory store's probe is a list scan, so the benchmark is
+proportional to the fixture size by construction. The property the plan cares about is the
+number of store operations, which is now asserted directly by counting-store tests rather
+than inferred from wall-clock.
