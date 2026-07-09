@@ -19,7 +19,8 @@ import System.Posix.Signals (Handler (Catch), installHandler, sigINT, sigTERM)
 
 import Config (PoolConfig (..), ServerConfig (..), TlsConfig (..), loadServerConfig, validateGcWindow)
 import En.Cache (Cache, CacheConfig (..), SubproblemKey, TupleReadKey, cacheStats, newCache)
-import En.Check (CheckCacheEnv (..), CheckDecision, check, checkCached)
+import En.Check (CheckCacheEnv (..), check, checkCached)
+import En.Decision (ResidualDecision)
 import En.Effect.CachedTupleStore (cachedTupleStore)
 import En.Effect.TupleStore (TuplePage, TupleStore)
 import En.Error (EnError)
@@ -122,7 +123,7 @@ main = do
                 }
     optimizedRevisionCache <- newOptimizedRevisionCache optimizedRevisionConfig getCurrentTime
     tupleReadCache <- newCache tupleReadConfig :: IO (Cache TupleReadKey TuplePage)
-    decisionCache <- newCache decisionConfig :: IO (Cache SubproblemKey CheckDecision)
+    decisionCache <- newCache decisionConfig :: IO (Cache SubproblemKey ResidualDecision)
     let checkCacheEnv =
             CheckCacheEnv
                 { cacheDatastoreId = config.datastoreId

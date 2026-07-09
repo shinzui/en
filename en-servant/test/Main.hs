@@ -26,6 +26,7 @@ import En.Conformance.Kikan (
     runConsistencyStoreInMemory,
     runTupleStoreInMemory,
  )
+import En.Decision (ResidualDecision)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
@@ -531,7 +532,7 @@ type TestEffects = '[ConsistencyStore, TupleStore, Error EnError, IOE]
 
 newCheckCacheEnv :: IO CheckCacheEnv
 newCheckCacheEnv = do
-    cache <- newCache CacheConfig{enabled = True, maxEntries = 100} :: IO (Cache SubproblemKey CheckDecision)
+    cache <- newCache CacheConfig{enabled = True, maxEntries = 100} :: IO (Cache SubproblemKey ResidualDecision)
     pure CheckCacheEnv{cacheDatastoreId = DatastoreId "test", cacheDecisions = cache}
 
 batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)

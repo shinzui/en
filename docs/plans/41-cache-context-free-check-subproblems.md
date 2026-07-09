@@ -52,11 +52,17 @@ context still gets `Conditional` from that same cached entry.
   agreement with `unionDecisions`/`intersectionDecisions`/`exclusionDecisions` over every
   pair of sample residuals under four contexts, plus the AND-vs-OR distinction and every
   smart-constructor collapse. Both negative controls observed failing.
-- [ ] M2: switch the `En.Check` evaluator to produce `ResidualDecision` internally and
-  apply context once at the top; all existing tests green (behavior identical).
-- [ ] M3: re-key the external cache — `SubproblemKey` loses `context`; cache value
-  becomes `ResidualDecision`; `checkCached` re-applies context on hit; failing-then-green
-  cross-context tests.
+- [x] M2 (2026-07-08): `En.Check` evaluates symbolically end to end; `context` is gone from
+  every internal evaluator and applied once at the top of
+  `check`/`checkCached`/`checkMany`. Full workspace suite green with zero assertion
+  changes. Two new assertions pin a deliberate narrowing (unknown caveat beside a
+  *caveated* grant now errors; beside an *uncaveated* grant still short-circuits).
+- [x] M2b (2026-07-08): cache *value* type moved here from M3 out of necessity — a hit must
+  hand a `ResidualDecision` back into the traversal. `CheckCacheEnv.cacheDecisions ::
+  Cache SubproblemKey ResidualDecision`; construction sites updated in
+  `en-core/test/Main.hs`, `en-servant/test/Main.hs`, `en-server/app/Main.hs`.
+- [ ] M3: re-key the external cache — `SubproblemKey` loses `context`; `checkCached`
+  re-applies context on hit; failing-then-green cross-context tests.
 - [ ] M4: cached tuple-page interposer handles `ProbeTuples` (integration point owned
   here per the master plan): `TupleReadKey` gains a probe variant; probe results cached
   by revision.
@@ -120,6 +126,65 @@ soundness failure, not just the shape change; the agreement-with-the-decision-al
 sweep over every pair of sample residuals is what makes M2's "symbolic detour is
 invisible" claim checkable rather than asserted.
 
+**M2 could not defer the cache *value* type to M3 (2026-07-08).** The plan assigned
+`CheckCacheEnv.cacheDecisions :: Cache SubproblemKey ResidualDecision` to M3, but M2 does
+not compile without it. On an external cache hit, `evalRelationMemo` must return the cached
+value *into* a symbolic traversal, and a stored `CheckDecision` cannot be turned back into a
+`ResidualDecision`: `Conditional [CaveatObligation]` has already discarded the caveat
+payloads and the union/intersection structure. There is no total function
+`CheckDecision -> ResidualDecision`. The value type therefore moved into M2 and only the
+*key* change (dropping `context`) remains for M3. This keeps M2 behavior-preserving — the
+key still separates by context, so hit rates are unchanged — and leaves M3 as a one-field
+deletion plus the test inversion, which is a cleaner review boundary than the plan's split.
+
+**Symbolic evaluation forces three behavior changes M2 had to make deliberately
+(2026-07-08).** All three are consequences of one fact: the traversal can no longer ask
+"does this caveat pass?", because it no longer has the request context. Each was checked
+against the suite; none changed a decision.
+
+The nested-group accelerator (`provenByDirectGroupMembership`) previously accepted an
+attachment or membership edge whose caveat *evaluated to* `Allowed` under the request
+context. It now requires the edge to carry no caveat at all (`isNothing tuple.caveat`).
+This strictly tightens the master plan's soundness guard rather than loosening it: the
+accelerator concludes `RAllowed` and cannot represent a gate. A caveated group edge simply
+falls back to recursion, which composes the gates into the residual correctly. Cost: a few
+more store reads on caveated group paths. Answer: identical, and
+`caveats on both edges of a nested-group path compose into both obligations` still passes.
+
+A caveated *probe* hit no longer short-circuits `evalThisMemo`. Under the old evaluator a
+satisfied caveat looked exactly like an unconditional grant and absorbed the union. That is
+precisely the value that must not be cached and replayed against a request whose context
+fails the same caveat, so `unionSettled` now tests for `RAllowed` only. An uncaveated probe
+hit still short-circuits, so EP-39's wide-relation bound (one probe read) is intact for the
+uncaveated case that motivated it.
+
+`Exclusion` now evaluates its subtrahend whenever the base is not *symbolically* `RDenied`,
+which includes a base whose caveats would have denied under this request's context. This
+cannot change the answer — `rExclusion` keeps the pair symbolic and `exclusionDecisions`
+ignores the subtrahend once the base folds to `Denied` — but it does perform store reads the
+old evaluator skipped, and it makes an error in the subtrahend observable where it was not.
+
+**The one observable answer change, and why it is the right one (2026-07-08).** A relation
+holding both a *satisfied caveated* grant and a row naming a caveat the schema does not
+define used to return `Right Allowed`: the satisfied row short-circuited the probe before
+`sequence` ever looked at the malformed row. It now returns
+`Left (UnknownRelation "unknown caveat: ghost")`.
+
+This is unavoidable, not a choice about where to validate. Deferring name validation to
+`applyResidual` does not help: that fold is a `traverse` and fails on the first `Left`
+anywhere in the union. The only way to keep the old answer would be to know, during the
+traversal, that the good row's caveat passes — which is the one thing symbolic evaluation
+gives up. Failing closed on data that references a caveat the schema no longer declares is
+the defensible reading, and eager validation buys an invariant worth having: a residual
+that reaches the decision cache names only caveats the schema defines, so a cache hit can
+always be re-applied.
+
+EP-39's blessed case is untouched, and both are now pinned by tests
+(`an unknown caveat beside a satisfied caveated grant fails the check` /
+`an unconditional grant still short-circuits past an unknown caveat`): an *unconditional*
+grant beside a malformed row still returns `Right Allowed`, because `RAllowed` is present in
+the probe residuals and settles the union before the `Left` is inspected.
+
 
 ## Decision Log
 
@@ -177,6 +242,30 @@ invisible" claim checkable rather than asserted.
   correctness argument is simple and obviously safe; reusing the `TuplePage` value type
   avoids widening the cache's value parameter.
   Date: 2026-07-07
+- Decision: The cache *value* type (`Cache SubproblemKey ResidualDecision`) changes in M2,
+  not M3 as planned; M3 keeps only the key change.
+  Rationale: no total `CheckDecision -> ResidualDecision` exists, so a symbolic evaluator
+  cannot consume a cache that stores `CheckDecision`. M2 does not compile without it. The
+  split still holds the property it was designed for — M2 changes no observable behavior,
+  because the key still carries `context` and hit rates are unchanged.
+  Date: 2026-07-08
+- Decision: The nested-group accelerator requires *uncaveated* edges, where it previously
+  accepted edges whose caveat evaluated to `Allowed` under the request context.
+  Rationale: the accelerator's conclusion is `RAllowed`, which cannot carry a gate, and the
+  traversal can no longer evaluate the gate. Falling back to recursion composes the gates
+  correctly. This tightens the `relationUnionsThis` soundness guard the master plan flagged
+  rather than weakening it, at the cost of extra store reads on caveated group paths.
+  Date: 2026-07-08
+- Decision: A relation holding a satisfied caveated grant beside a row naming an undefined
+  caveat now fails the check (`UnknownRelation`) instead of returning `Allowed`.
+  Rationale: symbolic evaluation cannot know the good row's caveat passes, and deferring
+  name validation to `applyResidual` does not recover the old answer (its `traverse` fails
+  on the first `Left` in the union). Failing closed on data referencing a caveat the schema
+  does not declare is the defensible reading, and eager validation guarantees that a cached
+  residual names only definable caveats — so a cache hit can always be re-applied. EP-39's
+  blessed case (an *unconditional* grant beside the same malformed row) still returns
+  `Allowed`; both are now pinned by tests.
+  Date: 2026-07-08
 - Decision: The existing test "different caveat context misses decision cache"
   (`en-core/test/Main.hs`, around lines 818–820) is deliberately inverted: after this
   plan a different context must **hit**.

@@ -11,13 +11,14 @@ module En.Check (
 
 import Control.Monad (foldM)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isNothing)
 import Data.Text (Text)
 import Effectful (Eff, IOE, liftIO, (:>))
 import Effectful.Error.Static (Error, throwError)
 
 import En.Cache (Cache, SubproblemKey (..), insertCache, lookupCache)
-import En.Caveat (evaluateCaveat)
-import En.Decision (CaveatObligation (..), CheckDecision (..))
+import En.Caveat (applyResidual)
+import En.Decision (CaveatObligation (..), CheckDecision (..), ResidualDecision (..))
 import En.Decision qualified as Decision
 import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
 import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, UsersetQuery (..), probeTuples, readObjectRelation, readStartingWithUser)
@@ -48,11 +49,17 @@ data BatchPair = BatchPair
 
 data CheckCacheEnv = CheckCacheEnv
     { cacheDatastoreId :: !DatastoreId
-    , cacheDecisions :: !(Cache SubproblemKey CheckDecision)
+    , cacheDecisions :: !(Cache SubproblemKey ResidualDecision)
     }
 
 {- | Does @subject@ have @permission@ on @object@? Forward evaluation over the
 reachability graph and the tuple store.
+
+Evaluation is /symbolic/: the traversal never looks at the request's caveat
+context. Every subproblem yields a 'ResidualDecision' -- the answer with its
+caveats left as named, unevaluated gates -- and the context is folded in exactly
+once, here at the top, by 'applyResidual'. See 'evalRelationMemo' for why that
+matters.
 -}
 check ::
     (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
@@ -65,11 +72,19 @@ check ::
     Eff es CheckDecision
 check graph consistency context subject permission object = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
-    (result, _memo) <- runCheckMemo graph context revision subject permission object Map.empty
-    either throwError pure result
+    (residual, _memo) <- runCheckMemo graph revision subject permission object Map.empty
+    either throwError pure (residual >>= applyResidual graph.caveats context)
 
 {- | Cached variant of 'check'. Cache hits are keyed by datastore id, schema
-hash, resolved revision, subject, relation, object, and caveat context.
+hash, resolved revision, subject, relation, and object -- deliberately /not/ by
+the request's caveat context.
+
+What the cache stores is a 'ResidualDecision': the fully-traversed answer with
+its caveats still symbolic. Two requests that differ only in @current_time@ ask
+the same question and share one entry, and each still gets its own correct
+answer, because the caveats are re-evaluated against each request's own context
+on the way out. A caveated decision can never be served with a stale context, by
+construction: no context ever entered the cache.
 -}
 checkCached ::
     (ConsistencyStore :> es, TupleStore :> es, IOE :> es, Error EnError :> es) =>
@@ -83,8 +98,8 @@ checkCached ::
     Eff es CheckDecision
 checkCached cacheEnv graph consistency context subject permission object = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
-    (result, _memo) <- runCheckMemoWithCache (Just (decisionCacheOps cacheEnv graph context)) graph context revision subject permission object Map.empty
-    either throwError pure result
+    (residual, _memo) <- runCheckMemoWithCache (Just (decisionCacheOps cacheEnv graph context)) graph revision subject permission object Map.empty
+    either throwError pure (residual >>= applyResidual graph.caveats context)
 
 {- | Evaluate many checks against one resolved consistency snapshot.
 
@@ -104,6 +119,13 @@ This function therefore needs no @Error EnError@ capability of its own -- it
 raises nothing that is not already raised by the interpreters it runs under, and
 reports everything else as a value.
 
+The within-call memo holds 'ResidualDecision's, which carry no caveat context, so
+sharing them between the pairs of one batch is safe for the same reason sharing
+them between requests is: the context is applied per pair, after the traversal.
+The memo is nonetheless discarded when the batch ends, because it may hold
+answers that are only true within this call -- see 'evalRelationMemo' on cut
+taint.
+
 Transport-layer handlers remain responsible for bounding batch size and adding
 any IO-specific concurrency.
 -}
@@ -116,17 +138,20 @@ checkMany ::
     Eff es [Either EnError CheckDecision]
 checkMany graph consistency context pairs = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
-    (resultsByPair, _memo) <-
+    (residualsByPair, _memo) <-
         foldM
             (evaluateDistinct revision)
             (Map.empty, Map.empty)
             (dedupePairs pairs)
-    pure [Map.findWithDefault (Right Denied) pair resultsByPair | pair <- pairs]
+    pure
+        [ Map.findWithDefault (Right RDenied) pair residualsByPair >>= applyResidual graph.caveats context
+        | pair <- pairs
+        ]
   where
-    evaluateDistinct revision (resultsByPair, memo) pair = do
-        (result, memo') <-
-            runCheckMemo graph context revision pair.subject pair.permission pair.object memo
-        pure (Map.insert pair result resultsByPair, memo')
+    evaluateDistinct revision (residualsByPair, memo) pair = do
+        (residual, memo') <-
+            runCheckMemo graph revision pair.subject pair.permission pair.object memo
+        pure (Map.insert pair residual residualsByPair, memo')
 
 dedupePairs :: [BatchPair] -> [BatchPair]
 dedupePairs =
@@ -154,7 +179,7 @@ data MemoKey = MemoKey
     }
     deriving stock (Eq, Ord, Show)
 
-type CheckMemo = Map.Map MemoKey CheckDecision
+type CheckMemo = Map.Map MemoKey ResidualDecision
 
 {- | Did a decision depend on cutting a cycle?
 
@@ -187,34 +212,32 @@ pageLimit = 1000
 runCheckMemo ::
     (TupleStore :> es) =>
     ReachabilityGraph ->
-    CaveatContext ->
     Revision ->
     Subject ->
     RelationName ->
     ObjectRef ->
     CheckMemo ->
-    Eff es (Either EnError CheckDecision, CheckMemo)
-runCheckMemo graph context revision subject permission object =
-    runCheckMemoWithCache Nothing graph context revision subject permission object
+    Eff es (Either EnError ResidualDecision, CheckMemo)
+runCheckMemo graph revision subject permission object =
+    runCheckMemoWithCache Nothing graph revision subject permission object
 
 runCheckMemoWithCache ::
     (TupleStore :> es) =>
     Maybe (DecisionCacheOps es) ->
     ReachabilityGraph ->
-    CaveatContext ->
     Revision ->
     Subject ->
     RelationName ->
     ObjectRef ->
     CheckMemo ->
-    Eff es (Either EnError CheckDecision, CheckMemo)
-runCheckMemoWithCache cacheOps graph context revision subject permission object memo = do
-    (result, memo', _taint) <- evalRelationMemo cacheOps graph context revision subject object permission initialState memo
-    pure (result, memo')
+    Eff es (Either EnError ResidualDecision, CheckMemo)
+runCheckMemoWithCache cacheOps graph revision subject permission object memo = do
+    (residual, memo', _taint) <- evalRelationMemo cacheOps graph revision subject object permission initialState memo
+    pure (residual, memo')
 
 data DecisionCacheOps es = DecisionCacheOps
-    { lookupDecision :: !(Revision -> Subject -> RelationName -> ObjectRef -> Eff es (Maybe CheckDecision))
-    , insertDecision :: !(Revision -> Subject -> RelationName -> ObjectRef -> CheckDecision -> Eff es ())
+    { lookupDecision :: !(Revision -> Subject -> RelationName -> ObjectRef -> Eff es (Maybe ResidualDecision))
+    , insertDecision :: !(Revision -> Subject -> RelationName -> ObjectRef -> ResidualDecision -> Eff es ())
     }
 
 decisionCacheOps ::
@@ -227,8 +250,8 @@ decisionCacheOps CheckCacheEnv{cacheDatastoreId, cacheDecisions} graph context =
     DecisionCacheOps
         { lookupDecision = \revision subject relation object ->
             liftIO (lookupCache cacheDecisions (cacheKey revision subject relation object))
-        , insertDecision = \revision subject relation object decision ->
-            liftIO (insertCache cacheDecisions (cacheKey revision subject relation object) decision)
+        , insertDecision = \revision subject relation object residual ->
+            liftIO (insertCache cacheDecisions (cacheKey revision subject relation object) residual)
         }
   where
     cacheKey revision subject relation object =
@@ -242,50 +265,58 @@ decisionCacheOps CheckCacheEnv{cacheDatastoreId, cacheDecisions} graph context =
             , context
             }
 
-{- | Evaluate @subject@'s membership in @object#relation@.
+{- | Evaluate @subject@'s membership in @object#relation@, as a residual.
+
+The result is a 'ResidualDecision': 'RAllowed', 'RDenied', or a tree of named
+caveats joined by the same union\/intersection\/exclusion structure the traversal
+found. No request context is consulted anywhere below this point. That is what
+lets the within-call memo and the cross-request decision cache both store the
+same value and share it between requests whose contexts differ; the caller folds
+its own context in afterwards with 'applyResidual'.
 
 A revisited subproblem contributes no members. Zanzibar's semantics for a
 membership recursion is its least fixpoint, and a cycle adds nothing to it, so
-re-entering a subproblem the evaluator is already inside yields 'Denied' -- the
-identity of 'Decision.union', which makes a cyclic branch simply drop out of a
+re-entering a subproblem the evaluator is already inside yields 'RDenied' -- the
+identity of 'Decision.rUnion', which makes a cyclic branch simply drop out of a
 union, and the absorbing element of intersection, which correctly denies. This is
-what 'En.Lookup' already does on revisit.
+what "En.Lookup" already does on revisit.
 
-That 'Denied' is true only /inside/ the current recursion stack: evaluated on its
-own, the same subproblem may well be 'Allowed'. Any decision computed with the
+That 'RDenied' is true only /inside/ the current recursion stack: evaluated on its
+own, the same subproblem may well be allowed. Any decision computed with the
 help of such a cut is therefore stack-local and must not outlive the stack, so
 this function reports whether its subtree consumed a cut, and refuses to write a
-tainted decision into the within-call memo or the cross-request decision cache.
+tainted residual into the within-call memo or the cross-request decision cache.
 Without that, evaluating @Y@ where @X = Y union carol@ and @Y = X@ could memoize
-@Y = Denied@ (cut at @X@) and hand that answer to a later pair of the same
-'checkMany' batch, for which @Y@ is genuinely 'Allowed'.
+@Y = RDenied@ (cut at @X@) and hand that answer to a later pair of the same
+'checkMany' batch, for which @Y@ is genuinely allowed. Making the residual
+context-free does not weaken this: a context-free decision derived under a cut is
+no safer to cache than a context-bearing one.
 -}
 evalRelationMemo ::
     (TupleStore :> es) =>
     Maybe (DecisionCacheOps es) ->
     ReachabilityGraph ->
-    CaveatContext ->
     Revision ->
     Subject ->
     ObjectRef ->
     RelationName ->
     EvalState ->
     CheckMemo ->
-    Eff es (Either EnError CheckDecision, CheckMemo, CutTaint)
-evalRelationMemo cacheOps graph context revision subject object relation state memo
+    Eff es (Either EnError ResidualDecision, CheckMemo, CutTaint)
+evalRelationMemo cacheOps graph revision subject object relation state memo
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded, memo, Untainted)
     | subproblem `elem` state.visited =
-        pure (Right Denied, memo, Tainted)
+        pure (Right RDenied, memo, Tainted)
     | otherwise =
         case Map.lookup key memo of
-            Just decision ->
-                pure (Right decision, memo, Untainted)
+            Just residual ->
+                pure (Right residual, memo, Untainted)
             Nothing -> do
                 external <- lookupExternalDecision
                 case external of
-                    Just decision ->
-                        pure (Right decision, Map.insert key decision memo, Untainted)
+                    Just residual ->
+                        pure (Right residual, Map.insert key residual memo, Untainted)
                     Nothing ->
                         case Map.lookup ref graph.relations of
                             Nothing ->
@@ -295,7 +326,6 @@ evalRelationMemo cacheOps graph context revision subject object relation state m
                                     evalRewriteMemo
                                         cacheOps
                                         graph
-                                        context
                                         revision
                                         subject
                                         object
@@ -304,9 +334,9 @@ evalRelationMemo cacheOps graph context revision subject object relation state m
                                         EvalState{depth = state.depth + 1, visited = subproblem : state.visited}
                                         memo
                                 case (result, taint) of
-                                    (Right decision, Untainted) -> do
-                                        insertExternalDecision decision
-                                        pure (result, Map.insert key decision memo', Untainted)
+                                    (Right residual, Untainted) -> do
+                                        insertExternalDecision residual
+                                        pure (result, Map.insert key residual memo', Untainted)
                                     _ ->
                                         pure (result, memo', taint)
   where
@@ -317,16 +347,15 @@ evalRelationMemo cacheOps graph context revision subject object relation state m
         case cacheOps of
             Nothing -> pure Nothing
             Just ops -> ops.lookupDecision revision subject relation object
-    insertExternalDecision decision =
+    insertExternalDecision residual =
         case cacheOps of
             Nothing -> pure ()
-            Just ops -> ops.insertDecision revision subject relation object decision
+            Just ops -> ops.insertDecision revision subject relation object residual
 
 evalRewriteMemo ::
     (TupleStore :> es) =>
     Maybe (DecisionCacheOps es) ->
     ReachabilityGraph ->
-    CaveatContext ->
     Revision ->
     Subject ->
     ObjectRef ->
@@ -334,46 +363,69 @@ evalRewriteMemo ::
     Rewrite ->
     EvalState ->
     CheckMemo ->
-    Eff es (Either EnError CheckDecision, CheckMemo, CutTaint)
-evalRewriteMemo cacheOps graph context revision subject object currentRelation rewrite state memo =
+    Eff es (Either EnError ResidualDecision, CheckMemo, CutTaint)
+evalRewriteMemo cacheOps graph revision subject object currentRelation rewrite state memo =
     case rewrite of
         This ->
-            evalThisMemo cacheOps graph context revision subject object currentRelation state memo
+            evalThisMemo cacheOps graph revision subject object currentRelation state memo
         ComputedUserset relation ->
-            evalRelationMemo cacheOps graph context revision subject object relation state memo
+            evalRelationMemo cacheOps graph revision subject object relation state memo
         TupleToUserset tuplesetRelation computedRelation ->
-            evalTupleToUsersetMemo cacheOps graph context revision subject object tuplesetRelation computedRelation state memo
+            evalTupleToUsersetMemo cacheOps graph revision subject object tuplesetRelation computedRelation state memo
         Union rewrites ->
-            evalBranchesMemo Decision.union unionSettled cacheOps graph context revision subject object currentRelation rewrites state memo
+            evalBranchesMemo Decision.rUnion unionSettled cacheOps graph revision subject object currentRelation rewrites state memo
         Intersection rewrites ->
-            evalBranchesMemo Decision.intersection intersectionSettled cacheOps graph context revision subject object currentRelation rewrites state memo
+            evalBranchesMemo Decision.rIntersection intersectionSettled cacheOps graph revision subject object currentRelation rewrites state memo
         Exclusion base subtractRewrite -> do
-            (baseDecision, memo', baseTaint) <- evalRewriteMemo cacheOps graph context revision subject object currentRelation base state memo
-            case baseDecision of
+            (baseResidual, memo', baseTaint) <- evalRewriteMemo cacheOps graph revision subject object currentRelation base state memo
+            case baseResidual of
                 Left err -> pure (Left err, memo', baseTaint)
                 -- Nothing can be subtracted from nothing, so the subtrahend is
                 -- never evaluated. Every other base must consult it: an
-                -- unconditional subtraction denies even a conditional base.
-                Right Denied -> pure (Right Denied, memo', baseTaint)
+                -- unconditional subtraction denies even a caveated base.
+                --
+                -- "Every other base" now includes a base whose caveats /would/
+                -- deny under this request's context, which the traversal can no
+                -- longer see. Evaluating the subtrahend anyway costs store reads
+                -- but cannot change the answer: 'Decision.rExclusion' keeps the
+                -- pair symbolic and 'applyResidual' lands on 'Denied' via
+                -- 'Decision.exclusionDecisions', whose base-'Denied' row ignores
+                -- the subtrahend entirely.
+                Right RDenied -> pure (Right RDenied, memo', baseTaint)
                 Right base' -> do
-                    (subtractDecision, memo'', subtractTaint) <- evalRewriteMemo cacheOps graph context revision subject object currentRelation subtractRewrite state memo'
-                    pure (Decision.exclusionDecisions base' <$> subtractDecision, memo'', baseTaint <> subtractTaint)
+                    (subtractResidual, memo'', subtractTaint) <- evalRewriteMemo cacheOps graph revision subject object currentRelation subtractRewrite state memo'
+                    pure (Decision.rExclusion base' <$> subtractResidual, memo'', baseTaint <> subtractTaint)
         Caveated caveat rewriteInner -> do
-            (inner, memo', taint) <- evalRewriteMemo cacheOps graph context revision subject object currentRelation rewriteInner state memo
-            pure (applyRewriteCaveat graph context caveat =<< inner, memo', taint)
+            (inner, memo', taint) <- evalRewriteMemo cacheOps graph revision subject object currentRelation rewriteInner state memo
+            pure (residualGate graph (Just (rewriteCaveat caveat)) =<< inner, memo', taint)
 
-{- | A branch decision that settles its combinator, letting the rest go unevaluated.
-
-'Allowed' absorbs a union and 'Denied' absorbs an intersection, so once one
-appears no later branch can change the answer -- see 'Decision.unionDecisions'
-and 'Decision.intersectionDecisions'. A conditional branch settles neither, since
-its obligations must still be merged with whatever follows.
+{- | A rewrite-level @Caveated@ node gates on a caveat with no stored arguments:
+everything it needs comes from the request context. Modelling it as a tuple
+caveat with the empty payload keeps one gating path in this module.
 -}
-unionSettled :: CheckDecision -> Bool
-unionSettled = (== Allowed)
+rewriteCaveat :: CaveatName -> TupleCaveat
+rewriteCaveat name =
+    TupleCaveat{name, payload = CaveatPayload Map.empty}
 
-intersectionSettled :: CheckDecision -> Bool
-intersectionSettled = (== Denied)
+{- | A branch residual that settles its combinator, letting the rest go unevaluated.
+
+'RAllowed' absorbs a union and 'RDenied' absorbs an intersection, so once one
+appears no later branch can change the answer -- see 'Decision.rUnion' and
+'Decision.rIntersection'.
+
+Only an /unconditional/ 'RAllowed' settles a union. A caveated allow is an
+'RCaveat', which settles nothing, because whether it allows at all depends on a
+request context the traversal cannot see. This is exactly the property that keeps
+the short-circuit sound once evaluation is symbolic: under the old inline
+evaluator a satisfied caveat looked like 'Allowed' and absorbed the union, which
+would be wrong to cache and replay against a request whose context fails that
+same caveat.
+-}
+unionSettled :: ResidualDecision -> Bool
+unionSettled = (== RAllowed)
+
+intersectionSettled :: ResidualDecision -> Bool
+intersectionSettled = (== RDenied)
 
 {- | Evaluate branches left to right, stopping at the first that settles the
 combinator, and combine what was evaluated with @combine@.
@@ -389,11 +441,10 @@ answering around it would turn outages into data-dependent decisions.
 -}
 evalBranchesMemo ::
     (TupleStore :> es) =>
-    ([CheckDecision] -> CheckDecision) ->
-    (CheckDecision -> Bool) ->
+    ([ResidualDecision] -> ResidualDecision) ->
+    (ResidualDecision -> Bool) ->
     Maybe (DecisionCacheOps es) ->
     ReachabilityGraph ->
-    CaveatContext ->
     Revision ->
     Subject ->
     ObjectRef ->
@@ -401,45 +452,50 @@ evalBranchesMemo ::
     [Rewrite] ->
     EvalState ->
     CheckMemo ->
-    Eff es (Either EnError CheckDecision, CheckMemo, CutTaint)
-evalBranchesMemo combine settles cacheOps graph context revision subject object currentRelation rewrites state memo =
+    Eff es (Either EnError ResidualDecision, CheckMemo, CutTaint)
+evalBranchesMemo combine settles cacheOps graph revision subject object currentRelation rewrites state memo =
     go [] memo mempty rewrites
   where
     go acc currentMemo taint [] =
         pure (Right (combine (reverse acc)), currentMemo, taint)
     go acc currentMemo taint (rewrite : rest) = do
-        (result, memo', branchTaint) <- evalRewriteMemo cacheOps graph context revision subject object currentRelation rewrite state currentMemo
+        (result, memo', branchTaint) <- evalRewriteMemo cacheOps graph revision subject object currentRelation rewrite state currentMemo
         let taint' = taint <> branchTaint
         case result of
             Left err -> pure (Left err, memo', taint')
-            Right decision
-                | settles decision -> pure (Right decision, memo', taint')
-                | otherwise -> go (decision : acc) memo' taint' rest
+            Right residual
+                | settles residual -> pure (Right residual, memo', taint')
+                | otherwise -> go (residual : acc) memo' taint' rest
 
 evalThisMemo ::
     (TupleStore :> es) =>
     Maybe (DecisionCacheOps es) ->
     ReachabilityGraph ->
-    CaveatContext ->
     Revision ->
     Subject ->
     ObjectRef ->
     RelationName ->
     EvalState ->
     CheckMemo ->
-    Eff es (Either EnError CheckDecision, CheckMemo, CutTaint)
+    Eff es (Either EnError ResidualDecision, CheckMemo, CutTaint)
 
 {- | Evaluate the directly-stored tuples of @object#relation@.
 
 Probe first: ask the store for just the rows granting @relation@ to @subject@ or
-to @subject@'s type wildcard. An uncaveated hit proves access, and 'Decision.union'
-returns 'Allowed' whenever any branch is 'Allowed', so nothing further can change
-the answer -- return immediately without reading the relation at all. This is what
-makes a check on a relation of any width cost one bounded store read.
+to @subject@'s type wildcard. An /uncaveated/ hit proves access, and
+'Decision.rUnion' returns 'RAllowed' whenever any branch is 'RAllowed', so nothing
+further can change the answer -- return immediately without reading the relation at
+all. This is what makes a check on a relation of any width cost one bounded store
+read.
+
+A /caveated/ probe hit no longer short-circuits, because the traversal cannot see
+the request context and so cannot know the caveat passes. It becomes an 'RCaveat'
+leaf and the relation is enumerated as usual. The answer is unchanged; the cost is
+that a caveated direct grant reads more than a bare one.
 
 If the probe cannot settle it, enumerate the relation to find nested groups. Only
 subject-set rows are worth recursing into: the probe has already answered exactly
-for concrete and wildcard subjects, so every other row contributes 'Denied', which
+for concrete and wildcard subjects, so every other row contributes 'RDenied', which
 is the identity of union. Rows the probe already matched are skipped here so they
 are not counted twice.
 
@@ -452,24 +508,24 @@ batched reverse query replaces one recursive descent per group, which is the
 difference between twenty store reads and three when an object is shared with
 twenty teams.
 -}
-evalThisMemo cacheOps graph context revision subject object relation state memo
+evalThisMemo cacheOps graph revision subject object relation state memo
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded, memo, Untainted)
     | otherwise = do
         probedRows <- probeTuples revision object relation candidates
-        let probeDecisions =
-                [applyTupleCaveat graph context tuple.caveat Allowed | TupleRow{tuple} <- probedRows]
-        if Right Allowed `elem` probeDecisions
-            then pure (Right Allowed, memo, Untainted)
+        let probeResiduals =
+                [residualGate graph tuple.caveat RAllowed | TupleRow{tuple} <- probedRows]
+        if Right RAllowed `elem` probeResiduals
+            then pure (Right RAllowed, memo, Untainted)
             else do
                 rows <- drainObjectRelation revision object relation
                 let usersetRows = filter recursable rows
                 proven <- provenByDirectGroupMembership usersetRows
                 if proven
-                    then pure (Right Allowed, memo, Untainted)
+                    then pure (Right RAllowed, memo, Untainted)
                     else do
-                        (recursedDecisions, memo', taint) <- foldM rowDecision ([], memo, mempty) usersetRows
-                        pure (Decision.union <$> sequence (probeDecisions <> recursedDecisions), memo', taint)
+                        (recursedResiduals, memo', taint) <- foldM rowResidual ([], memo, mempty) usersetRows
+                        pure (Decision.rUnion <$> sequence (probeResiduals <> recursedResiduals), memo', taint)
   where
     candidates = subjectsWithWildcard subject
 
@@ -481,18 +537,19 @@ evalThisMemo cacheOps graph context revision subject object relation state memo
             SubjectWildcard _ -> False
 
     {- A row the batched query may settle. Every condition is load-bearing:
-    the attachment edge must grant unconditionally (otherwise its caveat gates
-    the answer and only recursion composes the gates correctly); the group's
-    relation must union in its own stored tuples (a relation defined as, say,
-    @Intersection [This, other]@ is not satisfied by a stored tuple alone); and
-    the descent must be one the recursive path would actually have taken, so a
-    subproblem barred by the cycle or depth guard is left to recursion to
-    reject exactly as before. -}
+    the attachment edge must be uncaveated (a caveat gates the answer, and only
+    recursion composes the gates into the residual correctly -- the old inline
+    evaluator could ask whether the caveat passed under the request context,
+    which a symbolic traversal cannot); the group's relation must union in its
+    own stored tuples (a relation defined as, say, @Intersection [This, other]@
+    is not satisfied by a stored tuple alone); and the descent must be one the
+    recursive path would actually have taken, so a subproblem barred by the cycle
+    or depth guard is left to recursion to reject exactly as before. -}
     acceleratable row@TupleRow{tuple} =
         case tuple.subject of
             SubjectSet groupObject groupRelation ->
                 recursable row
-                    && applyTupleCaveat graph context tuple.caveat Allowed == Right Allowed
+                    && isNothing tuple.caveat
                     && relationUnionsThis graph groupObject.objectType groupRelation
                     && state.depth < maxDepth
                     && Subproblem{subject, object = groupObject, relation = groupRelation} `notElem` state.visited
@@ -500,8 +557,8 @@ evalThisMemo cacheOps graph context revision subject object relation state memo
 
     {- One reverse query per (group type, group relation) bucket answers "which
     of these groups contain the subject directly?". A hit on an uncaveated
-    membership edge, under an uncaveated attachment edge, proves Allowed for the
-    whole relation. A miss proves nothing -- the group may still grant access
+    membership edge, under an uncaveated attachment edge, proves 'RAllowed' for
+    the whole relation. A miss proves nothing -- the group may still grant access
     through its own rewrite -- so evaluation falls back to recursion. The query
     can therefore only find an answer earlier, never change one. -}
     provenByDirectGroupMembership rows
@@ -525,15 +582,15 @@ evalThisMemo cacheOps graph context revision subject object relation state memo
       where
         grantsDirectly TupleRow{tuple} =
             tuple.object `elem` groupObjects
-                && applyTupleCaveat graph context tuple.caveat Allowed == Right Allowed
+                && isNothing tuple.caveat
 
-    rowDecision (decisions, memo', taint) TupleRow{tuple} =
+    rowResidual (residuals, memo', taint) TupleRow{tuple} =
         case tuple.subject of
             SubjectSet subjectObject subjectRelation -> do
-                (decision, memo'', rowTaint) <- evalRelationMemo cacheOps graph context revision subject subjectObject subjectRelation state memo'
-                pure (decisions <> [decision >>= applyTupleCaveat graph context tuple.caveat], memo'', taint <> rowTaint)
+                (residual, memo'', rowTaint) <- evalRelationMemo cacheOps graph revision subject subjectObject subjectRelation state memo'
+                pure (residuals <> [residual >>= residualGate graph tuple.caveat], memo'', taint <> rowTaint)
             _ ->
-                pure (decisions, memo', taint)
+                pure (residuals, memo', taint)
 
 {- | Does @objectType#relation@ union in its directly-stored tuples?
 
@@ -556,7 +613,6 @@ evalTupleToUsersetMemo ::
     (TupleStore :> es) =>
     Maybe (DecisionCacheOps es) ->
     ReachabilityGraph ->
-    CaveatContext ->
     Revision ->
     Subject ->
     ObjectRef ->
@@ -564,25 +620,46 @@ evalTupleToUsersetMemo ::
     RelationName ->
     EvalState ->
     CheckMemo ->
-    Eff es (Either EnError CheckDecision, CheckMemo, CutTaint)
-evalTupleToUsersetMemo cacheOps graph context revision subject object tuplesetRelation computedRelation state memo = do
+    Eff es (Either EnError ResidualDecision, CheckMemo, CutTaint)
+evalTupleToUsersetMemo cacheOps graph revision subject object tuplesetRelation computedRelation state memo = do
     rows <- drainObjectRelation revision object tuplesetRelation
-    (decisions, memo', taint) <- foldM rowDecision ([], memo, mempty) rows
-    pure (Decision.union <$> sequence decisions, memo', taint)
+    (residuals, memo', taint) <- foldM rowResidual ([], memo, mempty) rows
+    pure (Decision.rUnion <$> sequence residuals, memo', taint)
   where
-    rowDecision (decisions, memo', taint) TupleRow{tuple} =
+    rowResidual (residuals, memo', taint) TupleRow{tuple} =
         case tuple.subject of
             SubjectId subjectObject -> do
-                (decision, memo'', rowTaint) <- evalRelationMemo cacheOps graph context revision subject subjectObject computedRelation state memo'
-                pure (decisions <> [applyRowGate tuple decision], memo'', taint <> rowTaint)
+                (residual, memo'', rowTaint) <- evalRelationMemo cacheOps graph revision subject subjectObject computedRelation state memo'
+                pure (residuals <> [applyRowGate tuple residual], memo'', taint <> rowTaint)
             SubjectSet subjectObject subjectRelation -> do
-                (decision, memo'', rowTaint) <- evalRelationMemo cacheOps graph context revision subject subjectObject subjectRelation state memo'
-                pure (decisions <> [applyRowGate tuple decision], memo'', taint <> rowTaint)
+                (residual, memo'', rowTaint) <- evalRelationMemo cacheOps graph revision subject subjectObject subjectRelation state memo'
+                pure (residuals <> [applyRowGate tuple residual], memo'', taint <> rowTaint)
             SubjectWildcard _ ->
-                pure (decisions <> [Right Denied], memo', taint)
+                pure (residuals <> [Right RDenied], memo', taint)
 
     applyRowGate tuple =
-        (>>= applyTupleCaveat graph context tuple.caveat)
+        (>>= residualGate graph tuple.caveat)
+
+{- | Gate a residual behind a tuple's caveat, if it has one.
+
+The caveat's /name/ is validated against the schema here, at evaluation time,
+rather than deferred to 'applyResidual'. Two reasons. An unknown caveat is a
+schema-or-data defect and should surface where the tuple is read, matching what
+the inline evaluator did. And it keeps the invariant that a residual reaching the
+decision cache names only caveats the schema defines, so a cache hit can always
+be re-applied.
+-}
+residualGate :: ReachabilityGraph -> Maybe TupleCaveat -> ResidualDecision -> Either EnError ResidualDecision
+residualGate _ Nothing residual =
+    Right residual
+residualGate graph (Just TupleCaveat{name, payload}) residual = do
+    requireCaveat graph name
+    pure (Decision.rIntersection [RCaveat name payload, residual])
+
+requireCaveat :: ReachabilityGraph -> CaveatName -> Either EnError ()
+requireCaveat graph caveat
+    | Map.member caveat graph.caveats = Right ()
+    | otherwise = Left (UnknownRelation ("unknown caveat: " <> caveatText caveat))
 
 {- | The subjects a stored row may name to grant @subject@ directly: the subject
 itself, and -- for a concrete subject -- the wildcard over its object type,
@@ -652,24 +729,6 @@ drainStartingWithUser revision objectType relation subjects =
             Exhausted -> pure acc'
             HasMore next -> drain (Just next) acc'
             Truncated next -> drain (Just next) acc'
-
-applyRewriteCaveat :: ReachabilityGraph -> CaveatContext -> CaveatName -> CheckDecision -> Either EnError CheckDecision
-applyRewriteCaveat graph context caveat decision = do
-    gate <- evaluateNamedCaveat graph context caveat (CaveatPayload Map.empty)
-    pure (Decision.applyGate gate decision)
-
-applyTupleCaveat :: ReachabilityGraph -> CaveatContext -> Maybe TupleCaveat -> CheckDecision -> Either EnError CheckDecision
-applyTupleCaveat _ _ Nothing decision =
-    Right decision
-applyTupleCaveat graph context (Just TupleCaveat{name, payload}) decision = do
-    gate <- evaluateNamedCaveat graph context name payload
-    pure (Decision.applyGate gate decision)
-
-evaluateNamedCaveat :: ReachabilityGraph -> CaveatContext -> CaveatName -> CaveatPayload -> Either EnError CheckDecision
-evaluateNamedCaveat graph context caveat payload =
-    case Map.lookup caveat graph.caveats of
-        Nothing -> Left (UnknownRelation ("unknown caveat: " <> caveatText caveat))
-        Just definition -> Right (evaluateCaveat definition payload context)
 
 renderRef :: RelationRef -> Text
 renderRef RelationRef{objectType = ObjectType objectType, relation = RelationName relation} =

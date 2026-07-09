@@ -442,6 +442,18 @@ main = do
         "conditional base and conditional ban merge both obligations"
         (Right (Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}, CaveatObligation{caveat = CaveatName "min_clearance", missingContext = ["clearance"]}]))
         =<< check consistencyStore (runTupleStoreInMemory caveatedBanTuples) roomGraph MinimizeLatency missingAutonomyContext (SubjectId erin) (RelationName "enter") roomR
+    -- Symbolic evaluation cannot ask whether a caveat passes, so a caveated grant
+    -- no longer settles a union and no longer hides a malformed sibling row. An
+    -- \*unconditional* grant still does, which is the case EP-39 introduced and
+    -- EP-40 blessed.
+    assertEqual
+        "an unknown caveat beside a satisfied caveated grant fails the check"
+        (Left (UnknownRelation "unknown caveat: ghost"))
+        =<< check consistencyStore (runTupleStoreInMemory ghostBesideCaveatedTuples) graph MinimizeLatency requestContext (SubjectId user) (RelationName "delegate") intention
+    assertEqual
+        "an unconditional grant still short-circuits past an unknown caveat"
+        (Right Allowed)
+        =<< check consistencyStore (runTupleStoreInMemory ghostBesideUncaveatedTuples) graph MinimizeLatency requestContext (SubjectId user) (RelationName "delegate") intention
     assertEqual "self-parent cycle yields Denied via cycle-as-empty" (Right Denied) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
     deepChainGraph <- either (fail . show) pure (compileSchema deepChainSchema)
     assertEqual "acyclic chain deeper than the depth budget still errors" (Left ResolutionLimitExceeded) =<< check consistencyStore (runTupleStoreInMemory deepChainTuples) deepChainGraph MinimizeLatency requestContext (SubjectId user) (RelationName "view") (deepSpace 1)
@@ -963,6 +975,31 @@ emptyPayload :: CaveatPayload
 emptyPayload =
     CaveatPayload Map.empty
 
+-- | A tuple caveat naming a caveat the schema does not define.
+ghostCaveat :: TupleCaveat
+ghostCaveat =
+    TupleCaveat{name = CaveatName "ghost", payload = emptyPayload}
+
+{- | @intention#delegate@ granted to @user@ twice: once behind a caveat that is
+satisfied under 'requestContext', once behind a caveat the schema never declared.
+-}
+ghostBesideCaveatedTuples :: [Tuple]
+ghostBesideCaveatedTuples =
+    [ delegateTuple (Just autonomyCaveat)
+    , delegateTuple (Just ghostCaveat)
+    ]
+
+-- | As 'ghostBesideCaveatedTuples', but the good grant carries no caveat at all.
+ghostBesideUncaveatedTuples :: [Tuple]
+ghostBesideUncaveatedTuples =
+    [ delegateTuple Nothing
+    , delegateTuple (Just ghostCaveat)
+    ]
+
+delegateTuple :: Maybe TupleCaveat -> Tuple
+delegateTuple caveat =
+    Tuple{object = intention, relation = RelationName "delegate", subject = SubjectId user, caveat}
+
 {- | The three caveat definitions the residual tests resolve names against:
 kikan's real time-and-autonomy caveat, plus a caveat that always passes and one
 that always fails, so AND and OR of the two can be told apart under one context.
@@ -1025,7 +1062,7 @@ testDecisionCache graph = do
 
 newCheckCacheEnv :: IO CheckCacheEnv
 newCheckCacheEnv = do
-    cache <- newCache CacheConfig{enabled = True, maxEntries = 100} :: IO (Cache SubproblemKey CheckDecision)
+    cache <- newCache CacheConfig{enabled = True, maxEntries = 100} :: IO (Cache SubproblemKey ResidualDecision)
     pure CheckCacheEnv{cacheDatastoreId = DatastoreId "test", cacheDecisions = cache}
 
 checkCachedEngine ::
