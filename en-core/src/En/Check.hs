@@ -20,7 +20,7 @@ import En.Caveat (evaluateCaveat)
 import En.Decision (CaveatObligation (..), CheckDecision (..))
 import En.Decision qualified as Decision
 import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
-import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, probeTuples, readObjectRelation)
+import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, UsersetQuery (..), probeTuples, readObjectRelation, readStartingWithUser)
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
 import En.Revision (Consistency, DatastoreId, Revision (..))
@@ -365,6 +365,12 @@ are not counted twice.
 
 Enumeration drains pages rather than demanding the relation fit in one. A relation
 wider than a page is a large group, not a resolution failure.
+
+Before recursing into the nested groups one at a time, ask the store once per
+(group type, group relation) which of them contain the subject directly. One
+batched reverse query replaces one recursive descent per group, which is the
+difference between twenty store reads and three when an object is shared with
+twenty teams.
 -}
 evalThisMemo cacheOps graph context revision subject object relation state memo
     | state.depth >= maxDepth =
@@ -377,8 +383,13 @@ evalThisMemo cacheOps graph context revision subject object relation state memo
             then pure (Right Allowed, memo)
             else do
                 rows <- drainObjectRelation revision object relation
-                (recursedDecisions, memo') <- foldM rowDecision ([], memo) (filter recursable rows)
-                pure (Decision.union <$> sequence (probeDecisions <> recursedDecisions), memo')
+                let usersetRows = filter recursable rows
+                proven <- provenByDirectGroupMembership usersetRows
+                if proven
+                    then pure (Right Allowed, memo)
+                    else do
+                        (recursedDecisions, memo') <- foldM rowDecision ([], memo) usersetRows
+                        pure (Decision.union <$> sequence (probeDecisions <> recursedDecisions), memo')
   where
     candidates = subjectsWithWildcard subject
 
@@ -389,6 +400,53 @@ evalThisMemo cacheOps graph context revision subject object relation state memo
             SubjectId _ -> False
             SubjectWildcard _ -> False
 
+    {- A row the batched query may settle. Every condition is load-bearing:
+    the attachment edge must grant unconditionally (otherwise its caveat gates
+    the answer and only recursion composes the gates correctly); the group's
+    relation must union in its own stored tuples (a relation defined as, say,
+    @Intersection [This, other]@ is not satisfied by a stored tuple alone); and
+    the descent must be one the recursive path would actually have taken, so a
+    subproblem barred by the cycle or depth guard is left to recursion to
+    reject exactly as before. -}
+    acceleratable row@TupleRow{tuple} =
+        case tuple.subject of
+            SubjectSet groupObject groupRelation ->
+                recursable row
+                    && applyTupleCaveat graph context tuple.caveat Allowed == Right Allowed
+                    && relationUnionsThis graph groupObject.objectType groupRelation
+                    && state.depth < maxDepth
+                    && Subproblem{subject, object = groupObject, relation = groupRelation} `notElem` state.visited
+            _ -> False
+
+    {- One reverse query per (group type, group relation) bucket answers "which
+    of these groups contain the subject directly?". A hit on an uncaveated
+    membership edge, under an uncaveated attachment edge, proves Allowed for the
+    whole relation. A miss proves nothing -- the group may still grant access
+    through its own rewrite -- so evaluation falls back to recursion. The query
+    can therefore only find an answer earlier, never change one. -}
+    provenByDirectGroupMembership rows
+        | null targets = pure False
+        | otherwise = or <$> traverse confirmBucket (Map.toList buckets)
+      where
+        targets =
+            [ (groupObject, groupRelation)
+            | row@TupleRow{tuple} <- rows
+            , acceleratable row
+            , SubjectSet groupObject groupRelation <- [tuple.subject]
+            ]
+        buckets =
+            Map.fromListWith
+                (<>)
+                [((groupObject.objectType, groupRelation), [groupObject]) | (groupObject, groupRelation) <- targets]
+
+    confirmBucket ((groupType, groupRelation), groupObjects) = do
+        rows <- drainStartingWithUser revision groupType groupRelation candidates
+        pure (any grantsDirectly rows)
+      where
+        grantsDirectly TupleRow{tuple} =
+            tuple.object `elem` groupObjects
+                && applyTupleCaveat graph context tuple.caveat Allowed == Right Allowed
+
     rowDecision (decisions, memo') TupleRow{tuple} =
         case tuple.subject of
             SubjectSet subjectObject subjectRelation -> do
@@ -396,6 +454,23 @@ evalThisMemo cacheOps graph context revision subject object relation state memo
                 pure (decisions <> [decision >>= applyTupleCaveat graph context tuple.caveat], memo'')
             _ ->
                 pure (decisions, memo')
+
+{- | Does @objectType#relation@ union in its directly-stored tuples?
+
+Only then does a stored membership tuple by itself prove the relation holds. A
+relation whose rewrite is an intersection, an exclusion, or an arrow may ignore
+its own stored tuples, or subtract from them.
+-}
+relationUnionsThis :: ReachabilityGraph -> ObjectType -> RelationName -> Bool
+relationUnionsThis graph objectType relation =
+    case Map.lookup RelationRef{objectType, relation} graph.relations of
+        Nothing -> False
+        Just schemaRelation -> unionsThis schemaRelation.rewrite
+  where
+    unionsThis = \case
+        This -> True
+        Union rewrites -> any unionsThis rewrites
+        _ -> False
 
 evalTupleToUsersetMemo ::
     (TupleStore :> es) =>
@@ -458,6 +533,40 @@ drainObjectRelation revision object relation =
   where
     drain cursor acc = do
         page <- readObjectRelation revision object relation pageLimit cursor
+        let acc' = acc <> page.rows
+        case page.state of
+            Exhausted -> pure acc'
+            HasMore next -> drain (Just next) acc'
+            Truncated next -> drain (Just next) acc'
+
+{- | Read every @objectType#relation@ row whose subject is one of @subjects@,
+following page cursors to the end. This is Zanzibar's reverse query: rather than
+asking each candidate group "do you contain the subject?", ask storage once for
+all the groups of a type that do. Mirrors 'En.Lookup.readRowsForSubjects'.
+-}
+drainStartingWithUser ::
+    (TupleStore :> es) =>
+    Revision ->
+    ObjectType ->
+    RelationName ->
+    [Subject] ->
+    Eff es [TupleRow]
+drainStartingWithUser _ _ _ [] =
+    pure []
+drainStartingWithUser revision objectType relation subjects =
+    drain Nothing []
+  where
+    drain cursor acc = do
+        page <-
+            readStartingWithUser
+                revision
+                UsersetQuery
+                    { queryType = objectType
+                    , queryRelation = relation
+                    , querySubjects = subjects
+                    , queryLimit = pageLimit
+                    , queryCursor = cursor
+                    }
         let acc' = acc <> page.rows
         case page.state of
             Exhausted -> pure acc'

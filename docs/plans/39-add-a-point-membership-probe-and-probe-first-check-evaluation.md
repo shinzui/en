@@ -75,8 +75,10 @@ number of store reads.
   with EXPLAIN; added the `runProbeScenario` integration test in
   `en-postgres/integration-test/Main.hs`. M2+M3 landed as one commit (`b0323d3`) because
   the GADT constructor breaks the exhaustive PostgreSQL interpreter until handled.
-- [ ] M4: unify `check` onto the memoized evaluator; make `evalThisMemo` probe-first;
-  replace `ensureExhausted` with a page-draining reader in `En.Check`.
+- [x] M4 (2026-07-08): unified `check` onto the memoized evaluator (commit `dfd6e37`);
+  made `evalThisMemo` probe-first and replaced `ensureExhausted` with
+  `drainObjectRelation` (commit `d3aecf5`). M1's two assertions are green and the full
+  workspace suite passes.
 - [ ] M5: batch direct-membership discovery for the subject-set recursion frontier with
   `readStartingWithUser`, mirroring `En.Lookup`.
 - [ ] M6: regression test green; add wide-relation benchmarks to `en-core/bench/Main.hs`
@@ -111,6 +113,42 @@ child plan of another master plan left a sibling package red. Neither master pla
 acceptance ran `cabal test all` across the whole workspace after landing. Later plans in
 this master plan should run the *full* workspace suite at their Final milestone, not only
 the focused suites they touch.
+
+**M4 — the probe-first path needed one rule the plan did not state: skip rows the probe
+already matched.** The plan's M4 step 3 says to keep "only the `SubjectSet` rows" during
+enumeration. That is very nearly right, but not quite: a stored row can name the checked
+subject *as a subject-set* — for example the tuple
+`space:userset-member#member@org:acme#member` when the checked subject is literally
+`org:acme#member`. The old code's first guard, `tuple.subject == subject`, short-circuited
+such a row to `applyTupleCaveat … Allowed` and never recursed into it. The probe also
+matches it, since it is in the candidate set. So "keep all subject-set rows" would evaluate
+that row twice — once as a probe decision and once as a recursion — and, when the row is
+caveated, contribute two `Conditional` decisions where the old evaluator contributed one.
+
+The fix is to define the enumeration filter as the exact complement of the probe's
+candidate set: recurse into a row only when its subject is a `SubjectSet` *and* that
+subject is not among the probe candidates. That preserves the old semantics precisely,
+because the old first guard (`tuple.subject == subject || wildcardMatches tuple.subject
+subject`) is, by construction, membership in `subjectsWithWildcard subject`.
+
+**M4 — union's identity is what makes it safe to drop rows.** `Decision.union` (see
+`unionDecisions` in `en-core/src/En/Decision.hs`) returns `Allowed` if any input is
+`Allowed`, and `Denied` for the empty list. Two consequences the rework leans on, recorded
+so a later plan does not "optimize" them away: an unconditional `Allowed` from the probe
+can return immediately (nothing downstream can beat `Allowed`), and concrete/wildcard rows
+that the probe did not match can be dropped from enumeration entirely (they could only
+have contributed `Denied`, the identity). Both are behavior-preserving under today's
+union. If EP-40 changes union's algebra, it must revisit both.
+
+There is one deliberate, visible consequence of the early return: if a relation contains
+both a row that grants unconditional access *and* a row whose caveat name is undefined in
+the schema, the old evaluator returned `Left (UnknownRelation "unknown caveat: …")` because
+`sequence` fails on the first `Left` anywhere in the list; the new one returns
+`Right Allowed`. This is the union short-circuit the Decision Log explicitly sanctions, and
+it is arguably the better answer — the subject provably has access by a path that involves
+no caveat at all. Recorded here because it is the one place M4 changes an observable
+outcome for an input no current test exercises. EP-40 owns the error taxonomy and should
+confirm this is the semantics it wants.
 
 **M3 — the planner picks the subject-side index, exactly as the Decision Log predicted.**
 The plan's "no new index" decision rested on a claim that had never been measured: that

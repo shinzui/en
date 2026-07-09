@@ -411,6 +411,21 @@ main = do
     let wideStore = runTupleStoreInMemory wideTuples
     assertEqual "wide relation: direct member checks Allowed" (Right Allowed) =<< check consistencyStore wideStore streamingGraph MinimizeLatency requestContext (SubjectId wideMember) (RelationName "viewer") wideFolder
     assertEqual "wide relation: non-member checks Denied" (Right Denied) =<< check consistencyStore wideStore streamingGraph MinimizeLatency requestContext (SubjectId bob) (RelationName "viewer") wideFolder
+    wideReadCount <- newIORef 0
+    assertEqual "wide relation member check is Allowed under a counting store" (Right Allowed) =<< check consistencyStore (countingStoreFor wideReadCount wideTuples) streamingGraph MinimizeLatency requestContext (SubjectId wideMember) (RelationName "viewer") wideFolder
+    wideReads <- readIORef wideReadCount
+    assertEqual "wide relation member check costs one probe, not a scan" 1 wideReads
+    groupGraph <- either (fail . show) pure (compileSchema groupSchema)
+    groupReadCount <- newIORef 0
+    assertEqual "membership through one of many groups is Allowed" (Right Allowed) =<< check consistencyStore (countingStoreFor groupReadCount manyGroupTuples) groupGraph MinimizeLatency requestContext (SubjectId groupUser) (RelationName "member") manyGroupSpace
+    groupReads <- readIORef groupReadCount
+    assertBool ("nested-group membership issues fewer reads than there are groups, got " <> show groupReads) (groupReads < length groupOrgs)
+    assertEqual "nested-group membership costs a probe, a drain, and one batched query" 3 groupReads
+    assertEqual "membership through a group the user is not in is Denied" (Right Denied) =<< check consistencyStore (runTupleStoreInMemory manyGroupTuples) groupGraph MinimizeLatency requestContext (SubjectId bob) (RelationName "member") manyGroupSpace
+    assertEqual
+        "caveats on both edges of a nested-group path compose into both obligations"
+        (Right (Conditional [CaveatObligation{caveat = CaveatName "min_level", missingContext = ["clearance"]}, CaveatObligation{caveat = CaveatName "min_rank", missingContext = ["rank"]}]))
+        =<< check consistencyStore (runTupleStoreInMemory caveatedGroupTuples) groupGraph MinimizeLatency (CaveatContext Map.empty) (SubjectId groupUser) (RelationName "member") caveatedGroupSpace
     assertEqual "recursive graph respects depth limit" (Left ResolutionLimitExceeded) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
     assertEqual "lookup returns direct and recursive view spaces" (Right (lookupPage [allowed childSpace, allowed space] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup follows userset subjects" (Right (lookupPage [allowed guestSpace, allowed sharedItem, allowed usersetMemberSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId agencyUser) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
@@ -1316,6 +1331,11 @@ countingTupleStore :: IORef Int -> TupleInterpreter -> TupleInterpreter
 countingTupleStore count _ =
     interpretFixtureTupleStore (Just count) Nothing fixtureTuples
 
+-- | Like 'countingTupleStore', but over a caller-supplied fixture.
+countingStoreFor :: IORef Int -> [Tuple] -> TupleInterpreter
+countingStoreFor count =
+    interpretFixtureTupleStore (Just count) Nothing
+
 {- | A store that makes every read of @badObject@ fail the check for that object.
 
 The failure is injected as a row pointing at a relation the schema does not
@@ -1518,6 +1538,102 @@ paginator =
         { objectType = ObjectType "user"
         , objectId = "paginator"
         }
+
+{- | A space shared with many organisations, where the checked user belongs to
+exactly one of them. Answering "is this user a member?" by recursing into each
+organisation costs one store read per organisation; asking storage once which
+organisations contain the user costs one read for all of them.
+
+The second caveat exists so a grant can be gated on two independent conditions,
+one on each edge of the two-level path (space to org, org to user).
+-}
+groupSchema :: Schema
+groupSchema =
+    testSchemaOrError $ do
+        minLevel <-
+            Schema.caveatWith
+                "min_level"
+                [ Schema.parameter "clearance" ParameterInteger
+                , Schema.parameter "level" ParameterInteger
+                ]
+                (Schema.cmpGe (Schema.ctxParam "clearance") (Schema.payloadParam "level"))
+        minRank <-
+            Schema.caveatWith
+                "min_rank"
+                [ Schema.parameter "rank" ParameterInteger
+                , Schema.parameter "floor" ParameterInteger
+                ]
+                (Schema.cmpGe (Schema.ctxParam "rank") (Schema.payloadParam "floor"))
+        userObject <- Schema.object "user" []
+        orgObject <-
+            Schema.object
+                "org"
+                [Schema.relation "member" [Schema.subject "user"] Schema.this]
+        spaceObject <-
+            Schema.object
+                "space"
+                [Schema.relation "member" [Schema.subject "user", Schema.userset "org" "member"] Schema.this]
+        Schema.buildWithCaveats [minLevel, minRank] [userObject, orgObject, spaceObject]
+
+groupUser :: ObjectRef
+groupUser =
+    ObjectRef{objectType = ObjectType "user", objectId = "group-user"}
+
+manyGroupSpace :: ObjectRef
+manyGroupSpace =
+    ObjectRef{objectType = ObjectType "space", objectId = "many-groups"}
+
+groupOrgs :: [ObjectRef]
+groupOrgs =
+    [ ObjectRef{objectType = ObjectType "org", objectId = "org-" <> showText index}
+    | index <- [1 :: Int .. 20]
+    ]
+
+{- | The user belongs only to the last organisation, so a per-group recursion
+would probe all twenty before finding the grant.
+-}
+manyGroupTuples :: [Tuple]
+manyGroupTuples =
+    [ Tuple
+        { object = manyGroupSpace
+        , relation = RelationName "member"
+        , subject = SubjectSet org (RelationName "member")
+        , caveat = Nothing
+        }
+    | org <- groupOrgs
+    ]
+        <> [ Tuple
+                { object = last groupOrgs
+                , relation = RelationName "member"
+                , subject = SubjectId groupUser
+                , caveat = Nothing
+                }
+           ]
+
+caveatedGroupSpace :: ObjectRef
+caveatedGroupSpace =
+    ObjectRef{objectType = ObjectType "space", objectId = "caveated-groups"}
+
+caveatedOrg :: ObjectRef
+caveatedOrg =
+    ObjectRef{objectType = ObjectType "org", objectId = "caveated"}
+
+-- | Both edges of the two-level path are caveated, on different caveats.
+caveatedGroupTuples :: [Tuple]
+caveatedGroupTuples =
+    [ Tuple
+        { object = caveatedGroupSpace
+        , relation = RelationName "member"
+        , subject = SubjectSet caveatedOrg (RelationName "member")
+        , caveat = Just TupleCaveat{name = CaveatName "min_level", payload = CaveatPayload (Map.fromList [("level", ValueInteger 3)])}
+        }
+    , Tuple
+        { object = caveatedOrg
+        , relation = RelationName "member"
+        , subject = SubjectId groupUser
+        , caveat = Just TupleCaveat{name = CaveatName "min_rank", payload = CaveatPayload (Map.fromList [("floor", ValueInteger 2)])}
+        }
+    ]
 
 {- | One folder whose @viewer@ relation is wider than a single store page
 (@pageLimit@ is 1000 in "En.Check"), used to prove that a check on a wide
