@@ -19,7 +19,7 @@ import System.Posix.Signals (Handler (Catch), installHandler, sigINT, sigTERM)
 
 import Config (PoolConfig (..), ServerConfig (..), TlsConfig (..), loadServerConfig, validateGcWindow)
 import En.Cache (Cache, CacheConfig (..), SubproblemKey, TupleReadKey, cacheStats, newCache)
-import En.Check (CheckCacheEnv (..), check, checkCached)
+import En.Check (CheckCacheEnv (..), checkCachedWithBudget, checkWithBudget)
 import En.Decision (ResidualDecision)
 import En.Effect.CachedTupleStore (cachedTupleStore)
 import En.Effect.TupleStore (TuplePage, TupleStore)
@@ -157,22 +157,26 @@ main = do
         tupleReadLayer cache action
             | tupleReadConfig.enabled = cachedTupleStore cache action
             | otherwise = action
+        -- The engine's static bounds are applied here, once, so no handler and no
+        -- request can choose them. See "En.Budget".
+        budget = serverConfig.budget
         checkOperation graph' consistency context subject relation object
             | decisionConfig.enabled =
-                checkCached checkCacheEnv graph' consistency context subject relation object
+                checkCachedWithBudget budget checkCacheEnv graph' consistency context subject relation object
             | otherwise =
-                check graph' consistency context subject relation object
+                checkWithBudget budget graph' consistency context subject relation object
         lookupWithDeadlineOperation deadline graph' consistency request
             | decisionConfig.enabled =
-                Lookup.lookupWithDeadlineCached checkCacheEnv deadline graph' consistency request
+                Lookup.lookupWithDeadlineCachedAndBudget budget checkCacheEnv deadline graph' consistency request
             | otherwise =
-                Lookup.lookupWithDeadline deadline graph' consistency request
+                Lookup.lookupWithDeadlineAndBudget budget deadline graph' consistency request
         serverEnv =
             Env
                 { runPorts = runAppIO
                 , graph
                 , checkOperation
                 , lookupWithDeadlineOperation
+                , budget
                 , maxBatchSize = serverConfig.maxBatchSize
                 , deadlineDefaultMillis = serverConfig.deadlineDefaultMillis
                 , deadlineMaxMillis = serverConfig.deadlineMaxMillis

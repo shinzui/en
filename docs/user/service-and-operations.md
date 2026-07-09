@@ -69,6 +69,9 @@ Environment variables:
 | `EN_MAX_BATCH_SIZE` | no | Maximum pairs in one `batch-check`, default `1000`. Must be at least `1` |
 | `EN_LOOKUP_DEADLINE_DEFAULT_MS` | no | Lookup time budget when the client omits `deadlineMillis`, default `3000` |
 | `EN_LOOKUP_DEADLINE_MAX_MS` | no | Ceiling on a client-supplied `deadlineMillis`, default `30000`. Must be at least the default |
+| `EN_MAX_DEPTH` | no | Recursion depth bound for check, lookup, and expand, default `25`. Exceeding it answers `422 resolution_limit_exceeded`. Must be at least `1` |
+| `EN_PAGE_LIMIT` | no | Rows the engine reads from storage per batch, default `1000`. A batch size, not a ceiling — the engines drain to exhaustion, so this trades store round trips against peak memory and cannot change an answer. Must be at least `1` |
+| `EN_RESULT_CAP` | no | Maximum objects a `lookup` page or nodes an `expand` tree may return, default `1000`. Must be at least `1` |
 | `EN_POOL_SIZE` | no | Maximum pooled PostgreSQL connections, default `10`. Must be at least `1` |
 | `EN_POOL_ACQUISITION_TIMEOUT_MS` | no | How long a request waits for a free connection before failing, default `10000` |
 | `EN_POOL_IDLENESS_TIMEOUT_MS` | no | Close a connection unused for this long, default `600000` (10 minutes) |

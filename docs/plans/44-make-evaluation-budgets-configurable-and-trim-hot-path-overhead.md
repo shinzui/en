@@ -54,12 +54,12 @@ recompiling anything but the test.
   fixtures in `en-core/bench/Main.hs`; every bench asserts its answer before timing;
   baseline numbers recorded below. Found and fixed a row-skipping bug in the in-memory
   conformance store on the way.
-- [ ] M2: `En.Budget.EvaluationBudget` record; threaded through check/lookup/expand as
-  `…WithBudget` variants; constants deduplicated to the one module; defaults preserved;
-  budget-override test.
-- [ ] M3: consumer wiring — `en-servant` `Env` carries a budget; `en-server` constructs
-  it (env-var parsing deferred to docs/plans/38's config record if not landed);
-  `maxBatchSize` note.
+- [x] M2 (2026-07-09): `En.Budget.EvaluationBudget`; threaded through check/lookup/expand
+  as `…WithBudget` variants; nine constants collapsed to one record; defaults preserved;
+  all three fields pinned by override tests.
+- [x] M3 (2026-07-09): `en-servant` `Env` carries a budget; `en-server` reads
+  `EN_MAX_DEPTH` / `EN_PAGE_LIMIT` / `EN_RESULT_CAP` into `ServerConfig`; `maxBatchSize`
+  stays a transport bound on `Env`.
 - [ ] M4: hot-path fixes in `En.Check`/`En.Lookup`/`En.Expand`/`En.Decision`/
   `En.Caveat` — strict accumulation, Set-based visited, Set/Map dedupe, single
   top-level lookup merge.
@@ -218,6 +218,25 @@ All
 rows and recurses into 64 groups, where before it read 2,000 rows and recursed into none.
 That is not a regression; it is the first honest measurement of that path.
 
+**The strict `budget` field on `Env` is a compiler-maintained invariant — but the config
+plumbing next to it is not (M3, 2026-07-09).** Adding `budget :: !EvaluationBudget` to
+`En.Servant.Seam.Env` produced a hard `GHC-95909` error at every construction site
+(`en-server/app/Main.hs`, `en-example`, `en-servant/test`), because a record construction
+missing a strict field is an error rather than a warning. That is the "compiler will force
+it" property EP-43 found absent for `\case` and `ToSchema`, and it holds here for the
+reason EP-43 identified: it is a *constructor*, not a pattern match or a hand-written list.
+
+The plumbing beside it has no such property. `Config.parseBudget` looks its variables up
+in a `Map String String` that `loadServerConfig` builds by reading only the names listed in
+`knownVariables`. Omit a name there and the variable is silently ignored — `withDefault`
+supplies the default, no warning, no error, and the operator's `EN_PAGE_LIMIT=10` does
+nothing. There is no `en-server` test suite, and nothing checks `knownVariables` against
+the documented reference it claims to be exhaustive for. The wiring was therefore verified
+by hand in `cabal repl exe:en-server` rather than trusted: unset yields
+`EvaluationBudget 25 1000 1000` (identical to the deleted constants), the three overrides
+land, and `EN_MAX_DEPTH=0` / `EN_MAX_DEPTH=abc` are rejected at startup. A `knownVariables`
+exhaustiveness test is a real gap this plan did not close.
+
 
 ## Decision Log
 
@@ -323,6 +342,21 @@ That is not a regression; it is the first honest measurement of that path.
   produce a plausible number, which is worse than an error. This is the master plan's
   testing rule ("when a test's subject is X, assert the value X produced") extended to
   benchmarks, which are tests whose assertion was left out.
+  Date: 2026-07-09
+- Decision: M3 wires `EN_MAX_DEPTH`, `EN_PAGE_LIMIT`, and `EN_RESULT_CAP` into
+  `ServerConfig` rather than hardcoding `defaultEvaluationBudget` in `en-server`, against
+  this plan's own M3 text.
+  Rationale: that text ("do not build env-var validation here — that is 38's scope") was
+  written while docs/plans/38 was pending. 38 has since landed and is Complete, so the
+  deferral had no owner and the budget would have stayed a source constant forever —
+  failing this plan's stated purpose, "budget changes are configuration, not source
+  edits", for the one artifact operators actually deploy. The master plan's Integration
+  Points anticipated exactly this: engine configuration "must slot into the server
+  configuration record established by docs/plans/38 *if that has landed*." It has. The
+  cost was six lines against 38's existing `withDefault … positive` helper. Confirmed by
+  hand in `cabal repl exe:en-server`: unset yields `EvaluationBudget 25 1000 1000`,
+  identical to the deleted constants; `EN_MAX_DEPTH=0` and `EN_MAX_DEPTH=abc` are both
+  rejected before startup.
   Date: 2026-07-09
 - Decision: The `pageTuples` row-skipping fix lands in its own commit, ahead of the
   benchmarks that exposed it.

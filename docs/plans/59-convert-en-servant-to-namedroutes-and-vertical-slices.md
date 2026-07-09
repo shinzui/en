@@ -61,6 +61,32 @@ carried through unchanged; the only thing that happens to them is that they move
 dedicated module (`En.Servant.Response`) and are re-exported, so no byte of their logic
 changes.
 
+**`en` already derives its OpenAPI document, and this plan must not regress it.** The companion
+best-practices document, `haskell-jitsurei/api/openapi-from-types.md`, states the rule: the
+OpenAPI document is *derived from the route types by `toOpenApi`, never hand-written*.
+`en-servant/src/En/Servant/OpenApi.hs` already obeys it — `enOpenApi = toOpenApi apiProxy`
+derives the document from the very `Proxy` the server serves, and hand-written `ToSchema`
+instances (matching en's hand-written aeson) are confined there as orphans under
+`-Wno-orphans`. Two facts make this correct rather than decorative, and both must survive the
+refactor. First, `en`'s `cabal.project` **pins the `shinzui` forks — `openapi-hs` and
+`servant-openapi-hs` — not Hackage `openapi3`/`servant-openapi3`.** This is load-bearing: `en`
+uses `MultiVerb`, and Hackage `servant-openapi3` carries *no `HasOpenApi` instance for
+`MultiVerb`*, so on the Hackage packages every one of en's declared `400/422/503` error
+responses would be silently absent from the generated document. En is correctly on the forks;
+do not "simplify" the `cabal.project` back to Hackage. Second, because Milestone 1 converts the
+API to `NamedRoutes`, the `Proxy` that `enOpenApi` derives from changes shape, so the generated
+document **will** change; regenerating it and reviewing that each operation still carries its
+error responses is the visible proof the conversion preserved the contract.
+
+Beyond preserving the derivation, this plan brings en's OpenAPI setup up to the *full* canonical
+recipe, which today it only partly meets. En derives and serves the document at
+`GET /v1/openapi.json` and tests two of the three conformance properties (exact path set; every
+operation declares its error responses), but it has **no checked-in `docs/api/openapi.json`
+artifact, no generator executable, no CI drift check, no stable `operationId`s, and not the
+third conformance test** (every DTO's `ToJSON` validates against its own `ToSchema`). A new
+Milestone 5 adds exactly those, so en matches meibo — the fullest reference — rather than
+trailing it.
+
 
 ## Progress
 
@@ -81,6 +107,13 @@ changes.
 - [ ] Milestone 4: amend the document of record,
       `docs/plans/35-version-the-wire-contract-and-type-the-error-model.md`, whose code
       blocks specify the `:<|>` chain and positional server this plan replaces.
+- [ ] Milestone 5: bring en's OpenAPI derivation up to the full canonical recipe — add stable
+      `operationId`s to `enOpenApi`, add an `en-openapi` executable that writes a checked-in
+      `docs/api/openapi.json` (sorted keys, trailing newline), commit the artifact, add a drift
+      check (`cabal run en-openapi && git diff --exit-code`) to the justfile / CI, and add the
+      one conformance test en lacks (every DTO's `ToJSON` validates against its `ToSchema`). The
+      derivation itself is unchanged — it still comes from `toOpenApi apiProxy`, on the pinned
+      `shinzui` forks. `cabal build all` and `cabal test all` pass.
 
 
 ## Surprises & Discoveries
@@ -182,6 +215,25 @@ changes.
   Rationale: those instances are not part of any operation's runtime behavior and are already
   isolated; moving them into slices would spread orphan instances across four modules for no
   benefit and complicate the golden OpenAPI test.
+  Date: 2026-07-09
+
+- Decision: Keep en on the `shinzui` OpenAPI forks (`openapi-hs`, `servant-openapi-hs`) — do not
+  move to Hackage `openapi3`/`servant-openapi3` — and add the canonical recipe's remaining
+  artifact machinery in a dedicated Milestone 5 rather than folding it into the type-change
+  milestones.
+  Rationale: `en` uses `MultiVerb`, and Hackage `servant-openapi3` has no `HasOpenApi` instance
+  for it, so on Hackage every declared `400/422/503` would silently vanish from the generated
+  document. En's `cabal.project` already pins the forks (verified: `source-repository-package`
+  blocks for `github.com/shinzui/openapi-hs` and `github.com/shinzui/servant-openapi-hs`), and
+  that pin is load-bearing, not incidental. The recipe (`haskell-jitsurei/api/openapi-from-types.md`)
+  additionally requires a checked-in `docs/api/openapi.json` produced by an *executable* (so the
+  artifact is deterministic, not a test side effect), a CI `git diff --exit-code` drift check,
+  stable `operationId`s (so a generated client's method names do not churn), and three
+  conformance tests. En today derives and *serves* the document and tests two of the three
+  properties, but has no checked-in artifact, no executable, no drift check, no `operationId`
+  enrichment, and not the `validateToJSON` DTO test. Milestone 5 closes exactly that gap; it is
+  separated so the type-change diffs stay readable and because it is orthogonal to the route
+  restructure (it can land any time after Milestone 1 stabilizes the derivation).
   Date: 2026-07-09
 
 - Decision: Do the `NamedRoutes` type change first (Milestone 1), the behavioral guard second
@@ -602,6 +654,14 @@ generic servant representation). If, and only if, that instance is missing, repl
 `Servant.API.Generic (ToServantApi)`), which describes the identical flattened API; record the
 outcome in Surprises & Discoveries either way.
 
+Because the `NamedRoutes` conversion changes the `Proxy` `enOpenApi` derives from, the generated
+document changes shape. It must still describe the same six paths with the same
+`200/400/422/503` responses per operation — the `openApiDocumentTests` in
+`en-servant/test/Main.hs` already assert exactly that, so a green run of those tests is the proof
+the derivation survived. If they fail, the derivation regressed (most likely
+`HasOpenApi (NamedRoutes EnApi)` resolving differently than the old flattened API); fix before
+proceeding. Milestone 5 turns this served document into a checked-in artifact.
+
 **The test.** In `en-servant/test/Main.hs`, the four helpers `batchHandler`, `checkHandler`,
 `lookupHandler`, `expandHandler` currently destructure `server env` positionally. Rewrite each
 to a record field bind, and drop `import Servant (… type (:<|>) (..))`:
@@ -882,6 +942,161 @@ Per the ExecPlan revision protocol, do not rewrite plan 35's history. Instead:
 Acceptance: plan 35's route-type and server blocks contain no `:<|>` except the OpenAPI mount,
 and it carries a dated revision note naming plan 59.
 
+### Milestone 5 — Bring the OpenAPI derivation to the full canonical recipe
+
+Scope: `en-servant/src/En/Servant/OpenApi.hs` (add stable `operationId`s), a new
+`en-servant/app/OpenApi.hs` plus an `en-openapi` executable stanza in `en-servant/en-servant.cabal`,
+a checked-in `docs/api/openapi.json`, a drift check in the `justfile` (and en's CI when it
+gains a build workflow), and one new conformance test in `en-servant/test/Main.hs`. **No change
+to the derivation itself** — `enOpenApi` still comes from `toOpenApi apiProxy` on the pinned
+forks — and no route or handler change. This milestone depends only on Milestone 1 (which fixes
+the derived shape) and is otherwise independent of the slice work; land it any time after
+Milestone 1 is green. At the end, en's OpenAPI setup matches meibo's, the fullest reference
+(`meibo-project/meibo/meibo-api/{app/OpenApi.hs, src/Meibo/Api/OpenApi.hs, test/Meibo/Api/OpenApiSpec.hs}`).
+
+**First, verify the fork pin (a 30-second guard, not a change).** Confirm en is on the forks and
+not Hackage before trusting the document at all:
+
+```bash
+grep -nE "openapi-hs|servant-openapi-hs|openapi3|servant-openapi3" \
+  /Users/shinzui/Keikaku/bokuno/en/cabal.project en-servant/en-servant.cabal
+```
+
+Expected: `source-repository-package` blocks for `github.com/shinzui/openapi-hs` and
+`github.com/shinzui/servant-openapi-hs`, and `en-servant.cabal` depending on `openapi-hs` /
+`servant-openapi-hs` — and **no** `openapi3` / `servant-openapi3` anywhere. If Hackage packages
+appear, that is a real bug (every en error response is missing from the document); fix the pins
+first and record it in Surprises & Discoveries.
+
+**Add stable `operationId`s to `enOpenApi`.** A client generator turns `operationId` into a
+method name; absent one it invents a churny name from the path. `enOpenApi` today sets title,
+version, and description but assigns no `operationId`s. Add a deterministic assignment, mirroring
+meibo's `withOperationIds` (read `meibo-api/src/Meibo/Api/OpenApi.hs` for the exact lens
+spelling):
+
+```haskell
+enOpenApi :: OpenApi
+enOpenApi =
+    toOpenApi apiProxy
+        & info . title .~ "en authorization API"
+        & info . version .~ "v1"
+        & info . description ?~ "Relationship-based authorization: check, lookup, expand, and write."
+        & withOperationIds
+
+-- | Assign a stable operationId to every operation from its method and path, so a generated
+-- client's method names are deterministic and do not churn when the document is regenerated.
+withOperationIds :: OpenApi -> OpenApi
+withOperationIds = paths %~ imap setForPath
+  where
+    setForPath path =
+      (post . _Just . operationId %~ orSet ("create" <> key))
+        . (get . _Just . operationId %~ orSet ("get" <> key))
+      where key = camel path
+    orSet v = Just . maybe v id
+```
+
+(All six en operations are `POST`s, so only the `post` arm fires; keep a `get` arm too for
+parity with the other services. Import `imap` and the `paths`/`post`/`operationId` lenses from
+`Data.OpenApi`/the lens the module already uses, and a `camel` path-to-identifier helper —
+mirror meibo's imports exactly.) Optionally also set `servers .~ ["http://localhost:8080"]`, as
+meibo does; note the choice in the Decision Log if you add it.
+
+**Add the generator executable and check in the artifact.** En serves the document but never
+writes it to a file. Add an executable that emits `docs/api/openapi.json` deterministically —
+sorted keys and a trailing newline so a diff is a real contract change, not a hash-order
+reshuffle. Copy meibo's `app/OpenApi.hs` structure verbatim:
+
+```haskell
+-- en-servant/app/OpenApi.hs
+module Main (main) where
+
+import Data.Aeson.Encode.Pretty (Config (..), Indent (Spaces), defConfig, encodePretty')
+import Data.ByteString.Lazy qualified as BSL
+import En.Servant.OpenApi (enOpenApi)
+import System.Directory (createDirectoryIfMissing)
+
+main :: IO ()
+main = do
+  createDirectoryIfMissing True "docs/api"
+  BSL.writeFile "docs/api/openapi.json" (encodePretty' config enOpenApi <> "\n")
+  where
+    config = defConfig {confIndent = Spaces 2, confCompare = compare, confTrailingNewline = False}
+```
+
+```cabal
+executable en-openapi
+  main-is:        OpenApi.hs
+  hs-source-dirs: app
+  build-depends:  base, bytestring, aeson-pretty, directory, en-servant
+```
+
+`enOpenApi` is already exported from `En.Servant.OpenApi`, so the executable needs nothing new
+from the library. Generate and commit the artifact from the repo root:
+
+```bash
+cabal run en-openapi
+git add docs/api/openapi.json
+```
+
+Review the artifact: it must begin `{"openapi":"3.1.0"` (proof the forks are in play, not
+Hackage 3.0), list exactly the six paths (`/v1/relationships`, `/v1/relationships/delete`,
+`/v1/check`, `/v1/batch-check`, `/v1/lookup`, `/v1/expand`), and — the visible payoff — carry a
+`400`, `422`, and `503` response under each operation. A document that shows only `200`s means
+the derivation is going through Hackage `servant-openapi3`; stop and fix the pins.
+
+**Add the drift check.** En has a `justfile` but no general build CI (only `bench.yml`). Add a
+`justfile` recipe and make it a required step wherever en's CI runs `cabal build`:
+
+```make
+# Regenerate docs/api/openapi.json from the route types and fail if it drifted.
+openapi:
+    cabal run -v0 en-openapi
+    git diff --exit-code -- docs/api/openapi.json
+```
+
+A red `just openapi` means someone changed the API type and did not regenerate — exactly the
+drift the checked-in artifact exists to catch.
+
+**Add the one missing conformance test.** `en-servant/test/Main.hs`'s `openApiDocumentTests`
+already pins the first two recipe properties: the path set is exactly the served set, and every
+operation's responses are exactly `["200","400","422","503"]` (the error-response test, in its
+strong form). It does **not** yet test the third: that every DTO's `ToJSON` validates against
+its own hand-written `ToSchema`. En is precisely the case where this matters — its `ToJSON` and
+its `ToSchema` are both hand-written (in `En.Servant.API`/the slices and in
+`En.Servant.OpenApi`), so a field renamed on one side only is invisible until a generated
+client fails to decode. Add a test using `Data.OpenApi (validateToJSON)` over the golden sample
+values the test file already defines for its wire-encoding tests:
+
+```haskell
+toJsonMatchesToSchema :: IO ()
+toJsonMatchesToSchema = do
+  conforms "CheckRequestWire"    sampleCheckRequest
+  conforms "CheckResponseWire"   sampleCheckResponse
+  conforms "LookupRequestWire"   sampleLookupRequest
+  conforms "LookupPageWire"      sampleLookupPage
+  conforms "ExpandRequestWire"   sampleExpandRequest
+  conforms "ExpandTreeWire"      sampleExpandTree
+  conforms "WriteTuplesRequestWire"  sampleWriteRequest
+  conforms "WriteTuplesResponseWire" sampleWriteResponse
+  conforms "ErrorEnvelopeWire"   (ErrorEnvelopeWire "unknown_relation" "…" False)
+  -- …one line per wire DTO; reuse the golden fixtures already in this file.
+  where
+    conforms :: (ToJSON a, ToSchema a) => String -> a -> IO ()
+    conforms label value = case validateToJSON value of
+      [] -> pure ()
+      errs -> assertFailure (label <> " does not match its schema: " <> show errs)
+```
+
+Add `toJsonMatchesToSchema` to the list `openApiDocumentTests` runs (or call it from `main`
+alongside it). It needs `validateToJSON` from `Data.OpenApi` and the `ToSchema` instances, which
+the test can import from `En.Servant.OpenApi`; the sample values already exist for the golden
+tests.
+
+Acceptance: `cabal build all && cabal test all` passes, including the new
+`toJsonMatchesToSchema`. `docs/api/openapi.json` is checked in, begins `{"openapi":"3.1.0"`, and
+carries `400/422/503` under each of the six operations. `just openapi` is clean on a freshly
+regenerated tree. `grep operationId docs/api/openapi.json` shows a stable id on every operation.
+
 
 ## Concrete Steps
 
@@ -987,6 +1202,33 @@ ExecPlan: docs/plans/59-convert-en-servant-to-namedroutes-and-vertical-slices.md
 Intention: intention_01kx3mms73ewyrfy9f61e5c3n6
 ```
 
+Milestone 5 — add stable `operationId`s, the `en-openapi` executable and checked-in artifact,
+the `just openapi` drift check, and the `toJsonMatchesToSchema` conformance test:
+
+```bash
+grep -nE "openapi-hs|servant-openapi-hs|openapi3" cabal.project en-servant/en-servant.cabal  # confirm forks
+# edit En/Servant/OpenApi.hs (withOperationIds); add en-servant/app/OpenApi.hs + the executable stanza
+cabal run en-openapi                 # writes docs/api/openapi.json
+git add docs/api/openapi.json
+# extend en-servant/test/Main.hs with toJsonMatchesToSchema; add the `openapi` justfile recipe
+cabal build all && cabal test all
+just openapi                         # regenerate + git diff --exit-code; must be clean
+git add -A && git commit
+```
+
+```text
+feat(en-servant): checked-in OpenAPI artifact, stable operationIds, and ToJSON/ToSchema test
+
+Add an en-openapi executable that writes docs/api/openapi.json (sorted keys, trailing
+newline), check the artifact in, assign stable operationIds in enOpenApi, add a
+`just openapi` drift check, and add the third conformance test (every wire DTO's ToJSON
+validates against its hand-written ToSchema). The derivation is unchanged; en stays on
+the shinzui openapi-hs/servant-openapi-hs forks.
+
+ExecPlan: docs/plans/59-convert-en-servant-to-namedroutes-and-vertical-slices.md
+Intention: intention_01kx3mms73ewyrfy9f61e5c3n6
+```
+
 
 ## Validation and Acceptance
 
@@ -1058,6 +1300,22 @@ Expected: `['/v1/batch-check', '/v1/check', '/v1/expand', '/v1/lookup', '/v1/rel
 This is the same set the `openApiDocumentTests` in `en-servant/test/Main.hs` already asserts;
 the curl is the runtime confirmation.
 
+The checked-in artifact (Milestone 5) matches the served document, is on the 3.1 forks, carries
+the error responses and stable operation ids, and regenerating is a no-op:
+
+```bash
+cabal run en-openapi
+just openapi                                     # regenerate + git diff --exit-code: clean
+python3 -c 'import json; d=json.load(open("docs/api/openapi.json")); \
+  print(d["openapi"]); print(sorted(d["paths"])); \
+  print({p+" "+m: sorted(o["responses"]) for p in d["paths"] for m,o in d["paths"][p].items() if m in ("get","post")})'
+```
+
+Expected: `3.1.0`; the six paths; and each operation listing `["200","400","422","503"]` — a
+document showing only `["200"]` would mean the Hackage packages had slipped back in and the
+`MultiVerb` errors were dropped. `cabal test all` additionally proves `toJsonMatchesToSchema`:
+every wire DTO's `ToJSON` validates against its hand-written `ToSchema`.
+
 Structural acceptance — the thing the slice half of this plan is *for*:
 
 ```bash
@@ -1116,8 +1374,15 @@ equivalent for document generation; note which path was taken in Surprises & Dis
 No new *library* dependencies for the `en-servant` library or `en-client`. `servant` already
 supplies `NamedRoutes`; `Servant.API.Generic` supplies `:-` and `ToServantApi`;
 `Servant.Server.Generic` supplies `AsServerT`; `Servant.Client.Generic` supplies `AsClientT`
-and `genericClient`. Milestone 2 adds `wai` and `wai-extra` to the `en-servant-tests`
-`build-depends` only.
+and `genericClient`. The OpenAPI toolchain is already pinned: `en`'s `cabal.project` carries
+`source-repository-package` blocks for the `shinzui` forks `openapi-hs` and
+`servant-openapi-hs` (the latter's `HasOpenApi (MultiVerb …)` instance is what puts en's error
+responses in the document), and `en-servant` depends on both — this plan does not change that
+pin and must not. Milestone 2 adds `wai` and `wai-extra` to the `en-servant-tests`
+`build-depends` only. Milestone 5 adds an `en-openapi` executable stanza whose `build-depends`
+include `aeson-pretty` and `directory` (for the pretty-printer and `createDirectoryIfMissing`);
+the `en-servant` library and `en-client` gain nothing. Milestone 5 also produces, and checks in,
+`docs/api/openapi.json`.
 
 At the end of Milestone 1 these must exist:
 
@@ -1182,3 +1447,26 @@ apiProxy, server, app, envelopeFormatters
 `enErrorToFault`, `faultToServerError`, `runEngineEither`, `badRequest`, `invalidRequest`,
 `batchTooLarge`, `notFound`) and `En.Servant.Authorize` (`requirePermission`) are unchanged
 throughout, because `en-server`, `en-example`, `nagare`, and `kikan-en` import them directly.
+
+
+## Revision Notes
+
+- 2026-07-09 — Aligned this plan with the canonical OpenAPI recipe
+  (`haskell-jitsurei/api/openapi-from-types.md`), the companion to the servant-routes document
+  en's `MultiVerb` design already followed. En already *derives* its document
+  (`En.Servant.OpenApi.enOpenApi = toOpenApi apiProxy`, served at `/v1/openapi.json`) on the
+  correctly-pinned `shinzui` forks (`openapi-hs`, `servant-openapi-hs`) — verified against
+  `cabal.project` — so nothing about generation, and no fork change, is introduced. Two things
+  were added. (1) A statement, across Purpose, the Milestone-1 OpenAPI-mount step, and Interfaces
+  & Dependencies, that the derivation must not regress: the `NamedRoutes` conversion changes the
+  `Proxy` `enOpenApi` derives from, so the document changes shape, and the existing
+  `openApiDocumentTests` (path set + per-operation `200/400/422/503`) are the proof it still
+  describes the same contract. (2) A new Milestone 5 closing the recipe gaps en had not yet met:
+  stable `operationId`s in `enOpenApi`, an `en-openapi` executable writing a checked-in
+  `docs/api/openapi.json` (sorted keys, trailing newline), a `just openapi` drift check
+  (`git diff --exit-code`), and the third conformance test (`validateToJSON` proving each wire
+  DTO's hand-written `ToJSON` agrees with its hand-written `ToSchema`). Reflected across Purpose,
+  Progress, Decision Log, Milestone 1, the new Milestone 5, Concrete Steps, Validation, and
+  Interfaces & Dependencies. Reason: en was the `MultiVerb` reference but only partly met the
+  document-artifact half of the recipe; this brings it level with meibo without touching the
+  derivation that other services copy.

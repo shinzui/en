@@ -17,6 +17,7 @@ import Effectful (IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Servant (Handler, ServerError (..), runHandler, type (:<|>) (..))
 
+import En.Budget (defaultEvaluationBudget)
 import En.Cache (Cache, CacheConfig (..), CacheStats (..), SubproblemKey, cacheStats, newCache)
 import En.Check (CheckCacheEnv (..), CheckDecision, check, checkCached)
 import En.Conformance.Kikan (
@@ -89,6 +90,7 @@ main = do
                 , graph = kikanGraph
                 , checkOperation = check
                 , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
+                , budget = defaultEvaluationBudget
                 , maxBatchSize = 10
                 , deadlineDefaultMillis = 3000
                 , deadlineMaxMillis = 30000

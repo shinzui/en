@@ -34,6 +34,7 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
+import En.Budget (EvaluationBudget (..))
 import Hasql.Decoders qualified as Decoders
 import Hasql.Encoders qualified as Encoders
 import Hasql.Session (Session)
@@ -71,6 +72,11 @@ data ServerConfig = ServerConfig
     , maxBatchSize :: !Int
     , deadlineDefaultMillis :: !Int
     , deadlineMaxMillis :: !Int
+    , budget :: !EvaluationBudget
+    {- ^ Static evaluation bounds for check, lookup, and expand. Distinct from the
+    deadline above, which is a clock rather than a bound: raising the depth budget
+    buys a slow lookup no more time.
+    -}
     , pool :: !PoolConfig
     , auth :: !AuthConfig
     , rateLimit :: !RateLimitConfig
@@ -94,7 +100,9 @@ knownVariables =
     , "EN_MAINTENANCE_BATCH_SIZE"
     , "EN_MAINTENANCE_INTERVAL_SECONDS"
     , "EN_MAX_BATCH_SIZE"
+    , "EN_MAX_DEPTH"
     , "EN_OPTIMIZED_REVISION_CACHE_TTL_MS"
+    , "EN_PAGE_LIMIT"
     , "EN_POOL_ACQUISITION_TIMEOUT_MS"
     , "EN_POOL_IDLENESS_TIMEOUT_MS"
     , "EN_POOL_MAX_LIFETIME_MS"
@@ -102,6 +110,7 @@ knownVariables =
     , "EN_PORT"
     , "EN_RATE_LIMIT_BURST"
     , "EN_RATE_LIMIT_RPS"
+    , "EN_RESULT_CAP"
     , "EN_SCHEMA_PATH"
     , "EN_TLS_CERT_FILE"
     , "EN_TLS_KEY_FILE"
@@ -129,6 +138,7 @@ parseServerConfig environment = do
     deadlineDefaultMillis <- withDefault "EN_LOOKUP_DEADLINE_DEFAULT_MS" 3000 positive
     deadlineMaxMillis <- withDefault "EN_LOOKUP_DEADLINE_MAX_MS" 30000 positive
     checkDeadlineOrdering deadlineDefaultMillis deadlineMaxMillis
+    budget <- parseBudget environment
     pool <- parsePool environment
     tls <- parseTls environment
     rateLimit <- parseRateLimit environment
@@ -146,6 +156,7 @@ parseServerConfig environment = do
             , maxBatchSize
             , deadlineDefaultMillis
             , deadlineMaxMillis
+            , budget
             , pool
             , auth
             , rateLimit
@@ -184,6 +195,23 @@ checkDeadlineOrdering defaultMillis maxMillis
                 <> ": it is below EN_LOOKUP_DEADLINE_DEFAULT_MS="
                 <> Text.pack (show defaultMillis)
                 <> ". Every lookup would be clamped below its own default."
+
+{- | The engine's static evaluation bounds.
+
+All three are @positive@: a zero depth budget answers nothing, a zero read batch
+never advances a cursor, and a zero result cap returns an empty page while
+claiming truncation. Defaults match 'En.Budget.defaultEvaluationBudget', so an
+unset environment behaves exactly as en did when these were source constants.
+-}
+parseBudget :: Map String String -> Either Text EvaluationBudget
+parseBudget environment = do
+    maxDepth <- withDefault "EN_MAX_DEPTH" 25 positive
+    pageLimit <- withDefault "EN_PAGE_LIMIT" 1000 positive
+    resultCap <- withDefault "EN_RESULT_CAP" 1000 positive
+    pure EvaluationBudget{maxDepth, pageLimit, resultCap}
+  where
+    withDefault :: forall a. String -> a -> Parser a -> Either Text a
+    withDefault = withDefaultIn environment
 
 parsePool :: Map String String -> Either Text PoolConfig
 parsePool environment = do

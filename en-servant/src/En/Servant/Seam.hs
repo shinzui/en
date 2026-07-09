@@ -32,6 +32,7 @@ import Effectful.Error.Static (Error)
 import Servant (Handler, ServerError (..), err400, err403, err404, err422, err503, throwError)
 import System.IO (stderr)
 
+import En.Budget (EvaluationBudget)
 import En.Check (CheckDecision)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
@@ -50,6 +51,13 @@ data Env es = Env
     , graph :: !ReachabilityGraph
     , checkOperation :: !(ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckDecision)
     , lookupWithDeadlineOperation :: !(Lookup.Deadline (Eff es) -> ReachabilityGraph -> Consistency -> Lookup.LookupRequest -> Eff es Lookup.LookupPage)
+    , budget :: !EvaluationBudget
+    {- ^ Static evaluation bounds. The operations above are already partially
+    applied to this budget by whoever built the 'Env'; the field is carried so a
+    host can report the bounds it runs under. It is engine configuration, never a
+    per-request wire field: a client able to raise @maxDepth@ remotely holds an
+    amplification lever.
+    -}
     , maxBatchSize :: !Int
     , deadlineDefaultMillis :: !Int
     -- ^ Lookup budget when the client omits @deadlineMillis@.

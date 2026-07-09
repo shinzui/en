@@ -45,6 +45,7 @@ import Servant (
     type (:>),
  )
 
+import En.Budget (defaultEvaluationBudget)
 import En.Check (CheckDecision (..), check)
 import En.Conformance.Kikan qualified as Kikan
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
@@ -114,6 +115,7 @@ mkEnv cStore tStore =
         , graph = either (error . show) id (compileSchema exampleSchema)
         , checkOperation = check
         , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
+        , budget = defaultEvaluationBudget
         , maxBatchSize = 400
         , deadlineDefaultMillis = 3000
         , deadlineMaxMillis = 30000
