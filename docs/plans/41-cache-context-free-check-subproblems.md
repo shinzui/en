@@ -66,9 +66,11 @@ context still gets `Conditional` from that same cached entry.
   never-stale assertions were observed failing against a cache that stores the
   context-applied answer — the one bug this milestone could plausibly have introduced.
   `laterRequestContext` added to `En.Conformance.Kikan`.
-- [ ] M4: cached tuple-page interposer handles `ProbeTuples` (integration point owned
-  here per the master plan): `TupleReadKey` gains a probe variant; probe results cached
-  by revision.
+- [x] M4 (2026-07-08): `TupleReadKey` gains `ProbeReadKey !Revision !ObjectRef
+  !RelationName ![Subject]`; `cachedTupleStore` caches `ProbeTuples` as an `Exhausted`
+  `TuplePage`. Repeat probes hit; other revisions and other subject lists miss; a disabled
+  cache is transparent. Verified by dropping the subject list from the key, which serves
+  one subject's rows to another.
 - [ ] M5: stats and staleness proofs — hits across contexts asserted via `cacheStats`;
   never-stale property tests; existing "context separates cache" test inverted
   deliberately with a Decision Log entry.
@@ -223,6 +225,23 @@ actual:   Right Allowed)
 An expired time-bounded grant, served as `Allowed` to a later request. Asserting the *hit*
 is not enough; a cross-context cache test must also assert that the answer still tracks the
 context, or it certifies the very bug it was written to prevent.
+
+**M4's probe key needs its subject list, and the test proves it (2026-07-08).** The probe
+asks "which of *these subjects* are named directly by `object#relation`?", so the subject
+list is part of the question, not an incidental parameter. Dropping `subjects` from
+`ProbeReadKey`'s `Ord` instance — an easy thing to do while writing a hand-rolled
+comparison, and one the type checker cannot catch — makes a probe for `bob` hit the entry
+inserted for `alice` and return `alice`'s ownership row:
+
+```text
+expected: Right ([<alice's owner row>], [<alice's owner row>], [<alice's owner row>], [])
+actual:   Right ([<alice's owner row>], [<alice's owner row>], [<alice's owner row>],
+                 [<alice's owner row>])
+```
+
+That is a privilege escalation through a read cache. Asserting only the read *count* would
+have missed it entirely (the count would have dropped to 2 and looked like a better cache).
+The test asserts the returned rows for every probe, which is why it catches it.
 
 
 ## Decision Log

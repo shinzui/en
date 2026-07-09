@@ -7,14 +7,21 @@ import Effectful (Eff, IOE, liftIO, (:>))
 import Effectful.Dispatch.Dynamic (interpose, passthrough, send)
 
 import En.Cache (Cache, TupleReadKey (..), insertCache, lookupCache)
-import En.Effect.TupleStore (TuplePage, TupleStore (..))
+import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleStore (..))
 
 {- | Cache tuple-store read pages by resolved revision and read parameters.
 
-The interposer is intentionally narrow: it caches only 'ReadObjectRelation' and
-'ReadStartingWithUser'. Writes, revision reads, and maintenance operations are
-forwarded to the upstream 'TupleStore' handler unchanged. Entries are safe to
-reuse because every key includes the resolved revision supplied by the engine.
+The interposer is intentionally narrow: it caches only the three read shapes --
+'ReadObjectRelation', 'ReadStartingWithUser', and 'ProbeTuples'. Writes, revision
+reads, and maintenance operations are forwarded to the upstream 'TupleStore'
+handler unchanged. Entries are safe to reuse because every key includes the
+resolved revision supplied by the engine, so an entry can never serve rows from a
+different snapshot.
+
+A probe returns a bare row list rather than a page, because it is unpaginated by
+construction: it asks for the rows naming specific subjects, and there are as many
+as there are. Storing it as an 'Exhausted' 'TuplePage' is therefore truthful, and
+it lets probes share the one cache and its bound rather than introducing a second.
 -}
 cachedTupleStore ::
     (TupleStore :> es, IOE :> es) =>
@@ -33,11 +40,18 @@ cachedTupleStore cache =
                 cache
                 (StartingWithUserReadKey revision query)
                 (send (ReadStartingWithUser revision query))
-        -- 'ProbeTuples' falls through here on purpose, not by oversight: whether a
-        -- probe result is cached as a single-tuple entry or reused from a cached
-        -- page is decided by docs/plans/41-cache-context-free-check-subproblems.md.
+        ProbeTuples revision object relation subjects ->
+            (.rows)
+                <$> cachedRead
+                    cache
+                    (ProbeReadKey revision object relation subjects)
+                    (probePage revision object relation subjects)
         operation ->
             passthrough env operation
+  where
+    probePage revision object relation subjects = do
+        rows <- send (ProbeTuples revision object relation subjects)
+        pure TuplePage{rows, state = Exhausted}
 
 cachedRead ::
     (IOE :> es) =>

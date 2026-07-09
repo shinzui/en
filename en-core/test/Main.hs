@@ -854,6 +854,48 @@ testCachedTupleStore = do
     assertEqual "disabled tuple read cache preserves results" (Right True) disabledResult
     assertEqual "disabled tuple read cache does not suppress reads" 2 =<< readIORef disabledReadCount
 
+    {- Probes are cached like the other two read shapes, keyed by resolved revision
+    plus the question asked. A repeat of the same probe is served from the entry; a
+    probe at another revision, or for other subjects, is a different question and
+    must reach the store. -}
+    probeReadCount <- newIORef 0
+    probeCache <- newCache CacheConfig{enabled = True, maxEntries = 10}
+    probeResult <-
+        runEff
+            ( runErrorNoCallStack
+                ( interpretFixtureTupleStore (Just probeReadCount) Nothing fixtureTuples
+                    . cachedTupleStore probeCache
+                    $ do
+                        firstProbe <- probeTuples (Revision "r1") space (RelationName "owner") [SubjectId user]
+                        secondProbe <- probeTuples (Revision "r1") space (RelationName "owner") [SubjectId user]
+                        otherRevisionProbe <- probeTuples (Revision "r2") space (RelationName "owner") [SubjectId user]
+                        otherSubjectsProbe <- probeTuples (Revision "r1") space (RelationName "owner") [SubjectId bob]
+                        pure (firstProbe, secondProbe, otherRevisionProbe, otherSubjectsProbe)
+                )
+            )
+    let ownerRow = [tupleRow 1 Tuple{object = space, relation = RelationName "owner", subject = SubjectId user, caveat = Nothing}]
+    assertEqual
+        "cached probe returns the same rows on a hit, and answers other questions correctly"
+        (Right (ownerRow, ownerRow, ownerRow, []))
+        probeResult
+    assertEqual "cached probe reads underlying store only on misses" 3 =<< readIORef probeReadCount
+
+    disabledProbeReadCount <- newIORef 0
+    disabledProbeCache <- newCache CacheConfig{enabled = False, maxEntries = 10}
+    disabledProbeResult <-
+        runEff
+            ( runErrorNoCallStack
+                ( interpretFixtureTupleStore (Just disabledProbeReadCount) Nothing fixtureTuples
+                    . cachedTupleStore disabledProbeCache
+                    $ do
+                        firstProbe <- probeTuples (Revision "r1") space (RelationName "owner") [SubjectId user]
+                        secondProbe <- probeTuples (Revision "r1") space (RelationName "owner") [SubjectId user]
+                        pure (firstProbe == secondProbe, firstProbe)
+                )
+            )
+    assertEqual "disabled probe cache preserves results" (Right (True, ownerRow)) disabledProbeResult
+    assertEqual "disabled probe cache does not suppress reads" 2 =<< readIORef disabledProbeReadCount
+
 sampleObjectPage :: Int -> Maybe StoreCursor -> TuplePage
 sampleObjectPage limit cursor =
     pageTuples limit cursor [tuple | tuple <- fixtureTuples, tuple.object == space, tuple.relation == RelationName "view"]

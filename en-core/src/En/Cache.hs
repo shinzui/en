@@ -53,9 +53,18 @@ data CacheEntry value = CacheEntry
     , value :: value
     }
 
+{- | Identifies one tuple-store read. Every variant pins the resolved revision the
+engine asked for, which is what makes an entry safe to reuse: it can never serve
+rows from a different snapshot.
+
+'ProbeReadKey' is the point-membership probe -- "which of these subjects are named
+directly by @object#relation@?" -- and its subject list is part of the key,
+because a probe for a different set of subjects is a different question.
+-}
 data TupleReadKey
     = ObjectRelationReadKey !Revision !ObjectRef !RelationName !Int !(Maybe StoreCursor)
     | StartingWithUserReadKey !Revision !UsersetQuery
+    | ProbeReadKey !Revision !ObjectRef !RelationName ![Subject]
     deriving stock (Eq, Show)
 
 instance Ord TupleReadKey where
@@ -69,8 +78,14 @@ instance Ord TupleReadKey where
                 compare
                     (revisionEncoding leftRevision, usersetQueryKey leftQuery)
                     (revisionEncoding rightRevision, usersetQueryKey rightQuery)
+            (ProbeReadKey leftRevision leftObject leftRelation leftSubjects, ProbeReadKey rightRevision rightObject rightRelation rightSubjects) ->
+                compare
+                    (revisionEncoding leftRevision, leftObject, leftRelation, leftSubjects)
+                    (revisionEncoding rightRevision, rightObject, rightRelation, rightSubjects)
             (ObjectRelationReadKey{}, StartingWithUserReadKey{}) -> LT
             (StartingWithUserReadKey{}, ObjectRelationReadKey{}) -> GT
+            (ProbeReadKey{}, _) -> GT
+            (_, ProbeReadKey{}) -> LT
 
 data DecisionKey = DecisionKey
     { datastoreId :: !DatastoreId
