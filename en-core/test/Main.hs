@@ -404,6 +404,9 @@ main = do
     assertLookupObjects "deadline cursor resumes remaining lookup results" (drop 500 expectedFolders) resumedFolders
     crowdedExpansion <- expandEngine consistencyStore (runTupleStoreInMemory expandTuples) streamingGraph MinimizeLatency (expandRequest crowdedFolder (RelationName "viewer") requestContext (ExpandLimit 1500) Nothing)
     assertEqual "expand drains multi-page object rows before applying result cap" (Right (1000, ExpandTruncated (ExpandCursor "1000"))) (fmap (\tree -> (length tree.children, tree.state)) crowdedExpansion)
+    let wideStore = runTupleStoreInMemory wideTuples
+    assertEqual "wide relation: direct member checks Allowed" (Right Allowed) =<< check consistencyStore wideStore streamingGraph MinimizeLatency requestContext (SubjectId wideMember) (RelationName "viewer") wideFolder
+    assertEqual "wide relation: non-member checks Denied" (Right Denied) =<< check consistencyStore wideStore streamingGraph MinimizeLatency requestContext (SubjectId bob) (RelationName "viewer") wideFolder
     assertEqual "recursive graph respects depth limit" (Left ResolutionLimitExceeded) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
     assertEqual "lookup returns direct and recursive view spaces" (Right (lookupPage [allowed childSpace, allowed space] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup follows userset subjects" (Right (lookupPage [allowed guestSpace, allowed sharedItem, allowed usersetMemberSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId agencyUser) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
@@ -1456,6 +1459,46 @@ paginator =
         { objectType = ObjectType "user"
         , objectId = "paginator"
         }
+
+{- | One folder whose @viewer@ relation is wider than a single store page
+(@pageLimit@ is 1000 in "En.Check"), used to prove that a check on a wide
+relation answers instead of erroring. @wideMember@ sits past the first page,
+so reading only page one cannot find it.
+-}
+wideFolder :: ObjectRef
+wideFolder =
+    ObjectRef
+        { objectType = ObjectType "folder"
+        , objectId = "wide"
+        }
+
+wideMember :: ObjectRef
+wideMember =
+    ObjectRef
+        { objectType = ObjectType "user"
+        , objectId = "wide-member"
+        }
+
+wideTuples :: [Tuple]
+wideTuples =
+    [ Tuple
+        { object = wideFolder
+        , relation = RelationName "viewer"
+        , subject = SubjectId member
+        , caveat = Nothing
+        }
+    | member <- wideMembers
+    ]
+
+wideMembers :: [ObjectRef]
+wideMembers =
+    fmap filler [1 .. 1199] <> [wideMember] <> fmap filler [1200 .. 1500]
+  where
+    filler index =
+        ObjectRef
+            { objectType = ObjectType "user"
+            , objectId = "wide-filler-" <> showText (index :: Int)
+            }
 
 expandTuples :: [Tuple]
 expandTuples =
