@@ -20,7 +20,7 @@ import En.Caveat (evaluateCaveat)
 import En.Decision (CaveatObligation (..), CheckDecision (..))
 import En.Decision qualified as Decision
 import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
-import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore, readObjectRelation)
+import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, probeTuples, readObjectRelation)
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
 import En.Revision (Consistency, DatastoreId, Revision (..))
@@ -348,29 +348,54 @@ evalThisMemo ::
     EvalState ->
     CheckMemo ->
     Eff es (Either EnError CheckDecision, CheckMemo)
+
+{- | Evaluate the directly-stored tuples of @object#relation@.
+
+Probe first: ask the store for just the rows granting @relation@ to @subject@ or
+to @subject@'s type wildcard. An uncaveated hit proves access, and 'Decision.union'
+returns 'Allowed' whenever any branch is 'Allowed', so nothing further can change
+the answer -- return immediately without reading the relation at all. This is what
+makes a check on a relation of any width cost one bounded store read.
+
+If the probe cannot settle it, enumerate the relation to find nested groups. Only
+subject-set rows are worth recursing into: the probe has already answered exactly
+for concrete and wildcard subjects, so every other row contributes 'Denied', which
+is the identity of union. Rows the probe already matched are skipped here so they
+are not counted twice.
+
+Enumeration drains pages rather than demanding the relation fit in one. A relation
+wider than a page is a large group, not a resolution failure.
+-}
 evalThisMemo cacheOps graph context revision subject object relation state memo
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded, memo)
     | otherwise = do
-        page <- readObjectRelation revision object relation pageLimit Nothing
-        case ensureExhausted page of
-            Left err -> pure (Left err, memo)
-            Right rows -> do
-                (decisions, memo') <- foldM rowDecision ([], memo) rows
-                pure (Decision.union <$> sequence decisions, memo')
+        probedRows <- probeTuples revision object relation candidates
+        let probeDecisions =
+                [applyTupleCaveat graph context tuple.caveat Allowed | TupleRow{tuple} <- probedRows]
+        if Right Allowed `elem` probeDecisions
+            then pure (Right Allowed, memo)
+            else do
+                rows <- drainObjectRelation revision object relation
+                (recursedDecisions, memo') <- foldM rowDecision ([], memo) (filter recursable rows)
+                pure (Decision.union <$> sequence (probeDecisions <> recursedDecisions), memo')
   where
-    rowDecision (decisions, memo') TupleRow{tuple}
-        | tuple.subject == subject || wildcardMatches tuple.subject subject =
-            pure (decisions <> [applyTupleCaveat graph context tuple.caveat Allowed], memo')
-        | otherwise =
-            case tuple.subject of
-                SubjectId _ ->
-                    pure (decisions <> [Right Denied], memo')
-                SubjectSet subjectObject subjectRelation -> do
-                    (decision, memo'') <- evalRelationMemo cacheOps graph context revision subject subjectObject subjectRelation state memo'
-                    pure (decisions <> [decision >>= applyTupleCaveat graph context tuple.caveat], memo'')
-                SubjectWildcard _ ->
-                    pure (decisions <> [Right Denied], memo')
+    candidates = subjectsWithWildcard subject
+
+    -- The probe answered for these; recursing would double-count them.
+    recursable TupleRow{tuple} =
+        case tuple.subject of
+            SubjectSet _ _ -> tuple.subject `notElem` candidates
+            SubjectId _ -> False
+            SubjectWildcard _ -> False
+
+    rowDecision (decisions, memo') TupleRow{tuple} =
+        case tuple.subject of
+            SubjectSet subjectObject subjectRelation -> do
+                (decision, memo'') <- evalRelationMemo cacheOps graph context revision subject subjectObject subjectRelation state memo'
+                pure (decisions <> [decision >>= applyTupleCaveat graph context tuple.caveat], memo'')
+            _ ->
+                pure (decisions, memo')
 
 evalTupleToUsersetMemo ::
     (TupleStore :> es) =>
@@ -386,12 +411,9 @@ evalTupleToUsersetMemo ::
     CheckMemo ->
     Eff es (Either EnError CheckDecision, CheckMemo)
 evalTupleToUsersetMemo cacheOps graph context revision subject object tuplesetRelation computedRelation state memo = do
-    page <- readObjectRelation revision object tuplesetRelation pageLimit Nothing
-    case ensureExhausted page of
-        Left err -> pure (Left err, memo)
-        Right rows -> do
-            (decisions, memo') <- foldM rowDecision ([], memo) rows
-            pure (Decision.union <$> sequence decisions, memo')
+    rows <- drainObjectRelation revision object tuplesetRelation
+    (decisions, memo') <- foldM rowDecision ([], memo) rows
+    pure (Decision.union <$> sequence decisions, memo')
   where
     rowDecision (decisions, memo') TupleRow{tuple} =
         case tuple.subject of
@@ -407,19 +429,40 @@ evalTupleToUsersetMemo cacheOps graph context revision subject object tuplesetRe
     applyRowGate tuple =
         (>>= applyTupleCaveat graph context tuple.caveat)
 
-wildcardMatches :: Subject -> Subject -> Bool
-wildcardMatches tupleSubject checkedSubject =
-    case (tupleSubject, checkedSubject) of
-        (SubjectWildcard wildcardType, SubjectId ObjectRef{objectType}) ->
-            wildcardType == objectType
-        _ -> False
+{- | The subjects a stored row may name to grant @subject@ directly: the subject
+itself, and -- for a concrete subject -- the wildcard over its object type,
+which means "every object of this type". Mirrors 'En.Lookup.subjectsWithWildcard'.
+-}
+subjectsWithWildcard :: Subject -> [Subject]
+subjectsWithWildcard subject =
+    subject
+        : case subject of
+            SubjectId object -> [SubjectWildcard object.objectType]
+            SubjectSet _ _ -> []
+            SubjectWildcard _ -> []
 
-ensureExhausted :: TuplePage -> Either EnError [TupleRow]
-ensureExhausted TuplePage{rows, state} =
-    case state of
-        Exhausted -> Right rows
-        HasMore (_ :: StoreCursor) -> Left ResolutionLimitExceeded
-        Truncated (_ :: StoreCursor) -> Left ResolutionLimitExceeded
+{- | Read every row of @object#relation@, following page cursors to the end.
+
+'pageLimit' is a batch size here, not a ceiling: a relation with more rows than
+one page is a large group, and asking whether someone belongs to it is a
+question with an answer. Mirrors the drain loops in "En.Lookup" and "En.Expand".
+-}
+drainObjectRelation ::
+    (TupleStore :> es) =>
+    Revision ->
+    ObjectRef ->
+    RelationName ->
+    Eff es [TupleRow]
+drainObjectRelation revision object relation =
+    drain Nothing []
+  where
+    drain cursor acc = do
+        page <- readObjectRelation revision object relation pageLimit cursor
+        let acc' = acc <> page.rows
+        case page.state of
+            Exhausted -> pure acc'
+            HasMore next -> drain (Just next) acc'
+            Truncated next -> drain (Just next) acc'
 
 applyRewriteCaveat :: ReachabilityGraph -> CaveatContext -> CaveatName -> CheckDecision -> Either EnError CheckDecision
 applyRewriteCaveat graph context caveat decision = do
