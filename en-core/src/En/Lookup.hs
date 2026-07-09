@@ -28,6 +28,7 @@ import Prelude hiding (lookup)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes)
+import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -411,7 +412,7 @@ data EmitWindow = EmitWindow
 
 data EvalState = EvalState
     { depth :: !Int
-    , visited :: ![Subproblem]
+    , visited :: !(Set Subproblem)
     , skipRecursive :: !(Maybe RecursiveStep)
     , budget :: !EvaluationBudget
     }
@@ -421,7 +422,7 @@ data Subproblem = Subproblem
     , objectType :: !ObjectType
     , relation :: !RelationName
     }
-    deriving stock (Eq, Show)
+    deriving stock (Eq, Ord, Show)
 
 data RecursiveStep = RecursiveStep
     { tuplesetRelation :: !RelationName
@@ -431,7 +432,7 @@ data RecursiveStep = RecursiveStep
 
 initialState :: EvaluationBudget -> EvalState
 initialState budget =
-    EvalState{depth = 0, visited = [], skipRecursive = Nothing, budget}
+    EvalState{depth = 0, visited = Set.empty, skipRecursive = Nothing, budget}
 
 evalRelation ::
     (TupleStore :> es, Error Interrupt :> es) =>
@@ -449,7 +450,7 @@ evalRelation ::
 evalRelation window candidateCheck deadline graph context revision subject objectType relation state
     | state.depth >= state.budget.maxDepth =
         pure (Left ResolutionLimitExceeded)
-    | subproblem `elem` state.visited && state.skipRecursive == Nothing =
+    | Set.member subproblem state.visited && state.skipRecursive == Nothing =
         pure (Right [])
     | otherwise =
         case Map.lookup ref graph.relations of
@@ -467,7 +468,7 @@ evalRelation window candidateCheck deadline graph context revision subject objec
                     objectType
                     relation
                     schemaRelation.rewrite
-                    state{depth = state.depth + 1, visited = subproblem : state.visited}
+                    state{depth = state.depth + 1, visited = Set.insert subproblem state.visited}
   where
     ref = RelationRef{objectType, relation}
     subproblem = Subproblem{subject, objectType, relation}

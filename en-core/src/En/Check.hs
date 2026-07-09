@@ -21,6 +21,8 @@ module En.Check (
 import Control.Monad (foldM)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isNothing)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Effectful (Eff, IOE, liftIO, (:>))
 import Effectful.Error.Static (Error, throwError)
@@ -301,7 +303,7 @@ dedupePairs =
 
 data EvalState = EvalState
     { depth :: !Int
-    , visited :: ![Subproblem]
+    , visited :: !(Set Subproblem)
     , budget :: !EvaluationBudget
     }
 
@@ -340,7 +342,7 @@ instance Monoid CutTaint where
 
 initialState :: EvaluationBudget -> EvalState
 initialState budget =
-    EvalState{depth = 0, visited = [], budget}
+    EvalState{depth = 0, visited = Set.empty, budget}
 
 runCheckMemo ::
     (TupleStore :> es) =>
@@ -445,7 +447,7 @@ evalRelationMemo ::
 evalRelationMemo cacheOps graph revision subject object relation state memo
     | state.depth >= state.budget.maxDepth =
         pure (Left ResolutionLimitExceeded, memo, Untainted)
-    | subproblem `elem` state.visited =
+    | Set.member subproblem state.visited =
         pure (Right RDenied, memo, Tainted)
     | otherwise =
         case Map.lookup key memo of
@@ -470,7 +472,7 @@ evalRelationMemo cacheOps graph revision subject object relation state memo
                                         object
                                         relation
                                         schemaRelation.rewrite
-                                        state{depth = state.depth + 1, visited = subproblem : state.visited}
+                                        state{depth = state.depth + 1, visited = Set.insert subproblem state.visited}
                                         memo
                                 case (result, taint) of
                                     (Right residual, Untainted) -> do
@@ -691,7 +693,7 @@ evalThisMemo cacheOps graph revision subject object relation state memo
                     && isNothing tuple.caveat
                     && relationUnionsThis graph groupObject.objectType groupRelation
                     && state.depth < state.budget.maxDepth
-                    && Subproblem{subject, object = groupObject, relation = groupRelation} `notElem` state.visited
+                    && Set.notMember Subproblem{subject, object = groupObject, relation = groupRelation} state.visited
             _ -> False
 
     {- One reverse query per (group type, group relation) bucket answers "which

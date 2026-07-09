@@ -17,6 +17,8 @@ module En.Expand (
 ) where
 
 import Data.Map.Strict qualified as Map
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Effectful (Eff, (:>))
@@ -134,7 +136,7 @@ runExpand budget graph revision request = do
 
 data EvalState = EvalState
     { depth :: !Int
-    , visited :: ![Subproblem]
+    , visited :: !(Set Subproblem)
     , budget :: !EvaluationBudget
     }
 
@@ -142,11 +144,11 @@ data Subproblem = Subproblem
     { object :: !ObjectRef
     , relation :: !RelationName
     }
-    deriving stock (Eq, Show)
+    deriving stock (Eq, Ord, Show)
 
 initialState :: EvaluationBudget -> EvalState
 initialState budget =
-    EvalState{depth = 0, visited = [], budget}
+    EvalState{depth = 0, visited = Set.empty, budget}
 
 expandRelation ::
     (TupleStore :> es) =>
@@ -162,7 +164,7 @@ expandRelation ::
 expandRelation graph revision object relation state
     | state.depth >= state.budget.maxDepth =
         pure (Left ResolutionLimitExceeded)
-    | subproblem `elem` state.visited =
+    | Set.member subproblem state.visited =
         pure (Left (CycleDetected (renderSubproblem subproblem)))
     | otherwise =
         case lookupRelation graph object.objectType relation of
@@ -174,7 +176,7 @@ expandRelation graph revision object relation state
                     object
                     relation
                     schemaRelation.rewrite
-                    state{depth = state.depth + 1, visited = subproblem : state.visited}
+                    state{depth = state.depth + 1, visited = Set.insert subproblem state.visited}
   where
     subproblem = Subproblem{object, relation}
 
