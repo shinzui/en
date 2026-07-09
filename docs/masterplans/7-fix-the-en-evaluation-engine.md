@@ -75,7 +75,7 @@ store implementation, which is risky enough to deserve its own validation cycle.
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | EP-39 | Add a point-membership probe and probe-first check evaluation | docs/plans/39-add-a-point-membership-probe-and-probe-first-check-evaluation.md | None | None | Complete |
-| EP-40 | Adopt Zanzibar cycle and exclusion semantics in check | docs/plans/40-adopt-zanzibar-cycle-and-exclusion-semantics-in-check.md | None | EP-39 | In Progress |
+| EP-40 | Adopt Zanzibar cycle and exclusion semantics in check | docs/plans/40-adopt-zanzibar-cycle-and-exclusion-semantics-in-check.md | None | EP-39 | Complete |
 | EP-41 | Cache context-free check subproblems | docs/plans/41-cache-context-free-check-subproblems.md | None | EP-39, EP-40 | Not Started |
 | EP-42 | Stream lookup pages with validated cursors and a real deadline | docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md | None | EP-39 | Not Started |
 | EP-43 | Preserve set operators in expand trees | docs/plans/43-preserve-set-operators-in-expand-trees.md | None | None | Not Started |
@@ -148,8 +148,8 @@ established by docs/plans/38-validate-configuration-and-persist-datastore-identi
 
 - [x] EP-39 (2026-07-08): point-membership probe on TupleStore with all three interpreters
 - [x] EP-39 (2026-07-08): check answers direct membership without full-relation scans; wide-relation checks no longer error
-- [ ] EP-40: data cycles yield empty results, not failures; union short-circuits on Allowed
-- [ ] EP-40: exclusion over a Conditional base evaluates the subtrahend; checkMany surfaces per-pair errors
+- [x] EP-40 (2026-07-08): data cycles yield empty results, not failures; union short-circuits on Allowed
+- [x] EP-40 (2026-07-08): exclusion over a Conditional base evaluates the subtrahend; checkMany surfaces per-pair errors
 - [ ] EP-41: decision cache keyed without caveat context; caveats re-applied on hit; cross-request hit rate demonstrated
 - [ ] EP-42: lookup pages resume incrementally from cursors instead of recomputing the traversal
 - [ ] EP-42: cursors validated like consistency tokens; deadline interrupts expansion
@@ -211,6 +211,43 @@ declines to accelerate any subproblem already on the `visited` stack or at the d
 limit, precisely so that EP-40 — not EP-39 — decides what cycles and depth exhaustion
 mean.
 
+**A hard precondition EP-41 inherits from EP-40 (2026-07-08): never cache a decision that
+consumed a cycle cut.** EP-40 made a revisited subproblem contribute `Denied` instead of an
+error, which is Zanzibar's semantics. But that `Denied` is true only while the revisited
+node sits on the recursion stack; evaluated on its own the same subproblem may be `Allowed`.
+Any decision computed *using* such a cut is therefore stack-local, and EP-40 found that
+`En/Check.hs` would happily write those into both the within-call memo and — through
+`checkCached`'s `insertExternalDecision` — the process-wide decision cache served to later
+requests. A legal cycle in customer data would have silently denied a subject with access
+until the cache expired.
+
+`En/Check.hs` now threads a `CutTaint` value beside the decision and refuses to memoize or
+cache a `Tainted` one. EP-41 rewrites exactly that path: it changes what `checkCached`
+stores (a context-free decision plus residual caveat obligations) and re-keys the cache. It
+must carry the `Untainted` precondition across to both writes. A context-free decision
+derived under a cut is no safer to cache than a context-bearing one, and the failure is
+silent — the test that catches it (`taintSchema` in `en-core/test/Main.hs`) had to be
+written twice, because the obvious version passes against a broken evaluator.
+
+**EP-40 narrowed `ResolutionLimitExceeded` and added `CycleDetected` (2026-07-08).** The
+constructor now means only "a configured budget was exhausted". `check` and `lookup` never
+raise `CycleDetected`; `expand` does, since it renders a tree for a human to audit. The
+master plan's Integration Points anticipated that
+docs/plans/35-version-the-wire-contract-and-type-the-error-model.md (master plan 6) would
+wire new constructors into the error envelope, "whichever lands second". That is now moot:
+`enErrorToFault` in `en-servant/src/En/Servant/Seam.hs` is a *total* match (EP-35 made it
+so), which means adding a constructor is a compile error, not a silent fall-through. EP-40
+therefore supplied the mapping itself — 422, `cycle_detected`, `retryable = false`. EP-43
+should note that if operator-preserving expand wants a dedicated cycle node in the tree
+instead of an error, that is a change to EP-40's deliberate choice and needs its own
+decision.
+
+**`checkMany` changed shape, and EP-44's benchmark work will see it (2026-07-08).** It now
+returns `[Either EnError CheckDecision]`. The HTTP batch response is byte-identical — an
+unevaluable pair is still a denial on the wire — but the engine no longer destroys the
+error. It also does *not* take an `Error EnError` constraint, contrary to its own plan's
+Decision Log: it raises nothing, and `-Wredundant-constraints` rejects the addition.
+
 **EP-44's `EntryPoint` question has a partial answer already (2026-07-08).** EP-39 needed
 "does this relation union in its directly-stored tuples?" and answered it by walking the
 `Rewrite` tree (`relationUnionsThis`), not by consulting the reachability graph's unused
@@ -236,6 +273,12 @@ should weigh that when it makes the call.
 - Decision: EP-39 fixed the unrelated `en-example` failure itself, in a separate commit, rather than reporting it back to master plan 6.
   Rationale: A red baseline makes "these tests failed before and pass after" unverifiable, which is the entire acceptance argument of EP-39. The fix is a one-line stale assertion. Landing it separately keeps EP-39's diff honest and leaves it independently revertible.
   Date: 2026-07-08
+- Decision: Cycle-as-empty ships with cut-taint propagation; decisions derived from a cycle cut are returned but never memoized or cached. Every later plan touching the memo or the decision cache inherits this precondition.
+  Rationale: EP-40 discovered that cycle-as-empty without taint tracking is worse than the erroring behavior it replaces: it silently writes stack-local `Denied` answers into the cross-request decision cache. This is a whole-initiative invariant, not an EP-40 implementation detail, because EP-41 rewrites the cache and EP-44 tunes the evaluator around it.
+  Date: 2026-07-08
+- Decision: A test for a memoization or caching bug is not accepted until it has been observed to fail against a deliberately broken implementation.
+  Rationale: EP-40's first cut-taint regression test passed against an evaluator with the guard removed — its two batch pairs used different subjects, and memo keys include the subject, so no entry was ever shared. It looked correct and proved nothing. Cheap to check, and the failure mode it guards against is silent.
+  Date: 2026-07-08
 
 
 ## Outcomes & Retrospective
@@ -244,6 +287,18 @@ should weigh that when it makes the call.
 
 
 ---
+
+Revision note (2026-07-08, second): EP-40 is complete. Registry, Progress, Surprises &
+Discoveries, and Decision Log updated. The initiative-level consequence is a new invariant,
+recorded in the Decision Log and in Surprises & Discoveries: cycle-as-empty is only safe
+alongside cut-taint propagation, and no decision derived from a cycle cut may enter the memo
+or the cross-request decision cache. EP-41 rewrites exactly that path and must carry the
+precondition forward. Two smaller consequences: `EnError` gained `CycleDetected` and got its
+wire mapping here rather than in master plan 6's docs/plans/35, because `enErrorToFault` is
+a total match and the compiler would not allow the deferral the Integration Points section
+assumed; and `checkMany` now returns `[Either EnError CheckDecision]` without an
+`Error EnError` constraint, which EP-44's benchmark work will encounter. No decomposition
+change: EP-41 through EP-44 keep their scopes, dependencies, and ordering.
 
 Revision note (2026-07-08): EP-39 is complete. The Exec-Plan Registry, Progress checklist,
 Surprises & Discoveries, and Decision Log are updated. Three of EP-39's discoveries change

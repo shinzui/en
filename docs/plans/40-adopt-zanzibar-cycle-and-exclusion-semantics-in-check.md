@@ -56,23 +56,84 @@ these is demonstrated by a conformance-style test that fails on today's tree.
 - [x] M0 (2026-07-08): baseline — `cabal build all && cabal test all` green across seven
   suites; EP-39 has landed, so only the memoized evaluator family exists. Cited symbols
   re-located (line numbers shifted); see Surprises & Discoveries.
-- [ ] M1: failing tests — mutual-group cycle answered via an unrelated union branch;
-  cycle-only path returns Denied; exclusion-over-conditional returns Denied; captured red
-  output.
-- [ ] M2: cycle-as-empty — revisited subproblems contribute `Denied` leaves; new
-  `CycleDetected` constructor added to `En.Error.EnError`; `En.Expand` revisit reports
-  `CycleDetected` instead of `ResolutionLimitExceeded`.
-- [ ] M3: union short-circuit on first unconditional `Allowed`, with the
-  Conditional-interaction semantics documented in code.
-- [ ] M4: sound exclusion — `Decision.exclusionDecisions` two-argument combinator;
-  `Exclusion` evaluation uses it; subtrahend evaluated for `Conditional` bases.
-- [ ] M5: `checkMany` returns per-pair `Either EnError CheckDecision`; `Error EnError`
-  constraint restored; en-servant batch handler and bench updated (wire behavior
-  unchanged, fail-closed).
-- [ ] Final: full suite green; Outcomes filled; master plan progress rows updated.
+- [x] M1 (2026-07-08): failing tests — mutual-group cycle answered via an unrelated union
+  branch; cycle-only path returns Denied; exclusion-over-conditional returns Denied; red
+  output captured (commit `d056afa`).
+- [x] M2 (2026-07-08): cycle-as-empty — revisited subproblems contribute `Denied`; new
+  `CycleDetected` constructor on `En.Error.EnError`; `En.Expand` revisit reports
+  `CycleDetected`. Landed in commit `8e31363`.
+- [x] M2a (new milestone, discovered during M2): cut-taint propagation. Not memoizing the
+  revisited subproblem is insufficient — its *ancestors* poison the memo and the
+  cross-request cache. See Surprises & Discoveries.
+- [x] M3 (2026-07-08): union short-circuit on the first unconditional `Allowed`, and the
+  free `Denied` short-circuit for intersections, via one `evalBranchesMemo` helper.
+  Landed in commit `8e31363`.
+- [x] M4 (2026-07-08): sound exclusion — `Decision.exclusionDecisions` two-argument
+  combinator; `Exclusion` evaluation uses it; subtrahend evaluated for `Conditional`
+  bases. Landed in commit `8e31363`.
+- [x] M5 (2026-07-08): `checkMany` returns per-pair `Either EnError CheckDecision`;
+  en-servant batch handler and tests updated, wire behavior unchanged and fail-closed
+  (commit `acad9ff`). The `Error EnError` constraint was *not* restored — it is redundant;
+  see the Decision Log.
+- [x] Final (2026-07-08): full suite green (seven suites); benchmarks run; Outcomes
+  filled; master plan Progress rows and Registry updated.
 
 
 ## Surprises & Discoveries
+
+**M2 — "do not memoize the revisited result" is not enough, and the gap is a correctness
+bug that reaches the cross-request cache.** This plan's M2 step 2 says: change the revisit
+branch to `pure (Right Denied, memo)` and "do **not** insert the revisited result into the
+memo", calling it "the classic fixpoint-vs-memo trap". The diagnosis is right and the
+prescription is incomplete. The revisit branch never inserted anything into the memo in the
+first place — it returns before reaching the insert. The values that get poisoned are the
+**ancestors** of the cut, whose results were computed *using* the cut's `Denied`.
+
+A minimal witness, now the fixture `taintSchema` in `en-core/test/Main.hs`:
+
+```haskell
+node#direct = this                       -- carol is granted directly
+node#x      = union [computed y, computed direct]
+node#y      = computed x
+```
+
+Evaluate `(carol, x, node:n)`. Entering `x` pushes it onto `visited`; branch one descends
+into `y`, which computes `x` again, hits the revisit guard, and cuts to `Denied`. So `y`
+evaluates to `Denied` — true only while `x` is on the stack. Branch two then grants, and
+`x` is `Allowed`. But `y = Denied` has been written to the memo. Now the second pair of the
+same `checkMany` batch asks `(carol, y, node:n)`: the memo answers `Denied`, and the true
+answer is `Allowed` (via `x`). The batch returns `[Allowed, Denied]`.
+
+Worse, `checkCached` runs `insertExternalDecision` on the same path, so the stack-local
+`Denied` is written into the process-wide decision cache keyed by
+`(datastore, schema hash, revision, subject, relation, object, context)` and served to
+*later requests*. A legal cycle in customer data would silently deny a subject who has
+access, until the cache expired.
+
+The fix, added as milestone M2a: evaluation reports whether its subtree consumed a cut. The
+type is a two-valued `CutTaint` monoid in `en-core/src/En/Check.hs`; every `eval*Memo`
+function returns it alongside the decision and memo, branch folds accumulate it, and
+`evalRelationMemo` writes to the memo and the external cache only when the result is
+`Untainted`. A cut itself returns `Tainted`; a memo or cache *hit* returns `Untainted`,
+because anything already stored is context-independent by construction. This is
+conservative — it declines to memoize some results that would have been fine — and
+correctness beats a cache hit rate on cyclic data.
+
+The test earns its keep by mutation. The obvious test to write here (mutual groups `a`/`b`
+with `carol` granted directly on the document) **passes even with the guard removed**,
+because memo keys include the subject and the two batch pairs used different subjects. That
+version was written, observed to pass against a deliberately broken evaluator, and thrown
+away. The `taintSchema` fixture above was built specifically so both pairs share a subject
+and differ only in relation. Verified both ways:
+
+```text
+with the guard:     Right [Right Allowed, Right Allowed]
+guard removed:      Right [Right Allowed, Right Denied]
+```
+
+Handed forward: docs/plans/41-cache-context-free-check-subproblems.md reshapes exactly this
+memoize-and-cache path. It must preserve the `Untainted` precondition on both writes. A
+context-free decision derived under a cut is no safer to cache than a context-bearing one.
 
 **M0 — EP-39 has landed, so this plan edits one evaluator, not two.** The plan is written
 to work either way ("make each semantic edit in both evaluator families" if EP-39 had not
@@ -101,6 +162,37 @@ error a stable code and an honest status"). Adding a constructor is therefore a 
 error in `en-servant`, not a silent fall-through, and this plan must supply a mapping. It
 does — see the Decision Log entry dated 2026-07-08. The compiler catching this is the
 system working as intended; the plan's prose was simply written against an older tree.
+
+**M5 — the `Error EnError` constraint this plan wanted to restore is redundant, and GHC
+says so.** The Decision Log dated 2026-07-07 says `checkMany` "regains the
+`Error EnError :> es` constraint for failures *before* per-pair evaluation begins
+(consistency resolution)". Adding it produces:
+
+```text
+src/En/Check.hs:107:5: warning: [GHC-30606] [-Wredundant-constraints]
+    Redundant constraint: Error EnError :> es
+```
+
+The reasoning behind the constraint was wrong. `checkMany` does not raise anything:
+`resolveConsistency` is a `ConsistencyStore` operation returning a plain
+`ResolvedConsistency`, and it is the *interpreter* (for instance
+`runConsistencyStorePostgres`) that throws on an invalid token. The batch aborts because
+the interpreter throws, not because `checkMany` has the capability to. `en-core` compiles
+with `-Wredundant-constraints`, so the constraint would be permanent noise. Omitting it is
+also the better contract: a function whose job is to report per-pair errors *as values*
+should not demand an error capability from its caller. The constraint was dropped and the
+haddock says why.
+
+**M2/M3/M4 landed as one commit rather than three.** The plan's Idempotence section asks for
+separate commits in order, noting that "M2 before M3 matters: short-circuiting is only
+provably safe once cycles stop erroring". That ordering argument is sound and was honored
+in the *reasoning* — union short-circuiting is justified in the code comment by cycles no
+longer producing `Left`. But the three edits turned out to occupy the same lines: threading
+`CutTaint` (M2a) rewrote every branch of `evalRewriteMemo`, which is precisely where the
+union fold (M3) and the exclusion case (M4) live. Splitting them would have meant writing
+the taint threading twice and landing an intermediate tree whose only distinction was
+cosmetic. They are one commit, `8e31363`, with a message that separates the three concerns.
+M1 and M5 are their own commits, as planned.
 
 **M0 — EP-39 left one semantic question on this plan's desk.** EP-39's probe-first `This`
 evaluation returns early on an unconditional `Allowed`, which means a relation containing
@@ -178,6 +270,24 @@ correct and this plan generalizes rather than reverts it.
   new constructors/channel into the envelope. A dedicated result record was rejected as
   premature — `Either` is sufficient and standard.
   Date: 2026-07-07
+- Decision (2026-07-08, during M2): A decision computed with the help of a cycle cut is
+  returned but never memoized and never written to the cross-request decision cache.
+  Evaluation threads a `CutTaint` monoid to track this.
+  Rationale: the plan's "do not memoize the revisited result" addresses the wrong node. The
+  cut's own frame never reaches the memo insert; its *ancestors* do, carrying a `Denied`
+  that is true only while the cut node sits on the `visited` stack. Left unguarded, a
+  legal data cycle poisons later pairs of the same `checkMany` batch and — through
+  `checkCached`'s `insertExternalDecision` — later *requests*. Conservative by design: some
+  cacheable results go uncached on cyclic data. See Surprises & Discoveries for the witness
+  and the mutation test that pins it.
+  Date: 2026-07-08
+- Decision (2026-07-08, during M5): `checkMany` does **not** regain the
+  `Error EnError :> es` constraint, contrary to the 2026-07-07 entry below.
+  Rationale: it raises nothing. Consistency-resolution failures escape through the
+  `ConsistencyStore` interpreter's own error effect, not through `checkMany`, so the
+  constraint is redundant — `-Wredundant-constraints` rejects it — and demanding an error
+  capability from callers contradicts the point of returning per-pair errors as values.
+  Date: 2026-07-08
 - Decision (2026-07-08): `CycleDetected` maps to HTTP 422 with code `cycle_detected` and
   `retryable = false` in `en-servant/src/En/Servant/Seam.hs`, alongside
   `ResolutionLimitExceeded`'s 422.
@@ -219,7 +329,57 @@ correct and this plan generalizes rather than reverts it.
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Landed 2026-07-08 in three commits (`d056afa`, `8e31363`, `acad9ff`) on `master`, with the
+full workspace suite green and benchmarks running. Findings B3, B4, and B5 of
+`docs/reviews/2026-07-07-architecture-performance-review.md` are closed.
+
+The engine's semantics changed in four ways a user can observe. A subject with access
+through any union branch is now `Allowed` even when another branch's data is cyclic; before,
+one cycle turned the entire check into `ResolutionLimitExceeded`. A path that exists only
+through a cycle is `Denied` rather than an error. `enter = allowed - banned` now denies a
+provably banned subject even when the base needed more context, instead of replying
+"supply more context and you may pass" — a false conditional that a caller acting on it
+would have turned into wrongly-granted access. And `checkMany` tells its caller which pair
+broke, rather than reporting every failure as a denial.
+
+Two things landed that the plan did not ask for, and one thing the plan asked for did not
+land.
+
+The unrequested ones. First, cut-taint propagation (`CutTaint` in `en-core/src/En/Check.hs`)
+— without it, cycle-as-empty is not merely incomplete but actively unsafe, poisoning the
+within-batch memo and the cross-request decision cache with stack-local answers. This was
+the single most valuable discovery of the plan and is written up at length in Surprises &
+Discoveries. Second, a wire mapping for `CycleDetected` (422, `cycle_detected`, not
+retryable), because `enErrorToFault` is a total match and the compiler would not let the
+question be deferred to docs/plans/35 as the plan's prose assumed.
+
+The thing that did not land: `checkMany` was not given back its `Error EnError` constraint.
+It raises nothing, and `-Wredundant-constraints` says as much. The plan's rationale
+confused "the batch aborts when consistency resolution fails" (true, via the interpreter)
+with "checkMany throws" (false).
+
+Method note, worth carrying into every later plan here. The first cut-taint regression test
+passed against a deliberately broken evaluator. It looked right — mutual groups, a batch,
+two pairs — but the memo key includes the subject, and its two pairs used different
+subjects, so no memo entry was ever shared. It was only caught by removing the guard and
+checking that the test went red. A test for a caching or memoization bug is worth nothing
+until you have watched it fail. Both directions are recorded in Surprises & Discoveries.
+
+Handed forward. docs/plans/41-cache-context-free-check-subproblems.md rewrites the exact
+memoize-and-cache path this plan guarded; it must keep the `Untainted` precondition on both
+writes, since a context-free decision derived under a cut is no safer to cache than a
+context-bearing one. docs/plans/44-make-evaluation-budgets-configurable-and-trim-hot-path-overhead.md
+inherits `evalBranchesMemo` (still `reverse`-ing an accumulator and threading a triple) and
+`maxDepth`, which remains a module constant here. docs/plans/35-version-the-wire-contract-and-type-the-error-model.md
+inherits a `CycleDetected` mapping it may refine, and the per-pair error channel that
+`checkMany` now has the information to feed.
+
+One limitation is recorded rather than fixed, as the Decision Log intended: subtract-side
+obligations pass through un-negated, because `CaveatObligation` cannot express "this caveat
+must evaluate false". `Conditional` keeps its plain meaning — supply the missing context and
+re-evaluate — which stays true and safe, since the re-evaluation runs the same combinator
+with a settled subtrahend. Expressing negated obligations is a wire-visible model change and
+belongs to whoever wants it.
 
 
 ## Context and Orientation
@@ -634,8 +794,57 @@ expected: Right Denied
 actual:   Right (Conditional [CaveatObligation {caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}])
 ```
 
-Update this section with real transcripts (red M1, green after M2/M4, the counting-store
-numbers from M3) as evidence while working.
+The real transcripts, recorded while working.
+
+M1, red (`cabal test en-core:en-core-interface-tests`). The suite stops at the first
+failure, so the cycle assertion is what it printed; the exclusion assertions were red
+underneath it and turned green with the same commit:
+
+```text
+user error (cycle does not poison an unrelated union branch
+expected: Right Allowed
+actual:   Left ResolutionLimitExceeded)
+```
+
+The cut-taint mutation test (M2a). With the `Untainted` guard on the memo write removed,
+the batch regresses; with it, the batch is correct. This is the evidence that the guard is
+load-bearing rather than decorative:
+
+```text
+guard removed:  user error (a cycle-tainted decision is not memoized across batch pairs
+                expected: Right [Right Allowed,Right Allowed]
+                actual:   Right [Right Allowed,Right Denied])
+
+guard restored: PASS
+```
+
+M3's counting-store number. The kikan permission `space#view` is a five-branch union whose
+first branch is `owner`; checking the owner now issues exactly one store read (EP-39's
+probe on `owner`), because the union stops there:
+
+```text
+union stops at the first branch that proves Allowed: 1 store read
+```
+
+Everything green at the end (`cabal test all`):
+
+```text
+Test suite en-biscuit-tests: PASS
+Test suite en-core-conformance: PASS
+Test suite en-core-interface-tests: PASS
+Test suite en-example-tests: PASS
+Test suite en-postgres-integration-tests: PASS
+Test suite en-postgres-revision-tests: PASS
+Test suite en-servant-tests: PASS
+```
+
+The benchmarks still run, unchanged in shape by this plan
+(`cabal bench en-core:en-core-bench`, `check-wide` group):
+
+```text
+direct-member:  25.2 μs ± 2.2 μs
+non-member:      343 μs ±  33 μs
+```
 
 
 ## Validation and Acceptance
@@ -702,3 +911,43 @@ docs/plans/41-cache-context-free-check-subproblems.md (its residual-decision alg
 reproduce `exclusionDecisions` exactly) and
 docs/plans/44-make-evaluation-budgets-configurable-and-trim-hot-path-overhead.md (which
 makes `maxDepth` configurable and optimizes the folds introduced here).
+
+Two additions to the end state that this plan discovered rather than planned:
+
+- `En.Check` threads a `CutTaint` value alongside the decision and memo. A decision whose
+  subtree consumed a cycle cut is `Tainted` and is never written to the within-call memo or
+  to the cross-request cache via `insertExternalDecision`.
+  docs/plans/41-cache-context-free-check-subproblems.md rewrites both writes and must
+  preserve that precondition.
+- `En.Servant.Seam.enErrorToFault` maps `CycleDetected` to 422 / `cycle_detected` /
+  `retryable = false`. It is a total match, so this could not be deferred.
+
+
+---
+
+Revision note (2026-07-08, written while implementing): Three corrections, all recorded in
+Surprises & Discoveries and the Decision Log.
+
+The important one: M2's instruction to avoid memoizing the revisited subproblem does not
+prevent the bug it names. The revisit frame never reaches the memo insert; the *ancestors*
+that consumed its `Denied` do, and they write a stack-local answer into the within-call
+memo and — through `checkCached` — into the process-wide decision cache served to later
+requests. Cycle-as-empty without taint propagation is worse than the erroring behavior it
+replaces, because it fails silently. A new milestone (M2a) adds a `CutTaint` monoid and
+withholds tainted decisions from both writes. The regression test for it was written twice:
+the first version passed against a deliberately broken evaluator, because memo keys include
+the subject and its two batch pairs used different subjects.
+
+Second, `checkMany` does not regain the `Error EnError` constraint. It raises nothing;
+consistency failures escape through the interpreter. GHC's `-Wredundant-constraints`
+settles it.
+
+Third, `CycleDetected` needed a wire mapping in this plan rather than in docs/plans/35: the
+plan's Context section describes an untyped 500 fallback in `en-servant` that no longer
+exists, since master plan 6's EP-35 made `enErrorToFault` total.
+
+Also resolved here, on EP-39's referral: the probe's early return on an unconditional
+`Allowed` stands, and M3 generalizes it to union branches. A relation holding both an
+unconditional grant and a row with an undefined caveat name answers `Right Allowed`. The
+alternative — letting a malformed row of an unrelated grant deny a subject who provably has
+access — conflates "your data has a problem" with "you may not enter".
