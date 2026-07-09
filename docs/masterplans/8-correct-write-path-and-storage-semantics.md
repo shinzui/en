@@ -72,7 +72,7 @@ that en-core consumers embed against).
 | EP-45 | Adopt touch semantics for tuple writes | docs/plans/45-adopt-touch-semantics-for-tuple-writes.md | None | None | Complete |
 | EP-46 | Add write preconditions and atomic mixed writes | docs/plans/46-add-write-preconditions-and-atomic-mixed-writes.md | EP-45 | None | Complete |
 | EP-47 | Fail loudly on storage decode errors and tighten write snapshots | docs/plans/47-fail-loudly-on-storage-decode-errors-and-tighten-write-snapshots.md | None | None | Complete |
-| EP-48 | Batch tuple writes and add bulk import and export | docs/plans/48-batch-tuple-writes-and-add-bulk-import-and-export.md | EP-45 | EP-46 | In Progress |
+| EP-48 | Batch tuple writes and add bulk import and export | docs/plans/48-batch-tuple-writes-and-add-bulk-import-and-export.md | EP-45 | EP-46 | Complete |
 | EP-49 | Trim dead indexes and resolve consistency lazily | docs/plans/49-trim-dead-indexes-and-resolve-consistency-lazily.md | None | None | Not Started |
 
 
@@ -104,6 +104,14 @@ possibly `relation_tuple_created_xid_idx` — but the watch changelog plan
 `created_xid` indexing, so EP-49 must check that plan's status before dropping it and
 record the coordination in both plans' Decision Logs.
 
+**EP-48 raised the stakes on that index review.** Every batch write statement now depends
+on `relation_tuple_live_unique` being the index a `LATERAL` probe reaches, and EP-48
+measured what happens when the planner reaches for `relation_tuple_subject_hist_idx`
+instead: a 55-second cross product. EP-49 must EXPLAIN the *write* statements, not only the
+read path, against a populated and analyzed table at a batch size above
+`EN_MAX_BATCH_SIZE`. Dropping or altering an index that the batched write statements probe
+is a write-path change wearing a read-path costume.
+
 The `TupleStore` effect (`en-core/src/En/Effect/TupleStore.hs`) write operations are
 changed by EP-45 (documented touch semantics; possibly a distinct result reporting
 created-vs-replaced), EP-46 (precondition parameter and a combined write-and-delete
@@ -114,7 +122,14 @@ interposer (`en-core/src/En/Effect/CachedTupleStore.hs`), and the in-memory conf
 store (`en-core/src/En/Conformance/Kikan.hs`). Cross-master-plan: the same effect gains
 a read-side membership probe in
 docs/plans/39-add-a-point-membership-probe-and-probe-first-check-evaluation.md (master
-plan 7); the extensions are disjoint.
+plan 7); the extensions are disjoint. **Resolved 2026-07-09:** EP-48 added exactly one
+constructor, `ReadAllTuples :: Revision -> Int -> Maybe StoreCursor -> TupleStore m
+TuplePage`, and left the write constructors byte-identical (`git diff bf9cd88 --
+en-core/src/En/Effect/TupleStore.hs`); its batching is interpreter-internal. There is a
+fourth interpreter the plan did not name — the fixture store in `en-core/test/Main.hs` —
+which a new constructor also breaks until it is handled. `ReadAllTuples` is deliberately
+uncached: `CachedTupleStore`'s catch-all `passthrough` forwards it, since export pages
+are read once and caching them would evict hot check-path entries.
 
 The write anchor and token minting (`writeVisibleSnapshot`, `anchorTransactionStatement`
 in `en-postgres/src/En/Postgres/TupleStore.hs`) are modified by EP-47 (tightened
@@ -140,7 +155,8 @@ in the generated OpenAPI document. Any later plan adding a status must do the sa
 - [x] EP-46: atomic mixed write-and-delete in one request/token
 - [x] EP-47: undecodable caveat payloads and malformed cursors are errors, not defaults
 - [x] EP-47: write tokens denote exact snapshots (gap marked in-progress); GC TOCTOU invariant documented
-- [ ] EP-48: N-tuple writes are O(1) round trips; bulk import/export commands exist
+- [x] EP-48: N-tuple writes are O(1) round trips (203 → 6 statements for 100 tuples); bulk import/export commands exist
+- [x] EP-48: batch statements are pinned to index probes by LATERAL, so the plan cannot degrade with batch or table size
 - [ ] EP-49: dead indexes removed (after watch-plan coordination); EXPLAIN confirms remaining index coverage
 - [ ] EP-49: consistency resolution fetches only what the requested mode needs
 
@@ -246,6 +262,59 @@ guide's variable table. Closing the race would require holding the horizon again
 the read's duration — a design decision no finding in the review asked for, and out of scope for
 every plan in this master plan. Discovered while implementing EP-47, 2026-07-09.
 
+**Batching a statement changes its plan, and `unnest` carries no statistics (binds EP-49, and any
+later batched statement).** Finding C6 counts round trips, so EP-48's plan reasoned entirely about
+round trips. But collapsing N indexed single-row statements into one N-row join replaces a plan the
+planner cannot get wrong with one it *estimates* — and a `Function Scan` gives it nothing to estimate
+from. Past roughly a thousand entries PostgreSQL abandoned the nested loop over
+`relation_tuple_live_unique` and chose a merge join over `relation_tuple_subject_hist_idx`, whose
+columns are the subject plus the object *type* and not the object id. `object_id` — the only
+discriminating column in a bulk import — was demoted to a join filter, and the merge computed the
+cross product: **55.8 seconds and 500 million discarded pairs for one 5,000-tuple statement against a
+100,000-row table.** The measured crossover sat between batch sizes 1,000 and 2,000, and
+`EN_MAX_BATCH_SIZE` defaults to **1,000**; an operator raising it slightly would have bought a table
+scan per HTTP write, with no code change and no warning.
+
+It hid from every check this master plan had specified. Integration tables are small. The 100-tuple
+statement-count measurement is small. And the *first* 100,000-tuple import ran in 3.12 s because
+autoanalyze had not yet fired — the second took 272 s. A performance property that depends on when
+autovacuum last ran is not a property.
+
+The fix pins all three batch statements to a `LATERAL` probe driven by the unnested batch, so the
+batch is always the outer relation and each entry probes the unique index once (`LIMIT 1` is exact
+under `relation_tuple_live_unique`, and also stops the planner flattening the subquery back into the
+join). 55,792 ms → 14.4 ms; the 100k re-import 272 s → 3.57 s. **EP-49 inherits two obligations:** its
+EXPLAIN work must run against a table large enough to have statistics and at a batch size well above
+`EN_MAX_BATCH_SIZE`, not against an empty fixture; and `relation_tuple_subject_hist_idx` is now known
+to be the index the planner reaches for when it goes wrong here, which is context for any decision
+about it. Discovered while implementing EP-48, 2026-07-09.
+
+**Two ways an integration suite can certify nothing, both found in scenarios written for EP-48
+(affects EP-49).** First, a retry ladder can launder a bug: a two-copy duplicate-key batch resolves
+last-wins *by accident* of the retry, because each attempt inserts the earliest surviving copy and
+drops the rest. The scenario passed against the deliberately broken code. Four copies are needed —
+that is where the fallback's `ON CONFLICT`-less insert receives two same-identity rows and raises.
+Second, within one transaction a batch always converges on its first attempt, so the convergence
+check, the second attempt, the fallback, and the ordinal bookkeeping were all unreachable from a
+single-connection suite; an injected off-by-one in the ordinal mapping left the entire suite green.
+Only `runBatchTouchRaceScenario`, which forces a racer to hold an uncommitted conflicting row and
+asserts the writer is blocked before releasing it, reaches them. Both scenarios were then run once
+against the bug they claim to catch, per EP-46's standing rule. Discovered while implementing EP-48,
+2026-07-09.
+
+**`loadServerConfig` fails closed without API keys, which is right for a server and wrong for a
+tool.** `en-server import` binds no port and serves no request, yet the shared configuration loader
+refused to start it without `EN_API_KEYS_READ_WRITE`. EP-48 split `StoreConfig` out of `ServerConfig`
+(`en-server/app/Config.hs`); `loadStoreConfig` reads only `EN_DATABASE_URL`, `EN_SCHEMA_PATH`,
+`EN_GC_WINDOW`, and `EN_POOL_*`, and `parseServerConfig` is defined in terms of `parseStoreConfig` so
+the two cannot drift. Any later plan adding an `en-server` subcommand should reach for
+`withSubcommandStore` rather than `loadServerConfig`. Discovered while implementing EP-48, 2026-07-09.
+
+**`cabal build en-postgres` does not relink `en-server`.** The first post-fix measurement of the
+`LATERAL` rewrite showed no improvement at all, because `cabal list-bin en-server` still named a
+binary linking the pre-fix library. Build the executable before timing it. Discovered while
+implementing EP-48, 2026-07-09.
+
 
 ## Decision Log
 
@@ -275,6 +344,15 @@ every plan in this master plan. Discovered while implementing EP-47, 2026-07-09.
   Date: 2026-07-09
 - Decision: EP-47 maps InvalidCursor to a 400 itself rather than deferring the HTTP mapping to docs/plans/35.
   Rationale: enErrorToFault is a total case; the mapping is a build requirement, not a scheduling choice. docs/plans/35 has landed and already provides the non-retryable BadRequestFault this belongs in.
+  Date: 2026-07-09
+- Decision: Every batched statement over relation_tuple drives from the unnested batch through a LATERAL probe of relation_tuple_live_unique, never as a bare join and never via NOT EXISTS. This binds EP-49 and any later plan that batches a statement.
+  Rationale: A Function Scan has no statistics, so the plan is the planner's guess rather than the statement's property. Left to choose, it picks a merge join on an index without object_id past ~1,000 entries and computes the cross product — 55.8 seconds for one 5,000-tuple statement, against 14.4 milliseconds for the LATERAL form. EN_MAX_BATCH_SIZE defaults to 1,000, one step from the cliff, and autoanalyze can move the cliff under a running import.
+  Date: 2026-07-09
+- Decision: A batched statement's cost is argued from its EXPLAIN plan at production batch and table sizes, not from its round-trip count. EP-49's index review must EXPLAIN against a populated, analyzed table.
+  Rationale: EP-48 delivered finding C6's round-trip reduction (203 → 6) in a change that simultaneously introduced a 55-second statement. Round-trip count and cost are independent axes, and this master plan's acceptance criteria only measured the first.
+  Date: 2026-07-09
+- Decision: Bulk import and export read StoreConfig, not ServerConfig; en-server subcommands never require serving credentials.
+  Rationale: A command that binds no port has no API keys, rate limit, or TLS material to configure. loadServerConfig's fail-closed behavior is correct for a server and was refusing a bulk load.
   Date: 2026-07-09
 
 
