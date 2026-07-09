@@ -75,7 +75,7 @@ merely because they touch the same lines, not because of real artifact dependenc
 | EP-35 | Version the wire contract and type the error model | docs/plans/35-version-the-wire-contract-and-type-the-error-model.md | None | None | Complete |
 | EP-36 | Add health endpoints, graceful shutdown, and observability | docs/plans/36-add-health-endpoints-graceful-shutdown-and-observability.md | None | EP-34, EP-35 | Complete |
 | EP-37 | Schedule background maintenance for reaping and transaction pruning | docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md | None | EP-34 | Complete |
-| EP-38 | Validate configuration and persist datastore identity | docs/plans/38-validate-configuration-and-persist-datastore-identity.md | None | None | In Progress |
+| EP-38 | Validate configuration and persist datastore identity | docs/plans/38-validate-configuration-and-persist-datastore-identity.md | None | None | Complete |
 
 
 ## Dependency Graph
@@ -158,8 +158,8 @@ recovery by the same horizon.
 - [x] EP-37: reaper and en_transaction pruning run on a schedule with batched deletes
 - [x] EP-37: en_transaction horizon query no longer scans lifetime writes — achieved by
   pruning, not by an index; the planned index was proven dead weight and cancelled
-- [ ] EP-38: datastore identity minted once, persisted, and used in tokens
-- [ ] EP-38: all config validated at startup with clear failures; deadlines and batch limits configurable
+- [x] EP-38: datastore identity minted once, persisted, and used in tokens
+- [x] EP-38: all config validated at startup with clear failures; deadlines and batch limits configurable
 
 
 ## Surprises & Discoveries
@@ -416,6 +416,49 @@ From EP-37 (2026-07-08), affecting sibling plans:
   time a plan's stated dependency signature was wrong (see EP-36 and `wai-extra`).
 
 
+From EP-38 (2026-07-08), closing this master plan:
+
+- **`en-server/app/Config.hs` is now the single entry point for configuration.** It owns
+  all 23 `EN_*` variables, including EP-33's auth/rate-limit/TLS and EP-37's maintenance
+  knobs, whose parsers moved here verbatim; `Middleware.hs` and `Maintenance.hs` keep
+  their types and behavior and no longer read the environment. `Main.hs` has zero
+  `lookupEnv` calls. `knownVariables` is exhaustive, so the documented configuration
+  reference can be checked against the source. **Any new endpoint or subsystem should add
+  its variable there**, not inline.
+
+- **Configuration failures exit `1` cleanly**, discharging EP-33's finding. Parsing is
+  pure over a snapshot of the environment and returns `Either Text (ServerConfig,
+  [Text])`; warnings print only once the whole config is accepted. `EN_PORT` no longer
+  silently falls back to `8080` on garbage — a behavior change, documented.
+
+- **Datastore identity is persisted and the hardcoded `DatastoreId "en-server"` is gone.**
+  Demonstrated end to end: two databases mint different UUIDs, and a token minted against
+  one is rejected by the other with `invalid_consistency_token` in EP-35's envelope.
+  **The first startup after this change invalidates every previously minted token**, once
+  per deployment, exactly as a schema change does. `en-biscuit` grants embed
+  `ConsistencyToken`s and inherit the strengthened guard; the watch API
+  (`docs/plans/53-add-a-watch-changelog-api.md`) can rely on identity being real.
+
+- **`En.Servant.Seam.Env` gained `deadlineDefaultMillis` and `deadlineMaxMillis`.** Every
+  construction site must supply them — including `en-example/src/En/Example/Host.hs`,
+  which EP-38's plan did not list. A client-supplied `deadlineMillis` above the ceiling is
+  clamped, not rejected.
+
+- **`pageLookup` reports `truncated` only when `hasMore && not hasBudget`.** An exhausted
+  page says `exhausted` no matter how little budget remained. Any plan asserting deadline
+  behavior must force a next page (`limit` below the result count) or the assertion passes
+  vacuously. Relevant to
+  `docs/masterplans/7-fix-the-en-evaluation-engine.md`'s budget work
+  (`docs/plans/44-make-evaluation-budgets-configurable-and-trim-hot-path-overhead.md`).
+
+- **Detecting a dump/restore into a fresh cluster remains manual.** The runbook is
+  `DELETE FROM en_datastore_metadata;` before starting the server, so pre-restore tokens
+  fail the identity check rather than validating against a reset `xid8` counter.
+  Persisting the cluster's system identifier (`pg_control_system()`) alongside the
+  datastore id and comparing at startup would make this automatic; it is the obvious
+  follow-up and is recorded in EP-38's Gaps.
+
+
 ## Decision Log
 
 - Decision: Group error typing, wire versioning, and OpenAPI generation into one plan (EP-35).
@@ -497,4 +540,81 @@ From EP-37 (2026-07-08), affecting sibling plans:
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Complete 2026-07-08. All six child plans landed. `en-server` is deployable as a real
+authorization microservice: callers authenticate and are rate limited per identity; the
+server serves concurrent traffic through `hasql-pool` and survives a PostgreSQL restart
+without a process restart; every response — success or failure — is a versioned, typed
+shape with a machine-readable `code` and an honest `retryable`, described by a generated
+OpenAPI document; orchestrators probe `/healthz` and `/readyz` and get a clean 30-second
+drain on SIGTERM, with one structured JSON log line per request and Prometheus metrics;
+soft-deleted tuples and `en_transaction` are pruned on a schedule in bounded batches; and
+datastore identity is minted once, persisted in the database, and enforced.
+
+Findings closed: Theme A's A1–A9 and storage items C2 and C4. Feature gap E7
+(observability) and E11 (OpenAPI) are closed as part of EP-36 and EP-35.
+
+### What the plans got wrong, and how it was caught
+
+Three child plans specified something that measurement contradicted. The pattern is worth
+recording, because in every case the *plan's own falsifiable acceptance criterion* is what
+exposed it — a vaguer plan would have shipped the mistake.
+
+- **EP-37's index.** The plan argued btree versus BRIN for `en_transaction (created_at,
+  xid)` and never asked whether the planner would choose either. It does not: PostgreSQL
+  rewrites `min(xid)` into a `Limit 1` over the `xid` primary key at every selectivity
+  tested. The index was cancelled; pruning is the fix, and it is better (`O(1)` rather
+  than `O(window)` per read). Caught by the criterion "the EXPLAIN transcript flips from
+  `Seq Scan` to `Index Only Scan`".
+
+- **EP-36's logger.** The plan named `wai-extra`'s `formatAsJSON`, which serializes every
+  request header and redacts only `Cookie`. en authenticates with
+  `Authorization: Bearer <secret>`, so every request would have written a working
+  credential to stdout. Its custom-formatter carrier also buffers both bodies. The logger
+  was hand-rolled in ~30 lines and the dependency dropped. Caught by the criterion
+  "verify this against the actual output".
+
+- **EP-38's clamp test.** The plan's proposed assertion could not fail: `pageLookup`
+  returns `exhausted` whenever the result set fits the limit, whatever the budget. The
+  test now forces a next page so the budget is the only difference between two runs, and
+  was mutation-checked. Caught by running it.
+
+A fourth, smaller pattern: two plans stated a dependency's type signature wrongly
+(`Statement.preparable` takes `Text`, not `ByteString`; `wai-extra`'s formatter emits
+headers rather than omitting them). Plans should treat any claim about a third-party API
+as a hypothesis with a stated check, which is what the good ones did.
+
+### What the decomposition got right
+
+No hard dependencies between children, coordinated through Integration Points, was the
+right call. Every plan compiled and was verifiable on the tree as it stood, and the
+CRITICAL auth fix shipped first without waiting on anything. The Integration Points did
+real work: EP-34 predicted that Warp's `runSettings` returning would make EP-36's
+`finally` load-bearing, and EP-36 in turn made EP-37's `withAsync` cancellation correct.
+The `Surprises & Discoveries` chain between siblings carried five findings forward that a
+plan author could not have known — most usefully EP-34's warning that a stale pooled
+connection fails *twice*, which EP-36's readiness probe and EP-37's maintenance loop both
+had to accommodate.
+
+The one decomposition seam that leaked: four plans edited `en-server/app/Main.hs`, and
+EP-38 had to absorb the env parsing three of them added. That was planned for and went
+smoothly, but it meant EP-38 was substantially larger than its finding severity (MED)
+suggested. Landing EP-38 first would have inverted the problem — the other plans would
+have had to add fields to a record that did not yet know about them — so the order was
+right; the cost was simply real.
+
+### Left open
+
+- `405` and `415` return empty bodies; Servant raises both outside the `ErrorFormatters`
+  hooks. Deliberately deferred by EP-36 as low-value.
+- `401`/`403`/`429` are neither request-logged nor counted in `/metrics`, because EP-33's
+  middlewares short-circuit outside those layers.
+- Maintenance exports no metric, so "the backlog is outgrowing the schedule" is visible
+  only in the log line.
+- Latency is a sum and a count, not a histogram; there are no quantiles.
+- A dump/restore into a fresh PostgreSQL cluster still requires the operator to rotate the
+  datastore id by hand. Persisting `pg_control_system()`'s system identifier next to the
+  id would automate it.
+- Configuration reports only its first error per startup.
+
+None of these blocks deployment. Each is recorded in its child plan's Gaps with the
+reasoning for deferral.

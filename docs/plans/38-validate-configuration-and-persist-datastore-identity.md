@@ -56,24 +56,31 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: `en-server/app/Config.hs` with `ServerConfig` and `loadServerConfig`;
-  all existing env parsing in `Main.hs` migrated onto it; fail-fast messages verified
-  for each variable; `EN_GC_WINDOW` validated against PostgreSQL at startup.
-- [ ] M2: migration `<timestamp>_datastore-metadata.sql` creating
-  `en_datastore_metadata`; Justfile guard added; `En.Postgres.Datastore` module with
-  `resolveDatastoreIdSession`; `Main.hs` mints/reads the persisted id; `uuid`
-  dependency added.
-- [ ] M2: restart/reuse behavior verified (same id across restarts; fresh database ⇒
-  fresh id; old-token rejection across identities demonstrated).
-- [ ] M3: `Env` in `en-servant/src/En/Servant/Seam.hs` gains
+- [x] M1 (2026-07-08): `en-server/app/Config.hs` with `ServerConfig` and
+  `loadServerConfig`; all env parsing in `Main.hs`, `Middleware.hs`, and
+  `Maintenance.hs` migrated onto it (23 variables; `Main.hs` has zero `lookupEnv`
+  calls); fail-fast messages verified per variable; `EN_GC_WINDOW` validated against
+  PostgreSQL at startup. Configuration failures now exit `1` cleanly instead of
+  surfacing as an uncaught `IOException` — the wart EP-33 assigned to this plan.
+- [x] M2 (2026-07-08): migration `20260709023019_datastore-metadata.sql` creating
+  `en_datastore_metadata`; Justfile guard added; `En.Postgres.Datastore` with
+  `resolveDatastoreIdSession`; `Main.hs` mints/reads the persisted id; `uuid` was
+  already a dependency (EP-36 added it for request ids).
+- [x] M2 (2026-07-08): restart/reuse behavior verified (same id across restarts; a
+  second database mints a different id; a token minted under another identity is
+  rejected with `invalid_consistency_token`). Missing-migration startup failure and the
+  rotation drill also verified.
+- [x] M3 (2026-07-08): `Env` in `en-servant/src/En/Servant/Seam.hs` gains
   `deadlineDefaultMillis`/`deadlineMaxMillis`; `lookupDeadline` in
   `en-servant/src/En/Servant/API.hs` clamps; `EN_LOOKUP_DEADLINE_DEFAULT_MS`,
-  `EN_LOOKUP_DEADLINE_MAX_MS`, `EN_MAX_BATCH_SIZE` wired; en-servant tests updated.
-- [ ] M4: `en-servant/en-servant.cabal` description and `README.md` row corrected
-  (helper, not combinator); migration-workflow wording made honest; xid8 restore
-  hazard + id-rotation runbook documented in `docs/user/service-and-operations.md`;
-  full configuration reference updated.
-- [ ] Final validation transcript recorded in Outcomes.
+  `EN_LOOKUP_DEADLINE_MAX_MS`, `EN_MAX_BATCH_SIZE` wired; en-servant clamp test added
+  and mutation-checked. `en-example` updated for the new `Env` fields.
+- [x] M4 (2026-07-08): `en-servant/en-servant.cabal` description and `README.md` rows
+  corrected (helper, not combinator); migration-workflow wording made honest; xid8
+  restore hazard + id-rotation runbook documented in
+  `docs/user/service-and-operations.md`; full configuration reference updated and
+  cross-checked against the source.
+- [x] Final validation transcript recorded in Outcomes.
 
 
 ## Surprises & Discoveries
@@ -81,7 +88,48 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- **Warnings had to move with the parsers.** `loadAuthConfig` printed
+  `WARNING: authentication is DISABLED` as a side effect of parsing. Once parsing became
+  pure, that had nowhere to go — and printing it from `Config.hs` would have been worse:
+  a configuration that later fails to parse would first emit advice about a setting that
+  never takes effect. `loadServerConfig` returns `(ServerConfig, [Text])` and `Main`
+  prints the warnings only after the whole config is accepted.
+
+- **The monomorphism restriction bites `where`-bound partial applications.** Writing
+  `withDefault = withDefaultIn environment` in a `where` clause monomorphizes it to the
+  first use site, so `EN_PORT`'s `Parser Int` poisoned `EN_GC_WINDOW`'s `Parser String`.
+  Each such binding needs an explicit `forall a.` signature. Cost one compile cycle;
+  worth knowing before writing the next parser module.
+
+- **`Pool.UsageError`'s `Show` instance nests four constructors around PostgreSQL's own
+  sentence.** The first `EN_GC_WINDOW` failure read
+  `SessionUsageError (StatementSessionError 1 0 "SELECT ($1::interval) …" [...] True
+  (ServerStatementError (ServerError "22007" "invalid input syntax for type interval:
+  \"24 hoursss\"" …)))`. `Hasql.Errors.toDetailedText` renders the useful part;
+  `renderUsageError` in `Main.hs` dispatches on the three `UsageError` constructors so
+  an acquisition timeout says so in prose. Any plan surfacing a hasql error to an
+  operator should do the same rather than `show`.
+
+- **The plan's clamp test would have passed vacuously.** M3 proposed asserting that a
+  lookup with `deadlineMaxMillis = 0` returns a truncated page. It does not:
+  `pageLookup` in `en-core/src/En/Lookup.hs` reports `LookupTruncated` only when
+  `hasMore && not hasBudget`, and returns `LookupExhausted` whenever the result set fits
+  the limit — *regardless of the budget*. The fixture's page fit, so the first version of
+  the test failed. The working test sets `limit = 1` against a subject with two auditable
+  spaces, which forces `hasMore`; the two runs then differ only in the budget, and the
+  states differ (`truncated` versus `hasMore`). Mutation-checked: replacing
+  `min env.deadlineMaxMillis (max 0 requested)` with `max 0 requested` fails it.
+
+- **`uuid` was already a dependency.** The plan's Interfaces section says to add it; EP-36
+  had already done so for request ids. No cabal change was needed.
+
+- **`Statement.preparable` takes `Text`.** Same trap EP-37 hit; noted again because
+  `Config.hs`'s interval-validation statement is the third place it appears.
+
+- **A second `Env` consumer existed outside the plan's list.**
+  `en-example/src/En/Example/Host.hs` constructs `Env` and broke on the two new fields.
+  The plan named only `en-server/app/Main.hs` and `en-servant/test/Main.hs`. Anything
+  adding a field to `Env` should grep the workspace, not the plan.
 
 
 ## Decision Log
@@ -158,13 +206,204 @@ Record every decision made while working on the plan.
   rather than implying a managed codd pipeline that does not exist in-tree.
   Date: 2026-07-07
 
+- Decision: `loadServerConfig` returns `Either Text (ServerConfig, [Text])`, and every
+  configuration failure exits `1` through `configFailure` instead of `fail`.
+  Rationale: EP-33 recorded that config errors surfaced as
+  `en-server: Uncaught exception … user error (…)` wrapped around an otherwise good
+  message, and assigned the fix here. `fail` in `IO` throws an `IOException`; nothing is
+  bound or opened at that point, so there is nothing to unwind and an exception buys
+  nothing. Warnings ride along in the tuple rather than being printed during parsing, so
+  a config that later fails never first advises the operator about a setting that will
+  not take effect.
+  Date: 2026-07-08
+
+- Decision: Absorb EP-33's and EP-37's parsers into `Config.hs`, leaving their *types*
+  and behavior in `Middleware.hs` and `Maintenance.hs`.
+  Rationale: The master plan promised one record the siblings read their knobs through.
+  Moving `loadAuthConfig`, `loadRateLimitConfig`, and `loadMaintenanceConfig` into
+  `Config.hs` gives one entry point, one error style, and one place to audit against the
+  documented configuration reference — `knownVariables` is exhaustive and the docs sweep
+  checks it. The types stay with their consumers, so `Config` imports `Middleware` and
+  `Maintenance` and neither imports `Config`. Recorded alternative: leave each loader in
+  place and have `loadServerConfig` call them (rejected — three error styles, and `fail`
+  survives in two of them).
+  Date: 2026-07-08
+
+- Decision: Parse from a snapshot `Map String String` rather than calling `lookupEnv`
+  inside the parsers.
+  Rationale: It makes `parseServerConfig` pure and therefore testable without a process,
+  it forces `knownVariables` to be exhaustive (which the docs sweep then checks against
+  the source), and it removes any question of the environment changing mid-parse. The
+  distinction between an absent variable and an empty one survives, because
+  `Map.lookup` returns `Just ""` for `EN_PORT=`.
+  Date: 2026-07-08
+
+- Decision: `en-server` renders `Pool.UsageError` through `Hasql.Errors.toDetailedText`
+  rather than `show`.
+  Rationale: `show` nests four hasql constructors around the one sentence PostgreSQL
+  wrote, which is the sentence the operator needs. An acquisition timeout gets prose of
+  its own, since hasql has no message for it.
+  Date: 2026-07-08
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Completed 2026-07-08 in one commit. All four milestones landed as specified; the only
+deviations were corrections (the clamp test as written could not fail — see Surprises).
+
+**Against the original purpose.** Two en deployments can no longer mint interchangeable
+tokens: identity is minted once per database and lives in it. All 23 environment
+variables are validated before the port binds, each failure naming its variable and
+value, and the process exits cleanly rather than throwing. The lookup deadline has a
+server-owned ceiling and the batch cap is configurable. The package descriptions say
+what the code does.
+
+### Validation transcript
+
+Configuration validation (M1). Each aborts before binding the port, exit `1`:
+
+```text
+EN_PORT=abc                    en-server: Invalid EN_PORT=abc: expected an integer in 1..65535
+EN_PORT=70000                  en-server: Invalid EN_PORT=70000: expected an integer in 1..65535
+EN_MAX_BATCH_SIZE=0            en-server: Invalid EN_MAX_BATCH_SIZE=0: expected a positive integer
+EN_LOOKUP_DEADLINE_MAX_MS=100  en-server: Invalid EN_LOOKUP_DEADLINE_MAX_MS=100: it is below
+                               EN_LOOKUP_DEADLINE_DEFAULT_MS=3000. Every lookup would be clamped
+                               below its own default.
+EN_RATE_LIMIT_RPS=-1           en-server: Invalid EN_RATE_LIMIT_RPS=-1: expected a non-negative number
+EN_TLS_CERT_FILE=/tmp/x        en-server: Invalid TLS configuration: set both EN_TLS_CERT_FILE and
+                               EN_TLS_KEY_FILE, or neither.
+(unset EN_DATABASE_URL)        en-server: Missing EN_DATABASE_URL: a PostgreSQL connection string, …
+```
+
+`EN_GC_WINDOW`, adjudicated by PostgreSQL after the database is reachable and before the
+port binds:
+
+```text
+$ EN_GC_WINDOW='24 hoursss' en-server
+en-server: Invalid EN_GC_WINDOW=24 hoursss: PostgreSQL rejected it: …
+  message: invalid input syntax for type interval: "24 hoursss"
+Expected a positive PostgreSQL interval, e.g. '24 hours' or '7 days'.
+$ echo $?
+1
+
+$ EN_GC_WINDOW='0 seconds' en-server
+en-server: Invalid EN_GC_WINDOW=0 seconds: it is not a positive interval
+```
+
+Identity lifecycle (M2). Two consecutive starts against one database, then a second
+database:
+
+```text
+first  start: Datastore id: 76efe58d-24e3-4ee2-8242-99050e3c348a
+second start: Datastore id: 76efe58d-24e3-4ee2-8242-99050e3c348a
+in database : Datastore id: 76efe58d-24e3-4ee2-8242-99050e3c348a
+row count   : 1
+
+database one: 76efe58d-24e3-4ee2-8242-99050e3c348a
+database two: f10d966e-7857-49d2-8034-5b1594e8c671
+token minted on database two: en1.f10d966e-7857-49d2-8…
+```
+
+Replaying database two's token against database one — the guard finding A6 said was
+defeated:
+
+```text
+{"code":"invalid_consistency_token","message":"token datastore does not match this en datastore","retryable":false}
+status=400
+```
+
+…while a locally minted token still resolves (`just test-server` → `allowed`). Startup
+against a database missing the migration, with the port never bound:
+
+```text
+  message: relation "en_datastore_metadata" does not exist
+Is the en_datastore_metadata migration from db/migrations applied?
+exit=1
+not bound (good)
+```
+
+Rotation drill (the restore runbook):
+
+```text
+before rotation: 76efe58d-24e3-4ee2-8242-99050e3c348a
+DELETE 1
+after rotation : 0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5
+=> identity rotated
+```
+
+Deadlines and batch cap (M3), against a running server:
+
+```text
+$ time curl … -d '{… "deadlineMillis": 86400000}'   # /v1/lookup
+lookup status=200
+0.027 total                                         # not a day of budget
+
+$ curl … /v1/batch-check  (2 pairs, EN_MAX_BATCH_SIZE=1)
+{"code":"batch_too_large","message":"batch exceeds the maximum of 1 pairs","retryable":false}
+status=400
+```
+
+The en-servant suite's clamp test asserts the same property at the handler layer, and
+was mutation-checked (removing `min env.deadlineMaxMillis` fails it).
+
+Documentation sweep (M4):
+
+```text
+$ rg -niE 'combinator' README.md en-servant/en-servant.cabal
+(clean)
+$ every EN_* read by en-server/app, checked against the docs table
+source variables: 23
+(all documented)
+$ grep -c 'en_datastore_metadata|xid8' docs/user/service-and-operations.md
+6
+$ grep -c lookupEnv en-server/app/Main.hs
+0
+$ grep -rn '"en-server"' en-server/app/
+(none)
+```
+
+Regressions (acceptance 6): `cabal build all` clean; `cabal test en-core`,
+`cabal test en-postgres`, `cabal test en-servant` all PASS; `just start-and-test`
+passes, and the supervised server logs its identity, deadlines, and batch cap.
+
+### Gaps
+
+- **`parseServerConfig` is pure and testable, but has no tests.** The validation table
+  was exercised by running the binary. A unit test over `Map String String` would be
+  cheap and would catch a regression in a parser without a database. Not added: this
+  plan had no test suite for `en-server`, and adding one is a larger change than the
+  finding warranted.
+- **Configuration reports only the first error.** An operator with three bad variables
+  fixes them one restart at a time. The plan explicitly chose this ("exhaustive
+  multi-error reporting is not worth the machinery here") and the choice still looks
+  right, but it is a real papercut.
+- **`EN_SCHEMA_PATH` file reading stays in `Main.hs`,** so a missing schema file is
+  reported after the config parse rather than with it. It exits cleanly via
+  `configFailure`, so the behavior is right; only the locality is odd.
+- **The docs sweep is a shell command, not a test.** `knownVariables` and the docs table
+  can drift, and nothing in CI notices.
+- **Identity rotation is a manual runbook step.** Nothing detects that a database was
+  restored into a fresh cluster; the operator must remember. Detecting it would mean
+  persisting a cluster fingerprint (e.g. `pg_control_system()`'s system identifier) next
+  to the datastore id and comparing at startup — a natural follow-up, and strictly
+  better than a runbook, but out of scope here.
+
+### Lessons
+
+The plan's most valuable line was an aside: "with `deadlineMaxMillis = 0` … returns a
+page whose state is `LookupTruncatedWire`-shaped rather than running unbounded". It was
+wrong — `pageLookup` reports `exhausted` when the result set fits the limit, whatever the
+budget — but it was *specific enough to be wrong*, so writing it exposed the gap. A vaguer
+instruction ("assert the clamp works") would have produced a test that passed for the
+wrong reason. The same pattern appears in EP-37, where the plan's falsifiable EXPLAIN
+prediction is what caught the useless index.
+
+Second: the plan enumerated the files that construct `Env` and missed one
+(`en-example`). Plans should name the *property* to re-establish ("every `Env`
+construction site compiles") rather than a list that the compiler will produce anyway.
 
 
 ## Context and Orientation
