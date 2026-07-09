@@ -59,7 +59,9 @@ the schema as the intersection `owner ∩ member`) returns, on the wire, an
 - [x] M2/M3 evidence (2026-07-09): both operator behaviours observed to fail against a
   deliberately broken evaluator — a concatenating `intersectionNode` and an exclusion that
   puts every child on the granting side. Transcripts in Concrete Steps.
-- [ ] Final: full suite green; Outcomes filled; master plan progress row updated.
+- [x] Final (2026-07-09): `cabal build all` and `cabal test all` green across all seven
+  suites; Outcomes filled; master plan registry, Progress, Integration Points, Surprises &
+  Discoveries and Decision Log updated.
 
 
 ## Surprises & Discoveries
@@ -325,7 +327,59 @@ rewrite; M0 confirms it is needed for the predicted reason rather than an incide
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Finding B10 is fixed. `ExpandNode` carries `ExpandUnion`, `ExpandIntersection`, and
+`ExpandExclusion`; `expandRewrite` preserves them; the wire carries them as `kind`
+`"union"` / `"intersection"` / `"exclusion"`; and the OpenAPI document describes them. All
+five Validation and Acceptance criteria hold. The headline one, byte for byte from the real
+handler: `audited-space#audit` now answers with a single `intersection` node over two
+conjunct subtrees, where before this plan it answered with a flat pair of usersets
+indistinguishable from what `act` — an `anyOf` over the same two relations — produces.
+
+The plan was accurate about the code and wrong about two things it could not have known,
+and both errors were in the same direction: it trusted the compiler further than the
+compiler goes.
+
+It said `expandNodeToWire` is "the total mapping the compiler will force you to extend",
+and its recovery section said "the compiler drives completeness". Neither is true here.
+`-Wall` is on, `-Werror` is not, so extending `ExpandNode` produced a warning and a green
+`cabal build all`, with a runtime `Non-exhaustive patterns` crash waiting on the first
+intersection any client expanded. And the plan's own survey of consumers missed
+`instance ToSchema ExpandNodeWire` in `en-servant/src/En/Servant/OpenApi.hs`, which
+hand-enumerates the node kinds into the published API document and would have silently
+shipped a specification contradicting the server. Two consumers, neither enforced. The
+lesson is narrow and worth carrying: when a plan justifies its safety with "the compiler
+will force it", check whether the project's warning flags actually make that a failure.
+
+The second error is the one this initiative keeps rediscovering, and this time it appeared
+in tests the plan *specified* rather than tests it inherited. Every conjunct in the kikan
+schema is a `ComputedUserset`, which expands to exactly one node. So `audited-space#audit`
+yields two children under a correct evaluator and two children under one that concatenates
+every branch — `treeHasIntersection` passes against both, and so does counting conjuncts.
+`asBranchNode`, which the plan itself calls "the difference between n conjuncts and one
+blurry pile", was covered by nothing. `branchSchema` — an intersection over a two-row
+`This` — closes it, and the sabotage run shows only that fixture failing while all the
+kikan assertions stay green. Adding it changed no production code, which is exactly why it
+was easy to skip.
+
+The master plan predicted EP-43 would meet a test that encodes the bug it covers, and it
+did: `expand paginates top-level children` passed only because `audit`'s intersection was
+flattened into two pageable children. But the sharper instance was prospective rather than
+inherited — a test this plan told its implementer to write, which would have proved nothing.
+The rule "a test for this class of bug is not accepted until seen to fail against a broken
+implementation" caught it, and it is the only thing that would have.
+
+What went to plan: the node shapes, the single-branch collapse, atomic operator paging, the
+`ExpandCaveated` wrapper staying untouched, and EP-40's `CycleDetected` guard surviving the
+edit. The engine diff is 69 lines. No package dependencies, no migrations, no behavioural
+change to `check` or `lookup`.
+
+Left for others. `asBranchNode []` yields `ExpandUnion []` — an unsatisfiable conjunct,
+faithfully rendered — and no fixture exercises it, because it needs an intersection over a
+relation with no rows; it is correct by construction and by inspection, not by test.
+Expand's eager-then-slice paging (the sibling of lookup's B8) is untouched, as scoped.
+docs/plans/44 will replace `maxDepth` / `pageLimit` / `resultCap` with the shared budget
+record and should leave `unionNode` / `intersectionNode` / `asBranchNode` alone: the
+single-branch collapses are semantic, not optimizations.
 
 
 ## Context and Orientation
@@ -719,8 +773,40 @@ End-state interfaces (full module paths):
   `nodeHasCaveat`, plus new `treeHasIntersection`/`treeHasExclusion`) recurse through
   operator nodes.
 
-Consumed by: audit/review UI work and
-docs/plans/35-version-the-wire-contract-and-type-the-error-model.md (tag naming and
-versioning of the three new wire constructors — whichever lands second reconciles).
-Independent of docs/plans/39/40/41/42 except the trivial `En.Expand` merge seam with
-EP-40's `CycleDetected` revisit guard noted in Context and Orientation.
+Consumed by: audit/review UI work. The reconciliation with
+docs/plans/35-version-the-wire-contract-and-type-the-error-model.md is **done**, not
+pending: 35 landed first, so its `kind` vocabulary named the three new nodes and no
+`Wire`-suffixed tag reaches a client. Independent of docs/plans/39/40/41/42 except the
+`En.Expand` merge seam with EP-40's `CycleDetected` revisit guard, which was already in
+place and is untouched.
+
+Also extended, and *not* named in this plan's original survey:
+`En.Servant.OpenApi`'s `instance ToSchema ExpandNodeWire` hand-enumerates the node kinds
+into the published OpenAPI document. It is not a pattern match; nothing fails if a
+constructor is forgotten.
+
+
+---
+
+Revision note (2026-07-09): EP-43 is complete. Progress, Surprises & Discoveries, Decision
+Log, Concrete Steps, Outcomes & Retrospective, and Interfaces and Dependencies updated.
+
+Three sections were revised against what implementation found rather than merely filled in.
+The Decision Log's fourth entry (additive constructors on a `Generic`-derived tagged sum,
+byte-check for the string `ExpandIntersectionWire`) is superseded in spelling: docs/plans/35
+landed first, so the tags are `kind: "union" | "intersection" | "exclusion"` — the outcome
+that entry pre-committed to. The Idempotence section's "land M2 and M3 as separate commits,
+revert M3 to recover" is overridden and its premise recorded as false: `expandNodeToWire` is
+a non-exhaustive `\case` under `-Wall` without `-Werror`, so there is no commit boundary at
+which the tree is working, and reverting M3 alone restores a runtime crash. And the Context
+and Orientation claim "no other renderer consumes `ExpandNode` — verified by search" missed
+`ToSchema ExpandNodeWire`, because the search was for the engine type rather than the wire
+type.
+
+One change is additive rather than corrective, and matters most. The plan's specified
+assertions — `treeHasIntersection` over `audited-space#audit`, plus a conjunct count — are
+vacuous. Every kikan conjunct is a `ComputedUserset` expanding to exactly one node, so a
+correct `intersectionNode` and one that concatenates all branches produce identical trees
+there. `branchSchema` (`doc#reviewer = allOf this [computed approver]`, two stored reviewers)
+is the fixture that distinguishes them, and the sabotage transcript shows it is the only
+assertion that does.

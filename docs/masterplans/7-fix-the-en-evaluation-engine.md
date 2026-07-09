@@ -78,7 +78,7 @@ store implementation, which is risky enough to deserve its own validation cycle.
 | EP-40 | Adopt Zanzibar cycle and exclusion semantics in check | docs/plans/40-adopt-zanzibar-cycle-and-exclusion-semantics-in-check.md | None | EP-39 | Complete |
 | EP-41 | Cache context-free check subproblems | docs/plans/41-cache-context-free-check-subproblems.md | None | EP-39, EP-40 | Complete |
 | EP-42 | Stream lookup pages with validated cursors and a real deadline | docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md | None | EP-39 | Complete |
-| EP-43 | Preserve set operators in expand trees | docs/plans/43-preserve-set-operators-in-expand-trees.md | None | None | In Progress |
+| EP-43 | Preserve set operators in expand trees | docs/plans/43-preserve-set-operators-in-expand-trees.md | None | None | Complete |
 | EP-44 | Make evaluation budgets configurable and trim hot-path overhead | docs/plans/44-make-evaluation-budgets-configurable-and-trim-hot-path-overhead.md | None | EP-39, EP-40, EP-42 | Not Started |
 
 
@@ -156,6 +156,23 @@ docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md (maste
 reuses `MintToken` as-is. No wire change was needed: `enErrorToFault` already maps
 `InvalidConsistencyToken` to a 400, so docs/plans/35's contribution here was already in place.
 
+The expand node type (`En.Expand.ExpandNode`) and its wire mirror
+(`En.Servant.API.ExpandNodeWire`) are owned by EP-43. **Settled by EP-43 (2026-07-09):**
+`ExpandNode` gained `ExpandUnion ![ExpandNode]`, `ExpandIntersection ![ExpandNode]`, and
+`ExpandExclusion ![ExpandNode] ![ExpandNode]` (granted children, subtracted children). The
+handshake with docs/plans/35-version-the-wire-contract-and-type-the-error-model.md
+(master plan 6) is resolved in 35's favour, because 35 landed first: the wire tags are
+`kind: "union" | "intersection" | "exclusion"`, lowercase, following EP-35's `kind`
+discriminator vocabulary, and no `Wire`-suffixed constructor name reaches a client. The
+exclusion node's two sides are distinct JSON keys (`granted`, `subtracted`) so no encoder
+can merge them. EP-44 must leave `unionNode`/`intersectionNode`/`asBranchNode` in
+`En/Expand.hs` alone — the single-branch collapses are semantics, not optimizations.
+
+`ExpandNodeWire` has a consumer the compiler does not check: `instance ToSchema
+ExpandNodeWire` in `en-servant/src/En/Servant/OpenApi.hs` hand-enumerates the node kinds
+into the published OpenAPI 3.1 document. Any later plan adding a node kind must update it
+by hand or ship a specification that contradicts the server.
+
 Engine configuration (EP-44's budget record) is constructed in `en-server/app/Main.hs`
 and the `en-servant` seam defaults; it must slot into the server configuration record
 established by docs/plans/38-validate-configuration-and-persist-datastore-identity.md
@@ -172,7 +189,8 @@ established by docs/plans/38-validate-configuration-and-persist-datastore-identi
 - [x] EP-41 (2026-07-08): check evaluates symbolically; probe results cached in the tuple-read interposer
 - [x] EP-42 (2026-07-08): lookup confirmation resumes from the cursor watermark and is bounded to the page; the traversal itself still recomputes (see below)
 - [x] EP-42 (2026-07-08): cursors validated like consistency tokens; deadline interrupts expansion; one snapshot per lookup
-- [ ] EP-43: expand tree preserves union/intersection/exclusion operators end-to-end to the wire
+- [x] EP-43 (2026-07-09): expand tree preserves union/intersection/exclusion operators end-to-end to the wire
+- [x] EP-43 (2026-07-09): exclusion keeps granted and subtracted children apart; operator nodes are atomic under paging
 - [ ] EP-44: depth/page/result budgets configurable per engine; constants deduplicated
 - [ ] EP-44: EntryPoint machinery wired to a consumer or relocated; hot-path allocation fixes benchmarked
 
@@ -424,6 +442,56 @@ know why before it benchmarks: EP-39's probe already made an individual confirma
 memo sharing saves one bounded read per candidate rather than a whole relation drain.
 
 
+**"The compiler will force it" is false in this workspace, and EP-44 should stop relying on
+it (EP-43, 2026-07-09).** `-Wall` is on; `-Werror` is not. EP-43 extended `ExpandNode` and
+`cabal build all` exited 0, emitting only a `-Wincomplete-patterns` warning for
+`expandNodeToWire` — a function EP-43's plan twice called "the total mapping the compiler
+will force you to extend". Shipping that state means a `Non-exhaustive patterns` crash on
+the first intersection any client expands, and every test suite stays green, because no test
+expanded one.
+
+There is a second, worse instance in the same file's neighbourhood. `instance ToSchema
+ExpandNodeWire` in `en-servant/src/En/Servant/OpenApi.hs` hand-enumerates the wire node kinds
+into the published OpenAPI document. It is a list, not a pattern match, so it produces no
+warning at all. EP-43's own survey of `ExpandNode` consumers missed it, having searched for
+the engine type rather than the wire type.
+
+The consequence for this initiative is procedural. EP-44 deletes or relocates the
+`EntryPoint` machinery, deduplicates budget constants across three modules, and tunes hot
+paths — all changes whose safety argument is "the compiler finds the call sites". It will
+not, for hand-written schema instances, JSON decoders, or any `case` over `Text`. Grep for
+the *wire* type as well as the engine type, and remember that a green build here means less
+than it looks.
+
+**A fixture whose branches all have arity one cannot observe branching (EP-43,
+2026-07-09).** This is the master plan's testing rule meeting a new failure mode, and it is
+the first time the vacuous test was one a plan *specified in advance* rather than one it
+inherited.
+
+Every conjunct in the kikan schema is a `ComputedUserset`, and a `ComputedUserset` expands to
+exactly one node. So on `audited-space#audit`, an `intersectionNode` that emits one child per
+conjunct and a broken one that concatenates all branches produce the *same tree*: two
+children either way. `treeHasIntersection` passes against both. So does counting conjuncts.
+EP-43's plan specified exactly those assertions, and they would have covered `asBranchNode`
+— the function the plan calls "the difference between n conjuncts and one blurry pile" —
+not at all.
+
+The fix was a fixture, not an assertion: `branchSchema` in `en-core/test/Main.hs`, an
+intersection over a two-row `This`. Under sabotage it fails `Just 2` / `Just 3` while every
+kikan-based assertion stays green. The generalization, which EP-44's benchmark work should
+carry: before trusting a test, ask what *arity* the code under test distinguishes, then check
+the fixture exhibits more than one of it. A test over a one-element case is a test of the
+element, not of the structure.
+
+**EP-43 met the predicted inherited bug-pinning test too (2026-07-09).** `expand paginates
+top-level children` (`en-core/test/Main.hs`) expanded `audited-space#audit` at `ExpandLimit
+1` and asserted `ExpandHasMore`. It passed only because the intersection was flattened into
+two pageable children — the erasure B10 names. It now expands a flat two-row relation, and a
+sibling assertion pins that an operator node is atomic under paging: `audit` at limit 1 is
+`ExpandExhausted` with one child, because handing a client half a conjunction is worse than
+the flattening this plan removed. That is four bug-pinning tests across four plans.
+
+
 ## Decision Log
 
 - Decision: Split performance (EP-39) from semantics (EP-40) even though both rewrite `En/Check.hs`.
@@ -459,6 +527,15 @@ memo sharing saves one bounded read per candidate rather than a whole relation d
 - Decision: The check evaluator is symbolic throughout; `CaveatContext` does not appear below `check`/`checkCached`/`checkMany`, and the nested-group accelerator requires uncaveated edges.
   Rationale: caching a context-free decision requires that the traversal never consult the context, or only leaves could be cached. The accelerator's conclusion is an unconditional allow and cannot carry a gate, so a caveated edge must fall back to recursion. This tightens the `relationUnionsThis` guard rather than weakening it. EP-44 must not reintroduce a context-sensitive accelerator test as an optimization: it would cache a satisfied caveat as an unconditional allow, which is the same class of bug as B6's inverse.
   Date: 2026-07-08
+- Decision: A plan may not justify completeness with "the compiler will force it" without checking the workspace's warning flags. `-Werror` is off; a non-exhaustive `\case` warns and builds. Hand-written `ToSchema` instances, JSON decoders, and any `case` over `Text` produce no warning whatsoever.
+  Rationale: EP-43 extended `ExpandNode` and got a green `cabal build all` with a runtime crash latent in `expandNodeToWire`, and separately missed `instance ToSchema ExpandNodeWire` entirely, which would have shipped an OpenAPI document contradicting the server. Both were caught by reading warnings and by grepping the wire type, not by the build. EP-44's `EntryPoint` removal and constant deduplication rest on exactly this assumption.
+  Date: 2026-07-09
+- Decision: The testing rule extends again: when a test's subject is a *structure*, the fixture must exhibit more than one element of that structure. A test over a one-element case tests the element, not the structure.
+  Rationale: every kikan intersection conjunct expands to exactly one node, so EP-43's specified assertions — `treeHasIntersection` and a conjunct count over `audited-space#audit` — pass identically against a correct evaluator and against one that concatenates every branch. `asBranchNode`, the function that carries the whole meaning of B10, was covered by nothing until `branchSchema` added an intersection over a two-row `This`. This is the first vacuous test in this initiative that a plan specified in advance rather than inherited, which is why the rule needs stating separately from "invert the test against a broken implementation": inverting these assertions would have shown them green.
+  Date: 2026-07-09
+- Decision: Operator nodes in the expand tree are atomic under paging; `pageNodes` never splits one across pages, and a single-branch `Union`/`Intersection` collapses to its branch.
+  Rationale: slicing inside an intersection hands a client half a conjunction, which is a worse lie than the flattening EP-43 removes. The collapse is semantic — a one-branch operator carries no information — and EP-44 must not treat either as an optimization to tune away.
+  Date: 2026-07-09
 - Decision: An undefined caveat name beside a *satisfied caveated* grant now fails the check instead of returning `Allowed`; beside an *unconditional* grant it is still absorbed by the short-circuit.
   Rationale: symbolic evaluation cannot know the good row's caveat passes, and deferring name validation to re-application does not recover the old answer (the fold is a `traverse` and fails on the first `Left` in the union). Failing closed on data referencing a caveat the schema no longer declares is the defensible reading, and eager validation guarantees a cached residual names only definable caveats. This refines, and does not contradict, the case EP-39 introduced and EP-40 blessed.
   Date: 2026-07-08
@@ -540,6 +617,34 @@ matching notes.
 
 
 ---
+
+Revision note (2026-07-09, fifth): EP-43 is complete. Registry, Progress, Integration Points,
+Surprises & Discoveries, and Decision Log updated. Finding B10 is fixed: `space#audit`, an
+intersection, now answers with an intersection node over two conjunct subtrees rather than a
+flat subject list byte-identical to what `space#act` — a union over the same two relations —
+produces. Exclusion keeps its granted and subtracted children in separate wire keys, so an
+auditor can see who is carved out. Operator nodes are atomic under paging.
+
+The docs/plans/35 handshake this master plan left open is closed, and in 35's favour: 35
+landed first, so the wire tags follow its `kind` vocabulary (`"union"`, `"intersection"`,
+`"exclusion"`) and no Haskell constructor name reaches a client. No version bump; the tree
+semantics are EP-43's, the spelling is 35's, exactly as both plans pre-committed.
+
+Two discoveries change what EP-44 should expect, and both are about trusting the wrong thing.
+First: "the compiler will force it" is false here. `-Werror` is off, so extending `ExpandNode`
+built green with a latent `Non-exhaustive patterns` crash in `expandNodeToWire`, and the
+OpenAPI document's `ToSchema ExpandNodeWire` — a hand-written list, warning-free — was missed
+by EP-43's own consumer survey. EP-44 deletes `EntryPoint` machinery and deduplicates
+constants on precisely this assumption. Second: a fixture whose branches all have arity one
+cannot observe branching. Every kikan conjunct expands to exactly one node, so the assertions
+EP-43's plan specified in advance were vacuous with respect to the function that carries B10's
+whole meaning; a new `branchSchema` fixture closes it, and under sabotage it is the only
+assertion that fails. Both are now Decision Log entries.
+
+That makes four bug-pinning tests across four plans. The predicted one landed too: `expand
+paginates top-level children` passed only because `audit`'s intersection was flattened into
+two pageable children. No decomposition change: EP-44 keeps its scope, dependencies, and
+ordering, and is now the only child remaining.
 
 Revision note (2026-07-08, fourth): EP-42 is complete. Registry, Progress, Integration Points,
 Surprises & Discoveries, and Decision Log updated. B9 (forgeable cursors) and B7 (one lookup,
