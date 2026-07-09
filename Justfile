@@ -79,6 +79,11 @@ run-migrations: create-database
     else \
       echo "datastore metadata already applied"; \
     fi
+  @if psql "$PG_CONNECTION_STRING" -tAc "SELECT indexdef FROM pg_indexes WHERE indexname = 'relation_tuple_live_unique'" | grep -q caveat_name; then \
+      psql "$PG_CONNECTION_STRING" -v ON_ERROR_STOP=1 -f en-migrations/db/migrations/20260709202037_touch-semantics-live-unique.sql; \
+    else \
+      echo "touch-semantics unique index already applied"; \
+    fi
 
 # Run a write-token-check HTTP smoke test against a running en-server
 [group("testing")]

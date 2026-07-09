@@ -5,6 +5,7 @@ title: "Adopt touch semantics for tuple writes"
 kind: exec-plan
 created_at: 2026-07-07T15:24:59Z
 master_plan: "docs/masterplans/8-correct-write-path-and-storage-semantics.md"
+intention: intention_01kx48hvkeemk9j4r828132s2h
 ---
 
 # Adopt touch semantics for tuple writes

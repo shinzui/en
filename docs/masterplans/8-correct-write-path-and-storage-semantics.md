@@ -4,6 +4,7 @@ slug: correct-write-path-and-storage-semantics
 title: "Correct write-path and storage semantics"
 kind: master-plan
 created_at: 2026-07-07T15:24:21Z
+intention: intention_01kx48hvkeemk9j4r828132s2h
 ---
 
 # Correct write-path and storage semantics
@@ -68,7 +69,7 @@ that en-core consumers embed against).
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-45 | Adopt touch semantics for tuple writes | docs/plans/45-adopt-touch-semantics-for-tuple-writes.md | None | None | Not Started |
+| EP-45 | Adopt touch semantics for tuple writes | docs/plans/45-adopt-touch-semantics-for-tuple-writes.md | None | None | In Progress |
 | EP-46 | Add write preconditions and atomic mixed writes | docs/plans/46-add-write-preconditions-and-atomic-mixed-writes.md | EP-45 | None | Not Started |
 | EP-47 | Fail loudly on storage decode errors and tighten write snapshots | docs/plans/47-fail-loudly-on-storage-decode-errors-and-tighten-write-snapshots.md | None | None | Not Started |
 | EP-48 | Batch tuple writes and add bulk import and export | docs/plans/48-batch-tuple-writes-and-add-bulk-import-and-export.md | EP-45 | EP-46 | Not Started |

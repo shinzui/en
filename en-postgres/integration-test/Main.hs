@@ -666,7 +666,7 @@ schemaSql =
 
     CREATE UNIQUE INDEX relation_tuple_live_unique
       ON relation_tuple
-        (object_type, object_id, relation, subject_type, subject_id, coalesce(subject_relation, ''), coalesce(caveat_name, ''))
+        (object_type, object_id, relation, subject_type, subject_id, coalesce(subject_relation, ''))
       WHERE deleted_xid IS NULL;
 
     CREATE INDEX relation_tuple_object_live_idx
