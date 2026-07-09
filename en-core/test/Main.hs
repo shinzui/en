@@ -425,6 +425,32 @@ main = do
     -- with the candidate set rather than being a fixed discount.
     assertEqual "confirmations share subproblems through one memo" 17 =<< readIORef sharedMemoReads
 
+    {- B8, confirmation half: a later page must not re-confirm what earlier pages
+    already emitted. With LookupLimit 1 the watermark drops one more candidate on
+    every page, so each page confirms strictly less than the one before it. -}
+    let sharedMemoRequest cursor = lookupRequest (SubjectId alice) (RelationName "enter") (ObjectType "space") requestContext (LookupLimit 1) cursor
+        pagedSharedMemoLookup readRef cursor = lookupEngine noDeadline consistencyStore (countingStoreFor readRef sharedMemoTuples) sharedMemoGraph MinimizeLatency (sharedMemoRequest cursor)
+    firstPageReads <- newIORef 0
+    firstPage <- pagedSharedMemoLookup firstPageReads Nothing
+    firstCursor <- expectLookupHasMore "shared-memo page 1 has more" firstPage
+    firstReads <- readIORef firstPageReads
+    secondPageReads <- newIORef 0
+    secondPage <- pagedSharedMemoLookup secondPageReads (Just firstCursor)
+    secondCursor <- expectLookupHasMore "shared-memo page 2 has more" secondPage
+    secondReads <- readIORef secondPageReads
+    thirdPageReads <- newIORef 0
+    thirdPage <- pagedSharedMemoLookup thirdPageReads (Just secondCursor)
+    thirdReads <- readIORef thirdPageReads
+    assertEqual "shared-memo page 1 emits the first object" (Right (lookupPage [allowed memoChildA] (LookupHasMore firstCursor))) firstPage
+    assertEqual "shared-memo page 2 emits the second object" (Right (lookupPage [allowed memoChildB] (LookupHasMore secondCursor))) secondPage
+    assertEqual "shared-memo page 3 emits the last object" (Right (lookupPage [allowed memoRoot] LookupExhausted)) thirdPage
+    assertBool ("page 2 confirms less than page 1 (" <> show secondReads <> " < " <> show firstReads <> ")") (secondReads < firstReads)
+    assertBool ("page 3 confirms less than page 2 (" <> show thirdReads <> " < " <> show secondReads <> ")") (thirdReads < secondReads)
+    assertLookupObjects
+        "paged shared-memo lookup concatenates to the single-call result"
+        [allowed memoChildA, allowed memoChildB, allowed memoRoot]
+        =<< collectAllLookupPages noDeadline consistencyStore (runTupleStoreInMemory sharedMemoTuples) sharedMemoGraph (sharedMemoRequest Nothing)
+
     let strictLookupWithCursor cursor =
             lookupEngine noDeadline strictConsistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) (Just cursor))
     assertEqual "a forged v1 lookup cursor is rejected, not obeyed" (Left (InvalidConsistencyToken "lookup cursor")) =<< strictLookupWithCursor forgedLookupCursor
@@ -1354,6 +1380,12 @@ budgetedDeadline ref =
                     let hasBudget = remaining > 0
                      in (remaining - 1, hasBudget)
                 )
+
+expectLookupHasMore :: String -> Either EnError LookupPage -> IO LookupCursor
+expectLookupHasMore label =
+    \case
+        Right LookupPage{state = LookupHasMore cursor} -> pure cursor
+        other -> fail (label <> "\nexpected LookupHasMore, got: " <> show other)
 
 expectLookupTruncated :: String -> Either EnError LookupPage -> IO LookupCursor
 expectLookupTruncated label =

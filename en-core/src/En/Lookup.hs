@@ -23,7 +23,6 @@ module En.Lookup (
 
 import Prelude hiding (lookup)
 
-import Control.Monad (foldM)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes)
@@ -245,8 +244,36 @@ runLookup ::
     LookupRequest ->
     Eff es (Either EnError LookupPage)
 runLookup candidateCheck deadline graph revision token cursorState request = do
-    candidates <- evalRelation candidateCheck graph request.context revision request.subject request.objectType request.permission initialState
+    candidates <- evalRelation (Just emitWindow) candidateCheck graph request.context revision request.subject request.objectType request.permission initialState
     traverse (pageLookup deadline request.limit cursorState token) candidates
+  where
+    emitWindow =
+        EmitWindow
+            { watermark = cursorState >>= (.lastObject)
+            , confirmBudget = min resultCap (max 0 request.limit.unLookupLimit) + 1
+            }
+
+{- | What the current page still needs, handed to the /outermost/ confirmation only.
+
+Confirmation is the expensive half of reach-then-check: the reverse walk
+over-generates candidates and each one costs a forward check against storage.
+Before this existed, every page confirmed every candidate and then threw away the
+ones it had already emitted, so page N re-confirmed pages 1..N-1.
+
+'watermark' drops candidates already emitted -- results are sorted by object key, so
+anything at or below the watermark has been returned to the client already.
+'confirmBudget' stops confirming once the page can be filled: @limit + 1@ allowed
+candidates is enough to fill a page of @limit@ /and/ know that more remain.
+
+Both are sound only where the confirmation's output goes straight into the page. A
+nested confirmation feeds a further filter upstream, and truncating it could hide
+candidates the outer stage would have kept, so nested confirmations receive
+'Nothing' and confirm everything.
+-}
+data EmitWindow = EmitWindow
+    { watermark :: !(Maybe ObjectRef)
+    , confirmBudget :: !Int
+    }
 
 data EvalState = EvalState
     { depth :: !Int
@@ -282,6 +309,7 @@ resultCap = 1000
 
 evalRelation ::
     (TupleStore :> es) =>
+    Maybe EmitWindow ->
     CheckForCandidate es ->
     ReachabilityGraph ->
     CaveatContext ->
@@ -291,7 +319,7 @@ evalRelation ::
     RelationName ->
     EvalState ->
     Eff es (Either EnError [LookupObject])
-evalRelation candidateCheck graph context revision subject objectType relation state
+evalRelation window candidateCheck graph context revision subject objectType relation state
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded)
     | subproblem `elem` state.visited && state.skipRecursive == Nothing =
@@ -302,6 +330,7 @@ evalRelation candidateCheck graph context revision subject objectType relation s
                 pure (Left (UnknownRelation (renderRef ref)))
             Just schemaRelation ->
                 evalRewrite
+                    window
                     candidateCheck
                     graph
                     context
@@ -315,8 +344,21 @@ evalRelation candidateCheck graph context revision subject objectType relation s
     ref = RelationRef{objectType, relation}
     subproblem = Subproblem{subject, objectType, relation}
 
+{- | The emit window rides along a rewrite only where the rewrite's output /is/ the
+page's output.
+
+'Union' and 'Caveated' pass it through: a union branch contributes its own smallest
+@limit + 1@ candidates, which is enough for the merged page, and a rewrite-level
+caveat gates every object identically. 'Intersection' and 'Exclusion' consume it at
+their own confirmation but hand 'Nothing' to the sub-rewrites that /produce/ their
+candidates, since those must over-generate. 'This', 'ComputedUserset', and arrows
+never see it -- a relation reached through them may be an intermediate set, and for
+arrows it is used as the /subject/ of a further read, where dropping a low-keyed
+object would hide the high-keyed objects it leads to.
+-}
 evalRewrite ::
     (TupleStore :> es) =>
+    Maybe EmitWindow ->
     CheckForCandidate es ->
     ReachabilityGraph ->
     CaveatContext ->
@@ -327,29 +369,29 @@ evalRewrite ::
     Rewrite ->
     EvalState ->
     Eff es (Either EnError [LookupObject])
-evalRewrite candidateCheck graph context revision subject objectType currentRelation rewrite state =
+evalRewrite window candidateCheck graph context revision subject objectType currentRelation rewrite state =
     case rewrite of
         This ->
             evalThis candidateCheck graph context revision subject objectType currentRelation state
         ComputedUserset relation ->
-            evalRelation candidateCheck graph context revision subject objectType relation state
+            evalRelation Nothing candidateCheck graph context revision subject objectType relation state
         TupleToUserset tuplesetRelation computedRelation ->
             evalTupleToUserset candidateCheck graph context revision subject objectType currentRelation tuplesetRelation computedRelation state
         Union rewrites -> do
-            results <- traverse (\current -> evalRewrite candidateCheck graph context revision subject objectType currentRelation current state) rewrites
+            results <- traverse (\current -> evalRewrite window candidateCheck graph context revision subject objectType currentRelation current state) rewrites
             pure (mergeLookupObjects . concat <$> sequence results)
         Intersection rewrites ->
-            confirmCandidates candidateCheck graph context revision subject currentRelation
+            confirmCandidates window candidateCheck graph context revision subject currentRelation
                 =<< unionBranches rewrites
         Exclusion base _subtractRewrite ->
-            confirmCandidates candidateCheck graph context revision subject currentRelation
-                =<< evalRewrite candidateCheck graph context revision subject objectType currentRelation base state
+            confirmCandidates window candidateCheck graph context revision subject currentRelation
+                =<< evalRewrite Nothing candidateCheck graph context revision subject objectType currentRelation base state
         Caveated caveat rewriteInner -> do
-            inner <- evalRewrite candidateCheck graph context revision subject objectType currentRelation rewriteInner state
+            inner <- evalRewrite window candidateCheck graph context revision subject objectType currentRelation rewriteInner state
             pure (applyRewriteCaveat graph context caveat =<< inner)
   where
     unionBranches rewrites = do
-        results <- traverse (\current -> evalRewrite candidateCheck graph context revision subject objectType currentRelation current state) rewrites
+        results <- traverse (\current -> evalRewrite Nothing candidateCheck graph context revision subject objectType currentRelation current state) rewrites
         pure (mergeLookupObjects . concat <$> sequence results)
 
 evalThis ::
@@ -382,7 +424,7 @@ evalThis candidateCheck graph context revision subject objectType relation state
                             case allowed.relation of
                                 Nothing -> pure (Right [])
                                 Just subjectRelation -> do
-                                    subjectObjects <- evalRelation candidateCheck graph context revision subject allowed.objectType subjectRelation state
+                                    subjectObjects <- evalRelation Nothing candidateCheck graph context revision subject allowed.objectType subjectRelation state
                                     case subjectObjects of
                                         Left err -> pure (Left err)
                                         Right objects -> do
@@ -421,7 +463,7 @@ evalTupleToUserset candidateCheck graph context revision subject objectType curr
                             if allowed.objectType == objectType && computedRelation == currentRelation
                                 then evalRecursiveUserset allowed
                                 else do
-                                    usersetObjects <- evalRelation candidateCheck graph context revision subject allowed.objectType computedRelation state
+                                    usersetObjects <- evalRelation Nothing candidateCheck graph context revision subject allowed.objectType computedRelation state
                                     case usersetObjects of
                                         Left err -> pure (Left err)
                                         Right objects -> do
@@ -436,6 +478,7 @@ evalTupleToUserset candidateCheck graph context revision subject objectType curr
     evalRecursiveUserset allowed = do
         seeds <-
             evalRelation
+                Nothing
                 candidateCheck
                 graph
                 context
@@ -515,6 +558,15 @@ insertObjects objects objectMap =
 {- | Confirm over-generated candidates with a forward check at the lookup's pinned
 revision.
 
+Given an 'EmitWindow', confirmation costs what the /page/ costs rather than what the
+whole candidate set costs. Candidates at or below the watermark were emitted on an
+earlier page and are dropped without a check; confirmation then stops as soon as
+@limit + 1@ candidates have been allowed, which is exactly enough to fill a page of
+@limit@ and still know that more remain. Candidates arrive sorted by object key, so
+the ones confirmed are the ones the page wants. Without a window -- a nested
+confirmation, whose output is filtered again upstream -- every candidate is
+confirmed.
+
 The memo is folded across the candidate list, so subproblems shared between
 candidates are evaluated once: confirming twenty objects that all inherit from the
 same group reads that group once, not twenty times. It is deliberately not shared
@@ -528,6 +580,7 @@ candidates cannot leak one candidate's caveat answers into another's: the reques
 context is applied per candidate, inside 'checkAtRevision'.
 -}
 confirmCandidates ::
+    Maybe EmitWindow ->
     CheckForCandidate es ->
     ReachabilityGraph ->
     CaveatContext ->
@@ -536,15 +589,35 @@ confirmCandidates ::
     RelationName ->
     Either EnError [LookupObject] ->
     Eff es (Either EnError [LookupObject])
-confirmCandidates _ _ _ _ _ _ (Left err) =
+confirmCandidates _ _ _ _ _ _ _ (Left err) =
     pure (Left err)
-confirmCandidates candidateCheck graph context revision subject relation (Right candidates) = do
-    (confirmed, _memo) <- foldM step ([], emptyCheckMemo) candidates
-    pure (mergeLookupObjects . filterAllowed <$> sequence (reverse confirmed))
+confirmCandidates window candidateCheck graph context revision subject relation (Right candidates) =
+    confirmUntilPageFull emptyCheckMemo 0 [] wanted
   where
-    step (acc, memo) LookupObject{object} = do
-        (decision, memo') <- candidateCheck.runCandidateCheck graph context revision subject relation object memo
-        pure (fmap (LookupObject object) decision : acc, memo')
+    wanted =
+        case window of
+            Nothing -> candidates
+            Just EmitWindow{watermark} ->
+                case watermark of
+                    Nothing -> candidates
+                    Just lastSeen -> filter (\LookupObject{object} -> object > lastSeen) candidates
+
+    budgetReached allowedCount =
+        case window of
+            Nothing -> False
+            Just EmitWindow{confirmBudget} -> allowedCount >= confirmBudget
+
+    confirmUntilPageFull memo allowedCount acc remaining
+        | budgetReached allowedCount = pure (Right (mergeLookupObjects (reverse acc)))
+        | otherwise =
+            case remaining of
+                [] -> pure (Right (mergeLookupObjects (reverse acc)))
+                LookupObject{object} : rest -> do
+                    (decision, memo') <- candidateCheck.runCandidateCheck graph context revision subject relation object memo
+                    case decision of
+                        Left err -> pure (Left err)
+                        Right Denied -> confirmUntilPageFull memo' allowedCount acc rest
+                        Right allowed -> confirmUntilPageFull memo' (allowedCount + 1) (LookupObject object allowed : acc) rest
 
 readRowsForSubjects ::
     (TupleStore :> es) =>

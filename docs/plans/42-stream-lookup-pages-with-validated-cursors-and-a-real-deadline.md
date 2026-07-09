@@ -75,9 +75,15 @@ completion.
   threading a memo; `consistency` deleted from every internal evaluator, which now carry
   only `TupleStore :> es`. Resolution count 3 → 1 (red evidence captured); confirmations
   share a memo, 19 reads → 17 on a shared-subtree fixture.
-- [ ] M3: incremental resumption — cursor gains a traversal watermark and per-branch
-  store cursors for the direct-read stage; page N+1 provably cheaper than page N;
-  recompute fallback documented for the stages that keep it.
+- [x] M3 (2026-07-08), **partly as planned**: confirmation is now watermark-filtered and
+  bounded to the page (`EmitWindow`), so page N+1 never re-confirms pages 1..N. Per-page
+  store reads on the shared-memo fixture at `LookupLimit 1`: 15 / 12 / 7, against a flat
+  17 for every page before. Negative control observed failing.
+- [x] M3-retreat (2026-07-08): per-branch `StoreCursor` resumption of the direct-read stage
+  is **not implemented** — it is unsound against a store that returns rows in row-id order,
+  which both stores do. Evidence and the counterexample are in Surprises & Discoveries; the
+  Decision Log records the retreat, which the plan's Idempotence section authorized. The
+  cursor's `frontier` field is encoded, round-trip tested, and always empty.
 - [ ] M4: deadline inside the traversal loop — polls between store pages and between
   branch steps; mid-work truncation returns partial page + resumable cursor; existing
   deadline tests still pass.
@@ -223,6 +229,98 @@ Sharing the memo is sound for a stronger reason than "one lookup has one context
 EP-41, memo entries are `ResidualDecision`s and mention no caveat context at all. The context
 is applied per candidate, at the `checkAtRevision` boundary.
 
+**M3's central mechanism is unsound, and the store proves it (2026-07-08).** The plan asks
+for a per-branch `StoreCursor` in the cursor's frontier so a continuation "continues the
+underlying store scans instead of restarting them". That is not sound against either store en
+has, and no amount of care in `En.Lookup` can make it so.
+
+The reverse-query statement in `en-postgres/src/En/Postgres/TupleStore.hs` reads:
+
+```sql
+FROM relation_tuple
+WHERE object_type = $2 AND relation = $3 AND id > $8
+  ...
+ORDER BY id ASC
+LIMIT $7
+```
+
+Rows come back in **row-id order**, and the `StoreCursor` is that `id`. The in-memory store
+agrees — `pageTuples` pages by list index. Row id is insertion order; it has no relationship
+to `(object_type, object_id)`, which is the key the watermark and `mergeLookupObjects` sort
+by.
+
+The counterexample is short. A branch holds four rows whose objects, in store order, are
+`[z, a, b, c]`. Page 1 has `limit = 2`: the traversal drains the branch, merges and sorts to
+`[a, b, c, z]`, emits `[a, b]`, and sets the watermark to `b`. If page 2 resumes that branch
+from a `StoreCursor` past all four rows — which is where page 1 left it — the branch yields
+nothing, and `c` and `z` are lost forever. They were consumed but never emitted, because they
+fell beyond the page limit.
+
+Advancing the branch cursor only past rows whose objects are at or below the watermark does
+not rescue it either: those rows are interleaved arbitrarily with rows the page did not emit,
+so there is no prefix of the scan that is safe to skip. The property M3 needs is that the
+store returns rows in object order, and it does not.
+
+Making it so is a storage change, not an engine change: `ORDER BY object_type, object_id, id`
+with a matching keyset cursor on that triple, an index to support it, and the same treatment
+in the in-memory store. That is a coherent piece of work with its own correctness burden, and
+it belongs in its own plan rather than smuggled into this one. This plan takes the retreat its
+own Idempotence section authorizes: "fall back to watermark-only resumption (M3 step 3
+alone)".
+
+**What M3 does deliver, measured (2026-07-08).** Step 3 — "confirmations run only for
+candidates that survive the watermark filter" — is sound, and it is where B8's real cost sits.
+Confirmation is the expensive half of reach-then-check: the reverse walk over-generates, and
+each candidate costs a forward check against storage. Before this milestone every page
+confirmed every candidate and then threw away the ones it had already emitted.
+
+`EmitWindow` carries two things into the outermost confirmation: the watermark, which drops
+already-emitted candidates without checking them, and a budget of `limit + 1` allowed
+candidates, which is exactly enough to fill a page of `limit` and still know more remain.
+Candidates arrive sorted, so the ones confirmed are the ones the page wants.
+
+On the `sharedMemoSchema` fixture at `LookupLimit 1`, store reads per page:
+
+```text
+page 1: 15    page 2: 12    page 3: 7
+```
+
+Against the old behavior — 17 reads on *every* page, since each re-confirmed all three
+candidates. The negative control (restoring `wanted = candidates` and a no-op budget) fails
+the assertion exactly as it should:
+
+```text
+user error (page 2 confirms less than page 1 (17 < 17)
+expected True
+actual:   False)
+```
+
+**Where the emit window may and may not travel (2026-07-08).** Both the watermark filter and
+the budget are sound only where a confirmation's output goes straight into the page. Three
+places would silently corrupt results if the window reached them, and each is worth naming
+because the code deliberately passes `Nothing` there.
+
+A *nested* confirmation is filtered again upstream. Truncating it at `limit + 1` allowed could
+drop candidates the outer stage would have kept once its own filter denied the earlier ones.
+
+An *arrow* (`TupleToUserset`) uses the objects it finds as the **subjects** of a further read.
+On a recursive parent chain (`view = owner | parent->view`), dropping a low-keyed parent
+because it sits below the watermark would hide every high-keyed child reachable only through
+it. This is the subtlest of the three: the objects being filtered are of the request's own
+type, so a naive "same type, safe to filter" rule gets it wrong.
+
+The *candidate sources* of an intersection or exclusion must over-generate by construction, so
+they receive `Nothing` while the confirmation that consumes them receives the window.
+
+`Union` and `Caveated` do carry it: a union branch contributing its own smallest `limit + 1`
+candidates is enough for the merged page, and a rewrite-level caveat gates every object
+identically.
+
+**The reserved `frontier` field ships empty (2026-07-08).** It is encoded, parsed, and
+round-trip tested (including a two-entry frontier), and always `[]` in practice. It reserves
+format space so that a future object-ordered-scan plan need not bump the cursor version. A
+reader should not mistake its presence for a claim that branch resumption works.
+
 
 ## Decision Log
 
@@ -259,6 +357,29 @@ is applied per candidate, at the `checkAtRevision` boundary.
   plan's integration points; this plan keeps the constructor set stable so that plan has
   one fewer moving target.
   Date: 2026-07-07
+- Decision (2026-07-08, supersedes the staged-honesty decision below for the direct-read
+  half): per-branch `StoreCursor` resumption is **abandoned**, not deferred for effort
+  reasons — it is unsound against a store whose scans are ordered by row id, which both en
+  stores are (`ORDER BY id ASC`, keyset cursor on `id`). A branch's rows are interleaved
+  arbitrarily with respect to object key, so no prefix of a branch scan is safe to skip: rows
+  consumed but not emitted (they fell beyond the page limit) would be lost on resume. See
+  Surprises & Discoveries for the four-row counterexample. M3 keeps step 3 alone — the
+  watermark filter — extended with a page-sized confirmation budget, which is where B8's
+  cost actually lives. This is the retreat the Idempotence section pre-authorized.
+  Enabling the original design means making `readStartingWithUser` return rows ordered by
+  `(object_type, object_id, id)` with a keyset cursor on that triple, plus a supporting
+  index and the same change in the in-memory store. That is a storage plan, not this one.
+  Date: 2026-07-08
+- Decision: The emit window (watermark + confirmation budget) reaches only confirmations
+  whose output goes straight into the page: it propagates through `Union` and `Caveated`,
+  is consumed by `Intersection`/`Exclusion`, and is withheld from their candidate sources,
+  from `ComputedUserset`, and from arrows.
+  Rationale: an arrow uses the objects it finds as the *subjects* of a further read, so on a
+  recursive parent chain dropping a low-keyed parent below the watermark would hide every
+  high-keyed child reachable only through it — even though those parents are of the request's
+  own object type. A nested confirmation is filtered again upstream, so truncating it at
+  `limit + 1` could drop candidates the outer stage would have kept.
+  Date: 2026-07-08
 - Decision: Staged honesty about resumption (M3). The cursor's traversal state is
   (a) the last emitted object key — the correctness watermark that keeps pages
   duplicate- and gap-free regardless of how much is recomputed — plus (b) for the
@@ -682,10 +803,15 @@ transcripts as you go.
 2. **B7**: `countingConsistencyStore` proves exactly one `ResolveConsistency` per
    lookup request including intersection/exclusion confirmations; the shared-memo
    counting assertion shows confirmations cost fewer reads than independent checks.
-3. **B8 paging**: for the 1,200-folder fixture at `LookupLimit 100`, all pages
-   concatenate to exactly the single-call result (no duplicates, no gaps, sorted), and
-   the recorded store-read count of later pages is strictly below the full-recompute
-   count (numbers recorded in this plan).
+3. **B8 paging** (amended 2026-07-08 — see the Decision Log): for the 1,200-folder fixture
+   at `LookupLimit 100`, all pages concatenate to exactly the single-call result (no
+   duplicates, no gaps, sorted). For a fixture whose permission requires *confirmation*
+   (`sharedMemoSchema`, an exclusion), the store-read count falls strictly page over page —
+   15, 12, 7 — against a flat 17 per page before. The traversal itself is still recomputed
+   per page, and for a permission that needs no confirmation (a plain union of direct reads,
+   like the 1,200-folder fixture) later pages therefore cost the same as the first. Making
+   *that* cheaper requires object-ordered store scans and is out of scope; the original
+   acceptance criterion assumed a resumption mechanism that turned out to be unsound.
 4. **B8 deadline**: a 2-poll budget yields a first page with fewer objects than the
    limit and state `LookupTruncated cursor`; resuming with a fresh budget completes the
    set. The pre-existing truncate-and-resume tests stay green.
