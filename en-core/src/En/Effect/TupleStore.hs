@@ -12,6 +12,7 @@ module En.Effect.TupleStore (
     TupleStore (..),
     readObjectRelation,
     readStartingWithUser,
+    probeTuples,
     writeTuples,
     deleteTuples,
     headRevision,
@@ -86,6 +87,15 @@ writes return a 'ConsistencyToken' for read-your-writes.
 data TupleStore :: Effect where
     ReadObjectRelation :: Revision -> ObjectRef -> RelationName -> Int -> Maybe StoreCursor -> TupleStore m TuplePage
     ReadStartingWithUser :: Revision -> UsersetQuery -> TupleStore m TuplePage
+    {- | Point-membership probe: the live tuples at @revision@ on
+    @object#relation@ whose subject is one of the given candidates.
+
+    Callers pass a small candidate set (typically the concrete subject plus
+    its type wildcard), so the result needs no pagination. Several rows can
+    match one candidate when the same grant exists under different caveat
+    names, which is why this returns a list rather than a @Maybe@.
+    -}
+    ProbeTuples :: Revision -> ObjectRef -> RelationName -> [Subject] -> TupleStore m [TupleRow]
     WriteTuples :: [Tuple] -> TupleStore m ConsistencyToken
     DeleteTuples :: [Tuple] -> TupleStore m ConsistencyToken
     HeadRevision :: TupleStore m Revision
@@ -102,6 +112,10 @@ readObjectRelation revision object relation limit cursor =
 readStartingWithUser :: (TupleStore :> es) => Revision -> UsersetQuery -> Eff es TuplePage
 readStartingWithUser revision query =
     send (ReadStartingWithUser revision query)
+
+probeTuples :: (TupleStore :> es) => Revision -> ObjectRef -> RelationName -> [Subject] -> Eff es [TupleRow]
+probeTuples revision object relation subjects =
+    send (ProbeTuples revision object relation subjects)
 
 writeTuples :: (TupleStore :> es) => [Tuple] -> Eff es ConsistencyToken
 writeTuples =

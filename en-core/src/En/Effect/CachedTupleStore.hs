@@ -33,6 +33,9 @@ cachedTupleStore cache =
                 cache
                 (StartingWithUserReadKey revision query)
                 (send (ReadStartingWithUser revision query))
+        -- 'ProbeTuples' falls through here on purpose, not by oversight: whether a
+        -- probe result is cached as a single-tuple entry or reused from a cached
+        -- page is decided by docs/plans/41-cache-context-free-check-subproblems.md.
         operation ->
             passthrough env operation
 

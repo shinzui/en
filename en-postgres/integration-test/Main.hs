@@ -47,6 +47,7 @@ main = do
         connection <- acquire database
         resetSchema connection
         runTupleStoreScenario connection
+        runProbeScenario connection
         runMaintenanceBatchScenario connection
         Connection.release connection
     case result of
@@ -234,6 +235,96 @@ runTupleStoreScenario connection = do
     pgObjects <- collectLookupObjects connection config graph (AtLeastAsFresh pgToken) pgLookupRequest Nothing
     assertEqual "postgres-backed lookup drains multi-page storage reads" (sort pgFolders) pgObjects
 
+{- | The point-membership probe against real storage.
+
+Seeds a relation wider than one read page (1500 rows), then proves the four
+properties @check@ relies on: a present subject comes back with its caveat name
+and payload intact, an absent subject comes back empty, a subject and its type
+wildcard can be probed together in one call, and a soft-deleted grant is invisible
+at revisions after the delete while remaining visible at revisions before it.
+
+Finally it asks PostgreSQL how it intends to answer the probe. The probe must
+be served by an index; a sequential scan over a wide relation would reintroduce
+the very cost the probe exists to remove.
+-}
+runProbeScenario :: Connection.Connection -> IO ()
+runProbeScenario connection = do
+    validCheckSchema <- either (fail . show) pure (Schema.validateSchema checkSchema)
+    let config =
+            ConsistencyConfig
+                { datastoreId = DatastoreId "test-datastore"
+                , schemaHash = Schema.schemaHash validCheckSchema
+                , gcWindow = "24 hours"
+                }
+        wideFolder = ObjectRef (ObjectType "folder") "probe-wide"
+        viewer = RelationName "viewer"
+        userRef name = ObjectRef (ObjectType "user") name
+        member = SubjectId (userRef "probe-member")
+        absent = SubjectId (userRef "probe-absent")
+        caveatedSubject = SubjectId (userRef "probe-caveated")
+        probeCaveat =
+            TupleCaveat
+                { name = CaveatName "within_autonomy"
+                , payload = CaveatPayload (Map.fromList [("autonomy", ValueEnum "act"), ("level", ValueInteger 3)])
+                }
+        grant subject caveat = Tuple{object = wideFolder, relation = viewer, subject, caveat}
+        fillerTuples =
+            [ grant (SubjectId (userRef ("probe-filler-" <> showText index))) Nothing
+            | index <- [1 :: Int .. 1500]
+            ]
+        memberTuple = grant member Nothing
+        caveatedTuple = grant caveatedSubject (Just probeCaveat)
+        publicSpace = ObjectRef (ObjectType "space") "probe-public"
+        wildcardTuple = Tuple{object = publicSpace, relation = viewer, subject = SubjectWildcard (ObjectType "user"), caveat = Nothing}
+        concreteTuple = Tuple{object = publicSpace, relation = viewer, subject = member, caveat = Nothing}
+
+    seedToken <- runPgOrFail connection config (TupleStore.writeTuples (memberTuple : caveatedTuple : wildcardTuple : concreteTuple : fillerTuples))
+    TokenMetadata{revision = seedRevision} <- either (fail . show) pure (tokenMetadataFromPayload seedToken)
+
+    presentRows <- runPgOrFail connection config (TupleStore.probeTuples seedRevision wideFolder viewer [member])
+    assertEqual "probe finds a member of a relation wider than one page" [memberTuple] ((.tuple) <$> presentRows)
+
+    absentRows <- runPgOrFail connection config (TupleStore.probeTuples seedRevision wideFolder viewer [absent])
+    assertEqual "probe returns nothing for an absent subject" [] ((.tuple) <$> absentRows)
+
+    emptyCandidates <- runPgOrFail connection config (TupleStore.probeTuples seedRevision wideFolder viewer [])
+    assertEqual "probe with no candidates returns nothing" [] ((.tuple) <$> emptyCandidates)
+
+    caveatedRows <- runPgOrFail connection config (TupleStore.probeTuples seedRevision wideFolder viewer [caveatedSubject])
+    assertEqual "probe carries the caveat name and payload" [Just probeCaveat] ((.tuple.caveat) <$> caveatedRows)
+
+    wildcardRows <- runPgOrFail connection config (TupleStore.probeTuples seedRevision publicSpace viewer [member, SubjectWildcard (ObjectType "user")])
+    assertEqual "probe matches a subject and its type wildcard in one call" (sort [concreteTuple, wildcardTuple]) (sort ((.tuple) <$> wildcardRows))
+
+    deleteToken <- runPgOrFail connection config (TupleStore.deleteTuples [memberTuple])
+    TokenMetadata{revision = deleteRevision} <- either (fail . show) pure (tokenMetadataFromPayload deleteToken)
+    rowsBeforeDelete <- runPgOrFail connection config (TupleStore.probeTuples seedRevision wideFolder viewer [member])
+    rowsAfterDelete <- runPgOrFail connection config (TupleStore.probeTuples deleteRevision wideFolder viewer [member])
+    assertEqual "probe at the pre-delete revision still sees the grant" [memberTuple] ((.tuple) <$> rowsBeforeDelete)
+    assertEqual "probe at the post-delete revision hides the grant" [] ((.tuple) <$> rowsAfterDelete)
+
+    runSessionOrFail connection (Session.script "ANALYZE relation_tuple")
+    planLines <- runSessionOrFail connection (Session.statement () explainProbeStatement)
+    let plan = Text.unlines planLines
+    assertBool ("probe is served by an index, not a sequential scan; plan was:\n" <> Text.unpack plan) (Text.isInfixOf "Index Scan" plan || Text.isInfixOf "Bitmap Index Scan" plan)
+
+{- | Ask the planner how it would answer a probe. Mirrors 'probeTuplesStatement'
+with literal parameters, since @EXPLAIN@ of a prepared statement would report a
+generic plan rather than the one the probe's actual bindings produce.
+-}
+explainProbeStatement :: Statement () [Text]
+explainProbeStatement =
+    Statement.preparable
+        """
+        EXPLAIN (COSTS OFF)
+        SELECT id FROM relation_tuple
+        WHERE object_type = 'folder' AND object_id = 'probe-wide' AND relation = 'viewer'
+          AND (subject_type, subject_id, coalesce(subject_relation, '')) IN
+              (SELECT * FROM unnest(ARRAY['user'], ARRAY['probe-member'], ARRAY['']))
+        """
+        Encoders.noParams
+        (Decoders.rowList (Decoders.column (Decoders.nonNullable Decoders.text)))
+
 {- | Bounded-work maintenance: batched reap and batched prune.
 
 Seeds a backlog larger than the batch size, drains it, and proves three properties the
@@ -346,6 +437,11 @@ assertEqual label expected actual
                 <> show expected
                 <> "\nactual:   "
                 <> show actual
+
+assertBool :: String -> Bool -> IO ()
+assertBool label = \case
+    True -> pure ()
+    False -> fail label
 
 expectLookupHasMore :: String -> [LookupObject] -> Either EnError LookupPage -> IO LookupCursor
 expectLookupHasMore label expectedObjects =

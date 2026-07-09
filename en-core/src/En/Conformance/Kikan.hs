@@ -159,6 +159,14 @@ runTupleStoreInMemory tuples =
                     , tuple.subject `elem` query.querySubjects
                     ]
                 )
+        ProbeTuples _ object relation subjects ->
+            pure
+                [ tupleRow index tuple
+                | (index, tuple) <- zip [1 ..] tuples
+                , tuple.object == object
+                , tuple.relation == relation
+                , tuple.subject `elem` subjects
+                ]
         WriteTuples _ ->
             pure (ConsistencyToken "in-memory-write")
         DeleteTuples _ ->

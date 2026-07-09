@@ -48,6 +48,7 @@ import En.Effect.TupleStore (
     UsersetQuery (..),
     headRevision,
     optimizedRevision,
+    probeTuples,
     readObjectRelation,
     readStartingWithUser,
     writeTuples,
@@ -404,6 +405,9 @@ main = do
     assertLookupObjects "deadline cursor resumes remaining lookup results" (drop 500 expectedFolders) resumedFolders
     crowdedExpansion <- expandEngine consistencyStore (runTupleStoreInMemory expandTuples) streamingGraph MinimizeLatency (expandRequest crowdedFolder (RelationName "viewer") requestContext (ExpandLimit 1500) Nothing)
     assertEqual "expand drains multi-page object rows before applying result cap" (Right (1000, ExpandTruncated (ExpandCursor "1000"))) (fmap (\tree -> (length tree.children, tree.state)) crowdedExpansion)
+    assertEqual "probe returns the matching row" (Right [tupleRow 1 (Tuple{object = space, relation = RelationName "owner", subject = SubjectId user, caveat = Nothing})]) =<< probe consistencyStore tupleStore space (RelationName "owner") [SubjectId user]
+    assertEqual "probe returns nothing for a non-member" (Right []) =<< probe consistencyStore tupleStore space (RelationName "owner") [SubjectId bob]
+    assertEqual "probe carries the caveat name and payload" (Right [Just autonomyCaveat]) =<< fmap (fmap (fmap (\row -> row.tuple.caveat))) (probe consistencyStore tupleStore intention (RelationName "delegate") [SubjectId user])
     let wideStore = runTupleStoreInMemory wideTuples
     assertEqual "wide relation: direct member checks Allowed" (Right Allowed) =<< check consistencyStore wideStore streamingGraph MinimizeLatency requestContext (SubjectId wideMember) (RelationName "viewer") wideFolder
     assertEqual "wide relation: non-member checks Denied" (Right Denied) =<< check consistencyStore wideStore streamingGraph MinimizeLatency requestContext (SubjectId bob) (RelationName "viewer") wideFolder
@@ -905,6 +909,16 @@ check ::
 check cStore tStore graph consistency context subject relation object =
     runEngine cStore tStore (Check.check graph consistency context subject relation object)
 
+probe ::
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    ObjectRef ->
+    RelationName ->
+    [Subject] ->
+    IO (Either EnError [TupleRow])
+probe cStore tStore object relation subjects =
+    runEngine cStore tStore (probeTuples testRevision object relation subjects)
+
 checkMany ::
     ConsistencyInterpreter ->
     TupleInterpreter ->
@@ -1302,9 +1316,42 @@ countingTupleStore :: IORef Int -> TupleInterpreter -> TupleInterpreter
 countingTupleStore count _ =
     interpretFixtureTupleStore (Just count) Nothing fixtureTuples
 
+{- | A store that makes every read of @badObject@ fail the check for that object.
+
+The failure is injected as a row pointing at a relation the schema does not
+define, so the evaluator returns @Left (UnknownRelation …)@ /as a value/. That
+matters: 'checkMany' turns a returned @Left@ into a per-pair @Denied@, whereas an
+error thrown through the @Error EnError@ effect would escape and fail the whole
+batch.
+
+An earlier version injected the failure by returning @HasMore@ forever and
+relying on the (now deleted) @ensureExhausted@ to reject an unexhausted page.
+That could not survive an evaluator that drains pages: the drain loop would
+follow the cursor forever.
+-}
 erroringTupleStore :: ObjectRef -> TupleInterpreter -> TupleInterpreter
 erroringTupleStore badObject _ =
     interpretFixtureTupleStore Nothing (Just badObject) fixtureTuples
+
+missingRelation :: RelationName
+missingRelation =
+    RelationName "injected-missing-relation"
+
+injectedErrorRows :: ObjectRef -> RelationName -> TuplePage
+injectedErrorRows badObject relation =
+    TuplePage
+        { rows =
+            [ tupleRow
+                1
+                Tuple
+                    { object = badObject
+                    , relation
+                    , subject = SubjectSet badObject missingRelation
+                    , caveat = Nothing
+                    }
+            ]
+        , state = Exhausted
+        }
 
 interpretFixtureTupleStore :: Maybe (IORef Int) -> Maybe ObjectRef -> [Tuple] -> TupleInterpreter
 interpretFixtureTupleStore countRef errorObject tuples =
@@ -1312,7 +1359,7 @@ interpretFixtureTupleStore countRef errorObject tuples =
         ReadObjectRelation _ object relation limit cursor -> do
             countRead
             if Just object == errorObject
-                then pure TuplePage{rows = [], state = HasMore (StoreCursor "injected-error")}
+                then pure (injectedErrorRows object relation)
                 else pure (pageTuples limit cursor [tuple | tuple <- tuples, tuple.object == object, tuple.relation == relation])
         ReadStartingWithUser _ query -> do
             countRead
@@ -1327,6 +1374,18 @@ interpretFixtureTupleStore countRef errorObject tuples =
                     , tuple.subject `elem` query.querySubjects
                     ]
                 )
+        ProbeTuples _ object relation subjects -> do
+            countRead
+            if Just object == errorObject
+                then pure []
+                else
+                    pure
+                        [ tupleRow index tuple
+                        | (index, tuple) <- zip [1 ..] tuples
+                        , tuple.object == object
+                        , tuple.relation == relation
+                        , tuple.subject `elem` subjects
+                        ]
         WriteTuples _ ->
             pure (ConsistencyToken "in-memory-write")
         DeleteTuples _ ->

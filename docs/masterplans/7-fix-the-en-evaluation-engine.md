@@ -4,6 +4,7 @@ slug: fix-the-en-evaluation-engine
 title: "Fix the en evaluation engine"
 kind: master-plan
 created_at: 2026-07-07T15:24:21Z
+intention: intention_01kx2cmexke9mv9aggb7jf7w5t
 ---
 
 # Fix the en evaluation engine
@@ -73,7 +74,7 @@ store implementation, which is risky enough to deserve its own validation cycle.
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-39 | Add a point-membership probe and probe-first check evaluation | docs/plans/39-add-a-point-membership-probe-and-probe-first-check-evaluation.md | None | None | Not Started |
+| EP-39 | Add a point-membership probe and probe-first check evaluation | docs/plans/39-add-a-point-membership-probe-and-probe-first-check-evaluation.md | None | None | In Progress |
 | EP-40 | Adopt Zanzibar cycle and exclusion semantics in check | docs/plans/40-adopt-zanzibar-cycle-and-exclusion-semantics-in-check.md | None | EP-39 | Not Started |
 | EP-41 | Cache context-free check subproblems | docs/plans/41-cache-context-free-check-subproblems.md | None | EP-39, EP-40 | Not Started |
 | EP-42 | Stream lookup pages with validated cursors and a real deadline | docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md | None | EP-39 | Not Started |
@@ -159,7 +160,20 @@ established by docs/plans/38-validate-configuration-and-persist-datastore-identi
 
 ## Surprises & Discoveries
 
-(None yet.)
+**The workspace baseline was red before this initiative began (found in EP-39's M0,
+2026-07-08).** `cabal test all` failed in `en-example`, which still asserted that an engine
+error yields HTTP 500. Commit `059fbd4` — a completed child of
+`docs/masterplans/6-*` — had deliberately remapped `StoreError` to a 503 with
+`retryable=true` and did not update the sibling package's assertion. EP-39 fixed the stale
+assertion in its own commit (`54b58aa`) so that its before/after evidence for findings
+B1/B2 is not confounded.
+
+The lesson is a coordination one, and it applies to every child plan here: a plan whose
+acceptance runs only its own focused suites can leave another package broken without
+anyone noticing. Every child plan of this master plan must run the full workspace suite
+(`cabal build all && cabal test all`) at its Final milestone, not just the suites for the
+modules it edited. EP-39's Final milestone already specifies this; EP-40 through EP-44
+should be read as carrying the same requirement.
 
 
 ## Decision Log

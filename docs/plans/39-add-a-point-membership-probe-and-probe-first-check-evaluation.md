@@ -4,6 +4,7 @@ slug: add-a-point-membership-probe-and-probe-first-check-evaluation
 title: "Add a point-membership probe and probe-first check evaluation"
 kind: exec-plan
 created_at: 2026-07-07T15:24:51Z
+intention: intention_01kx2cmexke9mv9aggb7jf7w5t
 master_plan: "docs/masterplans/7-fix-the-en-evaluation-engine.md"
 ---
 
@@ -51,10 +52,17 @@ number of store reads.
 
 ## Progress
 
-- [ ] M0: baseline — build and test the current tree; confirm the file/line citations in
-  this plan still match; record drift in Surprises & Discoveries.
-- [ ] M1: add the failing wide-relation regression test in `en-core/test/Main.hs` and
-  capture its `Left ResolutionLimitExceeded` failure as evidence.
+- [x] M0 (2026-07-08): baseline — build and test the current tree; confirmed the file/line
+  citations in this plan still match; found and fixed one pre-existing red test
+  (`en-example`, commit `54b58aa`) recorded in Surprises & Discoveries.
+- [x] M1 (2026-07-08): added the failing wide-relation regression test in
+  `en-core/test/Main.hs` (commit `a6b7482`); captured the `Left ResolutionLimitExceeded`
+  failure. The fixture shape this plan originally proposed did not reproduce B1; see
+  Surprises & Discoveries for the corrected fixture.
+- [ ] M4a (new, discovered in M1): repair `erroringTupleStore` in `en-core/test/Main.hs`
+  before deleting `ensureExhausted` — it injects errors by returning `HasMore`
+  unconditionally, which turns M4's drain loop into an infinite loop. See Surprises &
+  Discoveries.
 - [ ] M2: add the `ProbeTuples` operation to the `TupleStore` effect
   (`en-core/src/En/Effect/TupleStore.hs`) and implement it in the in-memory conformance
   store (`en-core/src/En/Conformance/Kikan.hs`); leave the cached interposer as an explicit
@@ -74,7 +82,98 @@ number of store reads.
 
 ## Surprises & Discoveries
 
-(None yet.)
+**M0 — the baseline was not green.** This plan's M0 assumes `cabal test all` passes before
+any change. It did not: `en-example`'s test suite failed with
+
+```text
+user error (engine error route returns 500
+expected: Just 500
+actual:   Just 503)
+```
+
+The cause is not in the evaluation engine at all. Commit `059fbd4`
+("feat(en-servant): give every error a stable code and an honest status", part of
+`docs/masterplans/6-*`'s EP-35) deliberately stopped mapping every `EnError` to HTTP 500
+and gave `StoreError` a 503 with `retryable=true`, on the reasoning that a store outage is
+not the caller's fault. The `en-example` assertion was never updated to match, so master
+carried a red suite. The fix is a one-line assertion update (`en-example/test/Main.hs`,
+now asserting `Just 503` and renamed to "store error route returns 503") landed as its own
+commit `54b58aa` before any EP-39 work, so that this plan's before/after test evidence is
+not confounded by an unrelated failure.
+
+Cross-plan implication, mirrored into the master plan's Surprises section: a completed
+child plan of another master plan left a sibling package red. Neither master plan's
+acceptance ran `cabal test all` across the whole workspace after landing. Later plans in
+this master plan should run the *full* workspace suite at their Final milestone, not only
+the focused suites they touch.
+
+**M1 — this plan's proposed wide fixture would not have reproduced B1.** The M1 milestone
+text suggests a fixture "of at least 1,500 tuples `folder:fN#viewer@user:memberN`", and
+suggests reusing `streamingTuples`. Both are wrong, for the same reason: they spread the
+tuples across 1,200–1,500 *distinct* folder objects, one viewer each. `check` reads
+`readObjectRelation revision object relation …`, which filters by object, so every one of
+those relations has width one and the single-page read never reports `HasMore`. The bug
+needs *one object* whose relation is wider than a page.
+
+The fixture actually added is `wideFolder` (`folder:wide`) with 1,501 `viewer` rows, and
+`wideMember` (`user:wide-member`) placed at position 1,200 — deliberately *past* the
+1,000-row first page. Position matters: had the member sat inside page one, a naive "just
+stop erroring and use the rows we got" fix would pass the test while still being wrong.
+The schema is reused from `streamingSchema` unchanged (`folder#viewer` is a plain `this`
+relation over `user` subjects), so no new schema fixture was needed.
+
+Evidence — the red M1 run (`cabal test en-core:en-core-interface-tests`):
+
+```text
+user error (wide relation: direct member checks Allowed
+expected: Right Allowed
+actual:   Left ResolutionLimitExceeded)
+```
+
+**M1 — `erroringTupleStore` will infinite-loop the moment `ensureExhausted` is deleted.**
+This is a trap M4 walks straight into, so it is recorded now. The test helper
+`erroringTupleStore` (`en-core/test/Main.hs`, in `interpretFixtureTupleStore`) simulates a
+failing store read like this:
+
+```haskell
+if Just object == errorObject
+    then pure TuplePage{rows = [], state = HasMore (StoreCursor "injected-error")}
+```
+
+It returns `HasMore` *unconditionally* — the same page state for every cursor, forever. It
+"errors" only because today's `ensureExhausted` converts `HasMore` into
+`Left ResolutionLimitExceeded`. M4 replaces `ensureExhausted` with `drainObjectRelation`,
+which follows the `HasMore` cursor until `Exhausted`; against this store that loop never
+terminates, so the test suite would hang rather than fail.
+
+Why the helper was written that way: `checkMany`'s per-pair fail-closed behavior needs the
+evaluator to yield `Left EnError` *as a value*, not to throw through the `Error EnError`
+effect (a thrown error escapes `checkMany` and fails the whole batch, since
+`evaluateDistinct` only maps `either (const Denied) id` over the returned `Either`).
+Today, `ensureExhausted` is the only way a *store* can produce an in-band `Left`. Deleting
+it removes the sole error-injection route, which is why this is a plan change and not a
+one-line edit.
+
+The replacement (milestone M4a, added to Progress) keeps the in-band `Left` without
+depending on paging: the erroring store returns, for the bad object, a single row whose
+subject is a `SubjectSet` naming a relation absent from the schema. `evalRelationMemo`
+looks that relation up in `graph.relations`, misses, and returns
+`Left (UnknownRelation …)` — an in-band `Left` that flows through `sequence` exactly as
+the paging error did, so "batch fails closed per pair" keeps asserting what it always
+asserted. Note this row must be a `SubjectSet`, because M4's `evalThisMemo` skips
+`SubjectId`/`SubjectWildcard` rows during enumeration (the probe has already answered for
+those) and only recurses into subject-set rows.
+
+**M0 — plan citations verified accurate.** Every line range this plan cites still matches
+the tree: `check`/`runCheck` at `en-core/src/En/Check.hs:57-68` and `127-137`, the
+duplicated non-memo evaluator family at `169-201` and `454-558`, `evalThisMemo` at
+`383-417` (single `readObjectRelation … pageLimit Nothing` + `ensureExhausted`),
+`evalTupleToUsersetMemo` at `419-452`, `ensureExhausted` at `567-572`, `maxDepth = 25` and
+`pageLimit = 1000` at `163-167`. `readRowsForSubjects` (`en-core/src/En/Lookup.hs:483-509`)
+and `subjectsWithWildcard` (`441-447`) have the drain-loop and candidate-set shapes the
+plan says they do. The PostgreSQL interpreter matches exhaustively at
+`en-postgres/src/En/Postgres/TupleStore.hs:115-132`, confirming this plan's warning that
+M2 and M3 must land as one buildable unit.
 
 
 ## Decision Log

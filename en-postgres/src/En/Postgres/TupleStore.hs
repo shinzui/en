@@ -118,6 +118,8 @@ interpretTupleStorePostgres config readOptimizedRevision =
             orThrow =<< runSession (readObjectRelationSession revision object relation limit cursor)
         ReadStartingWithUser revision query ->
             orThrow =<< runSession (readStartingWithUserSession revision query)
+        ProbeTuples revision object relation subjects ->
+            orThrow =<< runSession (probeTuplesSession revision object relation subjects)
         WriteTuples tuples ->
             orThrow =<< runSession (writeTuplesSession config tuples)
         DeleteTuples tuples ->
@@ -237,6 +239,17 @@ readObjectRelationSession revision object relation limit maybeCursor = do
         cursorId = maybe 0 decodeCursor maybeCursor
     rows <- Session.statement (objectReadParams revision object relation limitPlusOne cursorId) readObjectRelationStatement
     pure (pageFromRows limit rows)
+
+{- | Answer a point-membership question with one indexed read.
+
+An empty candidate set cannot match anything, so it short-circuits without a
+round trip rather than sending an empty @unnest@.
+-}
+probeTuplesSession :: Revision -> ObjectRef -> RelationName -> [Subject] -> Session [TupleRow]
+probeTuplesSession _ _ _ [] =
+    pure []
+probeTuplesSession revision object relation subjects =
+    Session.statement (probeParams revision object relation subjects) probeTuplesStatement
 
 pageFromRows :: Int -> [TupleRow] -> TuplePage
 pageFromRows limit rows =
@@ -579,6 +592,66 @@ readObjectRelationEncoder =
         <> ((\params -> params.relation) >$< Encoders.param (Encoders.nonNullable Encoders.text))
         <> ((\params -> params.limit) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
         <> ((\params -> params.cursor) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+
+data ProbeParams = ProbeParams
+    { revision :: !Text
+    , objectType :: !Text
+    , objectId :: !Text
+    , relation :: !Text
+    , subjectTypes :: ![Text]
+    , subjectIds :: ![Text]
+    , subjectRelations :: ![Text]
+    }
+
+probeParams :: Revision -> ObjectRef -> RelationName -> [Subject] -> ProbeParams
+probeParams revision object relation subjects =
+    let keys = subjectKeys subjects
+     in ProbeParams
+            { revision = revision.revisionEncoding
+            , objectType = unObjectType object.objectType
+            , objectId = object.objectId
+            , relation = unRelationName relation
+            , subjectTypes = (\(subjectType, _, _) -> subjectType) <$> keys
+            , subjectIds = (\(_, subjectId, _) -> subjectId) <$> keys
+            , subjectRelations = (\(_, _, subjectRelation) -> subjectRelation) <$> keys
+            }
+
+{- | The probe carries no @LIMIT@: its result is bounded by the candidate-set
+size times the number of distinct caveat names a grant can carry, which is
+small by construction. Served by @relation_tuple_object_hist_idx@ (equality on
+object_type, object_id, relation) or @relation_tuple_subject_hist_idx@; the
+partial @*_live_idx@ indexes cannot serve it, because visibility is read
+through @pg_visible_in_snapshot@ rather than @deleted_xid IS NULL@.
+-}
+probeTuplesStatement :: Statement ProbeParams [TupleRow]
+probeTuplesStatement =
+    Statement.preparable
+        """
+        SELECT id, object_type, object_id, relation, subject_type, subject_id, subject_relation,
+               caveat_name, caveat_payload, created_xid::text, deleted_xid::text
+        FROM relation_tuple
+        WHERE object_type = $2
+          AND object_id = $3
+          AND relation = $4
+          AND (subject_type, subject_id, coalesce(subject_relation, '')) IN (
+            SELECT * FROM unnest($5::text[], $6::text[], $7::text[])
+          )
+          AND pg_visible_in_snapshot(created_xid, $1::pg_snapshot)
+          AND (deleted_xid IS NULL OR NOT pg_visible_in_snapshot(deleted_xid, $1::pg_snapshot))
+        ORDER BY id ASC
+        """
+        probeEncoder
+        (Decoders.rowList tupleRowDecoder)
+
+probeEncoder :: Encoders.Params ProbeParams
+probeEncoder =
+    ((\params -> params.revision) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.objectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.objectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.relation) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.subjectTypes) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.subjectIds) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.subjectRelations) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
 
 readStartingWithUserStatement :: Statement ReadParams [TupleRow]
 readStartingWithUserStatement =
