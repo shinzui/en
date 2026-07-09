@@ -77,7 +77,7 @@ store implementation, which is risky enough to deserve its own validation cycle.
 | EP-39 | Add a point-membership probe and probe-first check evaluation | docs/plans/39-add-a-point-membership-probe-and-probe-first-check-evaluation.md | None | None | Complete |
 | EP-40 | Adopt Zanzibar cycle and exclusion semantics in check | docs/plans/40-adopt-zanzibar-cycle-and-exclusion-semantics-in-check.md | None | EP-39 | Complete |
 | EP-41 | Cache context-free check subproblems | docs/plans/41-cache-context-free-check-subproblems.md | None | EP-39, EP-40 | Complete |
-| EP-42 | Stream lookup pages with validated cursors and a real deadline | docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md | None | EP-39 | In Progress |
+| EP-42 | Stream lookup pages with validated cursors and a real deadline | docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md | None | EP-39 | Complete |
 | EP-43 | Preserve set operators in expand trees | docs/plans/43-preserve-set-operators-in-expand-trees.md | None | None | Not Started |
 | EP-44 | Make evaluation budgets configurable and trim hot-path overhead | docs/plans/44-make-evaluation-budgets-configurable-and-trim-hot-path-overhead.md | None | EP-39, EP-40, EP-42 | Not Started |
 
@@ -135,7 +135,9 @@ cross-request cache, and every internal evaluator now hold that one context-free
 "depth exceeded" — both currently collapse into `ResolutionLimitExceeded`). EP-42
 decided to reuse the existing `InvalidConsistencyToken` error for cursor-validation
 failures, since its cursors literally carry a consistency token (see EP-42's Decision
-Log) — no new constructor there. The wire mapping of the new EP-40 constructors belongs
+Log) — no new constructor there. **Confirmed by EP-42 (2026-07-08):** that choice cost
+nothing to wire, because `enErrorToFault` already maps the constructor to a 400
+`invalid_consistency_token`. The wire mapping of the new EP-40 constructors belongs
 to docs/plans/35-version-the-wire-contract-and-type-the-error-model.md (master plan 6);
 whichever lands second wires the new constructors into the error envelope.
 
@@ -143,7 +145,16 @@ The lookup cursor codec (`en-core/src/En/Lookup.hs`, currently raw revision text
 redefined by EP-42 to carry a validated token. The service layer
 (`en-servant/src/En/Servant/API.hs`) passes cursors opaquely, so no wire change is
 expected, but docs/plans/52-add-a-lookup-subjects-api.md (master plan 9) should reuse
-EP-42's cursor discipline for its own paging.
+EP-42's cursor discipline for its own paging. **Settled by EP-42 (2026-07-08):** format
+`lookup-v2` is `token | lastObjectType | lastObjectId | branchCount ( … )*`; `v1` cursors are
+rejected, not migrated. `ConsistencyStore` gained
+`MintToken :: Revision -> ConsistencyStore m ConsistencyToken` with smart constructor
+`mintToken`, implemented by all four interpreters — the two in-memory ones (a new *strict*
+variant, `runConsistencyStoreInMemoryStrict`, exists because the permissive one cannot fail a
+token and so cannot test a rejection), the PostgreSQL one, and both in `en-example`.
+docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md (master plan 9)
+reuses `MintToken` as-is. No wire change was needed: `enErrorToFault` already maps
+`InvalidConsistencyToken` to a 400, so docs/plans/35's contribution here was already in place.
 
 Engine configuration (EP-44's budget record) is constructed in `en-server/app/Main.hs`
 and the `en-servant` seam defaults; it must slot into the server configuration record
@@ -159,8 +170,8 @@ established by docs/plans/38-validate-configuration-and-persist-datastore-identi
 - [x] EP-40 (2026-07-08): exclusion over a Conditional base evaluates the subtrahend; checkMany surfaces per-pair errors
 - [x] EP-41 (2026-07-08): decision cache keyed without caveat context; caveats re-applied on hit; cross-request hit rate demonstrated
 - [x] EP-41 (2026-07-08): check evaluates symbolically; probe results cached in the tuple-read interposer
-- [ ] EP-42: lookup pages resume incrementally from cursors instead of recomputing the traversal
-- [ ] EP-42: cursors validated like consistency tokens; deadline interrupts expansion
+- [x] EP-42 (2026-07-08): lookup confirmation resumes from the cursor watermark and is bounded to the page; the traversal itself still recomputes (see below)
+- [x] EP-42 (2026-07-08): cursors validated like consistency tokens; deadline interrupts expansion; one snapshot per lookup
 - [ ] EP-43: expand tree preserves union/intersection/exclusion operators end-to-end to the wire
 - [ ] EP-44: depth/page/result budgets configurable per engine; constants deduplicated
 - [ ] EP-44: EntryPoint machinery wired to a consumer or relocated; hot-path allocation fixes benchmarked
@@ -343,6 +354,76 @@ did not, which is evidence for relocating or deleting it rather than wiring it u
 should weigh that when it makes the call.
 
 
+**EP-42 found the limit of what the engine can fix alone: store scans are ordered by row id
+(2026-07-08).** Both of en's tuple stores return `readStartingWithUser` rows `ORDER BY id ASC`
+with a keyset cursor on `id`. Row id is insertion order and bears no relation to
+`(object_type, object_id)`, which is the key lookup sorts and paginates by. Two consequences,
+and they are the same fact seen twice.
+
+Per-branch cursor resumption — the mechanism EP-42's plan named for making page N+1 cheaper —
+is unsound. A branch yielding objects `[z, a, b, c]` in store order, paged at `limit 2`, emits
+`[a, b]`; resuming past those four rows loses `c` and `z`, consumed but never emitted because
+they fell beyond the page limit. No prefix of a branch scan is safe to skip. And an interrupted
+traversal cannot emit what it has found, for the same reason: those objects are an arbitrary
+subset, not the smallest members, so advancing the watermark past them would drop everything
+smaller that remains undiscovered.
+
+EP-42 therefore fixed the half that is fixable in the engine — confirmation, which is the
+expensive stage — and left the traversal recomputing per page. The unlock is a storage change:
+order `readStartingWithUser` by `(object_type, object_id, id)` with a matching keyset cursor and
+supporting index, in `en-postgres` and in the in-memory store. That would let the traversal
+resume *and* let an interrupted lookup emit a true prefix; both of EP-42's retreats dissolve at
+once. It is a coherent plan of its own and this master plan does not contain it. The lookup
+cursor reserves a `frontier` field for it, encoded and round-trip tested, currently always empty.
+
+**EP-42 fixed two findings structurally rather than behaviorally, and EP-44 must not undo it
+(2026-07-08).** B9 (forgeable cursors) is closed by importing `Revision` *without its
+constructor* into `en-core/src/En/Lookup.hs`: the module cannot build a revision from client
+text, so an edit that resurrects `Revision cursorText` does not compile. B7 (one lookup, many
+snapshots) is closed by deleting `consistency` from the internal evaluators, which also deleted
+`ConsistencyStore :> es` from their constraint sets: the traversal cannot resolve consistency,
+because the effect is not available to it.
+
+Both are compiler-maintained invariants. EP-44 tunes hot paths in exactly these functions. If a
+signature there grows `ConsistencyStore :> es` back, or `En.Lookup` starts importing
+`Revision (..)`, a fixed finding has been silently reopened.
+
+**`En.Check` gained two engine-internal entry points (2026-07-08).** `checkAtRevision` and
+`checkCachedAtRevision` take an already-resolved revision and a caller-owned `CheckMemo`,
+returning the updated memo. `CheckMemo` and `emptyCheckMemo` are exported. They exist so lookup
+can pin every confirmation to the snapshot its traversal read and share subproblems across a
+candidate list. Callers must not carry a memo across a revision boundary; the functions cannot
+check that, which is why they are documented engine-internal. EP-44's benchmark work will see
+them.
+
+**EP-41's context-free memo made EP-42's shared memo sound for a stronger reason than expected
+(2026-07-08).** The plan justified sharing one memo across a lookup's confirmations with "one
+lookup has one context". After EP-41 the memo holds `ResidualDecision`s, which mention no caveat
+context at all; the context is applied per candidate at the `checkAtRevision` boundary. And
+EP-40's cut-taint rule already guarantees a residual computed under a cycle cut is never
+memoized, so the shared memo cannot inherit a stack-local answer. Two earlier plans paid for a
+property this one needed.
+
+**A third test encoding a bug, and a pattern worth naming (2026-07-08).** EP-41 inverted a test
+asserting that a different caveat context must *miss* the decision cache. EP-42 inverted two
+more: one asserted a lookup with a budget of *zero polls* still returned a full 500-object page
+(the deadline could only relabel work it had already done in full), and the cursor round-trip
+test pinned the v1 format whose raw-revision field is the forgery.
+
+Three tests, three plans, one shape: a test written to pin current behavior pins current bugs,
+and reads as coverage. The only way to notice is to ask what the assertion *would* say if the
+bug were fixed. EP-43 and EP-44 should expect to find more of these — EP-43 in particular, since
+expand's current tree shape is what B10 says is wrong, and any test asserting that shape is
+asserting the finding.
+
+**EP-42 measured what it fixed (2026-07-08).** Consistency resolutions per lookup: 3 → 1.
+Confirmation store reads across three pages of an exclusion fixture: a flat 17 per page → 15,
+12, 7. Store pages read by a lookup with no deadline budget: 2 → 1. Shared-memo confirmation on
+a shared-subtree fixture: 19 → 17 reads. The last number is small on purpose, and EP-44 should
+know why before it benchmarks: EP-39's probe already made an individual confirmation cheap, so
+memo sharing saves one bounded read per candidate rather than a whole relation drain.
+
+
 ## Decision Log
 
 - Decision: Split performance (EP-39) from semantics (EP-40) even though both rewrite `En/Check.hs`.
@@ -368,6 +449,12 @@ should weigh that when it makes the call.
   Date: 2026-07-08
 - Decision: The rule above extends to read caches and pure algebra, and it is sharpened: when a test's subject is "X was reused", the assertion must be about the *value* the reuse produced, never about reuse having occurred.
   Rationale: EP-41 found two plausible implementations that pass reuse-shaped assertions while being badly wrong. A cross-context decision cache that stores the answer computed under the inserting request's context passes every "did it hit?" assertion in the suite and serves expired grants as `Allowed`. A `ProbeReadKey` whose `Ord` omits the subject list passes every "did reads drop?" assertion, makes the read count look better, and returns one subject's rows to another. Both were caught only by assertions about returned values.
+  Date: 2026-07-08
+- Decision: EP-42's fixes for B7 and B9 are enforced by the compiler, and no later plan may weaken them: `en-core/src/En/Lookup.hs` imports `Revision` without its constructor, and the internal lookup evaluators carry `TupleStore :> es` alone, without `ConsistencyStore`.
+  Rationale: a forged cursor was obeyed because nothing validated it, and a lookup spanned several snapshots because the traversal could re-resolve consistency. Removing the *capability* rather than the *call site* means a regression is a compile error. EP-44 tunes exactly these functions; if a signature there regains `ConsistencyStore :> es`, or the module starts importing `Revision (..)`, a fixed finding has been reopened silently.
+  Date: 2026-07-08
+- Decision: Lookup's traversal keeps recomputing per page. Per-branch cursor resumption is abandoned, not deferred, and an interrupted lookup emits no objects.
+  Rationale: both tuple stores scan `ORDER BY id ASC` with a keyset cursor on `id`, and row id bears no relation to object key. No prefix of a branch scan is safe to skip, and the objects found before an interruption are an arbitrary subset rather than the smallest members — emitting either would drop results silently. EP-42 fixed the half that is fixable in the engine (confirmation, the expensive stage) and left the rest to a storage plan that orders scans by `(object_type, object_id, id)`. Both retreats dissolve together if that lands.
   Date: 2026-07-08
 - Decision: The check evaluator is symbolic throughout; `CaveatContext` does not appear below `check`/`checkCached`/`checkMany`, and the nested-group accelerator requires uncaveated edges.
   Rationale: caching a context-free decision requires that the traversal never consult the context, or only leaves could be cached. The accelerator's conclusion is an unconditional allow and cannot carry a gate, so a caveated edge must fall back to recursion. This tightens the `relationUnionsThis` guard rather than weakening it. EP-44 must not reintroduce a context-sensitive accelerator test as an optimization: it would cache a satisfied caveat as an unconditional allow, which is the same class of bug as B6's inverse.
@@ -450,3 +537,34 @@ Second, EP-42 does touch `En/Check.hs` (a revision-pinned `checkAtRevision` entr
 is required to fix B7), so the Dependency Graph no longer claims it can treat check as a
 black box and now records the EP-41/EP-42 `checkCached` seam. Both child plans carry the
 matching notes.
+
+
+---
+
+Revision note (2026-07-08, fourth): EP-42 is complete. Registry, Progress, Integration Points,
+Surprises & Discoveries, and Decision Log updated. B9 (forgeable cursors) and B7 (one lookup,
+many snapshots) are closed, and closed *structurally*: `En.Lookup` imports `Revision` without
+its constructor, so it cannot build one from client text, and the lookup traversal no longer
+carries the `ConsistencyStore` effect, so it cannot re-resolve consistency. Both are
+compiler-maintained. EP-44 tunes these exact functions and must not reintroduce either
+capability.
+
+B8 splits. Its deadline half is fixed — polls sit inside the walk and an exhausted budget
+interrupts it, reading one store page instead of two. Its paging half is fixed only for
+confirmation, which is the expensive stage: 15/12/7 store reads across three pages where every
+page previously cost 17. The traversal still recomputes per page, and the mechanism EP-42's plan
+proposed for that (per-branch `StoreCursor` resumption) is unsound, because both stores scan
+`ORDER BY id ASC` and row id bears no relation to object key. The same fact decided that an
+interrupted lookup must emit nothing. Unlocking both requires object-ordered store scans — a
+storage plan this master plan does not contain, and which the reserved cursor `frontier` field
+awaits.
+
+`En.Check` gained `checkAtRevision` / `checkCachedAtRevision` with an exported `CheckMemo` and
+`emptyCheckMemo`; `ConsistencyStore` gained `MintToken`. Both are new shared vocabulary,
+recorded in Integration Points; master plan 9's docs/plans/51 reuses `MintToken` unchanged.
+
+Two more tests turned out to encode the bugs they covered — a zero-budget lookup asserting a
+full page, and a cursor round-trip pinning the forgeable v1 format. That is now three across
+three plans, and Surprises & Discoveries names the pattern for EP-43, which will meet it again:
+expand's current tree shape *is* finding B10, so any test asserting that shape is asserting the
+finding. No decomposition change: EP-43 and EP-44 keep their scopes, dependencies, and ordering.
