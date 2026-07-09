@@ -23,6 +23,7 @@ import Data.Foldable (traverse_)
 import Data.Functor.Contravariant ((>$<))
 import Data.Int (Int64)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
 import Data.Scientific (floatingOrInteger)
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -34,12 +35,17 @@ import Effectful.Error.Static (Error, throwError)
 
 import En.Effect.TupleStore (
     PageState (..),
+    Precondition (..),
     StoreCursor (..),
+    SubjectRelationFilter (..),
+    TupleFilter (..),
     TuplePage (..),
     TupleRow (..),
     TupleRowId (..),
     TupleStore (..),
+    TupleWriteRequest (..),
     UsersetQuery (..),
+    renderPrecondition,
  )
 import En.Error (EnError (..))
 import En.Postgres.Database (Database, runSession)
@@ -120,10 +126,9 @@ interpretTupleStorePostgres config readOptimizedRevision =
             orThrow =<< runSession (readStartingWithUserSession revision query)
         ProbeTuples revision object relation subjects ->
             orThrow =<< runSession (probeTuplesSession revision object relation subjects)
-        WriteTuples tuples ->
-            orThrow =<< runSession (writeTuplesSession config tuples)
-        DeleteTuples tuples ->
-            orThrow =<< runSession (deleteTuplesSession config tuples)
+        ApplyTupleWrites request -> do
+            outcome <- orThrow =<< runSession (applyTupleWritesSession config request)
+            either (throwError . WritePreconditionFailed) pure outcome
         HeadRevision ->
             orThrow =<< runSession headRevisionSession
         OptimizedRevision ->
@@ -158,27 +163,79 @@ cachedOptimizedRevision cache = do
             liftIO (storeOptimizedRevisionCache cache revision)
             pure revision
 
-{- | Write each tuple with touch semantics, then mint a token for the write.
+{- | Apply one atomic write request, then mint a token for it.
 
-A live tuple's identity is (object, relation, subject); its caveat is an
-attribute of the grant, not part of its identity. So a write either inserts,
-does nothing (the live row is already byte-identical), or retires the differing
-live row and inserts the replacement — all inside this session's single
-transaction, so no observer ever sees both rows live.
+The transaction checks every precondition, applies the deletes, applies the
+writes, and commits. A failing precondition rolls back and returns @Left@
+describing it: nothing was written and no token is minted.
 
-The same key appearing twice in one call resolves last-wins: the second tuple's
-touch retires the first tuple's row, stamping @deleted_xid = created_xid@, which
-is visible at no revision.
+Deletes run before writes so that "replace the grant on this key" is one natural
+request rather than a self-cancelling one.
+
+Writes have touch semantics. A live tuple's identity is (object, relation,
+subject); its caveat is an attribute of the grant, not part of its identity. So a
+write either inserts, does nothing (the live row is already byte-identical), or
+retires the differing live row and inserts the replacement — all inside this
+session's single transaction, so no observer ever sees both rows live. The same
+key appearing twice in one call resolves last-wins: the second tuple's touch
+retires the first tuple's row, stamping @deleted_xid = created_xid@, which is
+visible at no revision.
+
+The @ROLLBACK@ must be explicit. A precondition that merely matches zero rows
+leaves the transaction healthy rather than aborted, so hasql performs no
+automatic reset, and the connection would otherwise be handed back still inside
+an open transaction.
 -}
-writeTuplesSession :: ConsistencyConfig -> [Tuple] -> Session ConsistencyToken
-writeTuplesSession config tuples = do
+applyTupleWritesSession :: ConsistencyConfig -> TupleWriteRequest -> Session (Either Text ConsistencyToken)
+applyTupleWritesSession config request = do
     Session.script beginScript
     anchor <- Session.statement schemaHashText anchorTransactionStatement
-    traverse_ (touchTuple anchor.xid) tuples
-    Session.script commitScript
-    pure (tokenFromAnchor config anchor)
+    failure <- firstPreconditionFailure request.preconditions
+    case failure of
+        Just description -> do
+            Session.script rollbackScript
+            pure (Left description)
+        Nothing -> do
+            traverse_ (\tuple -> Session.statement (tupleDeleteParams anchor.xid tuple) deleteTupleStatement) request.deletes
+            traverse_ (touchTuple anchor.xid) request.writes
+            Session.script commitScript
+            pure (Right (tokenFromAnchor config anchor))
   where
     SchemaHash schemaHashText = config.schemaHash
+
+{- | The first precondition that does not hold, rendered; 'Nothing' when all hold.
+
+Checking stops at the first failure: the request is already doomed, and every
+further check would only take locks the impending @ROLLBACK@ must release.
+-}
+firstPreconditionFailure :: [Precondition] -> Session (Maybe Text)
+firstPreconditionFailure = \case
+    [] -> pure Nothing
+    precondition : rest -> do
+        held <- preconditionHolds precondition
+        if held
+            then firstPreconditionFailure rest
+            else pure (Just (renderPrecondition precondition))
+
+{- | Whether a precondition holds inside the write transaction.
+
+A must-exist check locks the row it found with @FOR SHARE@. Without the lock the
+check could pass while a concurrent transaction soft-deletes the row and commits
+— gap E1 exactly. With it, the racing revoke (an @UPDATE@ of @deleted_xid@)
+blocks until we commit; and if the revoke committed first, our @SELECT@
+re-evaluates under @READ COMMITTED@, finds @deleted_xid@ set, matches nothing,
+and the precondition fails.
+
+A must-not-exist check cannot lock what is not there. It relies on
+@relation_tuple_live_unique@ to turn a racing insert of the same identity into a
+loud unique-violation rather than a silent duplicate. Fail-closed either way.
+-}
+preconditionHolds :: Precondition -> Session Bool
+preconditionHolds = \case
+    TupleMustExist tupleFilter ->
+        isJust <$> Session.statement (tupleFilterParams tupleFilter) lockMatchingLiveTupleStatement
+    TupleMustNotExist tupleFilter ->
+        not <$> Session.statement (tupleFilterParams tupleFilter) matchingLiveTupleExistsStatement
 
 {- | Apply touch semantics to one tuple.
 
@@ -216,16 +273,6 @@ touchTuple writeXid tuple = do
         if inserted == 1
             then pure True
             else Session.statement params identicalLiveTupleStatement
-
-deleteTuplesSession :: ConsistencyConfig -> [Tuple] -> Session ConsistencyToken
-deleteTuplesSession config tuples = do
-    Session.script beginScript
-    anchor <- Session.statement schemaHashText anchorTransactionStatement
-    traverse_ (\tuple -> Session.statement (tupleDeleteParams anchor.xid tuple) deleteTupleStatement) tuples
-    Session.script commitScript
-    pure (tokenFromAnchor config anchor)
-  where
-    SchemaHash schemaHashText = config.schemaHash
 
 headRevisionSession :: Session Revision
 headRevisionSession =
@@ -356,6 +403,12 @@ commitScript :: Text
 commitScript =
     """
     COMMIT
+    """
+
+rollbackScript :: Text
+rollbackScript =
+    """
+    ROLLBACK
     """
 
 anchorTransactionStatement :: Statement Text Anchor
@@ -597,6 +650,118 @@ tupleInsertEncoder =
         <> ((\params -> params.subjectRelation) >$< Encoders.param (Encoders.nullable Encoders.text))
         <> ((\params -> params.caveatName) >$< Encoders.param (Encoders.nullable Encoders.text))
         <> ((\params -> params.caveatPayload) >$< Encoders.param (Encoders.nullable Encoders.jsonbLazyBytes))
+
+{- | A 'TupleFilter' flattened for the wire.
+
+The subject-relation constraint travels as a mode plus an optional name rather
+than a nullable name, because SQL @NULL@ cannot distinguish "unconstrained" from
+"the subject must carry no relation" — the distinction 'SubjectRelationFilter'
+exists to make.
+-}
+data TupleFilterParams = TupleFilterParams
+    { objectType :: !Text
+    , objectId :: !(Maybe Text)
+    , relation :: !(Maybe Text)
+    , subjectType :: !(Maybe Text)
+    , subjectId :: !(Maybe Text)
+    , subjectRelationMode :: !Text
+    , subjectRelationName :: !(Maybe Text)
+    }
+
+tupleFilterParams :: TupleFilter -> TupleFilterParams
+tupleFilterParams tupleFilter =
+    TupleFilterParams
+        { objectType = unObjectType tupleFilter.objectType
+        , objectId = tupleFilter.objectId
+        , relation = unRelationName <$> tupleFilter.relation
+        , subjectType = unObjectType <$> tupleFilter.subjectType
+        , subjectId = tupleFilter.subjectId
+        , subjectRelationMode = mode
+        , subjectRelationName = name
+        }
+  where
+    (mode, name) =
+        case tupleFilter.subjectRelation of
+            AnySubjectRelation -> ("any", Nothing)
+            NoSubjectRelation -> ("none", Nothing)
+            ExactSubjectRelation relationName -> ("exact", Just (unRelationName relationName))
+
+tupleFilterEncoder :: Encoders.Params TupleFilterParams
+tupleFilterEncoder =
+    ((\params -> params.objectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.objectId) >$< Encoders.param (Encoders.nullable Encoders.text))
+        <> ((\params -> params.relation) >$< Encoders.param (Encoders.nullable Encoders.text))
+        <> ((\params -> params.subjectType) >$< Encoders.param (Encoders.nullable Encoders.text))
+        <> ((\params -> params.subjectId) >$< Encoders.param (Encoders.nullable Encoders.text))
+        <> ((\params -> params.subjectRelationMode) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.subjectRelationName) >$< Encoders.param (Encoders.nullable Encoders.text))
+
+{- | The predicate shared by both precondition statements: a live row the filter
+matches. A @NULL@ parameter leaves its column unconstrained.
+-}
+tupleFilterPredicate :: Text
+tupleFilterPredicate =
+    """
+    object_type = $1
+    AND ($2::text IS NULL OR object_id = $2)
+    AND ($3::text IS NULL OR relation = $3)
+    AND ($4::text IS NULL OR subject_type = $4)
+    AND ($5::text IS NULL OR subject_id = $5)
+    AND ( $6 = 'any'
+          OR ($6 = 'none' AND subject_relation IS NULL)
+          OR ($6 = 'exact' AND subject_relation = $7) )
+    AND deleted_xid IS NULL
+    """
+
+{- | Find one live row the filter matches and hold a share lock on it until the
+write transaction ends.
+
+The lock is the whole point. A racing revoke is an @UPDATE … SET deleted_xid@ on
+this row, so it must wait for our share lock to be released by our COMMIT; if
+instead the revoke committed first, this @SELECT@ re-evaluates under
+@READ COMMITTED@, sees @deleted_xid@ set, and returns nothing. Either way the two
+writers serialize and exactly one wins.
+-}
+lockMatchingLiveTupleStatement :: Statement TupleFilterParams (Maybe Int64)
+lockMatchingLiveTupleStatement =
+    Statement.preparable
+        ( """
+          SELECT id
+          FROM relation_tuple
+          WHERE
+          """
+            <> tupleFilterPredicate
+            <> """
+               LIMIT 1
+               FOR SHARE
+               """
+        )
+        tupleFilterEncoder
+        (Decoders.rowMaybe (Decoders.column (Decoders.nonNullable Decoders.int8)))
+
+{- | Whether any live row matches the filter.
+
+Absent rows cannot be locked, so a must-not-exist precondition takes no lock. A
+racing insert of the same identity is caught instead by
+@relation_tuple_live_unique@, which turns it into a unique-violation rather than
+a silent duplicate.
+-}
+matchingLiveTupleExistsStatement :: Statement TupleFilterParams Bool
+matchingLiveTupleExistsStatement =
+    Statement.preparable
+        ( """
+          SELECT EXISTS (
+            SELECT 1
+            FROM relation_tuple
+            WHERE
+          """
+            <> tupleFilterPredicate
+            <> """
+               )
+               """
+        )
+        tupleFilterEncoder
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.bool)))
 
 data TupleDeleteParams = TupleDeleteParams
     { deletedXid :: !Text

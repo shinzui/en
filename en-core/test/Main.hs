@@ -1085,8 +1085,11 @@ testStorePaging = do
             [ Tuple pagedFolder (RelationName "viewer") (SubjectId (pagedUser index)) Nothing
             | index <- [1 .. pagedRowCount]
             ]
+        -- The store can now raise WritePreconditionFailed, so it demands an Error
+        -- handler even for a read-only drain. It stays pure regardless.
         drained =
-            runPureEff (runTupleStoreInMemory pagedRows (drainPaged Nothing []))
+            either (error . show) id $
+                runPureEff (runErrorNoCallStack @EnError (runTupleStoreInMemory pagedRows (drainPaged Nothing [])))
     assertEqual
         "the in-memory store drains every row of a relation spanning four pages"
         [SubjectId (pagedUser index) | index <- [1 .. pagedRowCount]]
@@ -2184,10 +2187,8 @@ interpretFixtureTupleStore countRef errorObject tuples =
                         , tuple.relation == relation
                         , tuple.subject `elem` subjects
                         ]
-        WriteTuples _ ->
+        ApplyTupleWrites _ ->
             pure (ConsistencyToken "in-memory-write")
-        DeleteTuples _ ->
-            pure (ConsistencyToken "in-memory-delete")
         HeadRevision ->
             pure testRevision
         OptimizedRevision ->

@@ -58,8 +58,11 @@ import En.Servant.API (
     LookupRequestWire (..),
     LookupStateWire (..),
     ObjectRefWire (..),
+    PreconditionWire (..),
+    SubjectRelationFilterWire (..),
     SubjectWire (..),
     TupleCaveatWire (..),
+    TupleFilterWire (..),
     TupleWire (..),
     WriteTuplesRequestWire (..),
     WriteTuplesResponseWire (..),
@@ -266,6 +269,100 @@ main = do
         (Right True)
         =<< fmap (fmap hasMore) (runHandler (lookupHandler env greedyRequest))
 
+    writePreconditionTests env
+
+{- | Preconditions over the wire, against the in-memory store.
+
+Three properties: a body written before preconditions existed still decodes and
+still writes; a precondition that does not hold refuses the write with @412@ and
+a stable code; and a precondition that does hold lets the write through.
+
+`fixtureTuples` has @space:project-x#owner\@user:alice@ and no @viewer@ grant for
+bob, which is what makes the must-exist and must-not-exist cases both expressible
+without seeding anything.
+-}
+writePreconditionTests :: Env TestEffects -> IO ()
+writePreconditionTests env = do
+    legacyBody <-
+        maybe (fail "a legacy write body no longer decodes") pure $
+            decode
+                "{\"tuples\":[{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"relation\":\"owner\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"bob\"},\"caveat\":null}]}"
+    assertEqual
+        "a write body without the new fields still decodes to an unguarded request"
+        (WriteTuplesRequestWire{tuples = legacyBody.tuples, deletes = Nothing, preconditions = Nothing})
+        legacyBody
+    assertOk "a legacy write body still writes" =<< runHandler (writeTuplesHandler env legacyBody)
+
+    -- alice IS an owner of project-x, so requiring her absence must refuse the write.
+    assertEqual
+        "a write whose must-not-exist precondition is violated is refused"
+        (Just "write_precondition_failed")
+        =<< preconditionCodeOf
+            ( writeTuplesHandler
+                env
+                WriteTuplesRequestWire
+                    { tuples = [bobOwnerTuple]
+                    , deletes = Nothing
+                    , preconditions = Just [TupleMustNotExistWire (ownerFilter "alice")]
+                    }
+            )
+
+    -- ... and requiring her presence must let it through.
+    assertOk "a write whose must-exist precondition holds is applied"
+        =<< runHandler
+            ( writeTuplesHandler
+                env
+                WriteTuplesRequestWire
+                    { tuples = [bobOwnerTuple]
+                    , deletes = Nothing
+                    , preconditions = Just [TupleMustExistWire (ownerFilter "alice")]
+                    }
+            )
+
+    -- The delete endpoint carries preconditions too.
+    assertEqual
+        "a delete whose must-exist precondition fails is refused"
+        (Just "write_precondition_failed")
+        =<< preconditionCodeOf
+            ( deleteTuplesHandler
+                env
+                DeleteTuplesRequestWire
+                    { tuples = [bobOwnerTuple]
+                    , preconditions = Just [TupleMustExistWire (ownerFilter "nobody")]
+                    }
+            )
+
+    -- A filter naming no object type cannot be index-served, so it is a client error.
+    assertEqual
+        "a precondition filter with an empty objectType is a client error"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf
+            ( writeTuplesHandler
+                env
+                WriteTuplesRequestWire
+                    { tuples = []
+                    , deletes = Nothing
+                    , preconditions = Just [TupleMustExistWire (ownerFilter "alice"){objectType = ""}]
+                    }
+            )
+  where
+    bobOwnerTuple =
+        TupleWire
+            { object = ObjectRefWire{objectType = "space", objectId = "project-x"}
+            , relation = "owner"
+            , subject = SubjectIdWire ObjectRefWire{objectType = "user", objectId = "bob"}
+            , caveat = Nothing
+            }
+    ownerFilter subjectId =
+        TupleFilterWire
+            { objectType = "space"
+            , objectId = Just "project-x"
+            , relation = Just "owner"
+            , subjectType = Just "user"
+            , subjectId = Just subjectId
+            , subjectRelation = Just NoSubjectRelationWire
+            }
+
 {- | The generated document describes the API that is actually served.
 
 Checks the two properties that silently rot: the path set, and that every operation
@@ -291,7 +388,7 @@ openApiDocumentTests = do
         ( \path ->
             assertEqual
                 ("operation " <> Text.unpack path <> " documents its error responses")
-                ["200", "400", "422", "503"]
+                ["200", "400", "412", "422", "503"]
                 (List.sort (objectKeys (document `at` "paths" `at` Key.fromText path `at` "post" `at` "responses")))
         )
         [ "/v1/batch-check"
@@ -328,7 +425,19 @@ errorModelTests = do
     mapsTo "InvalidConsistencyToken" (InvalidConsistencyToken "bad token") (400, "invalid_consistency_token", False)
     mapsTo "ResolutionLimitExceeded" ResolutionLimitExceeded (422, "resolution_limit_exceeded", False)
     mapsTo "CycleDetected" (CycleDetected "space:recursive#view") (422, "cycle_detected", False)
+    mapsTo
+        "WritePreconditionFailed"
+        (WritePreconditionFailed "must-exist: space:project-x#member@user:alice")
+        (412, "write_precondition_failed", False)
     mapsTo "StoreError" (StoreError secretDetail) (503, "store_error", True)
+
+    {- A precondition failure is an arbitration loss, not an outage. Retrying the same
+    request without re-reading the state it was guarded on will fail identically, so
+    `retryable` must stay False -- a client that retried on it would spin. -}
+    assertEqual
+        "write_precondition_failed names the precondition that did not hold"
+        "write precondition did not hold: must-exist: space:project-x#member@user:alice"
+        (envelopeOf (enErrorToFault (WritePreconditionFailed "must-exist: space:project-x#member@user:alice"))).message
 
     -- The 503 message must never carry the SQL text and bound parameters that
     -- Hasql.toDetailedText puts in StoreError; the operator gets those on stderr.
@@ -361,6 +470,7 @@ errorModelTests = do
 envelopeOf :: EnFault -> ErrorEnvelopeWire
 envelopeOf = \case
     BadRequestFault envelope -> envelope
+    PreconditionFailedFault envelope -> envelope
     UnprocessableFault envelope -> envelope
     UnavailableFault envelope -> envelope
 
@@ -536,15 +646,58 @@ wireContractTests = do
         "{\"root\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"permission\":\"view\",\"children\":[],\"state\":{\"status\":\"exhausted\"}}"
         ExpandTreeWire{root = projectX, permission = "view", children = [], state = ExpandExhaustedWire}
 
+    {- A request carrying no preconditions and no deletes must serialize to exactly the
+    bytes it did before those fields existed: the optional fields are omitted, not
+    encoded as null. This is one half of the backward-compatibility contract; the other
+    half -- that such a body still decodes -- is `legacyRequestBodyTests`. -}
     golden
         "WriteTuplesRequestWire"
         "{\"tuples\":[{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"relation\":\"viewer\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"caveat\":null}]}"
-        WriteTuplesRequestWire{tuples = [viewerTuple]}
+        WriteTuplesRequestWire{tuples = [viewerTuple], deletes = Nothing, preconditions = Nothing}
     golden
         "DeleteTuplesRequestWire"
         "{\"tuples\":[{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"relation\":\"viewer\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"caveat\":null}]}"
-        DeleteTuplesRequestWire{tuples = [viewerTuple]}
+        DeleteTuplesRequestWire{tuples = [viewerTuple], preconditions = Nothing}
     golden "WriteTuplesResponseWire" "{\"token\":\"en1.abc\"}" WriteTuplesResponseWire{token = "en1.abc"}
+
+    golden
+        "SubjectRelationFilterWire/any"
+        "{\"match\":\"any\"}"
+        AnySubjectRelationWire
+    golden
+        "SubjectRelationFilterWire/none"
+        "{\"match\":\"none\"}"
+        NoSubjectRelationWire
+    golden
+        "SubjectRelationFilterWire/exact"
+        "{\"match\":\"exact\",\"relation\":\"member\"}"
+        (ExactSubjectRelationWire "member")
+    rejects
+        "SubjectRelationFilterWire"
+        (decode "{\"match\":\"whatever\"}" :: Maybe SubjectRelationFilterWire)
+
+    -- An unconstrained field is an absent key, never a null one.
+    golden
+        "TupleFilterWire/broad"
+        "{\"objectType\":\"space\"}"
+        TupleFilterWire
+            { objectType = "space"
+            , objectId = Nothing
+            , relation = Nothing
+            , subjectType = Nothing
+            , subjectId = Nothing
+            , subjectRelation = Nothing
+            }
+    golden
+        "PreconditionWire/mustExist"
+        "{\"kind\":\"mustExist\",\"filter\":{\"objectType\":\"space\",\"objectId\":\"project-x\",\"relation\":\"member\",\"subjectType\":\"user\",\"subjectId\":\"alice\",\"subjectRelation\":{\"match\":\"none\"}}}"
+        (TupleMustExistWire (exactFilterWire "member" "alice"))
+    roundTrip
+        "PreconditionWire/mustNotExist"
+        (TupleMustNotExistWire (exactFilterWire "member" "alice"))
+    rejects
+        "PreconditionWire"
+        (decode "{\"kind\":\"mustProbablyExist\",\"filter\":{\"objectType\":\"space\"}}" :: Maybe PreconditionWire)
 
     -- A caveated tuple exercises the payload nesting the simpler goldens skip.
     roundTrip
@@ -569,6 +722,15 @@ wireContractTests = do
             , relation = "viewer"
             , subject = aliceSubject
             , caveat = Nothing
+            }
+    exactFilterWire relation subjectId =
+        TupleFilterWire
+            { objectType = "space"
+            , objectId = Just "project-x"
+            , relation = Just relation
+            , subjectType = Just "user"
+            , subjectId = Just subjectId
+            , subjectRelation = Just NoSubjectRelationWire
             }
     conditionalDecision =
         ConditionalWire [CaveatObligationWire{caveat = "business_hours", missingContext = ["now"]}]
@@ -634,6 +796,28 @@ lookupHandler env =
         :<|> lookupEndpoint
         :<|> _expand = server env
 
+writeTuplesHandler :: Env TestEffects -> WriteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
+writeTuplesHandler env =
+    writeEndpoint
+  where
+    writeEndpoint
+        :<|> _delete
+        :<|> _check
+        :<|> _batch
+        :<|> _lookup
+        :<|> _expand = server env
+
+deleteTuplesHandler :: Env TestEffects -> DeleteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
+deleteTuplesHandler env =
+    deleteEndpoint
+  where
+    _write
+        :<|> deleteEndpoint
+        :<|> _check
+        :<|> _batch
+        :<|> _lookup
+        :<|> _expand = server env
+
 expandHandler :: Env TestEffects -> ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
 expandHandler env =
     expandEndpoint
@@ -684,6 +868,13 @@ clientErrorCodeOf :: Handler (EnResult a) -> IO (Maybe Text)
 clientErrorCodeOf handler =
     runHandler handler <&> \case
         Right (EnClientError envelope) -> Just envelope.code
+        _ -> Nothing
+
+-- | The stable code of a 412, or 'Nothing' if the handler answered anything else.
+preconditionCodeOf :: Handler (EnResult a) -> IO (Maybe Text)
+preconditionCodeOf handler =
+    runHandler handler <&> \case
+        Right (EnPreconditionFailed envelope) -> Just envelope.code
         _ -> Nothing
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()

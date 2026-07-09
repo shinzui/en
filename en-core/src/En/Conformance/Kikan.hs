@@ -5,6 +5,8 @@ module En.Conformance.Kikan (
     tupleKey,
     touchTuple,
     deleteTupleByKey,
+    matchesFilter,
+    preconditionHolds,
     runConsistencyStoreInMemoryStrict,
     inMemoryToken,
     pageTuples,
@@ -39,7 +41,9 @@ module En.Conformance.Kikan (
     testRevision,
 ) where
 
+import Data.List (find)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isNothing)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Time (UTCTime, defaultTimeLocale, parseTimeOrError)
@@ -51,12 +55,17 @@ import Effectful.State.Static.Local (evalState, get, modify)
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (..))
 import En.Effect.TupleStore (
     PageState (..),
+    Precondition (..),
     StoreCursor (..),
+    SubjectRelationFilter (..),
+    TupleFilter (..),
     TuplePage (..),
     TupleRow (..),
     TupleRowId (..),
     TupleStore (..),
+    TupleWriteRequest (..),
     UsersetQuery (..),
+    renderPrecondition,
  )
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph, compileSchema)
@@ -162,7 +171,7 @@ assert.
 The state lives in 'Effectful.State.Static.Local', which runs under 'runPureEff',
 so the interpreter stays pure for @en-core/conformance/Main.hs@.
 -}
-runTupleStoreInMemory :: [Tuple] -> Eff (TupleStore : es) a -> Eff es a
+runTupleStoreInMemory :: (Error EnError :> es) => [Tuple] -> Eff (TupleStore : es) a -> Eff es a
 runTupleStoreInMemory initialTuples =
     reinterpret_ (evalState initialTuples) \case
         ReadObjectRelation _ object relation limit cursor -> do
@@ -190,12 +199,15 @@ runTupleStoreInMemory initialTuples =
                 , tuple.relation == relation
                 , tuple.subject `elem` subjects
                 ]
-        WriteTuples written -> do
-            modify (\tuples -> foldl' (flip touchTuple) tuples written)
-            pure (ConsistencyToken "in-memory-write")
-        DeleteTuples removed -> do
-            modify (\tuples -> foldl' (flip deleteTupleByKey) tuples removed)
-            pure (ConsistencyToken "in-memory-delete")
+        ApplyTupleWrites request -> do
+            tuples <- get
+            case find (not . preconditionHolds tuples) request.preconditions of
+                Just failed ->
+                    throwError (WritePreconditionFailed (renderPrecondition failed))
+                Nothing -> do
+                    modify (\current -> foldl' (flip deleteTupleByKey) current request.deletes)
+                    modify (\current -> foldl' (flip touchTuple) current request.writes)
+                    pure (ConsistencyToken "in-memory-write")
         HeadRevision ->
             pure testRevision
         OptimizedRevision ->
@@ -227,6 +239,41 @@ the request's caveat. Mirrors the PostgreSQL delete's re-keying.
 deleteTupleByKey :: Tuple -> [Tuple] -> [Tuple]
 deleteTupleByKey tuple =
     filter (\candidate -> tupleKey candidate /= tupleKey tuple)
+
+-- | Whether a precondition holds over the given tuples.
+preconditionHolds :: [Tuple] -> Precondition -> Bool
+preconditionHolds tuples = \case
+    TupleMustExist tupleFilter -> any (matchesFilter tupleFilter) tuples
+    TupleMustNotExist tupleFilter -> not (any (matchesFilter tupleFilter) tuples)
+
+{- | Whether a tuple matches a filter.
+
+The subject is flattened exactly as the PostgreSQL store stores it: a wildcard
+becomes the object id @*@ with no relation, and a userset carries its relation.
+Otherwise a filter would mean one thing in memory and another in the database.
+-}
+matchesFilter :: TupleFilter -> Tuple -> Bool
+matchesFilter tupleFilter tuple =
+    tupleFilter.objectType == tuple.object.objectType
+        && matchesMaybe tupleFilter.objectId tuple.object.objectId
+        && matchesMaybe tupleFilter.relation tuple.relation
+        && matchesMaybe tupleFilter.subjectType subjectObject.objectType
+        && matchesMaybe tupleFilter.subjectId subjectObject.objectId
+        && matchesSubjectRelation tupleFilter.subjectRelation subjectRelationName
+  where
+    (subjectObject, subjectRelationName) =
+        case tuple.subject of
+            SubjectId object -> (object, Nothing)
+            SubjectSet object relationName -> (object, Just relationName)
+            SubjectWildcard objectType -> (ObjectRef{objectType, objectId = "*"}, Nothing)
+
+    matchesMaybe expected actual = maybe True (== actual) expected
+
+    matchesSubjectRelation expected actual =
+        case expected of
+            AnySubjectRelation -> True
+            NoSubjectRelation -> isNothing actual
+            ExactSubjectRelation relationName -> actual == Just relationName
 
 {- | Page a filtered tuple list by a row-ordinal cursor.
 

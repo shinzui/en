@@ -29,7 +29,7 @@ import Data.Text.Encoding qualified as Text
 import Data.Text.IO qualified as Text
 import Effectful (Eff, IOE)
 import Effectful.Error.Static (Error)
-import Servant (Handler, ServerError (..), err400, err403, err404, err422, err503, throwError)
+import Servant (Handler, ServerError (..), err400, err403, err404, err412, err422, err503, throwError)
 import System.IO (stderr)
 
 import En.Budget (EvaluationBudget)
@@ -100,6 +100,10 @@ used by embedded hosts are built from one source of truth.
 data EnFault
     = -- | 400: the caller sent something en cannot act on.
       BadRequestFault !ErrorEnvelopeWire
+    | {- | 412: a write precondition did not hold, so the write was refused. The
+      caller's request was well-formed; the world changed under it.
+      -}
+      PreconditionFailedFault !ErrorEnvelopeWire
     | -- | 422: the request was well-formed but exceeded an evaluation bound.
       UnprocessableFault !ErrorEnvelopeWire
     | -- | 503: a dependency of en failed. Retryable.
@@ -129,6 +133,9 @@ enErrorToFault = \case
     CycleDetected subproblem ->
         UnprocessableFault
             (envelope "cycle_detected" ("the relationship data contains a cycle at " <> subproblem))
+    WritePreconditionFailed description ->
+        PreconditionFailedFault
+            (envelope "write_precondition_failed" ("write precondition did not hold: " <> description))
     StoreError _detail ->
         UnavailableFault
             ErrorEnvelopeWire
@@ -171,6 +178,7 @@ permissionDenied message =
 faultToServerError :: EnFault -> ServerError
 faultToServerError = \case
     BadRequestFault envelope -> envelopeError err400 envelope
+    PreconditionFailedFault envelope -> envelopeError err412 envelope
     UnprocessableFault envelope -> envelopeError err422 envelope
     UnavailableFault envelope -> envelopeError err503 envelope
 

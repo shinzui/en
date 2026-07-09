@@ -159,7 +159,7 @@ resolveWithGate Env{runPorts, graph, checkOperation} subject object result =
         Right (Conditional _) -> pure (Left ResolverForbidden)
         Left _ -> pure (Left ResolverForbidden)
 
-runTupleStoreInMemory :: [Tuple] -> Eff (TupleStore : es) a -> Eff es a
+runTupleStoreInMemory :: (Error EnError Effectful.:> es) => [Tuple] -> Eff (TupleStore : es) a -> Eff es a
 runTupleStoreInMemory =
     Kikan.runTupleStoreInMemory
 

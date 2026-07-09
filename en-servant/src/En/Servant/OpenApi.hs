@@ -15,7 +15,7 @@ describe an API en does not serve. The golden tests in @en-servant/test/Main.hs@
 JSON; these instances describe the same grammar, and a mismatch between them is a bug in
 this module.
 
-The error responses (400, 422, 503) are not declared here: they are response
+The error responses (400, 412, 422, 503) are not declared here: they are response
 alternatives of each operation's 'Servant.API.MultiVerb.MultiVerb' in "En.Servant.API",
 so @servant-openapi-hs@ emits them per operation from the API type itself.
 -}
@@ -98,8 +98,11 @@ import En.Servant.API (
     LookupRequestWire,
     LookupStateWire,
     ObjectRefWire,
+    PreconditionWire,
+    SubjectRelationFilterWire,
     SubjectWire,
     TupleCaveatWire,
+    TupleFilterWire,
     TupleWire,
     WriteTuplesRequestWire,
     WriteTuplesResponseWire,
@@ -148,6 +151,19 @@ objectSchema props =
         & type_ ?~ OpenApiTypeSingle OpenApiObject
         & properties .~ InsOrdHashMap.fromList props
         & required .~ map fst props
+
+{- | An object schema with required properties followed by optional ones.
+
+Distinct from 'objectSchema' because an omitted field and a @null@ field are not
+the same thing for the precondition types: omitting @subjectRelation@ means "any
+relation", and omitting @preconditions@ means "none".
+-}
+partialObjectSchema :: [(Text, Referenced Schema)] -> [(Text, Referenced Schema)] -> Schema
+partialObjectSchema requiredProps optionalProps =
+    mempty
+        & type_ ?~ OpenApiTypeSingle OpenApiObject
+        & properties .~ InsOrdHashMap.fromList (requiredProps <> optionalProps)
+        & required .~ map fst requiredProps
 
 -- | A string schema admitting exactly one value: a sum type's discriminator.
 literal :: Text -> Referenced Schema
@@ -421,15 +437,59 @@ instance ToSchema ExpandTreeWire where
                     , ("state", state)
                     ]
 
+instance ToSchema SubjectRelationFilterWire where
+    declareNamedSchema _ =
+        pure $
+            sumSchema
+                "SubjectRelationFilterWire"
+                [ objectSchema [("match", literal "any")]
+                , objectSchema [("match", literal "none")]
+                , objectSchema [("match", literal "exact"), ("relation", textRef)]
+                ]
+
+instance ToSchema TupleFilterWire where
+    declareNamedSchema _ = do
+        subjectRelation <- declareSchemaRef (Proxy @SubjectRelationFilterWire)
+        pure $
+            NamedSchema (Just "TupleFilterWire") $
+                partialObjectSchema
+                    [("objectType", textRef)]
+                    [ ("objectId", textRef)
+                    , ("relation", textRef)
+                    , ("subjectType", textRef)
+                    , ("subjectId", textRef)
+                    , ("subjectRelation", subjectRelation)
+                    ]
+
+instance ToSchema PreconditionWire where
+    declareNamedSchema _ = do
+        tupleFilter <- declareSchemaRef (Proxy @TupleFilterWire)
+        pure $
+            sumSchema
+                "PreconditionWire"
+                [ objectSchema [("kind", literal "mustExist"), ("filter", tupleFilter)]
+                , objectSchema [("kind", literal "mustNotExist"), ("filter", tupleFilter)]
+                ]
+
 instance ToSchema WriteTuplesRequestWire where
     declareNamedSchema _ = do
         tuple <- declareSchemaRef (Proxy @TupleWire)
-        pure (NamedSchema (Just "WriteTuplesRequestWire") (objectSchema [("tuples", arrayOf tuple)]))
+        precondition <- declareSchemaRef (Proxy @PreconditionWire)
+        pure $
+            NamedSchema (Just "WriteTuplesRequestWire") $
+                partialObjectSchema
+                    [("tuples", arrayOf tuple)]
+                    [("deletes", arrayOf tuple), ("preconditions", arrayOf precondition)]
 
 instance ToSchema DeleteTuplesRequestWire where
     declareNamedSchema _ = do
         tuple <- declareSchemaRef (Proxy @TupleWire)
-        pure (NamedSchema (Just "DeleteTuplesRequestWire") (objectSchema [("tuples", arrayOf tuple)]))
+        precondition <- declareSchemaRef (Proxy @PreconditionWire)
+        pure $
+            NamedSchema (Just "DeleteTuplesRequestWire") $
+                partialObjectSchema
+                    [("tuples", arrayOf tuple)]
+                    [("preconditions", arrayOf precondition)]
 
 instance ToSchema WriteTuplesResponseWire where
     declareNamedSchema _ =

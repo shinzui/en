@@ -39,7 +39,8 @@ import Auth.Biscuit (
     serializeB64,
     toPublic,
  )
-import Effectful (runEff)
+import Effectful (Eff, IOE, runEff)
+import Effectful.Error.Static (Error, runErrorNoCallStack)
 
 import En.Biscuit.Grant (
     Audience (..),
@@ -75,6 +76,9 @@ import En.Conformance.Kikan (
     runTupleStoreInMemory,
  )
 import En.Decision (CaveatObligation (..), CheckDecision (..))
+import En.Effect.ConsistencyStore (ConsistencyStore)
+import En.Effect.TupleStore (TupleStore)
+import En.Error (EnError)
 import En.Revision (Consistency (..), ConsistencyToken (..), SchemaHash (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
 import En.Tuple (CaveatContext (..), ObjectRef (..), Subject (..))
@@ -365,7 +369,7 @@ mintCheckedTest = do
                 (ObjectRef (ObjectType "space") "project-x")
 
     allowed <-
-        runEff . runTupleStoreInMemory fixtureTuples . runConsistencyStoreInMemory $
+        runMintEff $
             mintCheckedObjectGrant
                 MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
                 kikanGraph
@@ -382,7 +386,7 @@ mintCheckedTest = do
         Left e -> die ("mint checked allowed: token missing en_right: " <> show e)
 
     engineErr <-
-        runEff . runTupleStoreInMemory fixtureTuples . runConsistencyStoreInMemory $
+        runMintEff $
             mintCheckedObjectGrant
                 MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
                 kikanGraph
@@ -735,6 +739,23 @@ sampleObjectGrant =
         (SubjectId (ObjectRef (ObjectType "user") "alice"))
         (RelationName "view")
         (ObjectRef (ObjectType "document") "roadmap")
+
+{- | Run a mint against the in-memory stores.
+
+The @Error EnError@ handler is required by 'runTupleStoreInMemory', which can now
+raise 'WritePreconditionFailed'. Minting only reads, so it never fires; if it ever
+does, that is a bug worth dying on rather than folding into the mint's own error
+type.
+-}
+runMintEff :: Eff '[ConsistencyStore, TupleStore, Error EnError, IOE] a -> IO a
+runMintEff action = do
+    outcome <-
+        runEff
+            . runErrorNoCallStack @EnError
+            . runTupleStoreInMemory fixtureTuples
+            . runConsistencyStoreInMemory
+            $ action
+    either (die . ("in-memory store raised: " <>) . show) pure outcome
 
 showMintResult :: Either EnBiscuitMintError a -> String
 showMintResult (Left err) = "Left " <> show err

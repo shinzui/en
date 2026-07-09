@@ -30,6 +30,15 @@ data EnError
       data from the reviewer.
       -}
       CycleDetected Text
+    | {- | A write precondition did not hold inside the write transaction, so the
+      write was refused and nothing was applied. Carries a rendering of the
+      failing precondition, e.g. @"must-exist: space:project-x#member\@user:alice"@.
+
+      This is an arbitration loss, not an outage: the caller read a state, decided
+      on it, and by the time the write ran that state was gone. Retrying without
+      re-reading will fail again.
+      -}
+      WritePreconditionFailed Text
     | -- | The underlying tuple store failed.
       StoreError Text
     deriving stock (Eq, Show)

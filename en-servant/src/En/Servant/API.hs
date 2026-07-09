@@ -35,6 +35,10 @@ module En.Servant.API (
     ExpandStateWire (..),
     ExpandTreeWire (..),
     WriteTuplesRequestWire (..),
+    PreconditionWire (..),
+    TupleFilterWire (..),
+    SubjectRelationFilterWire (..),
+    preconditionFromWire,
     WriteTuplesResponseWire (..),
     DeleteTuplesRequestWire (..),
     objectRefToWire,
@@ -92,7 +96,14 @@ import Servant.Server (ErrorFormatter, ErrorFormatters (..), defaultErrorFormatt
 
 import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..), checkMany)
 import En.Effect.ConsistencyStore (ConsistencyStore)
-import En.Effect.TupleStore (TupleStore, deleteTuples, writeTuples)
+import En.Effect.TupleStore (
+    Precondition (..),
+    SubjectRelationFilter (..),
+    TupleFilter (..),
+    TupleStore,
+    TupleWriteRequest (..),
+    applyTupleWrites,
+ )
 import En.Error (EnError)
 import En.Expand qualified as Expand
 import En.Lookup qualified as Lookup
@@ -126,10 +137,11 @@ document and in @en-client@'s result type, instead of leaving them as untyped
 'Servant.ServerError's thrown from a handler.
 
 All six operations share this list even though a write cannot in practice exceed a
-traversal bound (422). 'En.Error.EnError' is one closed sum shared by every operation,
-so the type system cannot prove the write path never yields 'ResolutionLimitExceeded';
-a narrower list for writes would make 'faultToResult' partial. A total conversion is
-worth a slightly over-broad document.
+traversal bound (422), and a read can never fail a write precondition (412).
+'En.Error.EnError' is one closed sum shared by every operation, so the type system
+cannot prove the write path never yields 'ResolutionLimitExceeded' nor that the read
+path never yields 'WritePreconditionFailed'; a narrower list per operation would make
+'faultToResult' partial. A total conversion is worth a slightly over-broad document.
 
 Not covered here: errors raised before a handler runs. A malformed body or an unmatched
 route comes from Servant's routing layer ('envelopeFormatters'), and
@@ -139,6 +151,7 @@ them still carry 'ErrorEnvelopeWire'.
 type EnResponses (description :: Symbol) a =
     '[ Respond 200 description a
      , Respond 400 "Invalid request" ErrorEnvelopeWire
+     , Respond 412 "Write precondition failed" ErrorEnvelopeWire
      , Respond 422 "Resolution limit exceeded" ErrorEnvelopeWire
      , Respond 503 "Tuple store unavailable" ErrorEnvelopeWire
      ]
@@ -148,6 +161,8 @@ data EnResult a
     = EnOk a
     | -- | 400
       EnClientError !ErrorEnvelopeWire
+    | -- | 412
+      EnPreconditionFailed !ErrorEnvelopeWire
     | -- | 422
       EnUnprocessable !ErrorEnvelopeWire
     | -- | 503
@@ -162,6 +177,7 @@ instance
     AsUnion
         '[ Respond 200 description a
          , Respond 400 "Invalid request" ErrorEnvelopeWire
+         , Respond 412 "Write precondition failed" ErrorEnvelopeWire
          , Respond 422 "Resolution limit exceeded" ErrorEnvelopeWire
          , Respond 503 "Tuple store unavailable" ErrorEnvelopeWire
          ]
@@ -170,19 +186,22 @@ instance
     toUnion = \case
         EnOk value -> Z (I value)
         EnClientError envelope -> S (Z (I envelope))
-        EnUnprocessable envelope -> S (S (Z (I envelope)))
-        EnUnavailable envelope -> S (S (S (Z (I envelope))))
+        EnPreconditionFailed envelope -> S (S (Z (I envelope)))
+        EnUnprocessable envelope -> S (S (S (Z (I envelope))))
+        EnUnavailable envelope -> S (S (S (S (Z (I envelope)))))
     fromUnion = \case
         Z (I value) -> EnOk value
         S (Z (I envelope)) -> EnClientError envelope
-        S (S (Z (I envelope))) -> EnUnprocessable envelope
-        S (S (S (Z (I envelope)))) -> EnUnavailable envelope
-        S (S (S (S impossible))) -> case impossible of {}
+        S (S (Z (I envelope))) -> EnPreconditionFailed envelope
+        S (S (S (Z (I envelope)))) -> EnUnprocessable envelope
+        S (S (S (S (Z (I envelope))))) -> EnUnavailable envelope
+        S (S (S (S (S impossible)))) -> case impossible of {}
 
 -- | Every 'EnFault' has a home in 'EnResponses'. This totality is why the list is shared.
 faultToResult :: EnFault -> EnResult a
 faultToResult = \case
     BadRequestFault envelope -> EnClientError envelope
+    PreconditionFailedFault envelope -> EnPreconditionFailed envelope
     UnprocessableFault envelope -> EnUnprocessable envelope
     UnavailableFault envelope -> EnUnavailable envelope
 
@@ -887,29 +906,159 @@ instance FromJSON ExpandTreeWire where
     parseJSON = withObject "ExpandTreeWire" \o ->
         ExpandTreeWire <$> o .: "root" <*> o .: "permission" <*> o .: "children" <*> o .: "state"
 
-newtype WriteTuplesRequestWire = WriteTuplesRequestWire
-    { tuples :: [TupleWire]
+{- | How a filter constrains the subject's relation.
+
+@match@ discriminates. Omitting the whole @subjectRelation@ field means @any@,
+which is what SpiceDB's unset @optionalRelation@ means. To name one exact grant
+on a concrete subject, send @{"match":"none"}@ — @any@ would also match a userset
+over that subject, which is a different grant that can be live at the same time.
+-}
+data SubjectRelationFilterWire
+    = AnySubjectRelationWire
+    | NoSubjectRelationWire
+    | ExactSubjectRelationWire !Text
+    deriving stock (Eq, Show)
+
+instance ToJSON SubjectRelationFilterWire where
+    toJSON = \case
+        AnySubjectRelationWire -> Aeson.object ["match" .= ("any" :: Text)]
+        NoSubjectRelationWire -> Aeson.object ["match" .= ("none" :: Text)]
+        ExactSubjectRelationWire relation ->
+            Aeson.object ["match" .= ("exact" :: Text), "relation" .= relation]
+    toEncoding = \case
+        AnySubjectRelationWire -> pairs ("match" .= ("any" :: Text))
+        NoSubjectRelationWire -> pairs ("match" .= ("none" :: Text))
+        ExactSubjectRelationWire relation ->
+            pairs ("match" .= ("exact" :: Text) <> "relation" .= relation)
+
+instance FromJSON SubjectRelationFilterWire where
+    parseJSON = withObject "SubjectRelationFilterWire" \o ->
+        o .: "match" >>= \case
+            "any" -> pure AnySubjectRelationWire
+            "none" -> pure NoSubjectRelationWire
+            "exact" -> ExactSubjectRelationWire <$> o .: "relation"
+            other -> unknownVariant "subject relation match" other ["any", "none", "exact"]
+
+{- | A filter over live tuples. Every field but @objectType@ is optional; an
+omitted field matches anything.
+-}
+data TupleFilterWire = TupleFilterWire
+    { objectType :: !Text
+    , objectId :: !(Maybe Text)
+    , relation :: !(Maybe Text)
+    , subjectType :: !(Maybe Text)
+    , subjectId :: !(Maybe Text)
+    , subjectRelation :: !(Maybe SubjectRelationFilterWire)
     }
     deriving stock (Eq, Show)
 
+{- | An absent constraint is an absent key, not a @null@ one: @null@ would read as
+"the subject relation must be null", which 'NoSubjectRelationWire' already says.
+-}
+instance ToJSON TupleFilterWire where
+    toJSON wire =
+        Aeson.object $
+            ["objectType" .= wire.objectType]
+                <> foldMap (\value -> ["objectId" .= value]) wire.objectId
+                <> foldMap (\value -> ["relation" .= value]) wire.relation
+                <> foldMap (\value -> ["subjectType" .= value]) wire.subjectType
+                <> foldMap (\value -> ["subjectId" .= value]) wire.subjectId
+                <> foldMap (\value -> ["subjectRelation" .= value]) wire.subjectRelation
+    toEncoding wire =
+        pairs $
+            "objectType" .= wire.objectType
+                <> foldMap ("objectId" .=) wire.objectId
+                <> foldMap ("relation" .=) wire.relation
+                <> foldMap ("subjectType" .=) wire.subjectType
+                <> foldMap ("subjectId" .=) wire.subjectId
+                <> foldMap ("subjectRelation" .=) wire.subjectRelation
+
+instance FromJSON TupleFilterWire where
+    parseJSON = withObject "TupleFilterWire" \o ->
+        TupleFilterWire
+            <$> o .: "objectType"
+            <*> o .:? "objectId"
+            <*> o .:? "relation"
+            <*> o .:? "subjectType"
+            <*> o .:? "subjectId"
+            <*> o .:? "subjectRelation"
+
+-- | A fact the write transaction re-verifies before applying any change.
+data PreconditionWire
+    = TupleMustExistWire !TupleFilterWire
+    | TupleMustNotExistWire !TupleFilterWire
+    deriving stock (Eq, Show)
+
+instance ToJSON PreconditionWire where
+    toJSON = \case
+        TupleMustExistWire tupleFilter ->
+            Aeson.object ["kind" .= ("mustExist" :: Text), "filter" .= tupleFilter]
+        TupleMustNotExistWire tupleFilter ->
+            Aeson.object ["kind" .= ("mustNotExist" :: Text), "filter" .= tupleFilter]
+    toEncoding = \case
+        TupleMustExistWire tupleFilter ->
+            pairs ("kind" .= ("mustExist" :: Text) <> "filter" .= tupleFilter)
+        TupleMustNotExistWire tupleFilter ->
+            pairs ("kind" .= ("mustNotExist" :: Text) <> "filter" .= tupleFilter)
+
+instance FromJSON PreconditionWire where
+    parseJSON = withObject "PreconditionWire" \o ->
+        o .: "kind" >>= \case
+            "mustExist" -> TupleMustExistWire <$> o .: "filter"
+            "mustNotExist" -> TupleMustNotExistWire <$> o .: "filter"
+            other -> unknownVariant "precondition kind" other ["mustExist", "mustNotExist"]
+
+{- | A write request: @tuples@ are written, @deletes@ are removed first, and every
+precondition must hold or the whole request is refused with @412@.
+
+@deletes@ and @preconditions@ are optional, so a body carrying only @tuples@ —
+every request written before preconditions existed — decodes and behaves exactly
+as it did.
+-}
+data WriteTuplesRequestWire = WriteTuplesRequestWire
+    { tuples :: ![TupleWire]
+    , deletes :: !(Maybe [TupleWire])
+    , preconditions :: !(Maybe [PreconditionWire])
+    }
+    deriving stock (Eq, Show)
+
+{- | Absent optional fields are omitted rather than encoded as @null@, so a request
+carrying only @tuples@ serializes to exactly the bytes it did before preconditions
+existed. The golden test in @en-servant/test/Main.hs@ pins that.
+-}
 instance ToJSON WriteTuplesRequestWire where
-    toJSON wire = Aeson.object ["tuples" .= wire.tuples]
-    toEncoding wire = pairs ("tuples" .= wire.tuples)
+    toJSON wire =
+        Aeson.object $
+            ["tuples" .= wire.tuples]
+                <> foldMap (\value -> ["deletes" .= value]) wire.deletes
+                <> foldMap (\value -> ["preconditions" .= value]) wire.preconditions
+    toEncoding wire =
+        pairs $
+            "tuples" .= wire.tuples
+                <> foldMap ("deletes" .=) wire.deletes
+                <> foldMap ("preconditions" .=) wire.preconditions
 
 instance FromJSON WriteTuplesRequestWire where
-    parseJSON = withObject "WriteTuplesRequestWire" \o -> WriteTuplesRequestWire <$> o .: "tuples"
+    parseJSON = withObject "WriteTuplesRequestWire" \o ->
+        WriteTuplesRequestWire <$> o .: "tuples" <*> o .:? "deletes" <*> o .:? "preconditions"
 
-newtype DeleteTuplesRequestWire = DeleteTuplesRequestWire
-    { tuples :: [TupleWire]
+-- | A delete request. @preconditions@ is optional; see 'WriteTuplesRequestWire'.
+data DeleteTuplesRequestWire = DeleteTuplesRequestWire
+    { tuples :: ![TupleWire]
+    , preconditions :: !(Maybe [PreconditionWire])
     }
     deriving stock (Eq, Show)
 
 instance ToJSON DeleteTuplesRequestWire where
-    toJSON wire = Aeson.object ["tuples" .= wire.tuples]
-    toEncoding wire = pairs ("tuples" .= wire.tuples)
+    toJSON wire =
+        Aeson.object $
+            ["tuples" .= wire.tuples] <> foldMap (\value -> ["preconditions" .= value]) wire.preconditions
+    toEncoding wire =
+        pairs ("tuples" .= wire.tuples <> foldMap ("preconditions" .=) wire.preconditions)
 
 instance FromJSON DeleteTuplesRequestWire where
-    parseJSON = withObject "DeleteTuplesRequestWire" \o -> DeleteTuplesRequestWire <$> o .: "tuples"
+    parseJSON = withObject "DeleteTuplesRequestWire" \o ->
+        DeleteTuplesRequestWire <$> o .: "tuples" <*> o .:? "preconditions"
 
 newtype WriteTuplesResponseWire = WriteTuplesResponseWire
     { token :: Text
@@ -935,14 +1084,17 @@ enHandler body =
 
 writeTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> WriteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
 writeTuplesHandler env request = enHandler do
-    tuples <- traverseOrInvalid tupleFromWire request.tuples
-    token <- engine env (writeTuples tuples)
+    writes <- traverseOrInvalid tupleFromWire request.tuples
+    deletes <- traverseOrInvalid tupleFromWire (fromMaybe [] request.deletes)
+    preconditions <- traverseOrInvalid preconditionFromWire (fromMaybe [] request.preconditions)
+    token <- engine env (applyTupleWrites TupleWriteRequest{preconditions, writes, deletes})
     pure (tokenToWire token)
 
 deleteTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> DeleteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
 deleteTuplesHandler env request = enHandler do
-    tuples <- traverseOrInvalid tupleFromWire request.tuples
-    token <- engine env (deleteTuples tuples)
+    deletes <- traverseOrInvalid tupleFromWire request.tuples
+    preconditions <- traverseOrInvalid preconditionFromWire (fromMaybe [] request.preconditions)
+    token <- engine env (applyTupleWrites TupleWriteRequest{preconditions, writes = [], deletes})
     pure (tokenToWire token)
 
 checkHandler :: Env es -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
@@ -1109,6 +1261,38 @@ tupleFromWire TupleWire{object, relation, subject, caveat}
             <*> Right (RelationName relation)
             <*> subjectFromWire subject
             <*> traverse tupleCaveatFromWire caveat
+
+preconditionFromWire :: PreconditionWire -> Either Text Precondition
+preconditionFromWire = \case
+    TupleMustExistWire tupleFilter -> TupleMustExist <$> tupleFilterFromWire tupleFilter
+    TupleMustNotExistWire tupleFilter -> TupleMustNotExist <$> tupleFilterFromWire tupleFilter
+
+{- | An empty string is rejected rather than treated as an absent constraint: a
+filter whose @objectId@ is @""@ matches nothing, and silently accepting it would
+make a must-exist precondition fail for a reason the caller cannot see.
+-}
+tupleFilterFromWire :: TupleFilterWire -> Either Text TupleFilter
+tupleFilterFromWire tupleFilter
+    | Text.null tupleFilter.objectType = Left "filter objectType must not be empty"
+    | otherwise =
+        TupleFilter (ObjectType tupleFilter.objectType)
+            <$> traverse (nonEmpty "filter objectId") tupleFilter.objectId
+            <*> traverse (fmap RelationName . nonEmpty "filter relation") tupleFilter.relation
+            <*> traverse (fmap ObjectType . nonEmpty "filter subjectType") tupleFilter.subjectType
+            <*> traverse (nonEmpty "filter subjectId") tupleFilter.subjectId
+            <*> subjectRelationFromWire (fromMaybe AnySubjectRelationWire tupleFilter.subjectRelation)
+  where
+    nonEmpty label value
+        | Text.null value = Left (label <> " must not be empty")
+        | otherwise = Right value
+
+subjectRelationFromWire :: SubjectRelationFilterWire -> Either Text SubjectRelationFilter
+subjectRelationFromWire = \case
+    AnySubjectRelationWire -> Right AnySubjectRelation
+    NoSubjectRelationWire -> Right NoSubjectRelation
+    ExactSubjectRelationWire relation
+        | Text.null relation -> Left "filter subject relation must not be empty"
+        | otherwise -> Right (ExactSubjectRelation (RelationName relation))
 
 tupleCaveatToWire :: TupleCaveat -> TupleCaveatWire
 tupleCaveatToWire TupleCaveat{name = CaveatName name, payload} =
