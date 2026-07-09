@@ -426,7 +426,21 @@ main = do
         "caveats on both edges of a nested-group path compose into both obligations"
         (Right (Conditional [CaveatObligation{caveat = CaveatName "min_level", missingContext = ["clearance"]}, CaveatObligation{caveat = CaveatName "min_rank", missingContext = ["rank"]}]))
         =<< check consistencyStore (runTupleStoreInMemory caveatedGroupTuples) groupGraph MinimizeLatency (CaveatContext Map.empty) (SubjectId groupUser) (RelationName "member") caveatedGroupSpace
-    assertEqual "recursive graph respects depth limit" (Left ResolutionLimitExceeded) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
+    cyclicGraph <- either (fail . show) pure (compileSchema cyclicSchema)
+    let cyclicStore = runTupleStoreInMemory cyclicTuples
+    assertEqual "cycle does not poison an unrelated union branch" (Right Allowed) =<< check consistencyStore cyclicStore cyclicGraph MinimizeLatency requestContext (SubjectId carol) (RelationName "view") docD
+    assertEqual "cycle-only path returns Denied, not an error" (Right Denied) =<< check consistencyStore cyclicStore cyclicGraph MinimizeLatency requestContext (SubjectId dave) (RelationName "view") docD
+    roomGraph <- either (fail . show) pure (compileSchema roomSchema)
+    let roomStore = runTupleStoreInMemory roomTuples
+    assertEqual "exclusion over conditional base evaluates the subtrahend" (Right Denied) =<< check consistencyStore roomStore roomGraph MinimizeLatency missingAutonomyContext (SubjectId erin) (RelationName "enter") roomR
+    assertEqual "conditional base with no ban stays Conditional" (Right (Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}])) =<< check consistencyStore roomStore roomGraph MinimizeLatency missingAutonomyContext (SubjectId frank) (RelationName "enter") roomR
+    assertEqual
+        "conditional base and conditional ban merge both obligations"
+        (Right (Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}, CaveatObligation{caveat = CaveatName "min_clearance", missingContext = ["clearance"]}]))
+        =<< check consistencyStore (runTupleStoreInMemory caveatedBanTuples) roomGraph MinimizeLatency missingAutonomyContext (SubjectId erin) (RelationName "enter") roomR
+    assertEqual "self-parent cycle yields Denied via cycle-as-empty" (Right Denied) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
+    deepChainGraph <- either (fail . show) pure (compileSchema deepChainSchema)
+    assertEqual "acyclic chain deeper than the depth budget still errors" (Left ResolutionLimitExceeded) =<< check consistencyStore (runTupleStoreInMemory deepChainTuples) deepChainGraph MinimizeLatency requestContext (SubjectId user) (RelationName "view") (deepSpace 1)
     assertEqual "lookup returns direct and recursive view spaces" (Right (lookupPage [allowed childSpace, allowed space] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup follows userset subjects" (Right (lookupPage [allowed guestSpace, allowed sharedItem, allowed usersetMemberSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId agencyUser) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup confirms intersection candidates" (Right (lookupPage [allowed auditedSpace, allowed exclusionSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOwner) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
@@ -1537,6 +1551,180 @@ paginator =
     ObjectRef
         { objectType = ObjectType "user"
         , objectId = "paginator"
+        }
+
+{- | Two groups that contain each other. This is legal data, not corrupt data:
+@group:a#member@group:b#member@ and its mirror simply say the two groups share
+their membership.
+
+The union defining @doc#view@ puts the cyclic @team@ branch first, so a check
+that answers correctly cannot be doing so merely by reaching an earlier branch.
+-}
+cyclicSchema :: Schema
+cyclicSchema =
+    testSchemaOrError $ do
+        userObject <- Schema.object "user" []
+        groupObject <-
+            Schema.object
+                "group"
+                [Schema.relation "member" [Schema.subject "user", Schema.userset "group" "member"] Schema.this]
+        docObject <-
+            Schema.object
+                "doc"
+                [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
+                , Schema.relation "team" [Schema.userset "group" "member"] Schema.this
+                , Schema.permission "view" (Schema.anyOf (Schema.computed "team") [Schema.computed "viewer"])
+                ]
+        Schema.build [userObject, groupObject, docObject]
+
+groupA :: ObjectRef
+groupA =
+    ObjectRef{objectType = ObjectType "group", objectId = "a"}
+
+groupB :: ObjectRef
+groupB =
+    ObjectRef{objectType = ObjectType "group", objectId = "b"}
+
+docD :: ObjectRef
+docD =
+    ObjectRef{objectType = ObjectType "doc", objectId = "d"}
+
+carol :: ObjectRef
+carol =
+    ObjectRef{objectType = ObjectType "user", objectId = "carol"}
+
+-- | @dave@ has no tuples: his only route to @doc:d@ runs through the cycle.
+dave :: ObjectRef
+dave =
+    ObjectRef{objectType = ObjectType "user", objectId = "dave"}
+
+cyclicTuples :: [Tuple]
+cyclicTuples =
+    [ Tuple{object = groupA, relation = RelationName "member", subject = SubjectSet groupB (RelationName "member"), caveat = Nothing}
+    , Tuple{object = groupB, relation = RelationName "member", subject = SubjectSet groupA (RelationName "member"), caveat = Nothing}
+    , Tuple{object = docD, relation = RelationName "team", subject = SubjectSet groupA (RelationName "member"), caveat = Nothing}
+    , Tuple{object = docD, relation = RelationName "viewer", subject = SubjectId carol, caveat = Nothing}
+    ]
+
+{- | A chain of 26 distinct spaces, each the parent of the next: acyclic, but
+deeper than @maxDepth@ (25). This is what keeps the depth budget under test once
+cycles stop producing errors of their own.
+-}
+deepChainSchema :: Schema
+deepChainSchema =
+    testSchemaOrError $ do
+        userObject <- Schema.object "user" []
+        spaceObject <-
+            Schema.object
+                "space"
+                [ Schema.relation "owner" [Schema.subject "user"] Schema.this
+                , Schema.relation "parent" [Schema.subject "space"] Schema.this
+                , Schema.permission "view" (Schema.anyOf (Schema.computed "owner") [Schema.arrow "parent" "view"])
+                ]
+        Schema.build [userObject, spaceObject]
+
+deepChainLength :: Int
+deepChainLength =
+    26
+
+deepSpace :: Int -> ObjectRef
+deepSpace index =
+    ObjectRef{objectType = ObjectType "space", objectId = "deep-" <> showText index}
+
+-- | @deep-1@ is the deepest; @deep-26@ is the root and holds the owner grant.
+deepChainTuples :: [Tuple]
+deepChainTuples =
+    [ Tuple
+        { object = deepSpace index
+        , relation = RelationName "parent"
+        , subject = SubjectId (deepSpace (index + 1))
+        , caveat = Nothing
+        }
+    | index <- [1 .. deepChainLength - 1]
+    ]
+        <> [ Tuple
+                { object = deepSpace deepChainLength
+                , relation = RelationName "owner"
+                , subject = SubjectId user
+                , caveat = Nothing
+                }
+           ]
+
+{- | @enter = allowed - banned@, where the @allowed@ grant is caveated and the
+@banned@ grant is not. A subject who is provably banned must be denied even when
+the base could not be settled without more request context.
+-}
+roomSchema :: Schema
+roomSchema =
+    testSchemaOrError $ do
+        autonomy <-
+            Schema.caveatWith
+                "within_autonomy"
+                [ Schema.parameter "requested_autonomy" (ParameterEnum ["read", "act"])
+                , Schema.parameter "autonomy" (ParameterEnum ["read", "act", "admin"])
+                , Schema.parameter "current_time" ParameterTimestamp
+                , Schema.parameter "until" ParameterTimestamp
+                ]
+                ( Schema.predAnd
+                    [ Schema.cmpLe (Schema.ctxParam "requested_autonomy") (Schema.payloadParam "autonomy")
+                    , Schema.cmpLe (Schema.ctxParam "current_time") (Schema.payloadParam "until")
+                    ]
+                )
+        clearance <-
+            Schema.caveatWith
+                "min_clearance"
+                [ Schema.parameter "clearance" ParameterInteger
+                , Schema.parameter "level" ParameterInteger
+                ]
+                (Schema.cmpGe (Schema.ctxParam "clearance") (Schema.payloadParam "level"))
+        userObject <- Schema.object "user" []
+        roomObject <-
+            Schema.object
+                "room"
+                [ Schema.relation "allowed" [Schema.subject "user"] Schema.this
+                , Schema.relation "banned" [Schema.subject "user"] Schema.this
+                , Schema.permission "enter" (Schema.minus (Schema.computed "allowed") (Schema.computed "banned"))
+                ]
+        Schema.buildWithCaveats [autonomy, clearance] [userObject, roomObject]
+
+roomR :: ObjectRef
+roomR =
+    ObjectRef{objectType = ObjectType "room", objectId = "r"}
+
+erin :: ObjectRef
+erin =
+    ObjectRef{objectType = ObjectType "user", objectId = "erin"}
+
+frank :: ObjectRef
+frank =
+    ObjectRef{objectType = ObjectType "user", objectId = "frank"}
+
+{- | @erin@ is conditionally allowed and unconditionally banned; @frank@ is
+conditionally allowed and not banned at all.
+-}
+roomTuples :: [Tuple]
+roomTuples =
+    [ Tuple{object = roomR, relation = RelationName "allowed", subject = SubjectId erin, caveat = Just autonomyCaveat}
+    , Tuple{object = roomR, relation = RelationName "banned", subject = SubjectId erin, caveat = Nothing}
+    , Tuple{object = roomR, relation = RelationName "allowed", subject = SubjectId frank, caveat = Just autonomyCaveat}
+    ]
+
+-- | As 'roomTuples', but @erin@'s ban is itself caveated, on a different caveat.
+caveatedBanTuples :: [Tuple]
+caveatedBanTuples =
+    [ Tuple{object = roomR, relation = RelationName "allowed", subject = SubjectId erin, caveat = Just autonomyCaveat}
+    , Tuple{object = roomR, relation = RelationName "banned", subject = SubjectId erin, caveat = Just banCaveat}
+    ]
+
+{- | A second caveat with a distinct name and a distinct missing context key, so
+that merging the base's obligation with the subtrahend's yields two entries
+rather than one deduplicated entry.
+-}
+banCaveat :: TupleCaveat
+banCaveat =
+    TupleCaveat
+        { name = CaveatName "min_clearance"
+        , payload = CaveatPayload (Map.fromList [("level", ValueInteger 1)])
         }
 
 {- | A space shared with many organisations, where the checked user belongs to

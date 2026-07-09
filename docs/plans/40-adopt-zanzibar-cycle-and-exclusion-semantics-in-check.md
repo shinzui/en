@@ -4,6 +4,7 @@ slug: adopt-zanzibar-cycle-and-exclusion-semantics-in-check
 title: "Adopt Zanzibar cycle and exclusion semantics in check"
 kind: exec-plan
 created_at: 2026-07-07T15:24:51Z
+intention: intention_01kx2cmexke9mv9aggb7jf7w5t
 master_plan: "docs/masterplans/7-fix-the-en-evaluation-engine.md"
 ---
 
@@ -52,9 +53,9 @@ these is demonstrated by a conformance-style test that fails on today's tree.
 
 ## Progress
 
-- [ ] M0: baseline — build and test; confirm cited symbols/lines; note whether
-  docs/plans/39 has landed (this plan rebases on it if so) and record which evaluator
-  shape is present.
+- [x] M0 (2026-07-08): baseline — `cabal build all && cabal test all` green across seven
+  suites; EP-39 has landed, so only the memoized evaluator family exists. Cited symbols
+  re-located (line numbers shifted); see Surprises & Discoveries.
 - [ ] M1: failing tests — mutual-group cycle answered via an unrelated union branch;
   cycle-only path returns Denied; exclusion-over-conditional returns Denied; captured red
   output.
@@ -73,7 +74,42 @@ these is demonstrated by a conformance-style test that fails on today's tree.
 
 ## Surprises & Discoveries
 
-(None yet.)
+**M0 — EP-39 has landed, so this plan edits one evaluator, not two.** The plan is written
+to work either way ("make each semantic edit in both evaluator families" if EP-39 had not
+landed). It has: `runCheck`, `evalRelation`, `evalRewrite`, `evalThis`, and
+`evalTupleToUserset` are gone, and `check`/`checkCached`/`checkMany` all drive
+`evalRelationMemo`. Every semantic edit below is made once. Current locations, since line
+numbers moved:
+
+- Cycle-as-error: `evalRelationMemo`'s revisit guard, `en-core/src/En/Check.hs:231`; the
+  depth guard is `:229`, and `evalThisMemo` carries a second depth guard at `:377`.
+- Union via `sequence`: the `Union` case of `evalRewriteMemo`, built eagerly by
+  `evalRewriteListMemo`.
+- Exclusion early return: the `Exclusion` case of `evalRewriteMemo`.
+- `checkMany` error erasure: `either (const Denied) id result` in `evaluateDistinct`.
+- `En.Expand` revisit guard: `en-core/src/En/Expand.hs:137` (depth guard at `:135`).
+- The one `check`-side test asserting the old cycle semantics is
+  "recursive graph respects depth limit" (`en-core/test/Main.hs:429`), exactly as the plan
+  predicted.
+
+**M0 — `EnError` is consumed by an exhaustive match, so `CycleDetected` is not a free
+addition.** This plan's Context section says `CycleDetected` "surfaces via the existing
+(untyped) 500 mapping in `en-servant/src/En/Servant/Seam.hs`, which is acceptable in the
+interim". That is no longer true: `enErrorToFault` (`en-servant/src/En/Servant/Seam.hs`)
+is a total `\case` over every constructor, added by master plan 6's EP-35 ("give every
+error a stable code and an honest status"). Adding a constructor is therefore a compile
+error in `en-servant`, not a silent fall-through, and this plan must supply a mapping. It
+does — see the Decision Log entry dated 2026-07-08. The compiler catching this is the
+system working as intended; the plan's prose was simply written against an older tree.
+
+**M0 — EP-39 left one semantic question on this plan's desk.** EP-39's probe-first `This`
+evaluation returns early on an unconditional `Allowed`, which means a relation containing
+both an unconditional grant and a row whose caveat name is undefined in the schema now
+answers `Right Allowed` where the pre-EP-39 evaluator answered
+`Left (UnknownRelation "unknown caveat: …")` — `sequence` used to fail on the first `Left`
+anywhere in the decision list. EP-39 recorded this and deferred the call to this plan,
+which owns error taxonomy. Resolved in the Decision Log (2026-07-08): the early return is
+correct and this plan generalizes rather than reverts it.
 
 
 ## Decision Log
@@ -142,6 +178,36 @@ these is demonstrated by a conformance-style test that fails on today's tree.
   new constructors/channel into the envelope. A dedicated result record was rejected as
   premature — `Either` is sufficient and standard.
   Date: 2026-07-07
+- Decision (2026-07-08): `CycleDetected` maps to HTTP 422 with code `cycle_detected` and
+  `retryable = false` in `en-servant/src/En/Servant/Seam.hs`, alongside
+  `ResolutionLimitExceeded`'s 422.
+  Rationale: this plan's prose assumed an untyped 500 fallback existed to absorb a new
+  constructor. It does not — `enErrorToFault` is a total match (master plan 6's EP-35),
+  so the compiler demands a mapping and the choice cannot be deferred to
+  docs/plans/35-version-the-wire-contract-and-type-the-error-model.md. 422 is the honest
+  status for both members of the pair: the request is well-formed, the caller is not at
+  fault, retrying changes nothing, and the operation could not produce a result over this
+  data. Retryability is `False` for the same reason it is for `ResolutionLimitExceeded`.
+  Only `expand` can raise it, and only on genuinely cyclic data. docs/plans/35 may refine
+  the code or envelope; it does not need to invent the mapping from nothing.
+  Date: 2026-07-08
+- Decision (2026-07-08): Keep EP-39's early return on an unconditional `Allowed` from the
+  `This` probe, and extend the same principle to union branches (M3) rather than reverting
+  it. A row with an undefined caveat name in a relation that also grants unconditionally
+  therefore yields `Right Allowed`, not `Left (UnknownRelation …)`.
+  Rationale: EP-39 deferred this to this plan because this plan owns error taxonomy. Two
+  arguments settle it. First, consistency: M3 makes union stop at the first unconditional
+  `Allowed`, so a malformed branch *after* a proven `Allowed` is already unobserved by
+  design; it would be incoherent for a malformed *row* of one relation to behave
+  differently from a malformed *branch* of one union. Second, meaning: the subject
+  provably has access by a path that involves no caveat at all. Reporting a schema defect
+  in an unrelated row of the same relation as the *answer* to an authorization question
+  conflates "your data has a problem" with "you may not enter". The defect remains
+  discoverable — the same check for a subject who depends on that row still errors, and
+  schema validation catches undefined caveat names before any tuple can reference them.
+  Noted for docs/plans/35: `check` is therefore not a total detector of schema defects,
+  and never was.
+  Date: 2026-07-08
 - Decision: `En.Expand`'s revisit guard keeps *erroring* (now with `CycleDetected`)
   rather than adopting cycle-as-empty.
   Rationale: expand is an audit rendering — silently omitting a cyclic branch would hide
