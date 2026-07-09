@@ -2,6 +2,10 @@
 module En.Decision (
     CheckDecision (..),
     CaveatObligation (..),
+    ResidualDecision (..),
+    rUnion,
+    rIntersection,
+    rExclusion,
     unionDecisions,
     intersectionDecisions,
     exclusionDecision,
@@ -16,6 +20,7 @@ module En.Decision (
 
 import Data.Text (Text)
 
+import En.Caveat.Value (CaveatPayload)
 import En.Schema (CaveatName)
 
 -- | A caveat that could not be reduced to an unconditional answer.
@@ -99,6 +104,81 @@ exclusionDecisions base subtrahend =
         (Conditional obligations, Denied) -> Conditional obligations
         (Conditional baseObligations, Conditional subtractObligations) ->
             Conditional (dedupeObligations (baseObligations <> subtractObligations))
+
+{- | A decision with its caveats left symbolic: the shape of a check answer
+before any request context is applied.
+
+The evaluator produces one of these for every subproblem, and
+'En.Caveat.applyResidual' turns it into a 'CheckDecision' against a concrete
+'En.Tuple.CaveatContext'. Because no context went into building it, the same
+residual is a correct answer for /every/ request that asks the same
+(datastore, schema, revision, subject, relation, object) question -- which is
+what makes it cacheable across requests whose contexts differ.
+
+'RCaveat' names a schema-declared caveat and carries the payload the granting
+tuple was written with (a rewrite-level @Caveated@ node carries the empty
+payload). The caveat /definition/ is not stored: the cache key pins the schema
+hash, so the name resolves to the same definition at re-application time.
+
+The three combinators mirror 'unionDecisions', 'intersectionDecisions', and
+'exclusionDecisions' exactly. Keeping them as distinct constructors -- rather
+than flattening to a list of outstanding caveats -- is what preserves whether
+two residual caveats are joined by AND or by OR. An intersection of a failing
+and a passing caveat must deny; the union of the same two must allow. A flat
+list cannot tell those apart, and would silently pick one.
+-}
+data ResidualDecision
+    = RAllowed
+    | RDenied
+    | RCaveat !CaveatName !CaveatPayload
+    | RUnion ![ResidualDecision]
+    | RIntersection ![ResidualDecision]
+    | RExclusion !ResidualDecision !ResidualDecision
+    deriving stock (Eq, Show)
+
+{- | Union of residual decisions, collapsing the constant cases.
+
+'RAllowed' -- an /unconditional/ allow -- absorbs a union, exactly as 'Allowed'
+absorbs 'unionDecisions'. A caveated allow is an 'RCaveat' and absorbs nothing,
+which is precisely what keeps the evaluator's union short-circuit sound once it
+can no longer see the request context. 'RDenied' is the identity and drops out.
+-}
+rUnion :: [ResidualDecision] -> ResidualDecision
+rUnion residuals
+    | RAllowed `elem` residuals = RAllowed
+    | otherwise =
+        case filter (/= RDenied) residuals of
+            [] -> RDenied
+            [single] -> single
+            kept -> RUnion kept
+
+{- | Intersection of residual decisions, collapsing the constant cases.
+
+Dual to 'rUnion': 'RDenied' absorbs, 'RAllowed' is the identity and drops out,
+and the empty intersection is 'RAllowed'.
+-}
+rIntersection :: [ResidualDecision] -> ResidualDecision
+rIntersection residuals
+    | RDenied `elem` residuals = RDenied
+    | otherwise =
+        case filter (/= RAllowed) residuals of
+            [] -> RAllowed
+            [single] -> single
+            kept -> RIntersection kept
+
+{- | @base@ minus @subtrahend@, collapsing the constant cases of
+'exclusionDecisions'.
+
+Nothing can be subtracted from nothing, so an 'RDenied' base stays denied. An
+unconditionally allowed subtrahend denies whatever the base was. An 'RDenied'
+subtrahend subtracts nothing and leaves the base alone. Everything else stays
+symbolic, because whether it allows or denies depends on the request context.
+-}
+rExclusion :: ResidualDecision -> ResidualDecision -> ResidualDecision
+rExclusion RDenied _ = RDenied
+rExclusion _ RAllowed = RDenied
+rExclusion base RDenied = base
+rExclusion base subtrahend = RExclusion base subtrahend
 
 applyDecisionGate :: CheckDecision -> CheckDecision -> CheckDecision
 applyDecisionGate gate decision =

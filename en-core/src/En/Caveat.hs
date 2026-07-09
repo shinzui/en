@@ -1,17 +1,21 @@
 -- | Generic, schema-driven caveat evaluation.
 module En.Caveat (
     evaluateCaveat,
+    applyResidual,
 ) where
 
+import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 
 import En.Caveat.Value (CaveatContext (..), CaveatPayload (..), CaveatValue (..))
-import En.Decision (CaveatObligation (..), CheckDecision (..))
+import En.Decision (CaveatObligation (..), CheckDecision (..), ResidualDecision (..))
 import En.Decision qualified as Decision
+import En.Error (EnError (..))
 import En.Schema (
     CaveatCompare (..),
     CaveatDefinition (..),
+    CaveatName (..),
     CaveatOperand (..),
     CaveatParameterName (..),
     CaveatParameterType (..),
@@ -22,6 +26,48 @@ import En.Schema (
 evaluateCaveat :: CaveatDefinition -> CaveatPayload -> CaveatContext -> CheckDecision
 evaluateCaveat definition payload context =
     evalPredicate definition payload context definition.predicate
+
+{- | Resolve a residual decision against one request's caveat context.
+
+This is the step a decision-cache hit still has to run. The residual was built
+without any context, so it is shared by every request asking the same question;
+each request then folds its own context through it here and gets its own answer.
+A caveated grant can therefore never be served with a stale context -- no
+context was ever stored.
+
+The caveat definitions come from the compiled schema
+('En.Reachability.ReachabilityGraph'). The cache key pins the schema hash, so a
+name resolves to the same definition it resolved to when the residual was built.
+A name absent from the schema is the same error the evaluator raises,
+@UnknownRelation "unknown caveat: ..."@.
+
+The fold is exactly 'evaluateCaveat' at the leaves and the ordinary decision
+algebra at the nodes, so an answer computed here is indistinguishable from one
+the evaluator would have computed inline with the context in hand.
+-}
+applyResidual ::
+    Map CaveatName CaveatDefinition ->
+    CaveatContext ->
+    ResidualDecision ->
+    Either EnError CheckDecision
+applyResidual definitions context =
+    go
+  where
+    go =
+        \case
+            RAllowed -> Right Allowed
+            RDenied -> Right Denied
+            RCaveat name payload ->
+                case Map.lookup name definitions of
+                    Nothing -> Left (UnknownRelation ("unknown caveat: " <> caveatText name))
+                    Just definition -> Right (evaluateCaveat definition payload context)
+            RUnion residuals -> Decision.union <$> traverse go residuals
+            RIntersection residuals -> Decision.intersection <$> traverse go residuals
+            RExclusion base subtrahend -> Decision.exclusionDecisions <$> go base <*> go subtrahend
+
+caveatText :: CaveatName -> Text
+caveatText (CaveatName text) =
+    text
 
 evalPredicate :: CaveatDefinition -> CaveatPayload -> CaveatContext -> CaveatPredicate -> CheckDecision
 evalPredicate definition payload context =

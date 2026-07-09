@@ -33,9 +33,11 @@ import En.Cache (
     lookupCache,
     newCache,
  )
+import En.Caveat (applyResidual, evaluateCaveat)
 import En.Check (BatchPair (..), CaveatObligation (..), CheckCacheEnv (..), CheckDecision (..))
 import En.Check qualified as Check
 import En.Conformance.Kikan
+import En.Decision (ResidualDecision (..), rExclusion, rIntersection, rUnion)
 import En.Decision qualified as Decision
 import En.Effect.CachedTupleStore (cachedTupleStore)
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
@@ -254,6 +256,7 @@ main = do
         _ = sampleCaveatDefinition
     testCacheOperations
     testCachedTupleStore
+    testResidualDecision
     validKikan <- either (fail . show) pure (validateSchema kikanSchema)
     validKikanManual <- either (fail . show) pure (validateSchema kikanSchemaManual)
     validKikanReordered <- either (fail . show) pure (validateSchema kikanSchemaReordered)
@@ -842,6 +845,135 @@ testCachedTupleStore = do
 sampleObjectPage :: Int -> Maybe StoreCursor -> TuplePage
 sampleObjectPage limit cursor =
     pageTuples limit cursor [tuple | tuple <- fixtureTuples, tuple.object == space, tuple.relation == RelationName "view"]
+
+{- | The residual decision algebra: a decision with its caveats left symbolic.
+
+These are pure tests -- no store, no cache. They pin down three things the rest
+of this plan's correctness rests on. First, that 'applyResidual' at a leaf is
+exactly 'evaluateCaveat' on the stored payload with the request's own context, so
+folding a residual is indistinguishable from having evaluated the caveat inline.
+Second, that an intersection and a union of the same two caveats give different
+answers -- the case a flat list of outstanding caveats cannot represent, and the
+reason 'ResidualDecision' is a tree. Third, that the smart constructors only ever
+fold constants the decision algebra would have folded anyway.
+-}
+testResidualDecision :: IO ()
+testResidualDecision = do
+    let payload = autonomyCaveat.payload
+        withinAutonomy = RCaveat (CaveatName "within_autonomy") payload
+        always = RCaveat (CaveatName "always") emptyPayload
+        never = RCaveat (CaveatName "never") emptyPayload
+        apply = applyResidual residualCaveatDefinitions
+        autonomyObligation = Conditional [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}]
+
+    -- A leaf resolves to precisely what the caveat evaluator would have said.
+    traverse_
+        ( \(label, context, expected) -> do
+            assertEqual ("residual leaf agrees with evaluateCaveat: " <> label) (Right expected) (apply context withinAutonomy)
+            assertEqual
+                ("residual leaf equals inline evaluation: " <> label)
+                (Right (evaluateCaveat sampleCaveatDefinition payload context))
+                (apply context withinAutonomy)
+        )
+        [ ("satisfied", requestContext, Allowed)
+        , ("expired", expiredContext, Denied)
+        , ("missing context", missingAutonomyContext, autonomyObligation)
+        ]
+
+    -- Gating an unconditional allow behind a caveat: the RIntersection node
+    -- folds to the same thing the evaluator's applyGate produced inline.
+    traverse_
+        ( \(label, context) ->
+            assertEqual
+                ("gated allow folds like intersectionDecisions: " <> label)
+                (Right (Decision.intersection [evaluateCaveat sampleCaveatDefinition payload context, Allowed]))
+                (apply context (RIntersection [withinAutonomy, RAllowed]))
+        )
+        [ ("satisfied", requestContext)
+        , ("expired", expiredContext)
+        , ("missing context", missingAutonomyContext)
+        ]
+
+    -- The case a flat obligation list gets wrong: AND and OR of one failing and
+    -- one passing caveat must not agree.
+    assertEqual "intersection of a failing and a passing caveat denies" (Right Denied) (apply requestContext (RIntersection [never, always]))
+    assertEqual "union of a failing and a passing caveat allows" (Right Allowed) (apply requestContext (RUnion [never, always]))
+
+    -- Exclusion keeps the table En.Decision.exclusionDecisions defines, including
+    -- the conditional subtrahend that must not be reported as a false allow.
+    assertEqual "excluding a failing subtrahend allows" (Right Allowed) (apply requestContext (RExclusion RAllowed never))
+    assertEqual "excluding a passing subtrahend denies" (Right Denied) (apply requestContext (RExclusion RAllowed always))
+    assertEqual "excluding a conditional subtrahend stays conditional" (Right autonomyObligation) (apply missingAutonomyContext (RExclusion RAllowed withinAutonomy))
+
+    -- A name absent from the schema is the evaluator's own error.
+    assertEqual
+        "an unknown caveat name fails re-application"
+        (Left (UnknownRelation "unknown caveat: ghost"))
+        (apply requestContext (RCaveat (CaveatName "ghost") emptyPayload))
+
+    -- Smart-constructor collapses: uncaveated subproblems must cache as bare leaves.
+    assertEqual "rUnion of nothing denies" RDenied (rUnion [])
+    assertEqual "rUnion drops denied members" withinAutonomy (rUnion [RDenied, withinAutonomy, RDenied])
+    assertEqual "rUnion absorbs an unconditional allow" RAllowed (rUnion [withinAutonomy, RAllowed])
+    assertEqual "rUnion of only denials denies" RDenied (rUnion [RDenied, RDenied])
+    assertEqual "rUnion keeps two caveats symbolic" (RUnion [never, always]) (rUnion [never, always])
+    assertEqual "rIntersection of nothing allows" RAllowed (rIntersection [])
+    assertEqual "rIntersection drops allowed members" withinAutonomy (rIntersection [RAllowed, withinAutonomy, RAllowed])
+    assertEqual "rIntersection absorbs a denial" RDenied (rIntersection [withinAutonomy, RDenied])
+    assertEqual "rIntersection keeps two caveats symbolic" (RIntersection [never, always]) (rIntersection [never, always])
+    assertEqual "rExclusion from nothing denies" RDenied (rExclusion RDenied always)
+    assertEqual "rExclusion by an unconditional allow denies" RDenied (rExclusion withinAutonomy RAllowed)
+    assertEqual "rExclusion by nothing keeps the base" withinAutonomy (rExclusion withinAutonomy RDenied)
+    assertEqual "rExclusion of allow by nothing allows" RAllowed (rExclusion RAllowed RDenied)
+    assertEqual "rExclusion keeps two caveats symbolic" (RExclusion never always) (rExclusion never always)
+
+    -- Every smart constructor agrees with the decision algebra it stands for, on
+    -- every pair of sample residuals, under every sample context. This is the
+    -- statement that M2's symbolic detour is invisible.
+    traverse_
+        ( \context ->
+            traverse_
+                ( \(left, right) -> do
+                    assertEqual
+                        "rUnion agrees with unionDecisions"
+                        (Decision.union <$> traverse (apply context) [left, right])
+                        (apply context (rUnion [left, right]))
+                    assertEqual
+                        "rIntersection agrees with intersectionDecisions"
+                        (Decision.intersection <$> traverse (apply context) [left, right])
+                        (apply context (rIntersection [left, right]))
+                    assertEqual
+                        "rExclusion agrees with exclusionDecisions"
+                        (Decision.exclusionDecisions <$> apply context left <*> apply context right)
+                        (apply context (rExclusion left right))
+                )
+                [(left, right) | left <- sampleResiduals, right <- sampleResiduals]
+        )
+        [requestContext, expiredContext, missingAutonomyContext, adminContext]
+  where
+    sampleResiduals =
+        [ RAllowed
+        , RDenied
+        , RCaveat (CaveatName "always") emptyPayload
+        , RCaveat (CaveatName "never") emptyPayload
+        , RCaveat (CaveatName "within_autonomy") autonomyCaveat.payload
+        ]
+
+emptyPayload :: CaveatPayload
+emptyPayload =
+    CaveatPayload Map.empty
+
+{- | The three caveat definitions the residual tests resolve names against:
+kikan's real time-and-autonomy caveat, plus a caveat that always passes and one
+that always fails, so AND and OR of the two can be told apart under one context.
+-}
+residualCaveatDefinitions :: Map.Map CaveatName CaveatDefinition
+residualCaveatDefinitions =
+    Map.fromList
+        [ (CaveatName "within_autonomy", sampleCaveatDefinition)
+        , (CaveatName "always", CaveatDefinition{name = CaveatName "always", parameters = Map.empty, predicate = PredTrue})
+        , (CaveatName "never", CaveatDefinition{name = CaveatName "never", parameters = Map.empty, predicate = PredNot PredTrue})
+        ]
 
 testDecisionCache :: ReachabilityGraph -> IO ()
 testDecisionCache graph = do

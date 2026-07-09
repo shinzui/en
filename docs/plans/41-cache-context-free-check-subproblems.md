@@ -45,11 +45,13 @@ context still gets `Conditional` from that same cached entry.
 
 ## Progress
 
-- [ ] M0: baseline — build/test; confirm docs/plans/39 and docs/plans/40 landed (this
-  plan rebases on both); confirm cited symbols; record drift.
-- [ ] M1: define `ResidualDecision`, smart constructors, and `applyContext` in
-  `en-core/src/En/Decision.hs`; pure unit tests for the algebra, including agreement
-  with `unionDecisions`/`intersectionDecisions`/`exclusionDecisions`.
+- [x] M0 (2026-07-08): baseline `cabal build all && cabal test all` green; EP-39 and EP-40
+  confirmed landed; cited symbols confirmed with line drift recorded below.
+- [x] M1 (2026-07-08): `ResidualDecision` + `rUnion`/`rIntersection`/`rExclusion` in
+  `En.Decision`; `applyResidual` in `En.Caveat`; pure `testResidualDecision` proves
+  agreement with `unionDecisions`/`intersectionDecisions`/`exclusionDecisions` over every
+  pair of sample residuals under four contexts, plus the AND-vs-OR distinction and every
+  smart-constructor collapse. Both negative controls observed failing.
 - [ ] M2: switch the `En.Check` evaluator to produce `ResidualDecision` internally and
   apply context once at the top; all existing tests green (behavior identical).
 - [ ] M3: re-key the external cache — `SubproblemKey` loses `context`; cache value
@@ -66,7 +68,57 @@ context still gets `Conditional` from that same cached entry.
 
 ## Surprises & Discoveries
 
-(None yet.)
+**M0 baseline is green, unlike EP-39's (2026-07-08).** `cabal build all && cabal test all`
+passes across every package, so any red test from here on is this plan's doing. EP-39's
+repair of the stale `en-example` assertion has held.
+
+**M0 line drift (2026-07-08).** EP-39 and EP-40 both landed and grew `En/Check.hs`, so the
+line numbers this plan cites have moved. The symbols are all present and unchanged in
+meaning: `applyRewriteCaveat` is at `en-core/src/En/Check.hs:656-659` (plan said 574–577),
+`evaluateNamedCaveat` at `:668-672` (plan said 586–590), `DecisionCacheOps` at `:215-243`
+(plan said 229–257). `SubproblemKey` is exactly where the plan says it is,
+`en-core/src/En/Cache.hs:92-107`. The decision-cache test block is `testDecisionCache` at
+`en-core/test/Main.hs:846-892` (plan said ~794–840) and `testCachedTupleStore` at
+`:790-840` (plan said ~738–788). The "different caveat context misses decision cache"
+assertion this plan inverts is at `en-core/test/Main.hs:872`.
+
+**The import graph permits the placement M1 proposes, confirmed (2026-07-08).**
+`En.Error` imports no en-core module at all; `En.Caveat.Value` imports only `containers`,
+`text`, `time`, and `template-haskell`. So `En.Decision` may import `En.Caveat.Value` for
+`CaveatPayload` without a cycle, and `En.Caveat` (which already imports `En.Decision`,
+`En.Caveat.Value`, and `En.Schema`) may import `En.Error` to host `applyResidual`. No
+`.cabal` change is needed.
+
+**M1's algebra tests were verified against two deliberately broken implementations
+(2026-07-08),** per the master plan's rule that a test for this class of bug is not
+accepted until it has been seen to fail. The rule was written for memo/cache tests; it
+earns its keep here too.
+
+The first sabotage made `rIntersection` build an `RUnion` node — the exact AND/OR
+conflation the tree exists to prevent. The *structural* assertion caught it, which proves
+little, since a structural assertion cannot distinguish a wrong answer from a differently
+spelled right one:
+
+```text
+user error (rIntersection keeps two caveats symbolic
+expected: RIntersection [RCaveat (CaveatName "never") …,RCaveat (CaveatName "always") …]
+actual:   RUnion [RCaveat (CaveatName "never") …,RCaveat (CaveatName "always") …])
+```
+
+The second sabotage is the one that matters. It left the tree alone and made
+`applyResidual` fold an `RIntersection` with `Decision.union` — precisely the bug a flat
+list of outstanding caveats would have, and precisely the bug that grants access:
+
+```text
+user error (gated allow folds like intersectionDecisions: expired
+expected: Right Denied
+actual:   Right Allowed)
+```
+
+An *expired* time-bounded grant returned `Allowed`. The semantic assertions catch the
+soundness failure, not just the shape change; the agreement-with-the-decision-algebra
+sweep over every pair of sample residuals is what makes M2's "symbolic detour is
+invisible" claim checkable rather than asserted.
 
 
 ## Decision Log
