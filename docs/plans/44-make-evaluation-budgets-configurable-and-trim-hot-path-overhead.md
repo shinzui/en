@@ -50,8 +50,10 @@ recompiling anything but the test.
 
 - [x] M0 (2026-07-09): baseline — build/test green; EP-39…EP-43 all landed; constant
   sites, `entries` consumers, and bench numbers recorded below.
-- [ ] M1: benchmark fixtures first — wide-relation and deep-nesting groups in
-  `en-core/bench/Main.hs`; baseline numbers recorded in this plan.
+- [x] M1 (2026-07-09): wide-relation, deep-nesting, fanout-lookup, and cache-churn
+  fixtures in `en-core/bench/Main.hs`; every bench asserts its answer before timing;
+  baseline numbers recorded below. Found and fixed a row-skipping bug in the in-memory
+  conformance store on the way.
 - [ ] M2: `En.Budget.EvaluationBudget` record; threaded through check/lookup/expand as
   `…WithBudget` variants; constants deduplicated to the one module; defaults preserved;
   budget-override test.
@@ -136,6 +138,85 @@ All
 `check-wide/non-member` at 296 μs against `direct-member` at 24 μs is the shape to keep in
 view: a probe miss falls through to draining a 2048-row relation, and that drain is where
 the `acc <> page.rows` append and the `elem`-based `visited` list do their damage.
+
+**The in-memory conformance store skipped rows on any relation wider than two pages
+(M1, 2026-07-09).** `pageTuples` in `en-core/src/En/Conformance/Kikan.hs` resumed a cursor
+with `drop start (zip [start + 1 ..] tuples)` — dropping from the *zipped* list, not the
+tuple list. Each page's outgoing cursor was therefore `2 * start` instead of
+`start + limit`, so the read sequence went `0…999`, `1000…1999`, `3000…3999`, then
+`Exhausted`. Rows 2000–2999 and everything past 4000 were never returned, and the store
+reported exhaustion as though it had read them.
+
+Every engine drains through that function. A check could deny a subject whose granting
+tuple sat in a skipped window; `lookup` and `expand` could omit results. It is a fixture
+bug, not an engine bug, so no production path was affected — but every wide-relation claim
+this master plan has made was measured against a store that quietly stopped reading.
+EP-39's own `check-wide` fixture is 2048 rows, which is where the skipping *starts*: it
+read 2000 of them.
+
+The bug surfaced because M1's `checkMany/wide-overlapping` assertion denied on the
+5064-row `folder:wide` and allowed on the 64-row `folder:wide2` and `folder:wide3`, which
+carry identical group attachments. Without that assertion the benchmark would have reported
+a plausible time for the wrong computation. This is the master plan's testing rule reaching
+a place nobody thought to apply it: **a benchmark is a test whose assertion is missing.**
+`en-core/bench/Main.hs` now pins every benched call's answer before `defaultMain` runs, so
+a fixture that stops meaning what its name says fails loudly instead of getting faster.
+
+The fix is one line, committed separately (`996462c`) with a regression test
+(`testStorePaging`) that drives the store at a four-page limit and asserts the returned
+rows. Against the old implementation it loses rows 5 and 6 of 7. Asserting the page *count*
+would have passed: a store that returns four pages and drops the middle two still returns
+four pages.
+
+**A benchmark that closes over its arguments measures a CAF (M1, 2026-07-09).** The
+existing benches pass `()` and evaluate `\() -> action`, whose body is a constant
+expression. GHC's full-laziness pass floats it out of the lambda, so every iteration after
+the first reads a memoized result. `lookup/wide-fanout` reported **2.29 ns** — three orders
+of magnitude below the cheapest honest bench in the file — before the fixture was passed in
+as an argument the function actually consumes. Every bench in the file now applies its
+engine call to a value; EP-44's before/after numbers depend on it, and so did EP-39's, which
+were recorded under the old shape.
+
+### M1 baseline measurements (post-fix, the honest "before" for M7)
+
+`cabal bench en-core:en-core-bench`, same machine. These supersede the M0 table: the store
+fix changed what `check-wide` measures, and the CAF fix changed what `lookup` measures.
+
+```text
+All
+  check
+    shallow-owner:    OK
+      539  ns ±  33 ns
+    nested-parent:    OK
+      1.18 μs ±  71 ns
+    deep-nested:      OK
+      34.5 μs ± 1.8 μs
+  checkMany
+    overlapping:      OK
+      1.52 μs ± 105 ns
+    wide-overlapping: OK
+      4.74 ms ± 359 μs
+  lookup
+    reachable-spaces: OK
+      2.22 μs ± 139 ns
+    wide-fanout:      OK
+      258  μs ±  14 μs
+  expand
+    deep-nested:      OK
+      19.0 μs ± 1.7 μs
+  check-wide
+    direct-member:    OK
+      62.1 μs ± 3.8 μs
+    non-member:       OK
+      5.45 ms ± 476 μs
+  cache
+    evict-churn:      OK
+      2.11 ms ± 110 μs
+```
+
+`check-wide/non-member` rose from 296 μs to 5.45 ms because it now actually drains 5,064
+rows and recurses into 64 groups, where before it read 2,000 rows and recursed into none.
+That is not a regression; it is the first honest measurement of that path.
 
 
 ## Decision Log
@@ -231,6 +312,27 @@ the `acc <> page.rows` append and the `elem`-based `visited` list do their damag
   (`--baseline`). If docs/plans/39 already added a `check-wide` group, extend rather
   than duplicate it (reconcile at M0).
   Date: 2026-07-07
+- Decision: Every benchmark asserts the value its call returns before `defaultMain` times
+  it, and every benchmark applies its engine call to an argument rather than closing over
+  one.
+  Rationale: a benchmark reports a time whatever the engine returns, so an `UnknownRelation`
+  from a mistyped fixture reads as a fast benchmark and a wrongly-denied check reads as an
+  expensive one. The assertion is what caught the conformance store dropping rows. And a
+  `\() -> action` thunk is a constant expression that GHC floats out of the lambda:
+  `lookup/wide-fanout` first reported 2.29 ns, timing a memoized result. Both failures
+  produce a plausible number, which is worse than an error. This is the master plan's
+  testing rule ("when a test's subject is X, assert the value X produced") extended to
+  benchmarks, which are tests whose assertion was left out.
+  Date: 2026-07-09
+- Decision: The `pageTuples` row-skipping fix lands in its own commit, ahead of the
+  benchmarks that exposed it.
+  Rationale: same reasoning EP-39 recorded for the stale `en-example` assertion. This
+  plan's entire acceptance is a before/after comparison, and a "before" measured against a
+  store that stops reading at 2,000 rows is not a measurement of anything. Landing the fix
+  separately keeps EP-44's optimization diff honest and leaves the store fix independently
+  revertible — it is a correctness fix that happens to have been found here, not part of a
+  hot-path sweep.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective
