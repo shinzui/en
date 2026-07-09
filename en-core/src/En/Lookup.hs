@@ -29,8 +29,8 @@ import Data.Maybe (catMaybes)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Effectful (Eff, IOE, (:>))
-import Effectful.Error.Static (Error, throwError)
+import Effectful (Eff, IOE, raise, (:>))
+import Effectful.Error.Static (Error, runErrorNoCallStack, throwError)
 import Text.Read (readMaybe)
 
 import En.Caveat (evaluateCaveat)
@@ -244,14 +244,83 @@ runLookup ::
     LookupRequest ->
     Eff es (Either EnError LookupPage)
 runLookup candidateCheck deadline graph revision token cursorState request = do
-    candidates <- evalRelation (Just emitWindow) candidateCheck graph request.context revision request.subject request.objectType request.permission initialState
-    traverse (pageLookup deadline request.limit cursorState token) candidates
+    outcome <-
+        runErrorNoCallStack
+            ( evalRelation
+                (Just emitWindow)
+                (raiseCheckForCandidate candidateCheck)
+                (raiseDeadline deadline)
+                graph
+                request.context
+                revision
+                request.subject
+                request.objectType
+                request.permission
+                initialState
+            )
+    case outcome of
+        Left Interrupt ->
+            pure (Right (interruptedPage cursorState token))
+        Right candidates ->
+            traverse (pageLookup deadline request.limit cursorState token) candidates
   where
     emitWindow =
         EmitWindow
             { watermark = cursorState >>= (.lastObject)
             , confirmBudget = min resultCap (max 0 request.limit.unLookupLimit) + 1
             }
+
+{- | The traversal ran out of budget before it could decide anything.
+
+The page carries /no new objects/ and the watermark does not move. That is the only
+sound answer, and the reason is the same one that defeats per-branch resumption:
+the objects discovered before the interruption are an arbitrary subset of the
+result, not its smallest members. Emitting an object @z@ while an unexplored branch
+still holds @a@ would advance the watermark past @a@, and the next page -- filtering
+to objects strictly greater than @z@ -- would never return it. A gap, silently.
+
+So an interrupted lookup reports 'LookupTruncated' with the cursor it came in with.
+The caller retries, with a fresh budget on a fresh request, and makes progress the
+moment the budget suffices for one page. A caller whose budget never suffices gets
+told so, rather than being handed a plausible, incomplete answer.
+-}
+interruptedPage :: Maybe LookupCursorState -> ConsistencyToken -> LookupPage
+interruptedPage cursorState token =
+    LookupPage
+        { objects = []
+        , state =
+            LookupTruncated
+                ( encodeLookupCursor
+                    LookupCursorState
+                        { version = 2
+                        , token
+                        , lastObject = cursorState >>= (.lastObject)
+                        , frontier = []
+                        }
+                )
+        }
+
+{- | The traversal's budget ran out. Raised inside the reverse walk and caught by
+'runLookup', which never lets it escape to the caller: it is a paging outcome, not
+an error.
+-}
+data Interrupt = Interrupt
+    deriving stock (Eq, Show)
+
+-- | Stop the traversal unless the caller's budget still permits more store work.
+requireBudget :: (Error Interrupt :> es) => Deadline (Eff es) -> Eff es ()
+requireBudget deadline = do
+    hasBudget <- deadline.remainingBudget
+    if hasBudget then pure () else throwError Interrupt
+
+raiseDeadline :: Deadline (Eff es) -> Deadline (Eff (Error Interrupt : es))
+raiseDeadline deadline =
+    Deadline (raise deadline.remainingBudget)
+
+raiseCheckForCandidate :: CheckForCandidate es -> CheckForCandidate (Error Interrupt : es)
+raiseCheckForCandidate candidateCheck =
+    CheckForCandidate \graph context revision subject relation object memo ->
+        raise (candidateCheck.runCandidateCheck graph context revision subject relation object memo)
 
 {- | What the current page still needs, handed to the /outermost/ confirmation only.
 
@@ -308,9 +377,10 @@ resultCap :: Int
 resultCap = 1000
 
 evalRelation ::
-    (TupleStore :> es) =>
+    (TupleStore :> es, Error Interrupt :> es) =>
     Maybe EmitWindow ->
     CheckForCandidate es ->
+    Deadline (Eff es) ->
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -319,7 +389,7 @@ evalRelation ::
     RelationName ->
     EvalState ->
     Eff es (Either EnError [LookupObject])
-evalRelation window candidateCheck graph context revision subject objectType relation state
+evalRelation window candidateCheck deadline graph context revision subject objectType relation state
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded)
     | subproblem `elem` state.visited && state.skipRecursive == Nothing =
@@ -332,6 +402,7 @@ evalRelation window candidateCheck graph context revision subject objectType rel
                 evalRewrite
                     window
                     candidateCheck
+                    deadline
                     graph
                     context
                     revision
@@ -357,9 +428,10 @@ arrows it is used as the /subject/ of a further read, where dropping a low-keyed
 object would hide the high-keyed objects it leads to.
 -}
 evalRewrite ::
-    (TupleStore :> es) =>
+    (TupleStore :> es, Error Interrupt :> es) =>
     Maybe EmitWindow ->
     CheckForCandidate es ->
+    Deadline (Eff es) ->
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -369,34 +441,42 @@ evalRewrite ::
     Rewrite ->
     EvalState ->
     Eff es (Either EnError [LookupObject])
-evalRewrite window candidateCheck graph context revision subject objectType currentRelation rewrite state =
+evalRewrite window candidateCheck deadline graph context revision subject objectType currentRelation rewrite state =
     case rewrite of
         This ->
-            evalThis candidateCheck graph context revision subject objectType currentRelation state
+            evalThis candidateCheck deadline graph context revision subject objectType currentRelation state
         ComputedUserset relation ->
-            evalRelation Nothing candidateCheck graph context revision subject objectType relation state
+            evalRelation Nothing candidateCheck deadline graph context revision subject objectType relation state
         TupleToUserset tuplesetRelation computedRelation ->
-            evalTupleToUserset candidateCheck graph context revision subject objectType currentRelation tuplesetRelation computedRelation state
-        Union rewrites -> do
-            results <- traverse (\current -> evalRewrite window candidateCheck graph context revision subject objectType currentRelation current state) rewrites
-            pure (mergeLookupObjects . concat <$> sequence results)
+            evalTupleToUserset candidateCheck deadline graph context revision subject objectType currentRelation tuplesetRelation computedRelation state
+        Union rewrites ->
+            branches window rewrites
         Intersection rewrites ->
             confirmCandidates window candidateCheck graph context revision subject currentRelation
-                =<< unionBranches rewrites
+                =<< branches Nothing rewrites
         Exclusion base _subtractRewrite ->
             confirmCandidates window candidateCheck graph context revision subject currentRelation
-                =<< evalRewrite Nothing candidateCheck graph context revision subject objectType currentRelation base state
+                =<< evalRewrite Nothing candidateCheck deadline graph context revision subject objectType currentRelation base state
         Caveated caveat rewriteInner -> do
-            inner <- evalRewrite window candidateCheck graph context revision subject objectType currentRelation rewriteInner state
+            inner <- evalRewrite window candidateCheck deadline graph context revision subject objectType currentRelation rewriteInner state
             pure (applyRewriteCaveat graph context caveat =<< inner)
   where
-    unionBranches rewrites = do
-        results <- traverse (\current -> evalRewrite Nothing candidateCheck graph context revision subject objectType currentRelation current state) rewrites
+    -- One budget poll per branch. A branch is the coarsest unit of traversal work
+    -- that can be skipped whole, and polling any finer costs a clock read per row.
+    branches branchWindow rewrites = do
+        results <-
+            traverse
+                ( \current -> do
+                    requireBudget deadline
+                    evalRewrite branchWindow candidateCheck deadline graph context revision subject objectType currentRelation current state
+                )
+                rewrites
         pure (mergeLookupObjects . concat <$> sequence results)
 
 evalThis ::
-    (TupleStore :> es) =>
+    (TupleStore :> es, Error Interrupt :> es) =>
     CheckForCandidate es ->
+    Deadline (Eff es) ->
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -405,8 +485,8 @@ evalThis ::
     RelationName ->
     EvalState ->
     Eff es (Either EnError [LookupObject])
-evalThis candidateCheck graph context revision subject objectType relation state = do
-    direct <- readRowsForSubjects revision objectType relation (subjectsWithWildcard subject)
+evalThis candidateCheck deadline graph context revision subject objectType relation state = do
+    direct <- readRowsForSubjects deadline revision objectType relation (subjectsWithWildcard subject)
     case direct of
         Left err -> pure (Left err)
         Right directRows -> do
@@ -424,12 +504,12 @@ evalThis candidateCheck graph context revision subject objectType relation state
                             case allowed.relation of
                                 Nothing -> pure (Right [])
                                 Just subjectRelation -> do
-                                    subjectObjects <- evalRelation Nothing candidateCheck graph context revision subject allowed.objectType subjectRelation state
+                                    subjectObjects <- evalRelation Nothing candidateCheck deadline graph context revision subject allowed.objectType subjectRelation state
                                     case subjectObjects of
                                         Left err -> pure (Left err)
                                         Right objects -> do
                                             let subjectSets = [SubjectSet object subjectRelation | LookupObject{object} <- objects]
-                                            rows <- readRowsForSubjects revision objectType relation subjectSets
+                                            rows <- readRowsForSubjects deadline revision objectType relation subjectSets
                                             pure (catMaybes <$> (rows >>= traverse rowLookupObject))
                         )
                         (Set.toAscList relationDefinition.allowedSubjects)
@@ -438,8 +518,9 @@ evalThis candidateCheck graph context revision subject objectType relation state
         fmap (LookupObject tuple.object) <$> includeDecision graph context tuple.caveat Allowed
 
 evalTupleToUserset ::
-    (TupleStore :> es) =>
+    (TupleStore :> es, Error Interrupt :> es) =>
     CheckForCandidate es ->
+    Deadline (Eff es) ->
     ReachabilityGraph ->
     CaveatContext ->
     Revision ->
@@ -450,7 +531,7 @@ evalTupleToUserset ::
     RelationName ->
     EvalState ->
     Eff es (Either EnError [LookupObject])
-evalTupleToUserset candidateCheck graph context revision subject objectType currentRelation tuplesetRelation computedRelation state
+evalTupleToUserset candidateCheck deadline graph context revision subject objectType currentRelation tuplesetRelation computedRelation state
     | state.skipRecursive == Just RecursiveStep{tuplesetRelation, computedRelation} =
         pure (Right [])
     | otherwise = do
@@ -463,12 +544,12 @@ evalTupleToUserset candidateCheck graph context revision subject objectType curr
                             if allowed.objectType == objectType && computedRelation == currentRelation
                                 then evalRecursiveUserset allowed
                                 else do
-                                    usersetObjects <- evalRelation Nothing candidateCheck graph context revision subject allowed.objectType computedRelation state
+                                    usersetObjects <- evalRelation Nothing candidateCheck deadline graph context revision subject allowed.objectType computedRelation state
                                     case usersetObjects of
                                         Left err -> pure (Left err)
                                         Right objects -> do
                                             let subjects = concatMap (subjectsForAllowed allowed) objects
-                                            rows <- readRowsForSubjects revision objectType tuplesetRelation subjects
+                                            rows <- readRowsForSubjects deadline revision objectType tuplesetRelation subjects
                                             pure (rows >>= applyRows objects)
                         )
                         (Set.toAscList tuplesetDefinition.allowedSubjects)
@@ -480,6 +561,7 @@ evalTupleToUserset candidateCheck graph context revision subject objectType curr
             evalRelation
                 Nothing
                 candidateCheck
+                deadline
                 graph
                 context
                 revision
@@ -500,7 +582,9 @@ evalTupleToUserset candidateCheck graph context revision subject objectType curr
         | depth >= maxDepth = pure (Left ResolutionLimitExceeded)
         | null frontier = pure (Right (Map.elems seen))
         | otherwise = do
-            rows <- readRowsForSubjects revision objectType tuplesetRelation (concatMap (subjectsForAllowed allowed) frontier)
+            -- Each round of the fixpoint is a unit of skippable work, like a branch.
+            requireBudget deadline
+            rows <- readRowsForSubjects deadline revision objectType tuplesetRelation (concatMap (subjectsForAllowed allowed) frontier)
             case rows of
                 Left err -> pure (Left err)
                 Right tupleRows -> do
@@ -619,16 +703,25 @@ confirmCandidates window candidateCheck graph context revision subject relation 
                         Right Denied -> confirmUntilPageFull memo' allowedCount acc rest
                         Right allowed -> confirmUntilPageFull memo' (allowedCount + 1) (LookupObject object allowed : acc) rest
 
+{- | Drain every page of a reverse query, polling the caller's budget /between/
+store pages.
+
+Between, not before: a relation that fits in one page never polls, so a lookup
+small enough to answer always answers. Not per row either -- the poll is an
+effectful action, and a clock read per row would cost more than the read it guards.
+A page boundary bounds the overshoot at one store round trip.
+-}
 readRowsForSubjects ::
-    (TupleStore :> es) =>
+    (TupleStore :> es, Error Interrupt :> es) =>
+    Deadline (Eff es) ->
     Revision ->
     ObjectType ->
     RelationName ->
     [Subject] ->
     Eff es (Either EnError [TupleRow])
-readRowsForSubjects _ _ _ [] =
+readRowsForSubjects _ _ _ _ [] =
     pure (Right [])
-readRowsForSubjects revision objectType relation subjects =
+readRowsForSubjects deadline revision objectType relation subjects =
     drain Nothing []
   where
     drain cursor acc = do
@@ -644,8 +737,12 @@ readRowsForSubjects revision objectType relation subjects =
                     }
         case page.state of
             Exhausted -> pure (Right (acc <> page.rows))
-            HasMore next -> drain (Just next) (acc <> page.rows)
-            Truncated next -> drain (Just next) (acc <> page.rows)
+            HasMore next -> continue next (acc <> page.rows)
+            Truncated next -> continue next (acc <> page.rows)
+
+    continue next acc = do
+        requireBudget deadline
+        drain (Just next) acc
 
 lookupRelation :: ReachabilityGraph -> ObjectType -> RelationName -> Either EnError Relation
 lookupRelation graph objectType relation =

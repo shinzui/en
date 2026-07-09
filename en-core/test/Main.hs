@@ -473,9 +473,41 @@ main = do
     streamedFolders <- collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
     assertLookupObjects "streaming lookup returns every reachable folder across pages" expectedFolders streamedFolders
     assertLookupObjects "streaming lookup returns the same set with small pages" expectedFolders =<< collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 100) Nothing)
-    truncatedDeadlineRef <- newIORef 0
-    truncatedPage <- lookupEngine (budgetedDeadline truncatedDeadlineRef) consistencyStore streamingStore streamingGraph MinimizeLatency (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
+    {- B8, deadline half. The 1,200-folder relation spans two store pages, so the
+    drain loop polls the budget exactly once, between them.
+
+    With no budget, the poll interrupts the traversal. The page carries no objects
+    and the watermark does not move, because the folders read from the first store
+    page are an arbitrary subset of the answer, not its smallest members: emitting
+    them and advancing the watermark would silently drop everything smaller that the
+    unread page still holds. So an interrupted lookup says "truncated, nothing yet",
+    and one store page is all it reads.
+
+    This assertion is inverted from the one it replaces. That one fed a budget of
+    zero polls and still expected a full 500-object page, which is finding B8 written
+    down as a requirement: the deadline relabelled the result after doing all the
+    work. -}
+    interruptedReads <- newIORef 0
+    interruptedDeadlineRef <- newIORef 0
+    interruptedPage <- lookupEngine (budgetedDeadline interruptedDeadlineRef) consistencyStore (countingStoreFor interruptedReads streamingTuples) streamingGraph MinimizeLatency (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
+    interruptedCursor <- expectLookupTruncated "an exhausted budget truncates with a cursor" interruptedPage
+    assertEqual "an interrupted lookup emits nothing" (Right (lookupPage [] (LookupTruncated interruptedCursor))) interruptedPage
+    assertEqual "an interrupted lookup stops after one store page" 1 =<< readIORef interruptedReads
+    assertLookupObjects
+        "resuming an interrupted lookup loses nothing"
+        expectedFolders
+        =<< collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) (Just interruptedCursor))
+
+    {- One poll of budget is exactly enough to reach the second store page. The
+    traversal completes, so the page is full and the watermark moves; the budget is
+    spent by the time paging asks, so the state is still LookupTruncated and the
+    cursor resumes the remainder. This is the case the old test thought it was
+    exercising. -}
+    truncatedReads <- newIORef 0
+    truncatedDeadlineRef <- newIORef 1
+    truncatedPage <- lookupEngine (budgetedDeadline truncatedDeadlineRef) consistencyStore (countingStoreFor truncatedReads streamingTuples) streamingGraph MinimizeLatency (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
     truncatedCursor <- expectLookupTruncated "deadline-bounded lookup truncates with a cursor" truncatedPage
+    assertEqual "a lookup with budget for the second page reads both" 2 =<< readIORef truncatedReads
     resumedFolders <- collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) (Just truncatedCursor))
     assertLookupObjects "deadline cursor resumes remaining lookup results" (drop 500 expectedFolders) resumedFolders
     crowdedExpansion <- expandEngine consistencyStore (runTupleStoreInMemory expandTuples) streamingGraph MinimizeLatency (expandRequest crowdedFolder (RelationName "viewer") requestContext (ExpandLimit 1500) Nothing)

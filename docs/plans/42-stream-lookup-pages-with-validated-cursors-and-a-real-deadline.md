@@ -84,9 +84,13 @@ completion.
   which both stores do. Evidence and the counterexample are in Surprises & Discoveries; the
   Decision Log records the retreat, which the plan's Idempotence section authorized. The
   cursor's `frontier` field is encoded, round-trip tested, and always empty.
-- [ ] M4: deadline inside the traversal loop — polls between store pages and between
-  branch steps; mid-work truncation returns partial page + resumable cursor; existing
-  deadline tests still pass.
+- [x] M4 (2026-07-08): the deadline is polled inside the traversal — between store pages in
+  `readRowsForSubjects`, before each union/intersection branch, and before each round of the
+  recursive fixpoint. An exhausted budget raises an internal `Interrupt`, caught by
+  `runLookup`. An interrupted lookup reads **1** store page instead of 2 and emits **no**
+  objects with an unmoved watermark; a budget of one poll completes the traversal and
+  returns its full page as `LookupTruncated`. The existing deadline test was **inverted**:
+  it fed a budget of zero polls and still demanded a 500-object page.
 - [ ] M5: documentation and wire pass — fix the `En.Lookup` haddock (lines 105–108),
   en-servant handler unchanged (cursor stays opaque `Text`), en-postgres integration
   test for cursor validation against a real store.
@@ -321,6 +325,63 @@ round-trip tested (including a two-entry frontier), and always `[]` in practice.
 format space so that a future object-ordered-scan plan need not bump the cursor version. A
 reader should not mistake its presence for a claim that branch resumption works.
 
+**M4: an interrupted lookup can emit nothing, and the plan's own test proved it
+(2026-07-08).** The plan says an interrupted traversal returns "the watermark-safe prefix of
+what was merged". There is no such prefix. The objects discovered before an interruption are
+an arbitrary subset of the answer, not its smallest members: emit `z` from a completed branch
+while an unexplored branch still holds `a`, advance the watermark to `z`, and the next page —
+which filters to objects strictly greater than `z` — never returns `a`. A silent gap. This is
+the same fact that defeats per-branch resumption, seen from the other side.
+
+So an interrupted lookup reports `LookupTruncated` carrying **no new objects** and an
+**unmoved watermark**. The caller retries with a fresh budget and makes progress the moment
+the budget suffices for one page; a caller whose budget never suffices is told so, rather than
+handed a plausible, incomplete answer.
+
+This inverts an existing test, and the inversion is the point. That test fed a budget of
+**zero** polls and asserted the resumed pages were `drop 500 expectedFolders` — that is, it
+demanded a full 500-object first page from a lookup with no budget at all. It was finding B8
+written down as a requirement: the deadline relabelled `HasMore` as `Truncated` *after* doing
+every bit of the work. The first run under the new evaluator says so plainly:
+
+```text
+user error (deadline cursor resumes remaining lookup results
+expected count: 700
+actual count:   1200)
+```
+
+The replacement asserts both halves, and measures the halt directly. The 1,200-folder
+relation spans two store pages, so the drain loop polls exactly once, between them:
+
+```text
+budget 0 polls  -> 1 store page read, 0 objects emitted, LookupTruncated, watermark unmoved
+budget 1 poll   -> 2 store pages read, 500 objects emitted, LookupTruncated, watermark moved
+```
+
+Before M4 the zero-budget case read both pages. That difference — 1 read against 2 — *is*
+"the deadline interrupts work", stated as a number rather than a promise.
+
+**Where the polls go, and why not finer (2026-07-08).** `readRowsForSubjects` polls *between*
+store pages, never before the first: a relation that fits in one page never polls, so a lookup
+small enough to answer always answers regardless of budget. Union and intersection branches
+poll once per branch, and each round of the recursive arrow fixpoint polls once. Per-row polls
+were rejected: the deadline is an effectful action, and a clock read per row would cost more
+than the store read it guards. A page or branch boundary bounds the overshoot at one store
+round trip.
+
+Interruption travels as a dedicated internal `Interrupt` error, run under a local
+`runErrorNoCallStack` in `runLookup` and never escaping to the caller — it is a paging
+outcome, not an error. The alternative, threading a `TraversalOutcome` return type through
+every evaluator, would have bought nothing: on interruption there are no partial results worth
+carrying back.
+
+**Confirmation is bounded by the page, not by the clock (2026-07-08).** The deadline does not
+interrupt `confirmCandidates`, because its store reads go through `checkAtRevision` rather
+than `readRowsForSubjects`. It is not unbounded, though: M3's `confirmBudget` caps it at
+`limit + 1` forward checks per page. So a page's work is bounded in *candidates* by M3 and in
+*store pages* by M4. A single forward check on a pathological graph is still bounded only by
+`maxDepth`. Worth stating rather than implying the clock governs everything.
+
 
 ## Decision Log
 
@@ -398,6 +459,17 @@ reader should not mistake its presence for a claim that branch resumption works.
   cursors make the dominant stage incremental. If benchmarks later demand more,
   a follow-up can extend the frontier encoding — the v2 format reserves a field for it.
   Date: 2026-07-07
+- Decision (2026-07-08, corrects the entry below): an interrupted traversal emits **no**
+  objects and leaves the watermark where it was. There is no "watermark-safe prefix of what
+  was merged" to emit.
+  Rationale: results discovered before an interruption are an arbitrary subset of the answer,
+  not its smallest members. Emitting a high-keyed object from a completed branch while an
+  unexplored branch still holds a lower-keyed one would advance the watermark past it, and
+  the next page — filtering to objects strictly greater than the watermark — would never
+  return it. The same ordering fact that defeats per-branch resumption. An empty truncated
+  page is the honest answer: retry with a budget that suffices for a page. This inverted an
+  existing test that fed a zero-poll budget and still demanded a full page.
+  Date: 2026-07-08
 - Decision: The deadline is polled between store pages and between traversal branches —
   never per row — and an expired budget produces `LookupTruncated` with a cursor built
   from the watermark of results already merged, discarding the partially-explored
@@ -812,9 +884,13 @@ transcripts as you go.
    like the 1,200-folder fixture) later pages therefore cost the same as the first. Making
    *that* cheaper requires object-ordered store scans and is out of scope; the original
    acceptance criterion assumed a resumption mechanism that turned out to be unsound.
-4. **B8 deadline**: a 2-poll budget yields a first page with fewer objects than the
-   limit and state `LookupTruncated cursor`; resuming with a fresh budget completes the
-   set. The pre-existing truncate-and-resume tests stay green.
+4. **B8 deadline** (amended 2026-07-08 — see the Decision Log): a zero-poll budget over the
+   1,200-folder fixture reads **one** store page instead of two, emits **no** objects, and
+   returns `LookupTruncated` with the watermark unmoved; resuming with a fresh budget yields
+   the whole set with no duplicates or gaps. A one-poll budget completes the traversal and
+   returns its full 500-object page, still labelled `LookupTruncated`, whose cursor resumes
+   the remainder. The pre-existing truncate-and-resume test was **inverted**: it asserted a
+   zero-budget lookup returned 500 objects, which is the bug.
 5. **Docs match behavior**: the `En.Lookup` module haddock states the validated-cursor,
    staged-resumption, interruptible-deadline contract; no claim of full streaming
    remains.
