@@ -208,8 +208,10 @@ stored membership tuple alone does not prove a relation that unions in no @this@
 So a check that the probe cannot answer recurses into every group, which is the
 path where the evaluation folds accumulate.
 
-@folder#reader@ unions two wide relations, so a lookup over it merges two large
-already-merged branch results -- the per-union-node re-merge finding B12 names.
+@folder#reader@ unions four wide relations over overlapping object sets, so a lookup
+over it merges four large already-merged branch results -- the per-union-node re-merge
+finding B12 names. Four rather than two because a two-branch union performs exactly one
+combining step, which cannot distinguish a merge that is cheap from one that re-sorts.
 -}
 wideSchema :: Schema
 wideSchema =
@@ -226,7 +228,14 @@ wideSchema =
                 "folder"
                 [ Schema.relation "viewer" [Schema.subject "user", Schema.userset "team" "member"] Schema.this
                 , Schema.relation "editor" [Schema.subject "user"] Schema.this
-                , Schema.permission "reader" (Schema.anyOf (Schema.computed "viewer") [Schema.computed "editor"])
+                , Schema.relation "commenter" [Schema.subject "user"] Schema.this
+                , Schema.relation "auditor" [Schema.subject "user"] Schema.this
+                , Schema.permission
+                    "reader"
+                    ( Schema.anyOf
+                        (Schema.computed "viewer")
+                        [Schema.computed "editor", Schema.computed "commenter", Schema.computed "auditor"]
+                    )
                 ]
         Schema.build [userObject, teamObject, folderObject]
 
@@ -288,9 +297,6 @@ wideOverlappingPairs =
 fanoutViewerCount :: Int
 fanoutViewerCount = 1200
 
-fanoutEditorCount :: Int
-fanoutEditorCount = 600
-
 fanoutUser :: ObjectRef
 fanoutUser =
     ObjectRef (ObjectType "user") "fanout"
@@ -299,19 +305,23 @@ fanFolder :: Int -> ObjectRef
 fanFolder index =
     ObjectRef (ObjectType "folder") ("fan-" <> Text.pack (show index))
 
+{- | Four overlapping grants over the same 1,200 folders: 3,000 rows resolving to
+1,200 distinct objects, so every union branch carries objects the others also carry
+and the merge has real work to do.
+-}
 fanoutTuples :: [Tuple]
 fanoutTuples =
-    [ Tuple (fanFolder index) (RelationName "viewer") (SubjectId fanoutUser) Nothing
-    | index <- [1 .. fanoutViewerCount]
-    ]
-        <> [ Tuple (fanFolder index) (RelationName "editor") (SubjectId fanoutUser) Nothing
-           | index <- [1 .. fanoutEditorCount]
-           ]
+    concat
+        [ [Tuple (fanFolder index) (RelationName "viewer") (SubjectId fanoutUser) Nothing | index <- [1 .. fanoutViewerCount]]
+        , [Tuple (fanFolder index) (RelationName "editor") (SubjectId fanoutUser) Nothing | index <- [1 .. 600]]
+        , [Tuple (fanFolder index) (RelationName "commenter") (SubjectId fanoutUser) Nothing | index <- [301 .. 1200]]
+        , [Tuple (fanFolder index) (RelationName "auditor") (SubjectId fanoutUser) Nothing | index <- [1 .. 300]]
+        ]
 
-{- | A subject reaching 1,200 folders through a union of two wide branches.
+{- | A subject reaching 1,200 folders through a union of four wide branches.
 
-The page is 50 objects, so nothing here is about page size: the traversal finds
-all 1,800 rows, merges each branch, and then merges the branches together.
+The page is 50 objects, so nothing here is about page size: the traversal finds all
+3,000 rows, merges each branch, and then merges the four branches together.
 -}
 fanoutRequest :: LookupRequest
 fanoutRequest =
