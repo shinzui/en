@@ -79,7 +79,7 @@ store implementation, which is risky enough to deserve its own validation cycle.
 | EP-41 | Cache context-free check subproblems | docs/plans/41-cache-context-free-check-subproblems.md | None | EP-39, EP-40 | Complete |
 | EP-42 | Stream lookup pages with validated cursors and a real deadline | docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md | None | EP-39 | Complete |
 | EP-43 | Preserve set operators in expand trees | docs/plans/43-preserve-set-operators-in-expand-trees.md | None | None | Complete |
-| EP-44 | Make evaluation budgets configurable and trim hot-path overhead | docs/plans/44-make-evaluation-budgets-configurable-and-trim-hot-path-overhead.md | None | EP-39, EP-40, EP-42 | In Progress |
+| EP-44 | Make evaluation budgets configurable and trim hot-path overhead | docs/plans/44-make-evaluation-budgets-configurable-and-trim-hot-path-overhead.md | None | EP-39, EP-40, EP-42 | Complete |
 
 
 ## Dependency Graph
@@ -176,7 +176,24 @@ by hand or ship a specification that contradicts the server.
 Engine configuration (EP-44's budget record) is constructed in `en-server/app/Main.hs`
 and the `en-servant` seam defaults; it must slot into the server configuration record
 established by docs/plans/38-validate-configuration-and-persist-datastore-identity.md
-(master plan 6) if that has landed.
+(master plan 6) if that has landed. **Settled by EP-44 (2026-07-09):** 38 had landed, so
+the budget went into `ServerConfig`, read from `EN_MAX_DEPTH`, `EN_PAGE_LIMIT`, and
+`EN_RESULT_CAP` through 38's `withDefault … positive` helper. EP-44's own M3 text said to
+hardcode `defaultEvaluationBudget` and leave env parsing to 38; that text predated 38
+landing, and following it would have left the budget a source constant with no remaining
+plan owning the lift. `En.Budget.EvaluationBudget { maxDepth, pageLimit, resultCap }` is
+the shared vocabulary; the `…WithBudget` entry points (`checkWithBudget`,
+`checkAtRevisionWithBudget`, `lookupWithDeadlineAndBudget`, `expandWithBudget`, and cached
+variants) are the real ones, and every pre-existing name is a thin
+`defaultEvaluationBudget` wrapper, so no call site changed. `En.Servant.Seam.Env` gained a
+strict `budget` field.
+
+`En.Reachability.ReachabilityGraph` no longer carries `entries`. **Settled by EP-44
+(2026-07-09):** entry-point compilation moved behind
+`entryPoints :: ValidSchema -> Map RelationRef [EntryPoint]`, and
+`En.Schema.Render.renderReachabilityMermaid` now takes a `ValidSchema` rather than a
+graph. Any later plan that wants reverse-edge metadata — the explain/trace feature the
+review files as E12 is the obvious one — calls `entryPoints`, and pays for it only there.
 
 
 ## Progress
@@ -191,8 +208,8 @@ established by docs/plans/38-validate-configuration-and-persist-datastore-identi
 - [x] EP-42 (2026-07-08): cursors validated like consistency tokens; deadline interrupts expansion; one snapshot per lookup
 - [x] EP-43 (2026-07-09): expand tree preserves union/intersection/exclusion operators end-to-end to the wire
 - [x] EP-43 (2026-07-09): exclusion keeps granted and subtracted children apart; operator nodes are atomic under paging
-- [ ] EP-44: depth/page/result budgets configurable per engine; constants deduplicated
-- [ ] EP-44: EntryPoint machinery wired to a consumer or relocated; hot-path allocation fixes benchmarked
+- [x] EP-44 (2026-07-09): depth/page/result budgets configurable per engine (`En.Budget`, read from `EN_MAX_DEPTH`/`EN_PAGE_LIMIT`/`EN_RESULT_CAP`); nine constants deduplicated to one record
+- [x] EP-44 (2026-07-09): EntryPoint machinery relocated to `entryPoints`; hot-path fixes landed; benchmarked, and the benchmarks' limits recorded
 
 
 ## Surprises & Discoveries
@@ -492,6 +509,61 @@ sibling assertion pins that an operator node is atomic under paging: `audit` at 
 the flattening this plan removed. That is four bug-pinning tests across four plans.
 
 
+**The in-memory conformance store skipped rows, and every wide-relation claim this
+initiative made was measured against it (EP-44, 2026-07-09).** `pageTuples` in
+`en-core/src/En/Conformance/Kikan.hs` resumed a cursor with
+`drop start (zip [start + 1 ..] tuples)` — dropping from the *zipped* list. Each page's
+outgoing cursor was `2 * start` instead of `start + limit`, so a relation spanning three or
+more pages silently lost rows and then reported `Exhausted` as though it had read them all.
+
+Every engine drains through that function. It is a fixture bug, so no production path was
+affected, but it means EP-39's `check-wide` evidence — a 2,048-row relation, which is where
+the skipping *begins* — was gathered from a store that read 2,000 of those rows. The bug
+had been invisible for the same reason throughout: the widest fixture in the suite spanned
+two pages, and two pages is exactly where it starts.
+
+What found it was an *assertion on a benchmark*. EP-44's `checkMany/wide-overlapping`
+fixture pins its answer before `defaultMain` times it, and it denied on a 5,064-row folder
+while allowing on 64-row folders carrying identical group attachments. Without that
+assertion the benchmark would have reported a plausible time for the wrong computation, and
+gotten *faster* for it. The generalization, which is the master plan's testing rule reaching
+somewhere nobody thought to apply it: **a benchmark is a test whose assertion was left
+out.** A benchmark reports a time whatever the engine returns, so a mistyped fixture reads
+as a fast benchmark and a wrongly-denied check reads as an expensive one.
+
+In the same file, `lookup/wide-fanout` first reported **2.29 ns** — three orders of
+magnitude below the cheapest honest bench — because `\() -> action` is a constant
+expression and GHC's full-laziness pass floats it out of the lambda, so every iteration
+after the first read a memoized result. EP-39's benchmarks were written in that shape too.
+
+**Microbenchmarks at millisecond scale are not evidence on this hardware, and a bisect will
+happily explain the noise (EP-44, 2026-07-09).** The two fixtures EP-44 built to see B12's
+quadratic accumulation are bimodal at a ratio of 1.35: the same binary, the same command,
+lands near 4.7 ms or near 6.3 ms. Within one shell session the mode is *stable* — five
+alternating before/after rounds gave spreads of 1.01×–1.05× — so a single session reads as
+clean evidence. Across sessions the mode flips, and it flips per configuration. Two
+sessions, identical commits and method, gave `checkMany/wide-overlapping` at **+34%** and at
+**−26%**.
+
+Bisecting the second attributed the entire swing, reproducibly, to a commit that deletes an
+unused record field from `En.Reachability` — a module `checkMany` never calls at runtime.
+A field no engine reads cannot slow an engine by a third; what moved was code and data
+layout. `-fproc-alignment=64` is already set and a 64 MB nursery changed nothing.
+
+Two consequences for anything that follows this initiative. The deferred concurrency work
+will want to show speedups on exactly these fixtures, and must not trust a single session's
+numbers: alternate configurations within one session, take minima, and check whether an
+unrelated commit moves the same number. And `en-core/bench/baseline.csv` — which CI gates
+at `--fail-if-slower 25` — must never contain them. It currently contains four benchmarks
+recorded on CI hardware and knows nothing of the seven added since EP-39; that gap is
+better than a gate that flakes at ±35% until people learn to ignore it.
+
+**`cabal build all` does not build test suites (EP-44, 2026-07-09).** It reported zero
+errors while `en-core/test/Main.hs` had an out-of-scope identifier. Only `cabal test all`
+compiles test components. The Decision Log's full-workspace rule already requires both;
+this is why the second half is not optional, and it is one more instance of the pattern
+EP-43 named — the build is greener than it looks.
+
 ## Decision Log
 
 - Decision: Split performance (EP-39) from semantics (EP-40) even though both rewrite `En/Check.hs`.
@@ -536,6 +608,12 @@ the flattening this plan removed. That is four bug-pinning tests across four pla
 - Decision: Operator nodes in the expand tree are atomic under paging; `pageNodes` never splits one across pages, and a single-branch `Union`/`Intersection` collapses to its branch.
   Rationale: slicing inside an intersection hands a client half a conjunction, which is a worse lie than the flattening EP-43 removes. The collapse is semantic — a one-branch operator carries no information — and EP-44 must not treat either as an optimization to tune away.
   Date: 2026-07-09
+- Decision: The testing rule extends to benchmarks: a benchmark asserts the value its call returns before it is timed, and applies its call to an argument rather than closing over one.
+  Rationale: a benchmark reports a time whatever the engine returns, so it is a test with the assertion left out. EP-44's assertion caught the conformance store dropping rows on any relation wider than two pages — a bug every engine drains through, which had been invisible since EP-39 measured its wide-relation evidence against it. And `\() -> action` is a constant expression GHC floats out of the lambda: `lookup/wide-fanout` first reported 2.29 ns, timing a memoized result. Both failures produce a plausible number, which is worse than an error, and both make the benchmark look *better*.
+  Date: 2026-07-09
+- Decision: This initiative does not claim performance improvements from its millisecond-scale microbenchmarks, and they never enter `en-core/bench/baseline.csv`.
+  Rationale: they are bimodal at 1.35×, stable within a shell session and flipping across sessions, so any one session reads as clean evidence. Two sessions of five alternating rounds, same commits and command, gave `checkMany/wide-overlapping` at +34% and at −26%; bisecting the second blamed a commit that deletes an unused record field from a module the benchmark never calls. That is code layout. CI gates at `--fail-if-slower 25`, and a ±35% benchmark behind that gate teaches operators to ignore it. The deferred concurrency work will want to demonstrate speedups on exactly these fixtures and must not trust one session: alternate within a session, take minima, and check whether an unrelated commit moves the number.
+  Date: 2026-07-09
 - Decision: An undefined caveat name beside a *satisfied caveated* grant now fails the check instead of returning `Allowed`; beside an *unconditional* grant it is still absorbed by the short-circuit.
   Rationale: symbolic evaluation cannot know the good row's caveat passes, and deferring name validation to re-application does not recover the old answer (the fold is a `traverse` and fails on the first `Left` in the union). Failing closed on data referencing a caveat the schema no longer declares is the defensible reading, and eager validation guarantees a cached residual names only definable caveats. This refines, and does not contradict, the case EP-39 introduced and EP-40 blessed.
   Date: 2026-07-08
@@ -543,7 +621,65 @@ the flattening this plan removed. That is four bug-pinning tests across four pla
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+All six child plans are complete, and every finding in Theme B (B1–B12) of
+`docs/reviews/2026-07-07-architecture-performance-review.md` is closed or explicitly
+retreated from with its reason recorded.
+
+Check answers direct membership with one bounded probe instead of draining the relation,
+so a check on a relation of any width no longer errors (B1, B2). Data cycles contribute
+nothing rather than poisoning the whole check, and a decision derived from a cycle cut
+never enters the memo or the cross-request cache (B3, B4). Exclusion over a conditional
+base evaluates its subtrahend, and `checkMany` surfaces per-pair errors instead of
+destroying them (B5). The decision cache is keyed without caveat context and stores a
+`ResidualDecision`, so requests differing only in `current_time` share one entry and each
+still gets its own answer (B6). A lookup reads one snapshot for its whole life, its cursors
+are validated like consistency tokens, and its deadline interrupts the walk rather than
+relabelling a finished one (B7 partial, B8, B9). Expand preserves union, intersection, and
+exclusion, so an auditor can tell "all of" from "any of" from "except" (B10). The three
+evaluation budgets are one record read from the environment, and the hot-path and cache
+mechanics of B11/B12 are worked through (B11, B12).
+
+Two retreats are deliberate and documented. Lookup's traversal still recomputes per page,
+because both tuple stores scan `ORDER BY id ASC` and row id bears no relation to object
+key, so no prefix of a branch scan is safe to skip; the fix is a storage plan this master
+plan does not contain, and the lookup cursor reserves a `frontier` field for it. And
+concurrent subproblem dispatch stays deferred, as decided at the outset.
+
+**What this initiative learned about its own evidence is worth more than any single fix.**
+Six plans produced a chain of discoveries about tests that read as coverage and prove
+nothing, and each one sharpened the rule that caught the next.
+
+It began as "invert a caching test against a broken implementation" (EP-40). EP-41 widened
+it: when a test's subject is "X was reused", assert the *value* the reuse produced, never
+that reuse occurred — two plausible implementations passed every reuse-shaped assertion in
+the suite while serving expired grants as `Allowed` and one subject's rows to another.
+EP-43 widened it again: when a test's subject is a *structure*, the fixture must exhibit
+more than one element of it — every kikan intersection conjunct expands to exactly one
+node, so the assertions EP-43's own plan specified in advance could not distinguish a
+conjunction from a pile. EP-44 widened it once more, to a place nobody had thought to look:
+a benchmark is a test whose assertion was left out, and adding one exposed a paging bug in
+the conformance store that every engine drains through and that had silently truncated
+EP-39's wide-relation evidence.
+
+Five tests across the initiative turned out to encode the bugs they covered. EP-43 predicted
+it would meet more, and it did.
+
+The counterpart lesson is about trusting the compiler. "The compiler will force it" is false
+here — `-Werror` is off, so EP-43 shipped a green build with a latent crash, and a
+hand-written `ToSchema` instance produced no warning at all. EP-44 found the boundary of
+that lesson: a *strict record field* genuinely is compiler-enforced (`Env.budget` errored at
+every construction site), while the configuration plumbing beside it is not — omit a name
+from `Config.knownVariables` and an operator's environment variable is silently ignored. And
+`cabal build all` never compiles test suites, so a green build says less than it appears to.
+
+Finally, EP-44 could not measure most of what it fixed. Its two millisecond benchmarks are
+bimodal at 1.35×, stable within a session and flipping across them, and a bisect attributed
+a 34% swing to deleting an unused record field from a module the benchmark never calls. One
+change — `Map.lookupMin` eviction — is a reproducible 51% win; four are reproducible
+regressions of 8–13% on sub-microsecond in-memory fixtures, the price of a cycle guard that
+no longer degrades as `EN_MAX_DEPTH` rises. The rest is asymptotics the hardware cannot see.
+The concurrency work this master plan deferred will want to demonstrate speedups on exactly
+these fixtures, and should read that section before it starts.
 
 
 ---
@@ -617,6 +753,34 @@ matching notes.
 
 
 ---
+
+Revision note (2026-07-09, sixth): EP-44 is complete, and with it this master plan.
+Registry, Progress, Integration Points, Surprises & Discoveries, Decision Log, and
+Outcomes & Retrospective updated. B11 and B12 are closed: the three evaluation budgets are
+one `En.Budget.EvaluationBudget` read from `EN_MAX_DEPTH` / `EN_PAGE_LIMIT` /
+`EN_RESULT_CAP`, the nine constant definitions are gone, the `EntryPoint` machinery is off
+the structure every engine carries, and B12's hot-path list is worked through one commit at
+a time.
+
+Two Integration Points are now settled rather than pending. The budget slotted into
+docs/plans/38's `ServerConfig` because 38 had landed — EP-44's own M3 text said to defer
+env parsing to 38, advice written while 38 was still pending, which would have left the
+budget a source constant with no remaining plan owning the lift. And `ReachabilityGraph`
+lost `entries`; reverse-edge metadata now comes from
+`entryPoints :: ValidSchema -> Map RelationRef [EntryPoint]`, which is where a future
+explain/trace feature should look.
+
+Three discoveries outlive the plan. The in-memory conformance store skipped rows on any
+relation wider than two pages, which means every wide-relation claim this initiative made —
+including EP-39's — was measured against a store that stopped reading; it was caught by
+*asserting a benchmark's answer*, and the initiative's testing rule now covers benchmarks,
+which are tests with the assertion left out. The millisecond microbenchmarks are bimodal at
+1.35× and a bisect will happily attribute the noise to an unrelated commit, so this
+initiative claims no speedup from them and they must stay out of `baseline.csv`, which CI
+gates at `--fail-if-slower 25`. And `cabal build all` does not compile test suites, so the
+Decision Log's `&& cabal test all` is load-bearing.
+
+No decomposition change. This was the last child plan; the master plan is complete.
 
 Revision note (2026-07-09, fifth): EP-43 is complete. Registry, Progress, Integration Points,
 Surprises & Discoveries, and Decision Log updated. Finding B10 is fixed: `space#audit`, an
