@@ -30,6 +30,29 @@ deleteToken <- tupleStore.deleteTuples [tuple]
 
 Each write returns a `ConsistencyToken`.
 
+### Write semantics
+
+A grant is identified by its object, relation, and subject. The caveat is an
+attribute of that grant, not part of what identifies it, so there is at most one
+live grant per (object, relation, subject).
+
+Writing a tuple therefore *replaces* whatever grant that identity currently
+holds:
+
+- If no grant exists, the write creates one.
+- If a grant exists with a different caveat name or payload, the write replaces
+  it atomically. Reads at the write's token see only the new grant; reads at
+  earlier tokens still see the old one.
+- If the existing grant is identical, the write is a no-op.
+
+This means changing a caveat's payload (say, extending an expiry) and tightening
+an unconditional grant by adding a caveat both do what they look like they do —
+you do not need to delete the old grant first, and you cannot end up with an
+unconditional grant silently outliving the caveated one meant to replace it.
+
+Deletes work on the same identity and ignore the `caveat` field of the tuple you
+pass, so you never need to know a grant's current caveat in order to revoke it.
+
 ## Consistency modes
 
 Every read takes a `Consistency`:

@@ -214,8 +214,16 @@ PostgreSQL datastore, this is **mostly Postgres MVCC + a codec**, not a consiste
   an `en_transaction` row with `xid xid8` + `snapshot pg_snapshot DEFAULT pg_current_snapshot()`.
 - **Tuples are soft-deleted by xid**: `relation_tuple` carries `created_xid`/`deleted_xid`
   (`deleted_xid IS NULL` means live; a non-null `deleted_xid` records the deleting
-  transaction). Upsert inserts a new row; delete stamps `deleted_xid`. Never update in place — that
+  transaction). Delete stamps `deleted_xid`. Never update in place — that
   is what makes point-in-time reads possible.
+- **Writes have touch semantics**: a live tuple's identity is (object, relation, subject) — the
+  caveat is an attribute of the grant, not part of its identity, and
+  `relation_tuple_live_unique` is keyed accordingly. A write whose identity already holds a live
+  row with a different caveat name or payload stamps that row's `deleted_xid` and inserts the
+  replacement in the same transaction, so no reader ever sees both live and every earlier token
+  still sees the grant it was minted against. A byte-identical rewrite is a no-op that leaves the
+  row's `created_xid` alone. A delete targets the identity and ignores the caveat the caller
+  supplies.
 - **Read at revision `R`** is one predicate:
   `pg_visible_in_snapshot(created_xid, R) AND NOT pg_visible_in_snapshot(deleted_xid, R)`.
   Postgres decides visibility; `en` does not build a consistency protocol.

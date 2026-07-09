@@ -2,6 +2,9 @@ module En.Conformance.Kikan (
     kikanSchema,
     kikanGraph,
     runTupleStoreInMemory,
+    tupleKey,
+    touchTuple,
+    deleteTupleByKey,
     runConsistencyStoreInMemoryStrict,
     inMemoryToken,
     pageTuples,
@@ -41,8 +44,9 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Time (UTCTime, defaultTimeLocale, parseTimeOrError)
 import Effectful (Eff, (:>))
-import Effectful.Dispatch.Dynamic (interpret_)
+import Effectful.Dispatch.Dynamic (interpret_, reinterpret_)
 import Effectful.Error.Static (Error, throwError)
+import Effectful.State.Static.Local (evalState, get, modify)
 
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (..))
 import En.Effect.TupleStore (
@@ -146,12 +150,26 @@ fixtureSchemaOrError :: Either EnError Schema -> Schema
 fixtureSchemaOrError =
     either (error . ("invalid conformance schema fixture: " <>) . show) id
 
+{- | The in-memory tuple store.
+
+Writes and deletes mutate the tuple set with the same touch semantics the
+PostgreSQL store implements (see "En.Postgres.TupleStore"): a tuple's identity is
+its 'tupleKey', and a write replaces whatever grant that key currently holds. The
+store has no revisions, so every read sees the current state — which is exactly
+the "a read at the write's token sees the write" behavior the conformance suites
+assert.
+
+The state lives in 'Effectful.State.Static.Local', which runs under 'runPureEff',
+so the interpreter stays pure for @en-core/conformance/Main.hs@.
+-}
 runTupleStoreInMemory :: [Tuple] -> Eff (TupleStore : es) a -> Eff es a
-runTupleStoreInMemory tuples =
-    interpret_ \case
-        ReadObjectRelation _ object relation limit cursor ->
+runTupleStoreInMemory initialTuples =
+    reinterpret_ (evalState initialTuples) \case
+        ReadObjectRelation _ object relation limit cursor -> do
+            tuples <- get
             pure (pageTuples limit cursor [tuple | tuple <- tuples, tuple.object == object, tuple.relation == relation])
-        ReadStartingWithUser _ query ->
+        ReadStartingWithUser _ query -> do
+            tuples <- get
             pure
                 ( pageTuples
                     query.queryLimit
@@ -163,7 +181,8 @@ runTupleStoreInMemory tuples =
                     , tuple.subject `elem` query.querySubjects
                     ]
                 )
-        ProbeTuples _ object relation subjects ->
+        ProbeTuples _ object relation subjects -> do
+            tuples <- get
             pure
                 [ tupleRow index tuple
                 | (index, tuple) <- zip [1 ..] tuples
@@ -171,9 +190,11 @@ runTupleStoreInMemory tuples =
                 , tuple.relation == relation
                 , tuple.subject `elem` subjects
                 ]
-        WriteTuples _ ->
+        WriteTuples written -> do
+            modify (\tuples -> foldl' (flip touchTuple) tuples written)
             pure (ConsistencyToken "in-memory-write")
-        DeleteTuples _ ->
+        DeleteTuples removed -> do
+            modify (\tuples -> foldl' (flip deleteTupleByKey) tuples removed)
             pure (ConsistencyToken "in-memory-delete")
         HeadRevision ->
             pure testRevision
@@ -183,6 +204,29 @@ runTupleStoreInMemory tuples =
             pure 0
         ReapDeletedTuples _ ->
             pure 0
+
+-- | The touch identity of a tuple: everything except the caveat.
+tupleKey :: Tuple -> (ObjectRef, RelationName, Subject)
+tupleKey tuple =
+    (tuple.object, tuple.relation, tuple.subject)
+
+{- | Apply one write with touch semantics: retire whatever grant shares the
+tuple's key, whatever its caveat, then append the new grant.
+
+An identical rewrite is a no-op that preserves the tuple's position, mirroring
+the PostgreSQL store leaving an identical live row's @created_xid@ untouched.
+-}
+touchTuple :: Tuple -> [Tuple] -> [Tuple]
+touchTuple tuple tuples
+    | tuple `elem` tuples = tuples
+    | otherwise = deleteTupleByKey tuple tuples <> [tuple]
+
+{- | Apply a delete by key: remove the grant sharing the tuple's key, ignoring
+the request's caveat. Mirrors the PostgreSQL delete's re-keying.
+-}
+deleteTupleByKey :: Tuple -> [Tuple] -> [Tuple]
+deleteTupleByKey tuple =
+    filter (\candidate -> tupleKey candidate /= tupleKey tuple)
 
 {- | Page a filtered tuple list by a row-ordinal cursor.
 

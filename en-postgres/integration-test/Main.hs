@@ -48,7 +48,10 @@ main = do
         resetSchema connection
         runTupleStoreScenario connection
         runProbeScenario connection
+        runTouchSemanticsScenario connection
         runMaintenanceBatchScenario connection
+        resetSchema connection
+        runMigrationDedupeScenario connection
         Connection.release connection
     case result of
         Left err -> fail ("ephemeral-pg failed to start: " <> Text.unpack (Pg.renderStartError err))
@@ -338,6 +341,191 @@ explainProbeStatement =
           AND (subject_type, subject_id, coalesce(subject_relation, '')) IN
               (SELECT * FROM unnest(ARRAY['user'], ARRAY['probe-member'], ARRAY['']))
         """
+        Encoders.noParams
+        (Decoders.rowList (Decoders.column (Decoders.nonNullable Decoders.text)))
+
+{- | Touch semantics: what a write that collides with a live grant means.
+
+Scenarios 1 and 2 are the two authorization-correctness traps of finding C1 in
+@docs/reviews/2026-07-07-architecture-performance-review.md@. Against the
+pre-plan write path scenario 1 reads back the /old/ expiry (the replacement was
+dropped by @ON CONFLICT DO NOTHING@ while the caller got a success token) and
+scenario 2 reads back two live rows (the caveated grant was inserted alongside
+the unconditional one it was meant to tighten, so the tightening did nothing).
+
+Each sub-scenario uses its own object so the reads cannot see each other's rows.
+-}
+runTouchSemanticsScenario :: Connection.Connection -> IO ()
+runTouchSemanticsScenario connection = do
+    validCheckSchema <- either (fail . show) pure (Schema.validateSchema checkSchema)
+    let config =
+            ConsistencyConfig
+                { datastoreId = DatastoreId "test-datastore"
+                , schemaHash = Schema.schemaHash validCheckSchema
+                , gcWindow = "24 hours"
+                }
+        viewer = RelationName "viewer"
+        alice = SubjectId (ObjectRef (ObjectType "user") "touch-alice")
+        spaceRef name = ObjectRef (ObjectType "space") name
+        grant object caveat = Tuple{object, relation = viewer, subject = alice, caveat}
+        untilCaveat expiry =
+            TupleCaveat
+                { name = CaveatName "within_autonomy"
+                , payload = CaveatPayload (Map.fromList [("until", ValueTimestamp expiry)])
+                }
+        july = read "2026-07-01 00:00:00 UTC"
+        december = read "2026-12-31 00:00:00 UTC"
+        readAt revision object =
+            (.rows) <$> runPgOrFail connection config (TupleStore.readObjectRelation revision object viewer 10 Nothing)
+        writeAt tuples = do
+            token <- runPgOrFail connection config (TupleStore.writeTuples tuples)
+            TokenMetadata{revision} <- either (fail . show) pure (tokenMetadataFromPayload token)
+            pure revision
+
+    -- 1. A rewrite with a different payload takes effect, and the old token still
+    --    sees the grant it was minted against.
+    let payloadSpace = spaceRef "touch-payload"
+    julyRevision <- writeAt [grant payloadSpace (Just (untilCaveat july))]
+    decemberRevision <- writeAt [grant payloadSpace (Just (untilCaveat december))]
+    rowsAtDecember <- readAt decemberRevision payloadSpace
+    assertEqual "payload update leaves one live row" 1 (length rowsAtDecember)
+    assertEqual
+        "payload update takes effect at the write's token"
+        [Just (untilCaveat december)]
+        ((.tuple.caveat) <$> rowsAtDecember)
+    rowsAtJuly <- readAt julyRevision payloadSpace
+    assertEqual
+        "the pre-rewrite token still sees the pre-rewrite payload"
+        [Just (untilCaveat july)]
+        ((.tuple.caveat) <$> rowsAtJuly)
+
+    -- 2. Adding a caveat to an unconditional grant replaces it rather than
+    --    coexisting with it.
+    let tightenSpace = spaceRef "touch-tighten"
+    _ <- writeAt [grant tightenSpace Nothing]
+    tightenedRevision <- writeAt [grant tightenSpace (Just (untilCaveat july))]
+    rowsAtTightened <- readAt tightenedRevision tightenSpace
+    assertEqual "caveat tightening leaves one live row" 1 (length rowsAtTightened)
+    assertEqual
+        "caveat tightening retires the unconditional grant"
+        [Just (untilCaveat july)]
+        ((.tuple.caveat) <$> rowsAtTightened)
+
+    -- 3. An identical rewrite is a no-op that does not churn the row.
+    let idempotentSpace = spaceRef "touch-idempotent"
+        idempotentTuple = grant idempotentSpace (Just (untilCaveat july))
+    firstRevision <- writeAt [idempotentTuple]
+    secondRevision <- writeAt [idempotentTuple]
+    rowsAtFirst <- readAt firstRevision idempotentSpace
+    rowsAtSecond <- readAt secondRevision idempotentSpace
+    assertEqual "identical rewrite leaves one live row" 1 (length rowsAtSecond)
+    assertEqual
+        "identical rewrite does not replace the row"
+        ((.rowId) <$> rowsAtFirst)
+        ((.rowId) <$> rowsAtSecond)
+
+    -- 4. The same identity written twice in one call resolves last-wins.
+    let lastWinsSpace = spaceRef "touch-last-wins"
+    lastWinsRevision <-
+        writeAt
+            [ grant lastWinsSpace (Just (untilCaveat july))
+            , grant lastWinsSpace (Just (untilCaveat december))
+            ]
+    rowsAtLastWins <- readAt lastWinsRevision lastWinsSpace
+    assertEqual "same key twice in one call leaves one live row" 1 (length rowsAtLastWins)
+    assertEqual
+        "same key twice in one call keeps the last write"
+        [Just (untilCaveat december)]
+        ((.tuple.caveat) <$> rowsAtLastWins)
+
+    -- 5. A delete targets the identity, ignoring the caveat the caller supplies.
+    let deleteSpace = spaceRef "touch-delete"
+    _ <- writeAt [grant deleteSpace (Just (untilCaveat december))]
+    deleteToken <- runPgOrFail connection config (TupleStore.deleteTuples [grant deleteSpace Nothing])
+    TokenMetadata{revision = deleteRevision} <- either (fail . show) pure (tokenMetadataFromPayload deleteToken)
+    rowsAtDelete <- readAt deleteRevision deleteSpace
+    assertEqual "delete ignores the request's caveat and retires the grant" 0 (length rowsAtDelete)
+
+{- | The migration's duplicate-resolution rule, against the schema it will meet.
+
+Recreates the /old/ index shape, seeds the duplicate live rows only that shape
+permits, then runs the migration's SQL and asserts the newest write survived.
+The SQL below must stay in sync with
+@en-migrations/db/migrations/20260709202037_touch-semantics-live-unique.sql@ --
+the same convention 'schemaSql' follows for the base migration.
+-}
+runMigrationDedupeScenario :: Connection.Connection -> IO ()
+runMigrationDedupeScenario connection = do
+    runSessionOrFail connection (Session.script oldLiveUniqueSql)
+    runSessionOrFail connection (Session.script duplicateSeedSql)
+    liveBefore <- runSessionOrFail connection (Session.statement () (countStatement "SELECT count(*) FROM relation_tuple WHERE deleted_xid IS NULL"))
+    assertEqual "the old index shape admits one live row per caveat name" 3 liveBefore
+
+    runSessionOrFail connection (Session.script dedupeAndReindexSql)
+    liveAfter <- runSessionOrFail connection (Session.statement () (countStatement "SELECT count(*) FROM relation_tuple WHERE deleted_xid IS NULL"))
+    assertEqual "the migration leaves one live row per identity" 1 liveAfter
+
+    survivor <- runSessionOrFail connection (Session.statement () (textStatement "SELECT caveat_name FROM relation_tuple WHERE deleted_xid IS NULL"))
+    assertEqual "the migration keeps the row with the highest created_xid" ["newest"] survivor
+
+    retired <- runSessionOrFail connection (Session.statement () (countStatement "SELECT count(*) FROM relation_tuple WHERE deleted_xid IS NOT NULL"))
+    assertEqual "the migration soft-deletes the losers rather than removing them" 2 retired
+
+-- | The pre-migration @relation_tuple_live_unique@, keyed on the caveat name too.
+oldLiveUniqueSql :: Text
+oldLiveUniqueSql =
+    """
+    DROP INDEX relation_tuple_live_unique;
+
+    CREATE UNIQUE INDEX relation_tuple_live_unique
+      ON relation_tuple
+        (object_type, object_id, relation, subject_type, subject_id, coalesce(subject_relation, ''), coalesce(caveat_name, ''))
+      WHERE deleted_xid IS NULL;
+    """
+
+{- | Three live rows for one identity, distinguished only by caveat name, with
+ascending @created_xid@. Only the pre-migration index shape permits this.
+-}
+duplicateSeedSql :: Text
+duplicateSeedSql =
+    """
+    INSERT INTO relation_tuple
+      (object_type, object_id, relation, subject_type, subject_id, caveat_name, created_xid)
+    VALUES
+      ('space', 'dupe', 'viewer', 'user', 'alice', 'oldest', '100'::xid8),
+      ('space', 'dupe', 'viewer', 'user', 'alice', 'middle', '200'::xid8),
+      ('space', 'dupe', 'viewer', 'user', 'alice', 'newest', '300'::xid8);
+    """
+
+dedupeAndReindexSql :: Text
+dedupeAndReindexSql =
+    """
+    WITH ranked AS (
+      SELECT id,
+             row_number() OVER (
+               PARTITION BY object_type, object_id, relation,
+                            subject_type, subject_id, coalesce(subject_relation, '')
+               ORDER BY created_xid DESC, id DESC
+             ) AS keep_rank
+      FROM relation_tuple
+      WHERE deleted_xid IS NULL
+    )
+    UPDATE relation_tuple
+    SET deleted_xid = pg_current_xact_id()
+    WHERE id IN (SELECT id FROM ranked WHERE keep_rank > 1);
+
+    DROP INDEX relation_tuple_live_unique;
+
+    CREATE UNIQUE INDEX relation_tuple_live_unique
+      ON relation_tuple
+        (object_type, object_id, relation, subject_type, subject_id, coalesce(subject_relation, ''))
+      WHERE deleted_xid IS NULL;
+    """
+
+textStatement :: Text -> Statement () [Text]
+textStatement sql =
+    Statement.preparable
+        sql
         Encoders.noParams
         (Decoders.rowList (Decoders.column (Decoders.nonNullable Decoders.text)))
 
