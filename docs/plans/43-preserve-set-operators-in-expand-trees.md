@@ -4,6 +4,7 @@ slug: preserve-set-operators-in-expand-trees
 title: "Preserve set operators in expand trees"
 kind: exec-plan
 created_at: 2026-07-07T15:24:51Z
+intention: intention_01kx2cmexke9mv9aggb7jf7w5t
 master_plan: "docs/masterplans/7-fix-the-en-evaluation-engine.md"
 ---
 
@@ -39,8 +40,9 @@ the schema as the intersection `owner ∩ member`) returns, on the wire, an
 
 ## Progress
 
-- [ ] M0: baseline — build/test; confirm cited symbols/lines in `En.Expand`,
-  `En.Servant.API`, and both test suites; record drift.
+- [x] M0 (2026-07-09): baseline — `cabal build all` and `cabal test all` green before any
+  edit; cited symbols confirmed, line numbers and the wire encoding drifted, and a fourth
+  consumer found. Drift recorded in Surprises & Discoveries.
 - [ ] M1: failing test — expanding `space#audit` on the kikan fixtures must contain an
   intersection node; captured red output (today: flat children).
 - [ ] M2: `ExpandNode` gains `ExpandUnion` / `ExpandIntersection` / `ExpandExclusion`;
@@ -54,7 +56,88 @@ the schema as the intersection `owner ∩ member`) returns, on the wire, an
 
 ## Surprises & Discoveries
 
-(None yet.)
+**The baseline is green (M0, 2026-07-09).** `cabal build all` and `cabal test all` both pass
+on `ac24e0e` before any edit. This is worth stating because it is the first child of this
+master plan for which it was true: EP-39 found the workspace red. The master plan's
+full-workspace-suite rule is doing its job.
+
+**docs/plans/35 landed first, inverting this plan's stated expectation (M0, 2026-07-09).**
+The Decision Log predicted "if this plan lands first (expected — it is small)". It did not.
+EP-35 is Complete in `docs/masterplans/6-*.md`, and it rewrote the wire layer this plan
+must extend. Four consequences, all of which make M3 *different* rather than larger:
+
+`ExpandNodeWire` is no longer a `Generic`-derived tagged sum emitting
+`{"tag":"ExpandUsersetWire",…}`. It is a hand-written `ToJSON`/`FromJSON` pair using a
+`kind` string discriminator with lowercase values (`"subject"`, `"userset"`, `"caveated"`),
+at `en-servant/src/En/Servant/API.hs` lines 756–794. The file's own header comment states
+the intent: every instance is hand-written "so that the wire shape is a reviewed artifact
+rather than a side effect of generic derivation — which, for sum types, would leak Haskell
+constructor names". The `Wire`-suffix leak this plan's Decision Log said EP-35 would
+eliminate is already gone.
+
+Per that Decision Log's own handshake ("**if docs/plans/35 lands first**, add the operator
+nodes to its `/v1` vocabulary following its naming scheme"), the new JSON tags are
+`"union"`, `"intersection"`, and `"exclusion"` — not `ExpandUnionWire` and friends. The
+Haskell constructors keep the `…Wire` suffix to match their siblings; only the wire
+spelling follows EP-35. The plan's proposed acceptance — "assert the encoded bytes contain
+`ExpandIntersectionWire`" — is therefore both wrong and unnecessary: EP-35 supplies a
+`golden` helper (`en-servant/test/Main.hs` line 530) that asserts *exact bytes* and the
+decode round-trip in one call, which is strictly stronger than a substring check.
+
+There is a `FromJSON` instance now, so the wire change is not write-only. Its fallthrough
+calls `unknownVariant "expand node kind" other ["subject", "userset", "caveated"]`, and
+`en-servant/test/Main.hs` line 477 pins that an unknown `kind` is *rejected*. Adding
+constructors means extending the decoder and that legal-values list; the compiler does not
+force either, because a `FromJSON` written as a `case` over `Text` has no exhaustive match
+to fail.
+
+**A fourth `ExpandNodeWire` consumer exists, and the compiler will not point at it
+(M0, 2026-07-09).** This plan's Context and Orientation says "No other renderer consumes
+`ExpandNode` — verified by search", listing `En.Expand`, the two test suites, and
+`expandNodeToWire`. That search was for `ExpandNode`. The *wire* type has one more:
+`instance ToSchema ExpandNodeWire` in `en-servant/src/En/Servant/OpenApi.hs` lines 379–397,
+which hand-enumerates the three variants into the published OpenAPI 3.1 document (EP-35's
+M4). It is a hand-written list, not a pattern match, so omitting the operator variants
+compiles clean and silently ships an OpenAPI document that contradicts the server.
+
+This is exactly the failure mode this plan's own Idempotence and Recovery section warns
+about ("do not add wildcard matches to silence them — that is how the next constructor gets
+silently dropped"), arriving through a door the section did not anticipate: not a wildcard,
+but a type whose totality was never compiler-checked to begin with. M3 must update
+`OpenApi.hs`, and the plan's claim that `expandNodeToWire` is "the total mapping the
+compiler will force you to extend" is true only of that one function.
+
+**`asBranchNode []` is reachable, contrary to the Decision Log (M0, 2026-07-09).** The
+third Decision Log entry says "empty branch lists cannot occur (schema validation rejects
+empty `Union`/`Intersection`)". That is true of *rewrite* branch lists and irrelevant to
+the branch rule, which operates on *expanded node* lists: a conjunct like
+`ComputedUserset "member"` over an object with no `member` rows expands to `[]` legitimately.
+`asBranchNode []` must therefore be defined. It yields `ExpandUnion []` — an empty union
+grants nobody, so the conjunct is unsatisfiable, which is the faithful reading and exactly
+what an auditor needs to see. Collapsing it away would erase the reason the intersection
+denies.
+
+**Cited line numbers have drifted; symbols have not (M0, 2026-07-09).** Every symbol the
+plan names still exists. Current locations: `expandRewrite`'s flattening at
+`en-core/src/En/Expand.hs` 155–185 (plan said 170–179); `ExpandNode` at 57–61 ✓;
+`pageNodes` at 281–292 (plan said 278–289); the `maxDepth`/`pageLimit`/`resultCap` constants
+at 116–123 ✓. In `en-servant/src/En/Servant/API.hs`, `ExpandNodeWire` at 756–794 (plan said
+272–277) and `expandNodeToWire` at 1172–1179 (plan said 576–583). In `en-core/test/Main.hs`,
+the expand assertions are at 587–595 (plan said ~417–425) and the tree helpers at 1448–1478
+(plan said ~1002–1036); the tree-level helper is named `treeHasUserset`, and `nodeHasUserset`
+is its per-node companion — the plan's Interfaces section names only the latter.
+
+EP-40's `CycleDetected` revisit guard is present at `En/Expand.hs` line 140 with its
+explanatory comment, as this plan's Context and Orientation anticipated. Keep it intact.
+
+**The existing pagination test is a test encoding a bug, as the master plan predicted
+(M0, 2026-07-09).** `en-core/test/Main.hs` line 595 asserts
+`expand paginates top-level children` by expanding `auditedSpace#audit` at `ExpandLimit 1`
+and expecting `ExpandHasMore (ExpandCursor "1")`. It passes today only because `audit`'s
+intersection is flattened into two children — the very erasure B10 names. The assertion is
+therefore a pin on the finding, and the master plan's Surprises & Discoveries called this
+shot for EP-43 specifically. This plan's fifth Decision Log entry already schedules the
+rewrite; M0 confirms it is needed for the predicted reason rather than an incidental one.
 
 
 ## Decision Log
@@ -116,6 +199,44 @@ the schema as the intersection `owner ∩ member`) returns, on the wire, an
   replacement (e.g. `exclusionSpace#member`, which has two direct member tuples in
   `fixtureTuples`) tests the same paging mechanics on a shape paging still applies to.
   Date: 2026-07-07
+- Decision: The docs/plans/35 handshake resolves in 35's favour, because 35 landed first.
+  The three new JSON tags are `kind: "union"`, `"intersection"`, `"exclusion"` — lowercase,
+  no `Wire` suffix — matching the `kind` discriminator vocabulary EP-35 established for
+  `ExpandNodeWire`. The Haskell constructors are still `ExpandUnionWire` /
+  `ExpandIntersectionWire` / `ExpandExclusionWire`, matching their siblings. The fourth
+  Decision Log entry above (additive constructors on a `Generic`-derived tagged sum, no
+  version bump, byte-check for the string `ExpandIntersectionWire`) is superseded in its
+  *spelling* and stands in its *semantics*.
+  Rationale: that entry pre-committed to exactly this outcome — "if docs/plans/35 lands
+  first, add the operator nodes to its `/v1` vocabulary following its naming scheme (losing
+  the `Wire`-suffix leak it eliminates); either way the tree semantics defined here are the
+  contract; only spelling is 35's." The additive-tag compatibility consequence it recorded
+  is unchanged and still true: a `/v1` client that exhaustively matches `kind` will reject
+  trees containing operators. No version bump here; the tree shape is what this plan owns.
+  Date: 2026-07-09
+- Decision: M3 also updates `instance ToSchema ExpandNodeWire` in
+  `en-servant/src/En/Servant/OpenApi.hs`, and the acceptance uses EP-35's `golden` helper
+  (exact bytes plus decode round-trip) rather than the substring byte-check this plan
+  proposed.
+  Rationale: `ToSchema` hand-enumerates the node variants, so it is a consumer the compiler
+  cannot force — omitting the operators would ship an OpenAPI document contradicting the
+  server, silently. `golden` is strictly stronger than a substring assertion and is the
+  house pattern for every other wire type; a substring check would pass against an encoder
+  that emitted the tag under the wrong key.
+  Date: 2026-07-09
+- Decision: M1's red is demonstrated with assertions written in terms of the *current*
+  constructors — `Right 1 == fmap (length . children) expansion` for both `audit` and
+  `member_not_owner` — which fail today (`Right 2`, the flattened pair) and pass after M2.
+  M2 then strengthens them to `treeHasIntersection` / `treeHasExclusion`. M1 and M2 land as
+  one commit; M3 lands separately.
+  Rationale: the plan offered three techniques and asked which was used. A child-count
+  assertion is the strongest statement expressible before `ExpandIntersection` exists, and
+  it is a real red rather than a compile error, so it demonstrates the tests detect
+  *flattening* rather than merely detecting a missing constructor. Committing the red test
+  alone would leave the tree failing, which the exec-plan protocol forbids; the Idempotence
+  section's separate-commit requirement is about M2 versus M3 (the revertible wire change),
+  and that is honoured.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective

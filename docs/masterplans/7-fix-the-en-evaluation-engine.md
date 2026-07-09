@@ -78,7 +78,7 @@ store implementation, which is risky enough to deserve its own validation cycle.
 | EP-40 | Adopt Zanzibar cycle and exclusion semantics in check | docs/plans/40-adopt-zanzibar-cycle-and-exclusion-semantics-in-check.md | None | EP-39 | Complete |
 | EP-41 | Cache context-free check subproblems | docs/plans/41-cache-context-free-check-subproblems.md | None | EP-39, EP-40 | Complete |
 | EP-42 | Stream lookup pages with validated cursors and a real deadline | docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md | None | EP-39 | Complete |
-| EP-43 | Preserve set operators in expand trees | docs/plans/43-preserve-set-operators-in-expand-trees.md | None | None | Not Started |
+| EP-43 | Preserve set operators in expand trees | docs/plans/43-preserve-set-operators-in-expand-trees.md | None | None | In Progress |
 | EP-44 | Make evaluation budgets configurable and trim hot-path overhead | docs/plans/44-make-evaluation-budgets-configurable-and-trim-hot-path-overhead.md | None | EP-39, EP-40, EP-42 | Not Started |
 
 
