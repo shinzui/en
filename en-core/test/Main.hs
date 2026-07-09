@@ -399,6 +399,32 @@ main = do
     assertEqual "lookup cursor codec round-trips a frontier" (Right frontierCursorState) (decodeLookupCursor (encodeLookupCursor frontierCursorState))
     -- B9: a cursor is client-supplied text. Nothing may read at a revision taken
     -- from it without decode+validate.
+    {- B7: one lookup request must read one snapshot. Confirming an intersection's
+    candidates used to call `check`, which re-resolved the caller's Consistency per
+    candidate -- so under MinimizeLatency or FullyConsistent a confirmation could
+    read a different snapshot than the traversal that produced the candidate. -}
+    lookupResolveCount <- newIORef 0
+    assertEqual
+        "cached lookup over an intersection confirms its candidates"
+        (Right (lookupPage [allowed auditedSpace, allowed exclusionSpace] LookupExhausted))
+        =<< lookupEngine noDeadline (countingConsistencyStore lookupResolveCount consistencyStore) tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOwner) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    assertEqual "a lookup resolves consistency exactly once, confirmations included" 1 =<< readIORef lookupResolveCount
+
+    {- The confirmations of one lookup share a memo. Both children inherit from one
+    root, so confirming the second and third candidate must not re-evaluate the
+    root's subtree. -}
+    sharedMemoGraph <- either (fail . show) pure (compileSchema sharedMemoSchema)
+    sharedMemoReads <- newIORef 0
+    assertEqual
+        "lookup over an exclusion confirms every inheriting candidate"
+        (Right (lookupPage [allowed memoChildA, allowed memoChildB, allowed memoRoot] LookupExhausted))
+        =<< lookupEngine noDeadline consistencyStore (countingStoreFor sharedMemoReads sharedMemoTuples) sharedMemoGraph MinimizeLatency (lookupRequest (SubjectId alice) (RelationName "enter") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
+    -- 17 reads with the memo threaded across the candidate list; 19 without, because
+    -- each child would re-derive memo-root#inherited for itself. The saving is one
+    -- read per candidate that shares a subproblem with an earlier one, so it grows
+    -- with the candidate set rather than being a fixed discount.
+    assertEqual "confirmations share subproblems through one memo" 17 =<< readIORef sharedMemoReads
+
     let strictLookupWithCursor cursor =
             lookupEngine noDeadline strictConsistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) (Just cursor))
     assertEqual "a forged v1 lookup cursor is rejected, not obeyed" (Left (InvalidConsistencyToken "lookup cursor")) =<< strictLookupWithCursor forgedLookupCursor
@@ -1669,7 +1695,13 @@ fixedRevisionConsistencyStore revision =
             pure ()
         ResolveConsistency consistency ->
             pure ResolvedConsistency{consistency, revision}
+        MintToken minted ->
+            pure (inMemoryToken (DatastoreId "test") minted)
 
+{- | Counts 'ResolveConsistency' calls only. 'MintToken' is a different question --
+"give me a token for this revision" -- and answering it costs no snapshot
+selection, so it must not inflate the count this store exists to measure.
+-}
 countingConsistencyStore :: IORef Int -> ConsistencyInterpreter -> ConsistencyInterpreter
 countingConsistencyStore count _ =
     interpret_ \case
@@ -1680,6 +1712,8 @@ countingConsistencyStore count _ =
         ResolveConsistency consistency -> do
             liftIO (modifyIORef' count (+ 1))
             pure ResolvedConsistency{consistency, revision = testRevision}
+        MintToken minted ->
+            pure (inMemoryToken (DatastoreId "test") minted)
 
 countingTupleStore :: IORef Int -> TupleInterpreter -> TupleInterpreter
 countingTupleStore count _ =
@@ -2260,6 +2294,50 @@ crowdedFolder =
 showText :: (Show a) => a -> Text
 showText =
     Text.pack . show
+
+{- | Two children inheriting from one root, gated by an exclusion so that lookup
+must confirm its candidates. Confirming @memo-child-b@ re-derives
+@memo-root#inherited@, which confirming @memo-child-a@ has already computed -- so a
+memo threaded across the candidate list must serve it from the entry rather than
+re-reading the store.
+-}
+sharedMemoSchema :: Schema
+sharedMemoSchema =
+    testSchemaOrError $ do
+        userObject <- Schema.object "user" []
+        spaceObject <-
+            Schema.object
+                "space"
+                [ Schema.relation "owner" [Schema.subject "user"] Schema.this
+                , Schema.relation "parent" [Schema.subject "space"] Schema.this
+                , Schema.relation "banned" [Schema.subject "user"] Schema.this
+                , Schema.permission "inherited" (Schema.anyOf (Schema.computed "owner") [Schema.arrow "parent" "inherited"])
+                , Schema.permission "enter" (Schema.minus (Schema.computed "inherited") (Schema.computed "banned"))
+                ]
+        Schema.build [userObject, spaceObject]
+
+sharedMemoTuples :: [Tuple]
+sharedMemoTuples =
+    [ Tuple{object = memoRoot, relation = RelationName "owner", subject = SubjectId alice, caveat = Nothing}
+    , Tuple{object = memoChildA, relation = RelationName "parent", subject = SubjectId memoRoot, caveat = Nothing}
+    , Tuple{object = memoChildB, relation = RelationName "parent", subject = SubjectId memoRoot, caveat = Nothing}
+    ]
+
+alice :: ObjectRef
+alice =
+    ObjectRef{objectType = ObjectType "user", objectId = "alice"}
+
+memoRoot :: ObjectRef
+memoRoot =
+    ObjectRef{objectType = ObjectType "space", objectId = "memo-root"}
+
+memoChildA :: ObjectRef
+memoChildA =
+    ObjectRef{objectType = ObjectType "space", objectId = "memo-child-a"}
+
+memoChildB :: ObjectRef
+memoChildB =
+    ObjectRef{objectType = ObjectType "space", objectId = "memo-child-b"}
 
 testSchemaOrError :: Either EnError Schema -> Schema
 testSchemaOrError =

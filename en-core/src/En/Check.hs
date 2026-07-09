@@ -4,9 +4,13 @@ module En.Check (
     CaveatObligation (..),
     BatchPair (..),
     CheckCacheEnv (..),
+    CheckMemo,
+    emptyCheckMemo,
     check,
     checkCached,
     checkMany,
+    checkAtRevision,
+    checkCachedAtRevision,
 ) where
 
 import Control.Monad (foldM)
@@ -152,6 +156,62 @@ checkMany graph consistency context pairs = do
         (residual, memo') <-
             runCheckMemo graph revision pair.subject pair.permission pair.object memo
         pure (Map.insert pair residual residualsByPair, memo')
+
+{- | Engine-internal: check at an already-resolved revision, threading a
+caller-owned memo.
+
+"En.Lookup" needs this. Its reach-then-check confirms each candidate with a
+forward check, and calling the public 'check' would re-resolve the caller's
+'Consistency' once per candidate -- so under @MinimizeLatency@ or
+@FullyConsistent@ a confirmation could read a /different snapshot/ than the
+traversal that produced the candidate it is confirming. Taking the revision as an
+argument makes one lookup read one snapshot.
+
+The memo is threaded rather than rebuilt so a batch of confirmations shares
+subproblems: confirming twenty objects that all descend from the same group reads
+that group once. The memo holds 'ResidualDecision's, which mention no caveat
+context, so sharing one across confirmations is sound even if the answers differ
+per context -- the context is applied here, at the boundary, per candidate.
+
+Callers must not carry a memo across a revision boundary. This function cannot
+check that for them, which is why it is engine-internal rather than public.
+-}
+checkAtRevision ::
+    (TupleStore :> es) =>
+    ReachabilityGraph ->
+    CaveatContext ->
+    Revision ->
+    Subject ->
+    RelationName ->
+    ObjectRef ->
+    CheckMemo ->
+    Eff es (Either EnError CheckDecision, CheckMemo)
+checkAtRevision graph context revision subject permission object memo = do
+    (residual, memo') <- runCheckMemo graph revision subject permission object memo
+    pure (residual >>= applyResidual graph.caveats context, memo')
+
+{- | 'checkAtRevision' against the cross-request decision cache. See 'checkCached'
+for what that cache stores and why a caveat context never enters it.
+-}
+checkCachedAtRevision ::
+    (TupleStore :> es, IOE :> es) =>
+    CheckCacheEnv ->
+    ReachabilityGraph ->
+    CaveatContext ->
+    Revision ->
+    Subject ->
+    RelationName ->
+    ObjectRef ->
+    CheckMemo ->
+    Eff es (Either EnError CheckDecision, CheckMemo)
+checkCachedAtRevision cacheEnv graph context revision subject permission object memo = do
+    (residual, memo') <- runCheckMemoWithCache (Just (decisionCacheOps cacheEnv graph)) graph revision subject permission object memo
+    pure (residual >>= applyResidual graph.caveats context, memo')
+
+-- | A memo with nothing in it, for the first check of a batch.
+emptyCheckMemo :: CheckMemo
+emptyCheckMemo =
+    Map.empty
 
 dedupePairs :: [BatchPair] -> [BatchPair]
 dedupePairs =

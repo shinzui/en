@@ -70,9 +70,11 @@ completion.
   forged v1, malformed v2, foreign-datastore, and unmintable-token cursors all rejected.
   Red evidence captured. `En.Lookup` now imports `Revision` without its constructor, so it
   *cannot* build a revision from client text.
-- [ ] M2: single consistency resolution per lookup — `En.Check.checkAtRevision` (and
-  cached variant) added; `CheckForCandidate` takes the pinned revision; shared memo
-  across confirmations; counting-store tests.
+- [x] M2 (2026-07-08): `En.Check.checkAtRevision` / `checkCachedAtRevision` added with
+  exported `CheckMemo` and `emptyCheckMemo`; `CheckForCandidate` pinned to a revision and
+  threading a memo; `consistency` deleted from every internal evaluator, which now carry
+  only `TupleStore :> es`. Resolution count 3 → 1 (red evidence captured); confirmations
+  share a memo, 19 reads → 17 on a shared-subtree fixture.
 - [ ] M3: incremental resumption — cursor gains a traversal watermark and per-branch
   store cursors for the direct-read stage; page N+1 provably cheaper than page N;
   recompute fallback documented for the stages that keep it.
@@ -172,6 +174,55 @@ Revision)`). Every `Revision` in `En/Lookup.hs` is a type in a signature; the mo
 way to build one. A future edit that tries to resurrect `Revision cursorText` does not pass
 review — it does not compile.
 
+**B7, measured (2026-07-08).** A lookup on kikan's `audit` permission (an intersection, so
+its candidates are confirmed by a forward check) under a consistency store that counts
+`ResolveConsistency` calls:
+
+```text
+user error (a lookup resolves consistency exactly once, confirmations included
+expected: 1
+actual:   3)
+```
+
+One resolution for the traversal, plus one per confirmed candidate. Under `MinimizeLatency`
+those three resolutions may select three different snapshots, so a candidate discovered in
+one snapshot could be confirmed against another.
+
+**M2's acceptance became structural too (2026-07-08).** Deleting the `consistency` parameter
+from `evalRelation`/`evalRewrite`/`evalThis`/`evalTupleToUserset` did more than tidy a
+signature: those functions no longer need `ConsistencyStore :> es` at all, and neither does
+`runLookup`. They now carry `(TupleStore :> es)` alone. The traversal *cannot* resolve
+consistency, because the effect is not available to it. `ConsistencyStore` survives only in
+the four public entry points, `lookupWithDeadlineWithChecker`, and `resolveCursor`, and
+`resolveConsistency` is called on exactly one line. As with the `Revision` import in M1,
+this is a property the compiler maintains rather than one a reviewer must re-check.
+
+**Memo sharing pays less than the plan implies, and the reason is EP-39 (2026-07-08).** The
+plan asks for a test showing confirmations "cost fewer reads than independent checks".
+Kikan's `audit` cannot show it: its two candidates are different objects with no shared
+subproblem, so there is nothing to share. The fixture that does show it is
+`sharedMemoSchema` — two children inheriting from one root through
+`inherited = owner | parent->inherited`, gated by `enter = inherited - banned` so that
+lookup must confirm.
+
+With the memo threaded across the candidate list: **17** store reads. Resetting it per
+candidate (the sabotage): **19**. The saving is one read per candidate that shares a
+subproblem with an earlier one, so it grows with the candidate set rather than being a fixed
+discount — but it is two reads, not twenty, because EP-39's probe already made each
+individual confirmation cheap. Before the probe, re-deriving `memo-root#inherited` meant
+draining a whole relation; now it is one bounded probe. The memo still matters, and matters
+more as candidate sets and inheritance depth grow, but this plan should not claim a dramatic
+number it does not have.
+
+The memo is shared across the candidate list of one `confirmCandidates` call, not across the
+whole traversal. A permission with nested intersections makes several such calls, and
+threading one memo through every evaluator would mean changing each to return it. The
+dominant case is one call with many candidates. Recorded rather than silently narrowed.
+
+Sharing the memo is sound for a stronger reason than "one lookup has one context": after
+EP-41, memo entries are `ResidualDecision`s and mention no caveat context at all. The context
+is applied per candidate, at the `checkAtRevision` boundary.
+
 
 ## Decision Log
 
@@ -246,6 +297,22 @@ review — it does not compile.
   round trips through token encode/decode and was rejected as the pinning mechanism —
   it would mint a token per candidate just to decode it again.
   Date: 2026-07-07
+- Decision: The memo is shared across the candidate list of one `confirmCandidates` call,
+  not across the whole lookup traversal.
+  Rationale: threading a memo through `evalRelation`/`evalRewrite`/`evalThis`/
+  `evalTupleToUserset` would mean changing each to return it, a restructuring M3 is already
+  doing for other reasons and which would collide. Nested intersections make several
+  `confirmCandidates` calls, but the dominant case is one call with many candidates. Stated
+  in the code comment so no reader assumes a lookup-wide memo.
+  Date: 2026-07-08
+- Decision: Removing `consistency` from the internal evaluators also removes
+  `ConsistencyStore :> es` and `Error EnError :> es` from their constraint sets; keep it
+  that way.
+  Rationale: B7 then cannot recur. A traversal without the `ConsistencyStore` effect cannot
+  re-resolve consistency even by accident, which is a compiler-checked version of the
+  invariant this milestone exists to establish. The same reasoning as M1's decision to
+  import `Revision` without its constructor.
+  Date: 2026-07-08
 
 
 ## Outcomes & Retrospective
