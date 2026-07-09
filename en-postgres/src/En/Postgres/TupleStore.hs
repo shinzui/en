@@ -158,15 +158,64 @@ cachedOptimizedRevision cache = do
             liftIO (storeOptimizedRevisionCache cache revision)
             pure revision
 
+{- | Write each tuple with touch semantics, then mint a token for the write.
+
+A live tuple's identity is (object, relation, subject); its caveat is an
+attribute of the grant, not part of its identity. So a write either inserts,
+does nothing (the live row is already byte-identical), or retires the differing
+live row and inserts the replacement — all inside this session's single
+transaction, so no observer ever sees both rows live.
+
+The same key appearing twice in one call resolves last-wins: the second tuple's
+touch retires the first tuple's row, stamping @deleted_xid = created_xid@, which
+is visible at no revision.
+-}
 writeTuplesSession :: ConsistencyConfig -> [Tuple] -> Session ConsistencyToken
 writeTuplesSession config tuples = do
     Session.script beginScript
     anchor <- Session.statement schemaHashText anchorTransactionStatement
-    traverse_ (\tuple -> Session.statement (tupleInsertParams anchor.xid tuple) insertTupleStatement) tuples
+    traverse_ (touchTuple anchor.xid) tuples
     Session.script commitScript
     pure (tokenFromAnchor config anchor)
   where
     SchemaHash schemaHashText = config.schemaHash
+
+{- | Apply touch semantics to one tuple.
+
+Each attempt retires a live row that shares the tuple's identity but carries a
+different caveat, then inserts. An insert that affects no row means /some/ live
+row already holds the identity; that is a legitimate no-op only when the row is
+byte-identical, which is checked rather than assumed.
+
+Both statements run at their own @READ COMMITTED@ snapshot, so a concurrent
+transaction that commits a differing caveat between them can make the pair
+observe "nothing to retire" and "conflict" at once — the silent-drop bug this
+protocol exists to remove, in racing form. A second attempt re-reads and retires
+the racer's now-committed row. If even that does not converge, the final insert
+omits @ON CONFLICT@ so PostgreSQL raises @unique_violation@ and the write fails
+loudly instead of being dropped.
+-}
+touchTuple :: Text -> Tuple -> Session ()
+touchTuple writeXid tuple = do
+    converged <- attempt
+    if converged
+        then pure ()
+        else do
+            convergedOnRetry <- attempt
+            if convergedOnRetry
+                then pure ()
+                else do
+                    _ <- Session.statement params touchReplaceStatement
+                    Session.statement params insertTupleStrictStatement
+  where
+    params = tupleInsertParams writeXid tuple
+
+    attempt = do
+        _ <- Session.statement params touchReplaceStatement
+        inserted <- Session.statement params insertTupleStatement
+        if inserted == 1
+            then pure True
+            else Session.statement params identicalLiveTupleStatement
 
 deleteTuplesSession :: ConsistencyConfig -> [Tuple] -> Session ConsistencyToken
 deleteTuplesSession config tuples = do
@@ -447,7 +496,43 @@ tupleInsertParams createdXid tuple =
             , caveatPayload = Aeson.encode . caveatPayloadToJson <$> maybePayload
             }
 
-insertTupleStatement :: Statement TupleInsertParams ()
+{- | Retire the live row that shares the tuple's identity but carries a different
+caveat, returning how many rows were retired (0 or 1, bounded by
+@relation_tuple_live_unique@).
+
+@IS DISTINCT FROM@ is null-safe, so an uncaveated row compares as different from
+a caveated one; @jsonb@ inequality is structural, so re-encoding an equal payload
+with different key order or whitespace does not count as a change. A live row
+identical to the tuple therefore matches nothing here and keeps its original
+@created_xid@ — an idempotent rewrite does not churn history.
+-}
+touchReplaceStatement :: Statement TupleInsertParams Int64
+touchReplaceStatement =
+    Statement.preparable
+        """
+        UPDATE relation_tuple
+        SET deleted_xid = $1::xid8
+        WHERE object_type = $2
+          AND object_id = $3
+          AND relation = $4
+          AND subject_type = $5
+          AND subject_id = $6
+          AND coalesce(subject_relation, '') = coalesce($7, '')
+          AND deleted_xid IS NULL
+          AND (caveat_name IS DISTINCT FROM $8
+               OR caveat_payload IS DISTINCT FROM $9::jsonb)
+        """
+        tupleInsertEncoder
+        Decoders.rowsAffected
+
+{- | Insert the tuple, tolerating a conflict with an identical live row.
+
+After 'touchReplaceStatement' the only live row that can still conflict is one
+byte-identical to the tuple, so @DO NOTHING@ means "already present" rather than
+"silently dropped" — except under the cross-transaction race 'touchTuple'
+documents, which is why the caller verifies rather than assumes.
+-}
+insertTupleStatement :: Statement TupleInsertParams Int64
 insertTupleStatement =
     Statement.preparable
         """
@@ -456,17 +541,62 @@ insertTupleStatement =
         VALUES ($2, $3, $4, $5, $6, $7, $8, $9, $1::xid8)
         ON CONFLICT DO NOTHING
         """
-        ( ((\params -> params.createdXid) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.objectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.objectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.relation) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.subjectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.subjectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.subjectRelation) >$< Encoders.param (Encoders.nullable Encoders.text))
-            <> ((\params -> params.caveatName) >$< Encoders.param (Encoders.nullable Encoders.text))
-            <> ((\params -> params.caveatPayload) >$< Encoders.param (Encoders.nullable Encoders.jsonbLazyBytes))
-        )
+        tupleInsertEncoder
+        Decoders.rowsAffected
+
+{- | Insert the tuple, letting a conflict raise.
+
+'touchTuple' falls back to this when its bounded retry has not converged: a
+@unique_violation@ surfaces as 'En.Error.StoreError', which is the honest report
+of a write that could not be applied. The alternative — one more @DO NOTHING@ —
+would drop the caller's write and return a success token.
+-}
+insertTupleStrictStatement :: Statement TupleInsertParams ()
+insertTupleStrictStatement =
+    Statement.preparable
+        """
+        INSERT INTO relation_tuple
+          (object_type, object_id, relation, subject_type, subject_id, subject_relation, caveat_name, caveat_payload, created_xid)
+        VALUES ($2, $3, $4, $5, $6, $7, $8, $9, $1::xid8)
+        """
+        tupleInsertEncoder
         Decoders.noResult
+
+-- | Whether a live row byte-identical to the tuple exists, caveat included.
+identicalLiveTupleStatement :: Statement TupleInsertParams Bool
+identicalLiveTupleStatement =
+    Statement.preparable
+        """
+        SELECT EXISTS (
+          SELECT 1 FROM relation_tuple
+          WHERE object_type = $2
+            AND object_id = $3
+            AND relation = $4
+            AND subject_type = $5
+            AND subject_id = $6
+            AND coalesce(subject_relation, '') = coalesce($7, '')
+            AND deleted_xid IS NULL
+            AND caveat_name IS NOT DISTINCT FROM $8
+            AND caveat_payload IS NOT DISTINCT FROM $9::jsonb
+        )
+        """
+        tupleInsertEncoder
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.bool)))
+
+{- | Shared by every touch statement so their parameter positions cannot drift
+apart. @$1@ is the write transaction's xid; @$2@–@$9@ are the tuple's columns.
+-}
+tupleInsertEncoder :: Encoders.Params TupleInsertParams
+tupleInsertEncoder =
+    ((\params -> params.createdXid) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.objectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.objectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.relation) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.subjectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.subjectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> params.subjectRelation) >$< Encoders.param (Encoders.nullable Encoders.text))
+        <> ((\params -> params.caveatName) >$< Encoders.param (Encoders.nullable Encoders.text))
+        <> ((\params -> params.caveatPayload) >$< Encoders.param (Encoders.nullable Encoders.jsonbLazyBytes))
 
 data TupleDeleteParams = TupleDeleteParams
     { deletedXid :: !Text
@@ -476,13 +606,11 @@ data TupleDeleteParams = TupleDeleteParams
     , subjectType :: !Text
     , subjectId :: !Text
     , subjectRelation :: !(Maybe Text)
-    , caveatName :: !(Maybe Text)
     }
 
 tupleDeleteParams :: Text -> Tuple -> TupleDeleteParams
 tupleDeleteParams deletedXid tuple =
     let (subjectObject, subjectRelation) = flattenSubject tuple.subject
-        (maybeCaveatName, _) = flattenCaveat tuple.caveat
      in TupleDeleteParams
             { deletedXid = deletedXid
             , objectType = unObjectType tuple.object.objectType
@@ -491,9 +619,15 @@ tupleDeleteParams deletedXid tuple =
             , subjectType = unObjectType subjectObject.objectType
             , subjectId = subjectObject.objectId
             , subjectRelation = unRelationName <$> subjectRelation
-            , caveatName = unCaveatName <$> maybeCaveatName
             }
 
+{- | Retire the live grant for an identity, whatever caveat it carries.
+
+The request's caveat is ignored. With one live row per identity, matching on
+@caveat_name@ would mean a caller who supplies yesterday's caveat name deletes
+nothing and is told it succeeded — the same silent no-op that touch semantics
+removes from the write path.
+-}
 deleteTupleStatement :: Statement TupleDeleteParams ()
 deleteTupleStatement =
     Statement.preparable
@@ -506,7 +640,6 @@ deleteTupleStatement =
           AND subject_type = $5
           AND subject_id = $6
           AND coalesce(subject_relation, '') = coalesce($7, '')
-          AND coalesce(caveat_name, '') = coalesce($8, '')
           AND deleted_xid IS NULL
         """
         ( ((\params -> params.deletedXid) >$< Encoders.param (Encoders.nonNullable Encoders.text))
@@ -516,7 +649,6 @@ deleteTupleStatement =
             <> ((\params -> params.subjectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
             <> ((\params -> params.subjectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
             <> ((\params -> params.subjectRelation) >$< Encoders.param (Encoders.nullable Encoders.text))
-            <> ((\params -> params.caveatName) >$< Encoders.param (Encoders.nullable Encoders.text))
         )
         Decoders.noResult
 
