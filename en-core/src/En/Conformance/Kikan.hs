@@ -184,12 +184,20 @@ runTupleStoreInMemory tuples =
         ReapDeletedTuples _ ->
             pure 0
 
+{- | Page a filtered tuple list by a row-ordinal cursor.
+
+The cursor is the ordinal of the last row emitted, so a continuation resumes at
+@drop start tuples@. Dropping from the /zipped/ list instead -- which this did
+until 2026-07-09 -- makes the next cursor @2 * start@ rather than
+@start + limit@, so a relation wider than two pages silently skips rows and
+reports 'Exhausted' as if it had read them all.
+-}
 pageTuples :: Int -> Maybe StoreCursor -> [Tuple] -> TuplePage
 pageTuples limit cursor tuples =
     let start =
             maybe 0 decodeTestCursor cursor
         indexed =
-            drop start (zip [start + 1 ..] tuples)
+            zip [start + 1 ..] (drop start tuples)
         (visible, extra) =
             splitAt limit indexed
         rows =

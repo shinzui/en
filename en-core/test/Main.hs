@@ -17,7 +17,7 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Time (UTCTime)
 import Data.Time.Format.ISO8601 (iso8601ParseM)
-import Effectful (Eff, IOE, liftIO, runEff)
+import Effectful (Eff, IOE, liftIO, runEff, runPureEff, (:>))
 import Effectful.Dispatch.Dynamic (interpret_)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 
@@ -257,6 +257,7 @@ main = do
         _ = sampleCaveatDefinition
     testCacheOperations
     testCachedTupleStore
+    testStorePaging
     testResidualDecision
     validKikan <- either (fail . show) pure (validateSchema kikanSchema)
     validKikanManual <- either (fail . show) pure (validateSchema kikanSchemaManual)
@@ -927,6 +928,58 @@ sampleDecisionKeyWith keySchemaHash keyRevision keyContext =
         , object = space
         , context = keyContext
         }
+
+{- | The in-memory conformance store pages a relation of any width without
+skipping rows.
+
+Its store cursor is a row ordinal, and until 2026-07-09 a continuation resumed by
+dropping @start@ elements from an /already-zipped/ list. That made each page's
+outgoing cursor @2 * start@ instead of @start + limit@, so from the third page on
+the store skipped rows and then reported 'Exhausted' as though it had read them
+all. Every engine drains through this path, so a check could deny a subject whose
+granting tuple sat in a skipped window.
+
+Nothing caught it because the widest fixture in the suite spanned two pages, and
+two pages is exactly where the bug begins. This test drives the store directly at
+a page limit small enough to need four pages, and asserts the /rows/, not the
+page count: a store that returns four pages and loses the middle two still
+returns four pages.
+-}
+testStorePaging :: IO ()
+testStorePaging = do
+    let pagedRows =
+            [ Tuple pagedFolder (RelationName "viewer") (SubjectId (pagedUser index)) Nothing
+            | index <- [1 .. pagedRowCount]
+            ]
+        drained =
+            runPureEff (runTupleStoreInMemory pagedRows (drainPaged Nothing []))
+    assertEqual
+        "the in-memory store drains every row of a relation spanning four pages"
+        [SubjectId (pagedUser index) | index <- [1 .. pagedRowCount]]
+        (fmap ((.subject) . (.tuple)) drained)
+
+pagedRowCount :: Int
+pagedRowCount = 7
+
+pagedPageLimit :: Int
+pagedPageLimit = 2
+
+pagedFolder :: ObjectRef
+pagedFolder =
+    ObjectRef (ObjectType "folder") "paged"
+
+pagedUser :: Int -> ObjectRef
+pagedUser index =
+    ObjectRef (ObjectType "user") ("paged-" <> Text.pack (show index))
+
+drainPaged :: (TupleStore :> es) => Maybe StoreCursor -> [TupleRow] -> Eff es [TupleRow]
+drainPaged cursor acc = do
+    page <- readObjectRelation testRevision pagedFolder (RelationName "viewer") pagedPageLimit cursor
+    let acc' = acc <> page.rows
+    case page.state of
+        Exhausted -> pure acc'
+        HasMore next -> drainPaged (Just next) acc'
+        Truncated next -> drainPaged (Just next) acc'
 
 testCachedTupleStore :: IO ()
 testCachedTupleStore = do
