@@ -219,12 +219,24 @@ firstPreconditionFailure = \case
 
 {- | Whether a precondition holds inside the write transaction.
 
-A must-exist check locks the row it found with @FOR SHARE@. Without the lock the
+A must-exist check locks the row it found with @FOR UPDATE@. Without a lock the
 check could pass while a concurrent transaction soft-deletes the row and commits
-— gap E1 exactly. With it, the racing revoke (an @UPDATE@ of @deleted_xid@)
-blocks until we commit; and if the revoke committed first, our @SELECT@
-re-evaluates under @READ COMMITTED@, finds @deleted_xid@ set, matches nothing,
-and the precondition fails.
+— gap E1 exactly. With one, a second transaction guarding on the same row blocks
+at this @SELECT@ until the first commits, then re-evaluates the row under
+@READ COMMITTED@ (EvalPlanQual), finds @deleted_xid@ now set, matches nothing,
+and fails its precondition.
+
+The lock is exclusive rather than shared even though this statement only reads.
+@FOR SHARE@ would let both racing transactions pass the check — share locks are
+compatible — and then deadlock them against each other when each tried to upgrade
+to the exclusive lock its @UPDATE@ needs. PostgreSQL would abort one with
+@deadlock_detected@, which is an outage-shaped 'En.Error.StoreError' rather than
+the arbitration loss that actually occurred.
+
+A filter matching several rows locks only the first (@LIMIT 1@). If that row is
+concurrently retired, the check reports failure even though another matching row
+survives. That is a spurious refusal, never a spurious success: this is a safety
+guard, and it fails closed.
 
 A must-not-exist check cannot lock what is not there. It relies on
 @relation_tuple_live_unique@ to turn a racing insert of the same identity into a
@@ -696,46 +708,36 @@ tupleFilterEncoder =
         <> ((\params -> params.subjectRelationMode) >$< Encoders.param (Encoders.nonNullable Encoders.text))
         <> ((\params -> params.subjectRelationName) >$< Encoders.param (Encoders.nullable Encoders.text))
 
-{- | The predicate shared by both precondition statements: a live row the filter
-matches. A @NULL@ parameter leaves its column unconstrained.
--}
-tupleFilterPredicate :: Text
-tupleFilterPredicate =
-    """
-    object_type = $1
-    AND ($2::text IS NULL OR object_id = $2)
-    AND ($3::text IS NULL OR relation = $3)
-    AND ($4::text IS NULL OR subject_type = $4)
-    AND ($5::text IS NULL OR subject_id = $5)
-    AND ( $6 = 'any'
-          OR ($6 = 'none' AND subject_relation IS NULL)
-          OR ($6 = 'exact' AND subject_relation = $7) )
-    AND deleted_xid IS NULL
-    """
+{- | Find one live row the filter matches and hold an exclusive lock on it until
+the write transaction ends.
 
-{- | Find one live row the filter matches and hold a share lock on it until the
-write transaction ends.
+The lock is the whole point: it serializes the transactions that guard on this
+row, so exactly one of two racing writers wins. See 'preconditionHolds' for why
+it must be @FOR UPDATE@ and not @FOR SHARE@.
 
-The lock is the whole point. A racing revoke is an @UPDATE … SET deleted_xid@ on
-this row, so it must wait for our share lock to be released by our COMMIT; if
-instead the revoke committed first, this @SELECT@ re-evaluates under
-@READ COMMITTED@, sees @deleted_xid@ set, and returns nothing. Either way the two
-writers serialize and exactly one wins.
+The filter predicate is spelled out here and again in
+'matchingLiveTupleExistsStatement' rather than shared as a spliced fragment. The
+two must agree, and a reader checking that they do would rather read two whole
+statements than reassemble them.
 -}
 lockMatchingLiveTupleStatement :: Statement TupleFilterParams (Maybe Int64)
 lockMatchingLiveTupleStatement =
     Statement.preparable
-        ( """
-          SELECT id
-          FROM relation_tuple
-          WHERE
-          """
-            <> tupleFilterPredicate
-            <> """
-               LIMIT 1
-               FOR SHARE
-               """
-        )
+        """
+        SELECT id
+        FROM relation_tuple
+        WHERE object_type = $1
+          AND ($2::text IS NULL OR object_id = $2)
+          AND ($3::text IS NULL OR relation = $3)
+          AND ($4::text IS NULL OR subject_type = $4)
+          AND ($5::text IS NULL OR subject_id = $5)
+          AND ( $6 = 'any'
+                OR ($6 = 'none' AND subject_relation IS NULL)
+                OR ($6 = 'exact' AND subject_relation = $7) )
+          AND deleted_xid IS NULL
+        LIMIT 1
+        FOR UPDATE
+        """
         tupleFilterEncoder
         (Decoders.rowMaybe (Decoders.column (Decoders.nonNullable Decoders.int8)))
 
@@ -749,17 +751,21 @@ a silent duplicate.
 matchingLiveTupleExistsStatement :: Statement TupleFilterParams Bool
 matchingLiveTupleExistsStatement =
     Statement.preparable
-        ( """
-          SELECT EXISTS (
-            SELECT 1
-            FROM relation_tuple
-            WHERE
-          """
-            <> tupleFilterPredicate
-            <> """
-               )
-               """
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM relation_tuple
+          WHERE object_type = $1
+            AND ($2::text IS NULL OR object_id = $2)
+            AND ($3::text IS NULL OR relation = $3)
+            AND ($4::text IS NULL OR subject_type = $4)
+            AND ($5::text IS NULL OR subject_id = $5)
+            AND ( $6 = 'any'
+                  OR ($6 = 'none' AND subject_relation IS NULL)
+                  OR ($6 = 'exact' AND subject_relation = $7) )
+            AND deleted_xid IS NULL
         )
+        """
         tupleFilterEncoder
         (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.bool)))
 

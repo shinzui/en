@@ -70,6 +70,11 @@ test-suite en-postgres-integration-tests
   type:           exitcode-stdio-1.0
   hs-source-dirs: integration-test
   main-is:        Main.hs
+
+  -- The write-race scenario runs two guarded revokes on two connections at once.
+  -- Without -threaded, the first thread's blocking libpq call parks the whole
+  -- runtime and the second never reaches the lock it is supposed to contend for.
+  ghc-options:    -threaded
   build-depends:
     , base
     , containers

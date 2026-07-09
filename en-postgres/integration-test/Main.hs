@@ -4,6 +4,9 @@
 
 module Main (main) where
 
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
+import Data.Either (isRight)
 import Data.Foldable (traverse_)
 import Data.Functor.Contravariant ((>$<))
 import Data.Int (Int64)
@@ -20,7 +23,16 @@ import Numeric (readDec)
 import En.Check (CheckDecision (..), check)
 import En.Effect.ConsistencyStore (ConsistencyStore, TokenMetadata (..))
 import En.Effect.ConsistencyStore qualified as ConsistencyStore
-import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, UsersetQuery (..))
+import En.Effect.TupleStore (
+    PageState (..),
+    Precondition (..),
+    TuplePage (..),
+    TupleRow (..),
+    TupleStore,
+    TupleWriteRequest (..),
+    UsersetQuery (..),
+    exactTupleFilter,
+ )
 import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError (..))
 import En.Lookup (LookupCursor (..), LookupLimit (..), LookupObject (..), LookupPage (..), LookupRequest (..), LookupState (..))
@@ -49,6 +61,8 @@ main = do
         runTupleStoreScenario connection
         runProbeScenario connection
         runTouchSemanticsScenario connection
+        runPreconditionScenario connection
+        runWriteRaceScenario database connection
         runMaintenanceBatchScenario connection
         resetSchema connection
         runMigrationDedupeScenario connection
@@ -445,6 +459,221 @@ runTouchSemanticsScenario connection = do
     TokenMetadata{revision = deleteRevision} <- either (fail . show) pure (tokenMetadataFromPayload deleteToken)
     rowsAtDelete <- readAt deleteRevision deleteSpace
     assertEqual "delete ignores the request's caveat and retires the grant" 0 (length rowsAtDelete)
+
+{- | Preconditions, sequentially: what a guarded write means on its own.
+
+Four properties. A guarded revoke succeeds once and then refuses to succeed
+again, which is the sequential shadow of gap E1 — before preconditions the second
+revoke returned a token having done nothing. A failed precondition writes
+nothing. Writes and deletes mix in one atomic request under one token. And the
+explicit @ROLLBACK@ leaves the connection usable, which every later assertion in
+this function silently depends on.
+-}
+runPreconditionScenario :: Connection.Connection -> IO ()
+runPreconditionScenario connection = do
+    config <- testConfig
+    let alice = SubjectId (ObjectRef (ObjectType "user") "precondition-alice")
+        viewer = RelationName "viewer"
+        spaceRef name = ObjectRef (ObjectType "space") name
+        grant object caveat = Tuple{object, relation = viewer, subject = alice, caveat}
+        readAt revision object =
+            (.rows) <$> runPgOrFail connection config (TupleStore.readObjectRelation revision object viewer 10 Nothing)
+        headRows object = do
+            revision <- runPgOrFail connection config TupleStore.headRevision
+            readAt revision object
+
+    -- 1. A guarded revoke succeeds once, then refuses.
+    let revokeSpace = spaceRef "precondition-revoke"
+        revokeTuple = grant revokeSpace Nothing
+        guardedRevoke =
+            TupleStore.applyTupleWrites
+                TupleWriteRequest
+                    { preconditions = [TupleMustExist (exactTupleFilter revokeTuple)]
+                    , writes = []
+                    , deletes = [revokeTuple]
+                    }
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [revokeTuple])
+    firstRevoke <- runPg connection config guardedRevoke
+    assertBool
+        ("the first guarded revoke succeeds; got " <> show firstRevoke)
+        (either (const False) (const True) firstRevoke)
+    secondRevoke <- runPg connection config guardedRevoke
+    assertBool
+        ("the second guarded revoke fails its precondition; got " <> show secondRevoke)
+        (isPreconditionFailure secondRevoke)
+    assertEqual "the revoked grant stays revoked" 0 . length =<< headRows revokeSpace
+
+    -- 2. A failed precondition writes nothing -- and leaves the connection healthy.
+    let unwrittenSpace = spaceRef "precondition-unwritten"
+        unwrittenTuple = grant unwrittenSpace Nothing
+        absentTuple = grant (spaceRef "precondition-absent") Nothing
+    refused <-
+        runPg
+            connection
+            config
+            ( TupleStore.applyTupleWrites
+                TupleWriteRequest
+                    { preconditions = [TupleMustExist (exactTupleFilter absentTuple)]
+                    , writes = [unwrittenTuple]
+                    , deletes = []
+                    }
+            )
+    assertBool
+        ("a write guarded on an absent tuple is refused; got " <> show refused)
+        (isPreconditionFailure refused)
+    assertEqual "a refused write leaves no row behind" 0 . length =<< headRows unwrittenSpace
+
+    -- 3. Writes and deletes mix in one request under one token.
+    let mixedOld = spaceRef "precondition-mixed-old"
+        mixedNew = spaceRef "precondition-mixed-new"
+        oldTuple = grant mixedOld Nothing
+        newTuple = grant mixedNew Nothing
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [oldTuple])
+    mixedToken <-
+        runPgOrFail
+            connection
+            config
+            ( TupleStore.applyTupleWrites
+                TupleWriteRequest{preconditions = [], writes = [newTuple], deletes = [oldTuple]}
+            )
+    TokenMetadata{revision = mixedRevision} <- either (fail . show) pure (tokenMetadataFromPayload mixedToken)
+    assertEqual "the mixed request's token sees the new grant" 1 . length =<< readAt mixedRevision mixedNew
+    assertEqual "the mixed request's token does not see the old grant" 0 . length =<< readAt mixedRevision mixedOld
+
+    -- 4. A must-not-exist precondition guards against clobbering an existing grant.
+    let guardSpace = spaceRef "precondition-guard"
+        guardTuple = grant guardSpace Nothing
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [guardTuple])
+    clobber <-
+        runPg
+            connection
+            config
+            ( TupleStore.applyTupleWrites
+                TupleWriteRequest
+                    { preconditions = [TupleMustNotExist (exactTupleFilter guardTuple)]
+                    , writes = [guardTuple]
+                    , deletes = []
+                    }
+            )
+    assertBool
+        ("a write guarded on the grant's absence is refused when it exists; got " <> show clobber)
+        (isPreconditionFailure clobber)
+
+{- | Preconditions, concurrently: gap E1 itself.
+
+Two administrators, each on its own connection, issue the same must-exist-guarded
+revoke. Exactly one must win.
+
+Forking two threads does not by itself make them race: the first finishes its
+whole transaction before the second reaches the row, and the test passes without
+ever contending for a lock -- it passes just as happily against a @FOR SHARE@
+implementation, which is broken. So a third connection takes the row's lock
+first, both racers are observed to /block/ on it, and only then is the lock
+released. From that moment the two are genuinely contending.
+
+With @FOR UPDATE@, one racer takes the lock, retires the grant and commits, while
+the other waits at its own @SELECT@, re-evaluates the row under @READ COMMITTED@,
+finds @deleted_xid@ set, and fails its precondition. With @FOR SHARE@ both would
+acquire compatible share locks, both would pass the check, and both would then
+deadlock upgrading to the exclusive lock their @UPDATE@ needs -- so one comes
+back with a @deadlock_detected@ 'StoreError' and the precondition assertion
+below fails. That is the difference this scenario exists to detect.
+-}
+runWriteRaceScenario :: Pg.Database -> Connection.Connection -> IO ()
+runWriteRaceScenario database connection = do
+    config <- testConfig
+    leftConnection <- acquire database
+    rightConnection <- acquire database
+    blocker <- acquire database
+    let racedSpace = ObjectRef (ObjectType "space") "race-revoke"
+        racedTuple =
+            Tuple
+                { object = racedSpace
+                , relation = RelationName "viewer"
+                , subject = SubjectId (ObjectRef (ObjectType "user") "race-alice")
+                , caveat = Nothing
+                }
+        guardedRevoke =
+            TupleStore.applyTupleWrites
+                TupleWriteRequest
+                    { preconditions = [TupleMustExist (exactTupleFilter racedTuple)]
+                    , writes = []
+                    , deletes = [racedTuple]
+                    }
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [racedTuple])
+
+    -- Hold the raced row's lock so neither racer can get past its precondition.
+    runSessionOrFail blocker (Session.script "BEGIN")
+    lockedRow <- runSessionOrFail blocker (Session.statement () lockRacedRowStatement)
+    assertEqual "the blocker locks the raced grant" 1 (length lockedRow)
+
+    leftResult <- newEmptyMVar
+    rightResult <- newEmptyMVar
+    _ <- forkIO (putMVar leftResult =<< runPg leftConnection config guardedRevoke)
+    _ <- forkIO (putMVar rightResult =<< runPg rightConnection config guardedRevoke)
+
+    -- Long enough that a racer which was going to finish would have finished.
+    threadDelay 500_000
+    pendingLeft <- tryReadMVar leftResult
+    pendingRight <- tryReadMVar rightResult
+    assertEqual
+        ("both racers block while the raced row is locked; got " <> show (pendingLeft, pendingRight))
+        (Nothing, Nothing)
+        (pendingLeft, pendingRight)
+
+    -- Release the lock without changing the row: now the two contend with each other.
+    runSessionOrFail blocker (Session.script "ROLLBACK")
+    outcomes <- traverse takeMVar [leftResult, rightResult]
+
+    assertEqual
+        ("exactly one racing revoke receives a token; got " <> show outcomes)
+        1
+        (length (filter isRight outcomes))
+    assertEqual
+        ("exactly one racing revoke fails its precondition; got " <> show outcomes)
+        1
+        (length (filter isPreconditionFailure outcomes))
+
+    headRevision <- runPgOrFail connection config TupleStore.headRevision
+    TuplePage{rows = survivingRows} <-
+        runPgOrFail connection config (TupleStore.readObjectRelation headRevision racedSpace (RelationName "viewer") 10 Nothing)
+    assertEqual "the raced grant is revoked exactly once" 0 (length survivingRows)
+
+    traverse_ Connection.release [leftConnection, rightConnection, blocker]
+
+{- | Take the raced grant's row lock, as 'lockMatchingLiveTupleStatement' would.
+
+Literal parameters rather than the real statement: this stands in for a third
+writer, and the test wants it to be obvious which row is locked.
+-}
+lockRacedRowStatement :: Statement () [Int64]
+lockRacedRowStatement =
+    Statement.preparable
+        """
+        SELECT id FROM relation_tuple
+        WHERE object_type = 'space' AND object_id = 'race-revoke' AND relation = 'viewer'
+          AND subject_type = 'user' AND subject_id = 'race-alice'
+          AND deleted_xid IS NULL
+        FOR UPDATE
+        """
+        Encoders.noParams
+        (Decoders.rowList (Decoders.column (Decoders.nonNullable Decoders.int8)))
+
+isPreconditionFailure :: Either EnError a -> Bool
+isPreconditionFailure = \case
+    Left (WritePreconditionFailed _) -> True
+    _ -> False
+
+-- | The 'ConsistencyConfig' every scenario shares.
+testConfig :: IO ConsistencyConfig
+testConfig = do
+    validCheckSchema <- either (fail . show) pure (Schema.validateSchema checkSchema)
+    pure
+        ConsistencyConfig
+            { datastoreId = DatastoreId "test-datastore"
+            , schemaHash = Schema.schemaHash validCheckSchema
+            , gcWindow = "24 hours"
+            }
 
 {- | The migration's duplicate-resolution rule, against the schema it will meet.
 
