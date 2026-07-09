@@ -198,8 +198,12 @@ HTTP/1.1 401 Unauthorized
 Content-Type: application/json
 WWW-Authenticate: Bearer
 
-{"code":"unauthenticated","error":"missing or invalid API key"}
+{"code":"unauthenticated","message":"missing or invalid API key","retryable":false}
 ```
+
+These use the same `{code, message, retryable}` envelope as every other error. Of the
+three, only `rate_limited` is retryable — the caller's token bucket refills, whereas a
+missing or read-only key does not fix itself.
 
 Rate limiting is a per-caller token bucket, keyed by the key *name*, so one
 noisy caller cannot exhaust another's budget. It is a per-process limiter:
@@ -339,7 +343,7 @@ change. `retryable` is the whole retry policy: it is `true` only for `store_erro
 | `403` | `permission_denied` | A read-only key attempted a write |
 | `404` | `not_found` | No such endpoint |
 | `422` | `resolution_limit_exceeded` | The traversal exceeded its depth or breadth bound |
-| `429` | `rate_limited` | The caller exhausted its token bucket |
+| `429` | `rate_limited` | The caller exhausted its token bucket. **Retryable** |
 | `503` | `store_error` | The tuple store failed. **Retryable** |
 
 A `503 store_error` never carries the underlying SQL or bound parameters; those go to

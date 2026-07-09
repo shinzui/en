@@ -72,7 +72,7 @@ merely because they touch the same lines, not because of real artifact dependenc
 |---|-------|------|-----------|-----------|--------|
 | EP-33 | Add caller authentication and rate limiting to en-server | docs/plans/33-add-caller-authentication-and-rate-limiting-to-en-server.md | None | None | Complete |
 | EP-34 | Pool database connections in en-server | docs/plans/34-pool-database-connections-in-en-server.md | None | None | Complete |
-| EP-35 | Version the wire contract and type the error model | docs/plans/35-version-the-wire-contract-and-type-the-error-model.md | None | None | In Progress |
+| EP-35 | Version the wire contract and type the error model | docs/plans/35-version-the-wire-contract-and-type-the-error-model.md | None | None | Complete |
 | EP-36 | Add health endpoints, graceful shutdown, and observability | docs/plans/36-add-health-endpoints-graceful-shutdown-and-observability.md | None | EP-34, EP-35 | Not Started |
 | EP-37 | Schedule background maintenance for reaping and transaction pruning | docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md | None | EP-34 | Not Started |
 | EP-38 | Validate configuration and persist datastore identity | docs/plans/38-validate-configuration-and-persist-datastore-identity.md | None | None | Not Started |
@@ -150,8 +150,8 @@ recovery by the same horizon.
 - [x] EP-33: write endpoints separately authorizable; rate limiting active
 - [x] EP-34: en-server serves concurrent requests through hasql-pool and survives a PostgreSQL restart
 - [x] EP-35: versioned path prefix and stable field names on all endpoints; constructor tags gone
-- [ ] EP-35: typed error envelope with machine-readable codes; 4xx/5xx split correct; OpenAPI document served
-- [ ] EP-35: handler errors are MultiVerb response alternatives, documented per operation in OpenAPI
+- [x] EP-35: typed error envelope with machine-readable codes; 4xx/5xx split correct; OpenAPI document served
+- [x] EP-35: handler errors are MultiVerb response alternatives, documented per operation in OpenAPI
 - [ ] EP-36: /healthz and /readyz respond correctly; SIGTERM drains in-flight requests
 - [ ] EP-36: structured request logs and a metrics endpoint (including cache stats) exposed
 - [ ] EP-37: reaper and en_transaction pruning run on a schedule with batched deletes
@@ -260,6 +260,54 @@ From EP-34 (2026-07-08), affecting sibling plans:
   `Connection pool: size=…` line. The same run under a pty prints all of them. EP-36's
   `hSetBuffering stdout LineBuffering` remains necessary and now hides operational
   configuration, not just the auth warning.
+
+
+From EP-35 (2026-07-08), affecting sibling plans:
+
+- **The error envelope is `{"code", "message", "retryable"}`, and every response in the
+  service now uses it** — engine faults, validation failures, Servant's body-parse and
+  404 errors, and EP-33's `unauthenticated`/`permission_denied`/`rate_limited` middleware
+  bodies, which EP-35 reconciled from their interim `{"error", "code"}` shape.
+  `en-server/app/Middleware.hs` writes the envelope by hand (a WAI middleware has no
+  `ServerError` to attach), so **any plan changing the envelope must change both it and
+  `En.Servant.Seam.ErrorEnvelopeWire`.** `retryable` is the whole retry contract: it is
+  `true` only for `store_error` and `rate_limited`.
+
+- **EP-35 completed the write-route predicate hand-off.** `isWriteRequest` in
+  `en-server/app/Middleware.hs` now prefix-matches `"v1" : "relationships" : _` with
+  `POST`, covering both write routes and any future sub-route under that prefix. EP-33's
+  warning is discharged.
+
+- **Handler errors are `MultiVerb` response alternatives, so `en-client` returns
+  `ClientM (EnResult X)`.** Any plan calling the Haskell client pattern-matches `EnOk` /
+  `EnClientError` / `EnUnprocessable` / `EnUnavailable`; a `ClientError` now means only a
+  transport failure or a pre-handler rejection (bad key, unmatched route, malformed body).
+  **New endpoints — notably those in `docs/masterplans/9-complete-the-en-api-surface.md`
+  — should be `MultiVerb` endpoints over `En.Servant.API.EnResponses`**, or their error
+  responses will be absent from `/v1/openapi.json` and untyped in the client.
+
+- **`en-server` now serves `En.Servant.OpenApi.appWithOpenApi`, not `En.Servant.API.app`.**
+  `appWithOpenApi` serves `ServedAPI` (the six operations plus `GET /v1/openapi.json`) and
+  installs the `ErrorFormatters` that make body-parse and 404 errors speak the envelope.
+  **EP-36 and EP-37 must wrap that application**, not `app`, or the server loses its
+  description route and its JSON 404s. `app` remains for embedded hosts.
+
+- **`405` and `415` still return empty bodies, and `ErrorFormatters` cannot reach them.**
+  Servant raises both outside the formatter hooks. EP-35 declined to add an outermost WAI
+  middleware rewriting bodyless 4xx into the envelope, because **EP-36 owns the middleware
+  stack** in `en-server/app/Main.hs`. If EP-36 wants uniformity, that rewrite is where it
+  belongs; it is otherwise a low-value fix, since both statuses mean the caller used the
+  wrong verb or content type.
+
+- **EP-35 discharged EP-34's retryability warning.** EP-34 recorded that a PostgreSQL
+  restart's first failure per stale connection is a *statement*-level error whose text
+  reads like a row-decoding bug, and warned that retryability must be classified by
+  constructor rather than message. `enErrorToFault` classifies on the `EnError`
+  constructor, so both failures reach the client as `503 store_error` with
+  `"retryable": true`. Verified by stopping PostgreSQL under load.
+
+- **`/v1/openapi.json` requires a bearer key**; only `/healthz` and `/readyz` are exempt.
+  A scraper must authenticate. EP-36 should not add the document route to the exempt set.
 
 
 ## Decision Log

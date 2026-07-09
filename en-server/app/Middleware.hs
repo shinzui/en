@@ -243,14 +243,14 @@ unauthenticated =
         [ (hContentType, "application/json")
         , ("WWW-Authenticate", "Bearer")
         ]
-        (errorBody "missing or invalid API key" "unauthenticated")
+        (errorBody "unauthenticated" "missing or invalid API key" False)
 
 readOnlyKey :: Response
 readOnlyKey =
     responseLBS
         status403
         [(hContentType, "application/json")]
-        (errorBody "this API key is read-only" "permission_denied")
+        (errorBody "permission_denied" "this API key is read-only" False)
 
 -- * Rate limiting
 
@@ -350,12 +350,18 @@ rateLimited =
         [ (hContentType, "application/json")
         , ("Retry-After", "1")
         ]
-        (errorBody "rate limit exceeded" "rate_limited")
+        (errorBody "rate_limited" "rate limit exceeded" True)
 
-{- | The minimal error envelope. EP-35
-(@docs/plans/35-version-the-wire-contract-and-type-the-error-model.md@)
-replaces this with the typed @{code, message, retryable}@ envelope.
+{- | The same @{code, message, retryable}@ envelope that @en-servant@ emits.
+
+Written out here rather than reused from 'En.Servant.Seam.ErrorEnvelopeWire' because
+these responses are produced by WAI middleware, outside Servant: there is no
+'Servant.ServerError' to attach, and no handler to return from. The field order and
+names must match, so a change to the envelope changes both.
+
+A rate limit is the one middleware rejection worth retrying: the caller's bucket
+refills. A missing key and a read-only key do not fix themselves.
 -}
-errorBody :: Text -> Text -> Lazy.ByteString
-errorBody message code =
-    encode (object ["error" .= message, "code" .= code])
+errorBody :: Text -> Text -> Bool -> Lazy.ByteString
+errorBody code message retryable =
+    encode (object ["code" .= code, "message" .= message, "retryable" .= retryable])

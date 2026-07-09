@@ -153,7 +153,15 @@ loads a schema, connects to PostgreSQL, builds `runAppIO :: Eff AppEffects a -> 
 (Either EnError a)` (the natural transformation that runs the effect stack — the
 `AppEffects` list in `en-servant/src/En/Servant/Seam.hs` includes the `Database` effect
 from `en-postgres/src/En/Postgres/Database.hs`), assembles the Servant `Env`, prints a
-few startup lines with `Text.putStrLn`, and ends in `Warp.run port (app serverEnv)`.
+few startup lines with `Text.putStrLn`, and ends in a `serve` call.
+
+Since EP-34 and EP-35 landed, that tail is
+`serve tlsConfig port wrappedApp \`finally\` Pool.release pool`, where
+`wrappedApp = authMiddleware authConfig (rateLimit (appWithOpenApi serverEnv))`. Note
+`appWithOpenApi` (from `en-servant/src/En/Servant/OpenApi.hs`), **not** the bare `app`
+from `En.Servant.API`: it serves the six operations plus `GET /v1/openapi.json`, and it
+installs the `ErrorFormatters` that make body-parse and 404 errors emit the
+`{code, message, retryable}` envelope. Wrapping `app` instead would silently drop both.
 
 Definitions for this plan. A **WAI middleware** is a function
 `Application -> Application` wrapping the whole HTTP app; the outermost middleware sees
@@ -241,9 +249,10 @@ let checkReady :: IO Bool
         pure (case result of Right (Right ()) -> True; _ -> False)
 ```
 
-and wrap the app: `healthRoutes checkReady (app serverEnv)` (placed *inside* the EP-33
-middlewares if present — auth already exempts these two paths — and *outside* the
-Servant app). Update the `Justfile` `start-and-test` wait loop to
+and wrap the app: `healthRoutes checkReady (appWithOpenApi serverEnv)` (placed *inside*
+the EP-33 middlewares if present — auth already exempts these two paths — and *outside*
+the Servant app). Use `appWithOpenApi`, not `app`; see Context and Orientation. Update
+the `Justfile` `start-and-test` wait loop to
 `curl -fsS "$url/healthz"` (the `-f` makes a 404 fail, so the loop now proves real
 readiness of this feature too).
 

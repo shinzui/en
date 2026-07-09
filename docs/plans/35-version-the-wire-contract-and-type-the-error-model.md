@@ -103,9 +103,13 @@ This section must always reflect the actual current state of the work.
   each of the six operations documents `200`, `400`, `422`, `503`. Pins recorded in the
   Decision Log. A test decodes `enOpenApi` and asserts the path set and per-operation
   response statuses.
-- [ ] Final: full curl transcript reproduced; `cabal test en-servant` and
-  `just start-and-test` green; breaking change called out in
-  `docs/user/service-and-operations.md`.
+- [x] Final (2026-07-08): reconciled EP-33's interim `{"error", "code"}` middleware
+  bodies onto the full envelope. `errorBody` in `en-server/app/Middleware.hs` now emits
+  `{code, message, retryable}`; `rate_limited` is `retryable: true` (the bucket refills),
+  `unauthenticated` and `permission_denied` are not.
+- [x] Final (2026-07-08): full curl transcript reproduced; `cabal build all`,
+  `cabal test en-servant`, and `just start-and-test` green; breaking change called out in
+  `docs/user/service-and-operations.md` under "API versioning".
 
 
 ## Surprises & Discoveries
@@ -217,6 +221,14 @@ implementation. Provide concise evidence.
   lives in `ServedAPI`, outside `EnAPI`, so it is served but not documented. This is the
   intended consequence of keeping `en-client` free of it, and the plan's acceptance
   criterion ("the `paths` set equals the served operations") reads on the six.
+
+- **`rate_limited` is the one retryable middleware rejection.** Reconciling EP-33's
+  bodies forced the question its interim `{"error", "code"}` shape never had to answer.
+  A token bucket refills, so a 429 is worth retrying; a missing key and a read-only key
+  do not fix themselves. `en-server/app/Middleware.hs` writes the envelope out by hand
+  rather than importing `ErrorEnvelopeWire`, because these responses are built by WAI
+  middleware with no `ServerError` to attach and no handler to return from — the comment
+  there notes that the two definitions must move together.
 
 - **`.:?` already handles explicit `null`.** `TupleWire.caveat` encodes as
   `"caveat":null` and decodes from either an explicit `null` or an absent key, because
@@ -389,7 +401,54 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+**Complete, 2026-07-08.** Every acceptance criterion in Validation and Acceptance was met
+and observed against a running server, not inferred.
+
+The purpose was that en's JSON wire format was an accident of Haskell internals. It no
+longer is. All twenty-five wire types have hand-written encodings pinned by exact-byte
+golden tests; a client sends `{"kind":"id",…}` and reads `{"result":"allowed"}`, and no
+constructor name reaches the wire. The six operations answer under `/v1`, deletion is a
+`POST` rather than a `DELETE` carrying a body, and the old paths return `404` — inside the
+envelope. Every error in the service, from an engine fault to a rate-limit rejection to a
+truncated request body, is exactly `{code, message, retryable}` with
+`Content-Type: application/json`; `code` is stable, `retryable` is the entire retry
+policy, and `StoreError`'s SQL never crosses the trust boundary. `GET /v1/openapi.json`
+serves an OpenAPI 3.1 document whose six paths each declare `200`, `400`, `422`, and
+`503`.
+
+**What changed from the plan, and why it was right.** Mid-implementation the plan grew a
+milestone: M3b lifted handler errors into the API type with Servant's `MultiVerb`. The
+argument that decided it is worth restating, because it inverts the usual "do it while
+we're already breaking things" reflex. `MultiVerb` changes the Haskell types and *not one
+byte of JSON* — so it was never a second break of the `/v1` contract that this plan exists
+to establish, only of `en-client`'s Haskell shape. What made it urgent was that en has no
+API consumers yet: the `en-client` break was free that day and would not have been later.
+The no-wire-change claim was the load-bearing one, so it was measured rather than argued —
+the full error transcript captured against the M3 commit and against the M3b tree diffed
+clean. The payoff arrived one milestone later: because the statuses were in the type, M4's
+OpenAPI document got its per-operation error responses for free, and the plan's original
+workaround (hand-attaching a default error response) was deleted rather than implemented.
+
+**Gaps, all recorded above with reasons.** Three are deliberate. `405` and `415` keep
+empty bodies, because Servant raises them outside `ErrorFormatters` and both mean the
+client is calling the API wrong rather than hitting a runtime condition; the plan offered
+a WAI middleware to rewrite them and it was declined, since EP-36 owns that stack.
+`InvalidConsistencyToken` messages still surface an engine-internal constructor name
+(`TokenBadPrefix`) — cosmetic, confined to `message`, which is explicitly prose that
+clients must not branch on; the next plan to touch `En.Revision`'s token parsing should
+fix it. An unknown discriminator arrives as `malformed_request_body` rather than a
+distinct code, which is correct (a bad discriminator *is* a malformed body) and
+unavoidable, since the failure happens inside `ReqBody`.
+
+**The lesson worth carrying.** Two of this plan's assumptions were wrong in the safe
+direction and one in the expensive one. Exact-byte goldens were assumed fragile and the
+plan pre-authorized a weaker fallback; writing `toEncoding` explicitly made them stable,
+and all forty assertions passed on the first run. Recursive `ExpandNodeWire` was assumed
+to need a hand-built self-reference; `openapi-hs`'s lazy `Declare` monad handles it. But
+the plan also promised `en-client` "unchanged code, recompiled" — a promise that a better
+design required breaking. Writing down what a plan will *not* change is useful precisely
+because it forces that decision into the open when the time comes, instead of letting it
+happen silently.
 
 
 ## Context and Orientation
