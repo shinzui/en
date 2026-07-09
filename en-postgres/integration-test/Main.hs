@@ -27,7 +27,7 @@ import En.Lookup (LookupCursor (..), LookupLimit (..), LookupObject (..), Lookup
 import En.Lookup qualified as Lookup
 import En.Postgres.Database (Database, runDatabaseConnection)
 import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgSnapshot, parsePgSnapshot, renderPgSnapshot, runConsistencyStorePostgres, tokenMetadataFromPayload, transactionVisible)
-import En.Postgres.TupleStore (runTupleStorePostgres)
+import En.Postgres.TupleStore (pruneTransactionsBatchSession, reapDeletedTuplesBatchSession, runTupleStorePostgres)
 import En.Reachability (ReachabilityGraph, compile)
 import En.Revision (Consistency (..), DatastoreId (..), Revision (..), RevisionOrder (..))
 import En.Schema (AllowedSubject (..), CaveatName (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..), Schema (..))
@@ -47,6 +47,7 @@ main = do
         connection <- acquire database
         resetSchema connection
         runTupleStoreScenario connection
+        runMaintenanceBatchScenario connection
         Connection.release connection
     case result of
         Left err -> fail ("ephemeral-pg failed to start: " <> Text.unpack (Pg.renderStartError err))
@@ -232,6 +233,94 @@ runTupleStoreScenario connection = do
     pgToken <- runPgOrFail connection config (TupleStore.writeTuples pgFolderTuples)
     pgObjects <- collectLookupObjects connection config graph (AtLeastAsFresh pgToken) pgLookupRequest Nothing
     assertEqual "postgres-backed lookup drains multi-page storage reads" (sort pgFolders) pgObjects
+
+{- | Bounded-work maintenance: batched reap and batched prune.
+
+Seeds a backlog larger than the batch size, drains it, and proves three properties the
+background maintenance loop depends on: no call removes more than its batch, the drained
+counts sum to the backlog, and rows at or after the horizon survive. The horizon is a
+literal (@1000@) rather than a derived one so the boundary rows can be placed exactly on
+it -- @< horizon@ must exclude a row whose xid equals the horizon.
+-}
+runMaintenanceBatchScenario :: Connection.Connection -> IO ()
+runMaintenanceBatchScenario connection = do
+    runSessionOrFail connection (Session.script maintenanceSeedSql)
+
+    reapCounts <-
+        drainBatches batchSize \batch ->
+            runSessionOrFail connection (reapDeletedTuplesBatchSession horizon batch)
+    assertEqual "no reap batch exceeds the batch size" True (all (<= fromIntegral batchSize) reapCounts)
+    assertEqual "reap batches sum to the soft-deleted backlog" 25 (sum reapCounts)
+    assertEqual "reap drains in ceil(25/10) batches" 3 (length reapCounts)
+    drainedReap <- runSessionOrFail connection (reapDeletedTuplesBatchSession horizon batchSize)
+    assertEqual "a drained reap backlog returns zero" 0 drainedReap
+    survivingTuples <- runSessionOrFail connection (Session.statement () (countStatement "SELECT count(*) FROM relation_tuple"))
+    assertEqual "reap spares the live tuple and the one deleted at the horizon" 2 survivingTuples
+
+    pruneCounts <-
+        drainBatches batchSize \batch ->
+            runSessionOrFail connection (pruneTransactionsBatchSession horizon batch)
+    assertEqual "no prune batch exceeds the batch size" True (all (<= fromIntegral batchSize) pruneCounts)
+    assertEqual "prune batches sum to the transaction backlog" 25 (sum pruneCounts)
+    drainedPrune <- runSessionOrFail connection (pruneTransactionsBatchSession horizon batchSize)
+    assertEqual "a drained prune backlog returns zero" 0 drainedPrune
+    survivingTransactions <- runSessionOrFail connection (Session.statement () (countStatement "SELECT count(*) FROM en_transaction"))
+    assertEqual "prune spares transactions at and after the horizon" 2 survivingTransactions
+  where
+    horizon = 1000
+    batchSize = 10
+
+{- | Run @step@ with the batch size until it reports a short batch, collecting each
+count. This is the loop the maintenance thread runs.
+-}
+drainBatches :: Int -> (Int -> IO Int64) -> IO [Int64]
+drainBatches batch step = go []
+  where
+    go acc = do
+        removed <- step batch
+        let acc' = acc <> [removed]
+        if removed < fromIntegral batch
+            then pure acc'
+            else go acc'
+
+runSessionOrFail :: Connection.Connection -> Session.Session a -> IO a
+runSessionOrFail connection session =
+    Connection.use connection session >>= either (fail . show) pure
+
+countStatement :: Text -> Statement () Int64
+countStatement sql =
+    Statement.preparable
+        sql
+        Encoders.noParams
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
+
+{- | 25 reapable tuples, one deleted exactly at the horizon, one live; likewise 25
+prunable transactions plus two at or after the horizon.
+-}
+maintenanceSeedSql :: Text
+maintenanceSeedSql =
+    """
+    TRUNCATE relation_tuple, en_transaction;
+
+    INSERT INTO relation_tuple
+      (object_type, object_id, relation, subject_type, subject_id, created_xid, deleted_xid)
+    SELECT 'space', 'reapable-' || g, 'viewer', 'user', 'alice', '1'::xid8, g::text::xid8
+    FROM generate_series(1, 25) g;
+
+    INSERT INTO relation_tuple
+      (object_type, object_id, relation, subject_type, subject_id, created_xid, deleted_xid)
+    VALUES ('space', 'at-horizon', 'viewer', 'user', 'alice', '1'::xid8, '1000'::xid8);
+
+    INSERT INTO relation_tuple
+      (object_type, object_id, relation, subject_type, subject_id, created_xid, deleted_xid)
+    VALUES ('space', 'live', 'viewer', 'user', 'alice', '1'::xid8, NULL);
+
+    INSERT INTO en_transaction (xid, schema_hash)
+    SELECT g::text::xid8, 'test' FROM generate_series(1, 25) g;
+
+    INSERT INTO en_transaction (xid, schema_hash)
+    VALUES ('1000'::xid8, 'test'), ('1001'::xid8, 'test');
+    """
 
 type PostgresEffects = '[ConsistencyStore, TupleStore, Error EnError, Database, IOE]
 

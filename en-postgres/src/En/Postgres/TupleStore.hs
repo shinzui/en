@@ -9,6 +9,8 @@ module En.Postgres.TupleStore (
     runTupleStorePostgresWithOptimizedRevisionCache,
     runTupleStorePostgresWithOptimizedRevisionCacheHandle,
     reapDeletedTuplesSession,
+    reapDeletedTuplesBatchSession,
+    pruneTransactionsBatchSession,
 ) where
 
 import Data.Aeson qualified as Aeson
@@ -182,9 +184,45 @@ oldestRetainedXidSession :: Text -> Session Word64
 oldestRetainedXidSession window =
     fromIntegral <$> Session.statement window oldestRetainedXidStatement
 
+{- | Physically delete every soft-deleted tuple behind @horizon@ in one statement.
+
+Retained for embedded consumers and the integration test. Background maintenance
+should prefer 'reapDeletedTuplesBatchSession': one unbounded @DELETE@ holds row locks
+for its whole duration and emits its write-ahead log in a single burst, both
+proportional to the size of the backlog.
+-}
 reapDeletedTuplesSession :: Word64 -> Session Int64
 reapDeletedTuplesSession horizon =
     Session.statement (Text.pack (show horizon)) reapDeletedTuplesStatement
+
+{- | Physically delete at most @batch@ soft-deleted tuples whose delete is behind
+@horizon@, returning how many were removed.
+
+A tuple deleted before the garbage-collection horizon cannot be seen by any
+consistency token that still validates (see @validateTokenMetadata@ in
+"En.Postgres.Revision", which rejects tokens whose snapshot @xmax@ is at or below the
+horizon), so its row can be removed.
+
+Callers loop until a call returns fewer than @batch@. Each call is its own
+transaction, so locks are released between batches and an interrupted loop leaves
+every completed batch committed.
+-}
+reapDeletedTuplesBatchSession :: Word64 -> Int -> Session Int64
+reapDeletedTuplesBatchSession horizon batch =
+    Session.statement (Text.pack (show horizon), fromIntegral batch) reapDeletedTuplesBatchStatement
+
+{- | Delete at most @batch@ @en_transaction@ rows behind @horizon@, returning how many
+were removed.
+
+Rows are selected by @xid < horizon@ rather than by re-deriving a cutoff from
+@created_at@, so the pruner, the reaper, and token validation share one horizon and
+cannot disagree. Because @horizon@ is @min(xid)@ over the rows inside the retention
+window, no row inside the window is ever selected: every such row has
+@xid >= horizon@ by construction.
+-}
+pruneTransactionsBatchSession :: Word64 -> Int -> Session Int64
+pruneTransactionsBatchSession horizon batch =
+    Session.statement (Text.pack (show horizon), fromIntegral batch) pruneTransactionsBatchStatement
 
 readStartingWithUserSession :: Revision -> UsersetQuery -> Session TuplePage
 readStartingWithUserSession revision query = do
@@ -312,6 +350,61 @@ reapDeletedTuplesStatement =
         """
         (Encoders.param (Encoders.nonNullable Encoders.text))
         (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
+
+{- | Victims are chosen by primary key in a CTE, then deleted by joining back on it.
+@LIMIT@ cannot appear directly on a @DELETE@.
+
+@relation_tuple_deleted_xid_idx@ (a partial index on @deleted_xid@ where it is not
+null) serves the victim scan.
+-}
+reapDeletedTuplesBatchStatement :: Statement (Text, Int64) Int64
+reapDeletedTuplesBatchStatement =
+    Statement.preparable
+        """
+        WITH victims AS (
+          SELECT id FROM relation_tuple
+          WHERE deleted_xid IS NOT NULL
+            AND deleted_xid < $1::xid8
+          LIMIT $2
+        ), reaped AS (
+          DELETE FROM relation_tuple t
+          USING victims v
+          WHERE t.id = v.id
+          RETURNING t.id
+        )
+        SELECT count(*) FROM reaped
+        """
+        (horizonAndBatchEncoder)
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
+
+-- | Victims are chosen by @en_transaction@'s primary key, @xid@.
+pruneTransactionsBatchStatement :: Statement (Text, Int64) Int64
+pruneTransactionsBatchStatement =
+    Statement.preparable
+        """
+        WITH victims AS (
+          SELECT xid FROM en_transaction
+          WHERE xid < $1::xid8
+          LIMIT $2
+        ), pruned AS (
+          DELETE FROM en_transaction t
+          USING victims v
+          WHERE t.xid = v.xid
+          RETURNING t.xid
+        )
+        SELECT count(*) FROM pruned
+        """
+        (horizonAndBatchEncoder)
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
+
+{- | The horizon travels as text and is cast to @xid8@ in SQL, matching
+'reapDeletedTuplesStatement': hasql has no @xid8@ encoder, and an @xid8@ does not fit
+a signed @int8@ near wraparound.
+-}
+horizonAndBatchEncoder :: Encoders.Params (Text, Int64)
+horizonAndBatchEncoder =
+    (fst >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> (snd >$< Encoders.param (Encoders.nonNullable Encoders.int8))
 
 data TupleInsertParams = TupleInsertParams
     { createdXid :: !Text
