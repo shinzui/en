@@ -8,6 +8,7 @@ module En.Reachability (
     RewriteStep (..),
     compile,
     compileSchema,
+    entryPoints,
 ) where
 
 import En.Error (EnError)
@@ -31,14 +32,16 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 
-{- | The compiled form of a 'Schema': for each subject type/relation, the
-entrypoints by which it can reach a target object/relation. Boolean reachability
-(SpiceDB-style); may later be refined with OpenFGA-style edge weights purely as a
-traversal-ordering optimization.
+{- | The compiled form of a 'Schema': everything @check@, @lookup@, and @expand@
+traverse, and nothing else.
+
+Reverse-edge metadata -- which subject shapes reach which relation, by what path
+-- is /not/ here. No engine reads it; only 'En.Schema.Render' does. Building it
+into the graph made every engine pay to construct and carry a structure none of
+them consulted, so it is computed on demand by 'entryPoints'.
 -}
 data ReachabilityGraph = ReachabilityGraph
-    { entries :: !(Map RelationRef [EntryPoint])
-    , relations :: !(Map RelationRef Relation)
+    { relations :: !(Map RelationRef Relation)
     , caveats :: !(Map CaveatName CaveatDefinition)
     , hash :: !SchemaHash
     }
@@ -93,14 +96,7 @@ and the 'ValidSchema' argument is proof that already happened.
 compile :: ValidSchema -> ReachabilityGraph
 compile valid =
     ReachabilityGraph
-        { entries =
-            Map.fromList
-                [ (target, compileRelation schema target relation)
-                | (objectType, relations) <- Map.toAscList schema.objectTypes
-                , (relationName, relation) <- Map.toAscList relations
-                , let target = RelationRef{objectType, relation = relationName}
-                ]
-        , relations =
+        { relations =
             Map.fromList
                 [ (RelationRef{objectType, relation = relationName}, relation)
                 | (objectType, objectRelations) <- Map.toAscList schema.objectTypes
@@ -117,6 +113,31 @@ compile valid =
 compileSchema :: Schema -> Either EnError ReachabilityGraph
 compileSchema schema =
     compile <$> validateSchema schema
+
+{- | For each relation, the subject shapes that reach it and the rewrite path each
+one takes.
+
+Reverse-edge metadata for people, not for the engine: 'En.Schema.Render' draws it,
+and it is the natural seed for the explain\/trace feature the architecture review
+files as E12 -- an 'EntryPoint' already carries the @path@ a decision would have
+followed. It lives outside 'ReachabilityGraph' because no evaluator consults it,
+and building it into the graph charged every check, lookup, and expand for a
+structure only a diagram reads.
+
+Pure and cheap to recompute; a caller that draws many diagrams from one schema
+should bind it once.
+-}
+entryPoints :: ValidSchema -> Map RelationRef [EntryPoint]
+entryPoints valid =
+    Map.fromList
+        [ (target, compileRelation schema target relation)
+        | (objectType, relations) <- Map.toAscList schema.objectTypes
+        , (relationName, relation) <- Map.toAscList relations
+        , let target = RelationRef{objectType, relation = relationName}
+        ]
+  where
+    schema =
+        unValidSchema valid
 
 compileRelation :: Schema -> RelationRef -> Relation -> [EntryPoint]
 compileRelation schema target relation =

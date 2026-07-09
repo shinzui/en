@@ -83,6 +83,7 @@ import En.Reachability (
     SubjectSelector (..),
     compile,
     compileSchema,
+    entryPoints,
  )
 import En.Reachability qualified as Reachability
 import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
@@ -109,7 +110,7 @@ import En.Schema (
  )
 import En.Schema.Builder qualified as Schema
 import En.Schema.Parse qualified as SchemaParse
-import En.Schema.Render (renderMarkdown, renderMermaid)
+import En.Schema.Render (renderMarkdown, renderMermaid, renderReachabilityMermaid)
 import En.Schema.TH (mkValidSchema, schema)
 import En.Tuple (
     CaveatContext (..),
@@ -220,6 +221,65 @@ expectedKikanMarkdown =
         , "- **within_autonomy** — parameters: autonomy: enum[act, admin, read], current_time: timestamp, requested_autonomy: enum[act, read], until: timestamp"
         ]
 
+{- | The reachability diagram, pinned byte for byte.
+
+Written before EP-44 relocated the entry-point machinery off
+'En.Reachability.ReachabilityGraph'. Until then 'renderReachabilityMermaid' had
+no caller anywhere in the workspace -- not even a test -- so "the renderer still
+produces identical output" was a claim with nothing to check it. This fixture is
+what makes the relocation a verified refactor rather than an unobserved one.
+-}
+expectedKikanReachabilityMermaid :: Text
+expectedKikanReachabilityMermaid =
+    Text.unlines
+        [ "flowchart LR"
+        , "  relation_intention_delegate[\"intention#delegate\"]"
+        , "  relation_intention_view[\"intention#view\"]"
+        , "  relation_org_member[\"org#member\"]"
+        , "  relation_space_act[\"space#act\"]"
+        , "  relation_space_audit[\"space#audit\"]"
+        , "  relation_space_guest_org[\"space#guest_org\"]"
+        , "  relation_space_member[\"space#member\"]"
+        , "  relation_space_member_not_owner[\"space#member_not_owner\"]"
+        , "  relation_space_owner[\"space#owner\"]"
+        , "  relation_space_parent[\"space#parent\"]"
+        , "  relation_space_view[\"space#view\"]"
+        , "  relation_space_visibility_class[\"space#visibility_class\"]"
+        , "  relation_visibility_class_viewer[\"visibility_class#viewer\"]"
+        , "  subject_org[\"org\"]"
+        , "  subject_org_member[\"org#member\"]"
+        , "  subject_space[\"space\"]"
+        , "  subject_space_view[\"space#view\"]"
+        , "  subject_user[\"user\"]"
+        , "  subject_visibility_class[\"visibility_class\"]"
+        , "  subject_visibility_class_viewer[\"visibility_class#viewer\"]"
+        , "  subject_user -->|intention#delegate| relation_intention_delegate"
+        , "  subject_user -->|intention#view| relation_intention_view"
+        , "  subject_user -->|org#member| relation_org_member"
+        , "  subject_user -->|space#act| relation_space_act"
+        , "  subject_org_member -->|space#act| relation_space_act"
+        , "  subject_user -->|space#act| relation_space_act"
+        , "  subject_user -. \"space#audit\" .-> relation_space_audit"
+        , "  subject_org_member -. \"space#audit\" .-> relation_space_audit"
+        , "  subject_user -. \"space#audit\" .-> relation_space_audit"
+        , "  subject_org -->|space#guest_org| relation_space_guest_org"
+        , "  subject_org_member -->|space#member| relation_space_member"
+        , "  subject_user -->|space#member| relation_space_member"
+        , "  subject_org_member -. \"space#member_not_owner\" .-> relation_space_member_not_owner"
+        , "  subject_user -. \"space#member_not_owner\" .-> relation_space_member_not_owner"
+        , "  subject_user -. \"space#member_not_owner\" .-> relation_space_member_not_owner"
+        , "  subject_user -->|space#owner| relation_space_owner"
+        , "  subject_space -->|space#parent| relation_space_parent"
+        , "  subject_user -->|space#view| relation_space_view"
+        , "  subject_org_member -->|space#view| relation_space_view"
+        , "  subject_user -->|space#view| relation_space_view"
+        , "  subject_org_member -->|space#view| relation_space_view"
+        , "  subject_space_view -->|space#view| relation_space_view"
+        , "  subject_visibility_class_viewer -->|space#view| relation_space_view"
+        , "  subject_visibility_class -->|space#visibility_class| relation_space_visibility_class"
+        , "  subject_user -->|visibility_class#viewer| relation_visibility_class_viewer"
+        ]
+
 expectedKikanMermaid :: Text
 expectedKikanMermaid =
     Text.unlines
@@ -274,6 +334,7 @@ main = do
     assertEqual "handle form equals string form" handleStringSchema handleReferenceSchema
     assertEqual "renderMarkdown emits stable kikan reference" expectedKikanMarkdown (renderMarkdown kikanSchema)
     assertEqual "renderMermaid emits stable kikan diagram" expectedKikanMermaid (renderMermaid kikanSchema)
+    assertEqual "renderReachabilityMermaid emits stable kikan reachability diagram" expectedKikanReachabilityMermaid (renderReachabilityMermaid validKikan)
     assertBool "validateSchema produces evidence for a valid schema" (isRight (validateSchema kikanSchema))
     assertBool "validateSchema rejects an invalid schema (no evidence)" (isLeft (validateSchema unproductiveCycleSchema))
     assertEqual "builder anyOf constructs a non-empty union" (Union [This, ComputedUserset (RelationName "owner")]) (Schema.anyOf Schema.this [Schema.computed "owner"])
@@ -283,11 +344,11 @@ main = do
     testDecisionCache graph
     assertEqual "graph stores schema hash" (schemaHash validKikan) graph.hash
     assertEqual "schema hash is stable across map insertion order" (schemaHash validKikan) (schemaHash validKikanReordered)
-    assertBool "space view has a direct user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Direct False graph)
-    assertBool "space view has a guest-org userset entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "org") (Just (RelationName "member")) False) Reachability.Direct False graph)
-    assertBool "space view has a recursive parent entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "space") (Just (RelationName "view")) False) Reachability.Direct True graph)
-    assertBool "space audit relation is conditional" (hasEntry (relationRef "space" "audit") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Conditional False graph)
-    assertBool "space member-minus-owner relation is conditional" (hasEntry (relationRef "space" "member_not_owner") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Conditional False graph)
+    assertBool "space view has a direct user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Direct False validKikan)
+    assertBool "space view has a guest-org userset entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "org") (Just (RelationName "member")) False) Reachability.Direct False validKikan)
+    assertBool "space view has a recursive parent entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "space") (Just (RelationName "view")) False) Reachability.Direct True validKikan)
+    assertBool "space audit relation is conditional" (hasEntry (relationRef "space" "audit") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Conditional False validKikan)
+    assertBool "space member-minus-owner relation is conditional" (hasEntry (relationRef "space" "member_not_owner") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Conditional False validKikan)
     assertValidationFails "This requires allowed subjects" (schemaWithRelation "space" "viewer" Set.empty This)
     assertValidationFails "ComputedUserset rejects unknown relation" (schemaWithRelation "space" "viewer" userSubject (ComputedUserset (RelationName "missing")))
     assertValidationFails "TupleToUserset rejects incompatible arrows" invalidTupleToUsersetSchema
@@ -462,9 +523,10 @@ main = do
     assertEqual "a lookup cursor carrying an unmintable token is rejected" (Left (InvalidConsistencyToken "token is not an in-memory token")) =<< strictLookupWithCursor tamperedTokenLookupCursor
     -- The happy path still pages: a cursor this datastore minted is obeyed.
     assertEqual "a validly minted lookup cursor is obeyed" (Right (lookupPage [allowed space] LookupExhausted)) =<< strictLookupWithCursor (encodeLookupCursor LookupCursorState{version = 2, token = testToken, lastObject = Just childSpace, frontier = []})
-    publicGraph <- either (fail . show) pure (compileSchema publicSchema)
-    let publicStore = runTupleStoreInMemory [publicTuple]
-    assertBool "public view has a wildcard user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing True) Reachability.Direct False publicGraph)
+    validPublic <- either (fail . show) pure (validateSchema publicSchema)
+    let publicGraph = compile validPublic
+        publicStore = runTupleStoreInMemory [publicTuple]
+    assertBool "public view has a wildcard user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing True) Reachability.Direct False validPublic)
     assertEqual "wildcard subject grants concrete users" (Right Allowed) =<< check consistencyStore publicStore publicGraph MinimizeLatency requestContext (SubjectId bob) (RelationName "view") publicSpace
     assertEqual "wildcard subject does not match userset subjects" (Right Denied) =<< check consistencyStore publicStore publicGraph MinimizeLatency requestContext (SubjectSet guestOrg (RelationName "member")) (RelationName "view") publicSpace
     assertEqual "lookup includes public wildcard rows for concrete users" (Right (lookupPage [allowed publicSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore publicStore publicGraph MinimizeLatency (lookupRequest (SubjectId bob) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
@@ -1947,15 +2009,19 @@ relationRef :: Text -> Text -> RelationRef
 relationRef objectType relation =
     RelationRef{objectType = ObjectType objectType, relation = RelationName relation}
 
-hasEntry :: RelationRef -> SubjectSelector -> EntryKind -> Bool -> ReachabilityGraph -> Bool
-hasEntry target source kind recursive graph =
+{- | Entry points come from the schema now, not the compiled graph: no engine reads
+them, so they no longer ride along on the structure every evaluator carries. The
+assertions are unchanged -- they test the compilation, which still exists.
+-}
+hasEntry :: RelationRef -> SubjectSelector -> EntryKind -> Bool -> ValidSchema -> Bool
+hasEntry target source kind recursive valid =
     any
         ( \entry ->
             entry.source == source
                 && entry.kind == kind
                 && entry.recursive == recursive
         )
-        (Map.findWithDefault [] target graph.entries)
+        (Map.findWithDefault [] target (entryPoints valid))
 
 tupleStore :: TupleInterpreter
 tupleStore =

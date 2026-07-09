@@ -20,9 +20,9 @@ import Data.Text qualified as Text
 import En.Reachability (
     EntryKind (..),
     EntryPoint (..),
-    ReachabilityGraph (..),
     RelationRef (..),
     SubjectSelector (..),
+    entryPoints,
  )
 import En.Schema (
     AllowedSubject (..),
@@ -35,6 +35,7 @@ import En.Schema (
     RelationName (..),
     Rewrite (..),
     Schema (..),
+    ValidSchema,
  )
 
 -- | Fold a schema into a Markdown reference document.
@@ -98,23 +99,32 @@ renderMermaid schema =
                 [ edge (rewriteEdgeStyle rewrite) (objectId objectType) (objectId objectType) (relationNameText relationName <> " = " <> renderRewrite rewrite)
                 ]
 
--- | Fold a compiled reachability graph into a Mermaid flowchart of resolved entry points.
-renderReachabilityMermaid :: ReachabilityGraph -> Text
-renderReachabilityMermaid graph =
+{- | Fold a schema's resolved entry points into a Mermaid flowchart.
+
+Takes the 'ValidSchema' rather than the compiled 'En.Reachability.ReachabilityGraph':
+entry points are reverse-edge metadata for a reader, and the graph is what the
+engines traverse. This function is the only consumer of 'entryPoints' in the
+workspace.
+-}
+renderReachabilityMermaid :: ValidSchema -> Text
+renderReachabilityMermaid valid =
     Text.unlines
         ( ["flowchart LR"]
             <> renderNodes
-            <> concatMap renderEntries (Map.toAscList graph.entries)
+            <> concatMap renderEntries (Map.toAscList graphEntries)
         )
   where
+    graphEntries =
+        entryPoints valid
+
     renderNodes =
         Set.toAscList $
             Set.fromList
                 ( [ node (relationRefId target) (renderRelationRef target)
-                  | target <- Map.keys graph.entries
+                  | target <- Map.keys graphEntries
                   ]
                     <> [ node (subjectSelectorId entry.source) (renderSubjectSelector entry.source)
-                       | entries <- Map.elems graph.entries
+                       | entries <- Map.elems graphEntries
                        , entry <- entries
                        ]
                 )
