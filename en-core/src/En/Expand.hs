@@ -13,6 +13,7 @@ module En.Expand (
     ExpandNode (..),
     ExpandTree (..),
     expand,
+    expandWithBudget,
 ) where
 
 import Data.Map.Strict qualified as Map
@@ -21,6 +22,7 @@ import Data.Text qualified as Text
 import Effectful (Eff, (:>))
 import Effectful.Error.Static (Error, throwError)
 
+import En.Budget (EvaluationBudget (..), defaultEvaluationBudget)
 import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
 import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, readObjectRelation)
 import En.Error (EnError (..))
@@ -94,21 +96,33 @@ expand ::
     Consistency ->
     ExpandRequest ->
     Eff es ExpandTree
-expand graph consistency request = do
+expand =
+    expandWithBudget defaultEvaluationBudget
+
+-- | 'expand' under caller-chosen evaluation bounds. See "En.Budget".
+expandWithBudget ::
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
+    EvaluationBudget ->
+    ReachabilityGraph ->
+    Consistency ->
+    ExpandRequest ->
+    Eff es ExpandTree
+expandWithBudget budget graph consistency request = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
-    either throwError pure =<< runExpand graph revision request
+    either throwError pure =<< runExpand budget graph revision request
 
 runExpand ::
     (TupleStore :> es) =>
+    EvaluationBudget ->
     ReachabilityGraph ->
     Revision ->
     ExpandRequest ->
     Eff es (Either EnError ExpandTree)
-runExpand graph revision request = do
-    children <- expandRelation graph revision request.object request.permission initialState
+runExpand budget graph revision request = do
+    children <- expandRelation graph revision request.object request.permission (initialState budget)
     pure $
         ( \nodes ->
-            let (visible, state) = pageNodes request.limit request.cursor nodes
+            let (visible, state) = pageNodes budget request.limit request.cursor nodes
              in ExpandTree
                     { root = request.object
                     , permission = request.permission
@@ -121,6 +135,7 @@ runExpand graph revision request = do
 data EvalState = EvalState
     { depth :: !Int
     , visited :: ![Subproblem]
+    , budget :: !EvaluationBudget
     }
 
 data Subproblem = Subproblem
@@ -129,18 +144,9 @@ data Subproblem = Subproblem
     }
     deriving stock (Eq, Show)
 
-initialState :: EvalState
-initialState =
-    EvalState{depth = 0, visited = []}
-
-maxDepth :: Int
-maxDepth = 25
-
-pageLimit :: Int
-pageLimit = 1000
-
-resultCap :: Int
-resultCap = 1000
+initialState :: EvaluationBudget -> EvalState
+initialState budget =
+    EvalState{depth = 0, visited = [], budget}
 
 expandRelation ::
     (TupleStore :> es) =>
@@ -154,7 +160,7 @@ expandRelation ::
 -- empty result: it renders a tree for a human to audit, and quietly dropping a
 -- cyclic branch would hide data from the reviewer.
 expandRelation graph revision object relation state
-    | state.depth >= maxDepth =
+    | state.depth >= state.budget.maxDepth =
         pure (Left ResolutionLimitExceeded)
     | subproblem `elem` state.visited =
         pure (Left (CycleDetected (renderSubproblem subproblem)))
@@ -168,7 +174,7 @@ expandRelation graph revision object relation state
                     object
                     relation
                     schemaRelation.rewrite
-                    EvalState{depth = state.depth + 1, visited = subproblem : state.visited}
+                    state{depth = state.depth + 1, visited = subproblem : state.visited}
   where
     subproblem = Subproblem{object, relation}
 
@@ -246,7 +252,7 @@ expandThis ::
     EvalState ->
     Eff es (Either EnError [ExpandNode])
 expandThis graph revision object relation state = do
-    rows <- readObjectRows revision object relation
+    rows <- readObjectRows state.budget.pageLimit revision object relation
     case rows of
         Left err -> pure (Left err)
         Right tupleRows -> do
@@ -266,7 +272,7 @@ expandTupleToUserset ::
     EvalState ->
     Eff es (Either EnError [ExpandNode])
 expandTupleToUserset graph revision object tuplesetRelation computedRelation state = do
-    rows <- readObjectRows revision object tuplesetRelation
+    rows <- readObjectRows state.budget.pageLimit revision object tuplesetRelation
     case rows of
         Left err -> pure (Left err)
         Right tupleRows -> do
@@ -311,11 +317,12 @@ wrapTupleCaveat (Just TupleCaveat{name}) nodes = [ExpandCaveated name nodes]
 
 readObjectRows ::
     (TupleStore :> es) =>
+    Int ->
     Revision ->
     ObjectRef ->
     RelationName ->
     Eff es (Either EnError [TupleRow])
-readObjectRows revision object relation =
+readObjectRows pageLimit revision object relation =
     drain Nothing []
   where
     drain cursor acc = do
@@ -331,9 +338,10 @@ lookupRelation graph objectType relation =
         Just found -> Right found
         Nothing -> Left (UnknownRelation (renderRef RelationRef{objectType, relation}))
 
-pageNodes :: ExpandLimit -> Maybe ExpandCursor -> [ExpandNode] -> ([ExpandNode], ExpandState)
-pageNodes (ExpandLimit rawLimit) cursor nodes =
-    let limit = max 0 rawLimit
+pageNodes :: EvaluationBudget -> ExpandLimit -> Maybe ExpandCursor -> [ExpandNode] -> ([ExpandNode], ExpandState)
+pageNodes budget (ExpandLimit rawLimit) cursor nodes =
+    let resultCap = budget.resultCap
+        limit = max 0 rawLimit
         start = maybe 0 decodeCursor cursor
         capped = take resultCap nodes
         visible = take limit (drop start capped)

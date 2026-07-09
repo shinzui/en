@@ -11,6 +11,11 @@ module En.Check (
     checkMany,
     checkAtRevision,
     checkCachedAtRevision,
+    checkWithBudget,
+    checkCachedWithBudget,
+    checkManyWithBudget,
+    checkAtRevisionWithBudget,
+    checkCachedAtRevisionWithBudget,
 ) where
 
 import Control.Monad (foldM)
@@ -20,6 +25,7 @@ import Data.Text (Text)
 import Effectful (Eff, IOE, liftIO, (:>))
 import Effectful.Error.Static (Error, throwError)
 
+import En.Budget (EvaluationBudget (..), defaultEvaluationBudget)
 import En.Cache (Cache, SubproblemKey (..), insertCache, lookupCache)
 import En.Caveat (applyResidual)
 import En.Decision (CaveatObligation (..), CheckDecision (..), ResidualDecision (..))
@@ -74,9 +80,23 @@ check ::
     RelationName ->
     ObjectRef ->
     Eff es CheckDecision
-check graph consistency context subject permission object = do
+check =
+    checkWithBudget defaultEvaluationBudget
+
+-- | 'check' under caller-chosen evaluation bounds. See "En.Budget".
+checkWithBudget ::
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
+    EvaluationBudget ->
+    ReachabilityGraph ->
+    Consistency ->
+    CaveatContext ->
+    Subject ->
+    RelationName ->
+    ObjectRef ->
+    Eff es CheckDecision
+checkWithBudget budget graph consistency context subject permission object = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
-    (residual, _memo) <- runCheckMemo graph revision subject permission object Map.empty
+    (residual, _memo) <- runCheckMemo budget graph revision subject permission object Map.empty
     either throwError pure (residual >>= applyResidual graph.caveats context)
 
 {- | Cached variant of 'check'. Cache hits are keyed by datastore id, schema
@@ -100,9 +120,24 @@ checkCached ::
     RelationName ->
     ObjectRef ->
     Eff es CheckDecision
-checkCached cacheEnv graph consistency context subject permission object = do
+checkCached =
+    checkCachedWithBudget defaultEvaluationBudget
+
+-- | 'checkCached' under caller-chosen evaluation bounds. See "En.Budget".
+checkCachedWithBudget ::
+    (ConsistencyStore :> es, TupleStore :> es, IOE :> es, Error EnError :> es) =>
+    EvaluationBudget ->
+    CheckCacheEnv ->
+    ReachabilityGraph ->
+    Consistency ->
+    CaveatContext ->
+    Subject ->
+    RelationName ->
+    ObjectRef ->
+    Eff es CheckDecision
+checkCachedWithBudget budget cacheEnv graph consistency context subject permission object = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
-    (residual, _memo) <- runCheckMemoWithCache (Just (decisionCacheOps cacheEnv graph)) graph revision subject permission object Map.empty
+    (residual, _memo) <- runCheckMemoWithCache budget (Just (decisionCacheOps cacheEnv graph)) graph revision subject permission object Map.empty
     either throwError pure (residual >>= applyResidual graph.caveats context)
 
 {- | Evaluate many checks against one resolved consistency snapshot.
@@ -140,7 +175,19 @@ checkMany ::
     CaveatContext ->
     [BatchPair] ->
     Eff es [Either EnError CheckDecision]
-checkMany graph consistency context pairs = do
+checkMany =
+    checkManyWithBudget defaultEvaluationBudget
+
+-- | 'checkMany' under caller-chosen evaluation bounds. See "En.Budget".
+checkManyWithBudget ::
+    (ConsistencyStore :> es, TupleStore :> es) =>
+    EvaluationBudget ->
+    ReachabilityGraph ->
+    Consistency ->
+    CaveatContext ->
+    [BatchPair] ->
+    Eff es [Either EnError CheckDecision]
+checkManyWithBudget budget graph consistency context pairs = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
     (residualsByPair, _memo) <-
         foldM
@@ -154,7 +201,7 @@ checkMany graph consistency context pairs = do
   where
     evaluateDistinct revision (residualsByPair, memo) pair = do
         (residual, memo') <-
-            runCheckMemo graph revision pair.subject pair.permission pair.object memo
+            runCheckMemo budget graph revision pair.subject pair.permission pair.object memo
         pure (Map.insert pair residual residualsByPair, memo')
 
 {- | Engine-internal: check at an already-resolved revision, threading a
@@ -186,8 +233,23 @@ checkAtRevision ::
     ObjectRef ->
     CheckMemo ->
     Eff es (Either EnError CheckDecision, CheckMemo)
-checkAtRevision graph context revision subject permission object memo = do
-    (residual, memo') <- runCheckMemo graph revision subject permission object memo
+checkAtRevision =
+    checkAtRevisionWithBudget defaultEvaluationBudget
+
+-- | 'checkAtRevision' under caller-chosen evaluation bounds. See "En.Budget".
+checkAtRevisionWithBudget ::
+    (TupleStore :> es) =>
+    EvaluationBudget ->
+    ReachabilityGraph ->
+    CaveatContext ->
+    Revision ->
+    Subject ->
+    RelationName ->
+    ObjectRef ->
+    CheckMemo ->
+    Eff es (Either EnError CheckDecision, CheckMemo)
+checkAtRevisionWithBudget budget graph context revision subject permission object memo = do
+    (residual, memo') <- runCheckMemo budget graph revision subject permission object memo
     pure (residual >>= applyResidual graph.caveats context, memo')
 
 {- | 'checkAtRevision' against the cross-request decision cache. See 'checkCached'
@@ -204,8 +266,24 @@ checkCachedAtRevision ::
     ObjectRef ->
     CheckMemo ->
     Eff es (Either EnError CheckDecision, CheckMemo)
-checkCachedAtRevision cacheEnv graph context revision subject permission object memo = do
-    (residual, memo') <- runCheckMemoWithCache (Just (decisionCacheOps cacheEnv graph)) graph revision subject permission object memo
+checkCachedAtRevision =
+    checkCachedAtRevisionWithBudget defaultEvaluationBudget
+
+-- | 'checkCachedAtRevision' under caller-chosen evaluation bounds. See "En.Budget".
+checkCachedAtRevisionWithBudget ::
+    (TupleStore :> es, IOE :> es) =>
+    EvaluationBudget ->
+    CheckCacheEnv ->
+    ReachabilityGraph ->
+    CaveatContext ->
+    Revision ->
+    Subject ->
+    RelationName ->
+    ObjectRef ->
+    CheckMemo ->
+    Eff es (Either EnError CheckDecision, CheckMemo)
+checkCachedAtRevisionWithBudget budget cacheEnv graph context revision subject permission object memo = do
+    (residual, memo') <- runCheckMemoWithCache budget (Just (decisionCacheOps cacheEnv graph)) graph revision subject permission object memo
     pure (residual >>= applyResidual graph.caveats context, memo')
 
 -- | A memo with nothing in it, for the first check of a batch.
@@ -224,6 +302,7 @@ dedupePairs =
 data EvalState = EvalState
     { depth :: !Int
     , visited :: ![Subproblem]
+    , budget :: !EvaluationBudget
     }
 
 data Subproblem = Subproblem
@@ -259,18 +338,13 @@ instance Semigroup CutTaint where
 instance Monoid CutTaint where
     mempty = Untainted
 
-initialState :: EvalState
-initialState =
-    EvalState{depth = 0, visited = []}
-
-maxDepth :: Int
-maxDepth = 25
-
-pageLimit :: Int
-pageLimit = 1000
+initialState :: EvaluationBudget -> EvalState
+initialState budget =
+    EvalState{depth = 0, visited = [], budget}
 
 runCheckMemo ::
     (TupleStore :> es) =>
+    EvaluationBudget ->
     ReachabilityGraph ->
     Revision ->
     Subject ->
@@ -278,11 +352,12 @@ runCheckMemo ::
     ObjectRef ->
     CheckMemo ->
     Eff es (Either EnError ResidualDecision, CheckMemo)
-runCheckMemo graph revision subject permission object =
-    runCheckMemoWithCache Nothing graph revision subject permission object
+runCheckMemo budget =
+    runCheckMemoWithCache budget Nothing
 
 runCheckMemoWithCache ::
     (TupleStore :> es) =>
+    EvaluationBudget ->
     Maybe (DecisionCacheOps es) ->
     ReachabilityGraph ->
     Revision ->
@@ -291,8 +366,8 @@ runCheckMemoWithCache ::
     ObjectRef ->
     CheckMemo ->
     Eff es (Either EnError ResidualDecision, CheckMemo)
-runCheckMemoWithCache cacheOps graph revision subject permission object memo = do
-    (residual, memo', _taint) <- evalRelationMemo cacheOps graph revision subject object permission initialState memo
+runCheckMemoWithCache budget cacheOps graph revision subject permission object memo = do
+    (residual, memo', _taint) <- evalRelationMemo cacheOps graph revision subject object permission (initialState budget) memo
     pure (residual, memo')
 
 data DecisionCacheOps es = DecisionCacheOps
@@ -368,7 +443,7 @@ evalRelationMemo ::
     CheckMemo ->
     Eff es (Either EnError ResidualDecision, CheckMemo, CutTaint)
 evalRelationMemo cacheOps graph revision subject object relation state memo
-    | state.depth >= maxDepth =
+    | state.depth >= state.budget.maxDepth =
         pure (Left ResolutionLimitExceeded, memo, Untainted)
     | subproblem `elem` state.visited =
         pure (Right RDenied, memo, Tainted)
@@ -395,7 +470,7 @@ evalRelationMemo cacheOps graph revision subject object relation state memo
                                         object
                                         relation
                                         schemaRelation.rewrite
-                                        EvalState{depth = state.depth + 1, visited = subproblem : state.visited}
+                                        state{depth = state.depth + 1, visited = subproblem : state.visited}
                                         memo
                                 case (result, taint) of
                                     (Right residual, Untainted) -> do
@@ -573,7 +648,7 @@ difference between twenty store reads and three when an object is shared with
 twenty teams.
 -}
 evalThisMemo cacheOps graph revision subject object relation state memo
-    | state.depth >= maxDepth =
+    | state.depth >= state.budget.maxDepth =
         pure (Left ResolutionLimitExceeded, memo, Untainted)
     | otherwise = do
         probedRows <- probeTuples revision object relation candidates
@@ -582,7 +657,7 @@ evalThisMemo cacheOps graph revision subject object relation state memo
         if Right RAllowed `elem` probeResiduals
             then pure (Right RAllowed, memo, Untainted)
             else do
-                rows <- drainObjectRelation revision object relation
+                rows <- drainObjectRelation state.budget.pageLimit revision object relation
                 let usersetRows = filter recursable rows
                 proven <- provenByDirectGroupMembership usersetRows
                 if proven
@@ -615,7 +690,7 @@ evalThisMemo cacheOps graph revision subject object relation state memo
                 recursable row
                     && isNothing tuple.caveat
                     && relationUnionsThis graph groupObject.objectType groupRelation
-                    && state.depth < maxDepth
+                    && state.depth < state.budget.maxDepth
                     && Subproblem{subject, object = groupObject, relation = groupRelation} `notElem` state.visited
             _ -> False
 
@@ -641,7 +716,7 @@ evalThisMemo cacheOps graph revision subject object relation state memo
                 [((groupObject.objectType, groupRelation), [groupObject]) | (groupObject, groupRelation) <- targets]
 
     confirmBucket ((groupType, groupRelation), groupObjects) = do
-        rows <- drainStartingWithUser revision groupType groupRelation candidates
+        rows <- drainStartingWithUser state.budget.pageLimit revision groupType groupRelation candidates
         pure (any grantsDirectly rows)
       where
         grantsDirectly TupleRow{tuple} =
@@ -686,7 +761,7 @@ evalTupleToUsersetMemo ::
     CheckMemo ->
     Eff es (Either EnError ResidualDecision, CheckMemo, CutTaint)
 evalTupleToUsersetMemo cacheOps graph revision subject object tuplesetRelation computedRelation state memo = do
-    rows <- drainObjectRelation revision object tuplesetRelation
+    rows <- drainObjectRelation state.budget.pageLimit revision object tuplesetRelation
     (residuals, memo', taint) <- foldM rowResidual ([], memo, mempty) rows
     pure (Decision.rUnion <$> sequence residuals, memo', taint)
   where
@@ -739,17 +814,18 @@ subjectsWithWildcard subject =
 
 {- | Read every row of @object#relation@, following page cursors to the end.
 
-'pageLimit' is a batch size here, not a ceiling: a relation with more rows than
+@pageLimit@ is a batch size here, not a ceiling: a relation with more rows than
 one page is a large group, and asking whether someone belongs to it is a
 question with an answer. Mirrors the drain loops in "En.Lookup" and "En.Expand".
 -}
 drainObjectRelation ::
     (TupleStore :> es) =>
+    Int ->
     Revision ->
     ObjectRef ->
     RelationName ->
     Eff es [TupleRow]
-drainObjectRelation revision object relation =
+drainObjectRelation pageLimit revision object relation =
     drain Nothing []
   where
     drain cursor acc = do
@@ -767,14 +843,15 @@ all the groups of a type that do. Mirrors 'En.Lookup.readRowsForSubjects'.
 -}
 drainStartingWithUser ::
     (TupleStore :> es) =>
+    Int ->
     Revision ->
     ObjectType ->
     RelationName ->
     [Subject] ->
     Eff es [TupleRow]
-drainStartingWithUser _ _ _ [] =
+drainStartingWithUser _ _ _ _ [] =
     pure []
-drainStartingWithUser revision objectType relation subjects =
+drainStartingWithUser pageLimit revision objectType relation subjects =
     drain Nothing []
   where
     drain cursor acc = do

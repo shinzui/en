@@ -39,6 +39,7 @@ library
   import:          warnings, shared
   hs-source-dirs:  src
   exposed-modules:
+    En.Budget
     En.Cache
     En.Caveat
     En.Caveat.Value

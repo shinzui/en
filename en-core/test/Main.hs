@@ -21,6 +21,7 @@ import Effectful (Eff, IOE, liftIO, runEff, runPureEff, (:>))
 import Effectful.Dispatch.Dynamic (interpret_)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 
+import En.Budget (EvaluationBudget (..), defaultEvaluationBudget)
 import En.Cache (
     Cache,
     CacheConfig (..),
@@ -561,6 +562,27 @@ main = do
     assertEqual "self-parent cycle yields Denied via cycle-as-empty" (Right Denied) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
     deepChainGraph <- either (fail . show) pure (compileSchema deepChainSchema)
     assertEqual "acyclic chain deeper than the depth budget still errors" (Left ResolutionLimitExceeded) =<< check consistencyStore (runTupleStoreInMemory deepChainTuples) deepChainGraph MinimizeLatency requestContext (SubjectId user) (RelationName "view") (deepSpace 1)
+
+    {- The three budget fields are configuration, not constants, and each is pinned
+    against the default it overrides. A pair rather than a single assertion, because
+    "this errors under maxDepth = 3" is also true of a chain that errors for any
+    reason, and "this returns 1200 objects" is also true of a pageLimit that was
+    never read. -}
+    assertEqual "a four-space chain resolves under the default depth budget" (Right Allowed) =<< check consistencyStore (runTupleStoreInMemory deepChainTuples) deepChainGraph MinimizeLatency requestContext (SubjectId user) (RelationName "view") shallowChainRoot
+    assertEqual "the same chain exceeds a maxDepth of three" (Left ResolutionLimitExceeded) =<< checkBudgeted defaultEvaluationBudget{maxDepth = 3} consistencyStore (runTupleStoreInMemory deepChainTuples) deepChainGraph MinimizeLatency requestContext (SubjectId user) (RelationName "view") shallowChainRoot
+    {- pageLimit is a batch size, not a semantics knob: draining makes it invisible to
+    the answer. So the result-set assertion alone would pass against an engine that
+    ignored the field entirely -- it is the store-read count that shows the batch size
+    was used. Reading 1,200 rows ten at a time is also 120 store pages, which is where
+    a cursor that advanced by 2*start rather than start+limit would lose rows. -}
+    assertLookupObjects "a tenth-size read page returns the identical lookup result set" expectedFolders =<< collectAllLookupPagesBudgeted defaultEvaluationBudget{pageLimit = 10} noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
+    defaultPageReads <- newIORef 0
+    _ <- lookupEngineBudgeted defaultEvaluationBudget noDeadline consistencyStore (countingStoreFor defaultPageReads streamingTuples) streamingGraph MinimizeLatency (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
+    assertEqual "a 1200-row relation is two store pages at the default batch size" 2 =<< readIORef defaultPageReads
+    smallPageReads <- newIORef 0
+    _ <- lookupEngineBudgeted defaultEvaluationBudget{pageLimit = 10} noDeadline consistencyStore (countingStoreFor smallPageReads streamingTuples) streamingGraph MinimizeLatency (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
+    assertEqual "the same relation is 120 store pages at a batch size of ten" 120 =<< readIORef smallPageReads
+    assertEqual "a smaller result cap truncates the expand tree sooner" (Right (5, ExpandTruncated (ExpandCursor "5"))) . fmap (\tree -> (length tree.children, tree.state)) =<< expandBudgeted defaultEvaluationBudget{resultCap = 5} consistencyStore (runTupleStoreInMemory expandTuples) streamingGraph MinimizeLatency (expandRequest crowdedFolder (RelationName "viewer") requestContext (ExpandLimit 1500) Nothing)
     assertEqual "expand reports a cycle rather than hiding the branch" (Left (CycleDetected "space:recursive-space#view")) =<< expandEngine consistencyStore recursiveTupleStore graph MinimizeLatency (expandRequest recursiveSpace (RelationName "view") requestContext (ExpandLimit 10) Nothing)
     taintGraph <- either (fail . show) pure (compileSchema taintSchema)
     assertEqual "a cycle-tainted decision is not memoized across batch pairs" (Right [Right Allowed, Right Allowed]) =<< checkMany consistencyStore (runTupleStoreInMemory taintTuples) taintGraph MinimizeLatency requestContext [BatchPair (SubjectId carol) (RelationName "x") taintNode, BatchPair (SubjectId carol) (RelationName "y") taintNode]
@@ -1404,6 +1426,20 @@ check ::
 check cStore tStore graph consistency context subject relation object =
     runEngine cStore tStore (Check.check graph consistency context subject relation object)
 
+checkBudgeted ::
+    EvaluationBudget ->
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    ReachabilityGraph ->
+    Consistency ->
+    CaveatContext ->
+    Subject ->
+    RelationName ->
+    ObjectRef ->
+    IO (Either EnError CheckDecision)
+checkBudgeted budget cStore tStore graph consistency context subject relation object =
+    runEngine cStore tStore (Check.checkWithBudget budget graph consistency context subject relation object)
+
 probe ::
     ConsistencyInterpreter ->
     TupleInterpreter ->
@@ -1446,6 +1482,29 @@ expandEngine ::
 expandEngine cStore tStore graph consistency request =
     runEngine cStore tStore (Expand.expand graph consistency request)
 
+expandBudgeted ::
+    EvaluationBudget ->
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    ReachabilityGraph ->
+    Consistency ->
+    ExpandRequest ->
+    IO (Either EnError ExpandTree)
+expandBudgeted budget cStore tStore graph consistency request =
+    runEngine cStore tStore (Expand.expandWithBudget budget graph consistency request)
+
+lookupEngineBudgeted ::
+    EvaluationBudget ->
+    Deadline (Eff TestEffects) ->
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    ReachabilityGraph ->
+    Consistency ->
+    LookupRequest ->
+    IO (Either EnError LookupPage)
+lookupEngineBudgeted budget deadline cStore tStore graph consistency request =
+    runEngine cStore tStore (Lookup.lookupWithDeadlineAndBudget budget deadline graph consistency request)
+
 collectAllLookupPages ::
     Deadline (Eff TestEffects) ->
     ConsistencyInterpreter ->
@@ -1453,8 +1512,19 @@ collectAllLookupPages ::
     ReachabilityGraph ->
     LookupRequest ->
     IO [LookupObject]
-collectAllLookupPages deadline cStore tStore graph request = do
-    page <- lookupEngine deadline cStore tStore graph MinimizeLatency request
+collectAllLookupPages =
+    collectAllLookupPagesBudgeted defaultEvaluationBudget
+
+collectAllLookupPagesBudgeted ::
+    EvaluationBudget ->
+    Deadline (Eff TestEffects) ->
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    ReachabilityGraph ->
+    LookupRequest ->
+    IO [LookupObject]
+collectAllLookupPagesBudgeted budget deadline cStore tStore graph request = do
+    page <- lookupEngineBudgeted budget deadline cStore tStore graph MinimizeLatency request
     case page of
         Left err -> fail ("lookup failed while collecting pages: " <> show err)
         Right LookupPage{objects, state} ->
@@ -1464,7 +1534,7 @@ collectAllLookupPages deadline cStore tStore graph request = do
                 LookupTruncated cursor -> appendNext objects cursor
   where
     appendNext objects cursor = do
-        rest <- collectAllLookupPages deadline cStore tStore graph (requestWithCursor request cursor)
+        rest <- collectAllLookupPagesBudgeted budget deadline cStore tStore graph (requestWithCursor request cursor)
         pure (objects <> rest)
 
 requestWithCursor :: LookupRequest -> LookupCursor -> LookupRequest
@@ -2275,6 +2345,14 @@ deepChainLength =
 deepSpace :: Int -> ObjectRef
 deepSpace index =
     ObjectRef{objectType = ObjectType "space", objectId = "deep-" <> showText index}
+
+{- | The head of a four-space suffix of the deep chain: @deep-23@ through the
+@deep-26@ root. It resolves comfortably under the default depth budget of 25 and
+fails under a budget of 3, which is what makes 'En.Budget.maxDepth' observable.
+-}
+shallowChainRoot :: ObjectRef
+shallowChainRoot =
+    deepSpace (deepChainLength - 3)
 
 -- | @deep-1@ is the deepest; @deep-26@ is the root and holds the owner grant.
 deepChainTuples :: [Tuple]

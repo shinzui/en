@@ -19,6 +19,8 @@ module En.Lookup (
     lookupCached,
     lookupWithDeadline,
     lookupWithDeadlineCached,
+    lookupWithDeadlineAndBudget,
+    lookupWithDeadlineCachedAndBudget,
 ) where
 
 import Prelude hiding (lookup)
@@ -33,8 +35,9 @@ import Effectful (Eff, IOE, raise, (:>))
 import Effectful.Error.Static (Error, runErrorNoCallStack, throwError)
 import Text.Read (readMaybe)
 
+import En.Budget (EvaluationBudget (..), defaultEvaluationBudget)
 import En.Caveat (evaluateCaveat)
-import En.Check (CheckCacheEnv, CheckDecision (..), CheckMemo, checkAtRevision, checkCachedAtRevision, emptyCheckMemo)
+import En.Check (CheckCacheEnv, CheckDecision (..), CheckMemo, checkAtRevisionWithBudget, checkCachedAtRevisionWithBudget, emptyCheckMemo)
 import En.Decision qualified as Decision
 import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), TokenMetadata (..), decodeToken, mintToken, resolveConsistency, validateToken)
 import En.Effect.TupleStore (PageState (..), StoreCursor (..), TuplePage (..), TupleRow (..), TupleStore, UsersetQuery (..), readStartingWithUser)
@@ -190,8 +193,26 @@ lookupWithDeadline ::
     Consistency ->
     LookupRequest ->
     Eff es LookupPage
-lookupWithDeadline deadline graph consistency request = do
-    lookupWithDeadlineWithChecker (CheckForCandidate checkAtRevision) deadline graph consistency request
+lookupWithDeadline =
+    lookupWithDeadlineAndBudget defaultEvaluationBudget
+
+{- | 'lookupWithDeadline' under caller-chosen evaluation bounds.
+
+The budget and the deadline are both bounds and they are not the same bound: the
+budget is static (how deep to recurse, how many rows to read at a time, how many
+objects a page may hold), the deadline is a live clock the traversal polls. See
+"En.Budget". The lookup's confirmations run under the same budget as its walk.
+-}
+lookupWithDeadlineAndBudget ::
+    (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
+    EvaluationBudget ->
+    Deadline (Eff es) ->
+    ReachabilityGraph ->
+    Consistency ->
+    LookupRequest ->
+    Eff es LookupPage
+lookupWithDeadlineAndBudget budget deadline graph consistency request = do
+    lookupWithDeadlineWithChecker budget (CheckForCandidate (checkAtRevisionWithBudget budget)) deadline graph consistency request
 
 lookupCached ::
     (ConsistencyStore :> es, TupleStore :> es, IOE :> es, Error EnError :> es) =>
@@ -211,8 +232,21 @@ lookupWithDeadlineCached ::
     Consistency ->
     LookupRequest ->
     Eff es LookupPage
-lookupWithDeadlineCached cacheEnv =
-    lookupWithDeadlineWithChecker (CheckForCandidate (checkCachedAtRevision cacheEnv))
+lookupWithDeadlineCached =
+    lookupWithDeadlineCachedAndBudget defaultEvaluationBudget
+
+-- | 'lookupWithDeadlineCached' under caller-chosen evaluation bounds. See "En.Budget".
+lookupWithDeadlineCachedAndBudget ::
+    (ConsistencyStore :> es, TupleStore :> es, IOE :> es, Error EnError :> es) =>
+    EvaluationBudget ->
+    CheckCacheEnv ->
+    Deadline (Eff es) ->
+    ReachabilityGraph ->
+    Consistency ->
+    LookupRequest ->
+    Eff es LookupPage
+lookupWithDeadlineCachedAndBudget budget cacheEnv =
+    lookupWithDeadlineWithChecker budget (CheckForCandidate (checkCachedAtRevisionWithBudget budget cacheEnv))
 
 {- | How a lookup confirms one over-generated candidate.
 
@@ -242,13 +276,14 @@ its whole life, however many pages it takes.
 -}
 lookupWithDeadlineWithChecker ::
     (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
+    EvaluationBudget ->
     CheckForCandidate es ->
     Deadline (Eff es) ->
     ReachabilityGraph ->
     Consistency ->
     LookupRequest ->
     Eff es LookupPage
-lookupWithDeadlineWithChecker candidateCheck deadline graph consistency request =
+lookupWithDeadlineWithChecker budget candidateCheck deadline graph consistency request =
     case request.cursor of
         Just cursor -> do
             resolved <- resolveCursor cursor
@@ -260,10 +295,11 @@ lookupWithDeadlineWithChecker candidateCheck deadline graph consistency request 
             run revision token Nothing
   where
     run revision token cursorState =
-        either throwError pure =<< runLookup candidateCheck deadline graph revision token cursorState request
+        either throwError pure =<< runLookup budget candidateCheck deadline graph revision token cursorState request
 
 runLookup ::
     (TupleStore :> es) =>
+    EvaluationBudget ->
     CheckForCandidate es ->
     Deadline (Eff es) ->
     ReachabilityGraph ->
@@ -272,7 +308,7 @@ runLookup ::
     Maybe LookupCursorState ->
     LookupRequest ->
     Eff es (Either EnError LookupPage)
-runLookup candidateCheck deadline graph revision token cursorState request = do
+runLookup budget candidateCheck deadline graph revision token cursorState request = do
     outcome <-
         runErrorNoCallStack
             ( evalRelation
@@ -285,18 +321,18 @@ runLookup candidateCheck deadline graph revision token cursorState request = do
                 request.subject
                 request.objectType
                 request.permission
-                initialState
+                (initialState budget)
             )
     case outcome of
         Left Interrupt ->
             pure (Right (interruptedPage cursorState token))
         Right candidates ->
-            traverse (pageLookup deadline request.limit cursorState token) candidates
+            traverse (pageLookup budget deadline request.limit cursorState token) candidates
   where
     emitWindow =
         EmitWindow
             { watermark = cursorState >>= (.lastObject)
-            , confirmBudget = min resultCap (max 0 request.limit.unLookupLimit) + 1
+            , confirmBudget = min budget.resultCap (max 0 request.limit.unLookupLimit) + 1
             }
 
 {- | The traversal ran out of budget before it could decide anything.
@@ -377,6 +413,7 @@ data EvalState = EvalState
     { depth :: !Int
     , visited :: ![Subproblem]
     , skipRecursive :: !(Maybe RecursiveStep)
+    , budget :: !EvaluationBudget
     }
 
 data Subproblem = Subproblem
@@ -392,18 +429,9 @@ data RecursiveStep = RecursiveStep
     }
     deriving stock (Eq, Show)
 
-initialState :: EvalState
-initialState =
-    EvalState{depth = 0, visited = [], skipRecursive = Nothing}
-
-maxDepth :: Int
-maxDepth = 25
-
-pageLimit :: Int
-pageLimit = 1000
-
-resultCap :: Int
-resultCap = 1000
+initialState :: EvaluationBudget -> EvalState
+initialState budget =
+    EvalState{depth = 0, visited = [], skipRecursive = Nothing, budget}
 
 evalRelation ::
     (TupleStore :> es, Error Interrupt :> es) =>
@@ -419,7 +447,7 @@ evalRelation ::
     EvalState ->
     Eff es (Either EnError [LookupObject])
 evalRelation window candidateCheck deadline graph context revision subject objectType relation state
-    | state.depth >= maxDepth =
+    | state.depth >= state.budget.maxDepth =
         pure (Left ResolutionLimitExceeded)
     | subproblem `elem` state.visited && state.skipRecursive == Nothing =
         pure (Right [])
@@ -439,7 +467,7 @@ evalRelation window candidateCheck deadline graph context revision subject objec
                     objectType
                     relation
                     schemaRelation.rewrite
-                    EvalState{depth = state.depth + 1, visited = subproblem : state.visited, skipRecursive = state.skipRecursive}
+                    state{depth = state.depth + 1, visited = subproblem : state.visited}
   where
     ref = RelationRef{objectType, relation}
     subproblem = Subproblem{subject, objectType, relation}
@@ -515,7 +543,7 @@ evalThis ::
     EvalState ->
     Eff es (Either EnError [LookupObject])
 evalThis candidateCheck deadline graph context revision subject objectType relation state = do
-    direct <- readRowsForSubjects deadline revision objectType relation (subjectsWithWildcard subject)
+    direct <- readRowsForSubjects state.budget.pageLimit deadline revision objectType relation (subjectsWithWildcard subject)
     case direct of
         Left err -> pure (Left err)
         Right directRows -> do
@@ -538,7 +566,7 @@ evalThis candidateCheck deadline graph context revision subject objectType relat
                                         Left err -> pure (Left err)
                                         Right objects -> do
                                             let subjectSets = [SubjectSet object subjectRelation | LookupObject{object} <- objects]
-                                            rows <- readRowsForSubjects deadline revision objectType relation subjectSets
+                                            rows <- readRowsForSubjects state.budget.pageLimit deadline revision objectType relation subjectSets
                                             pure (catMaybes <$> (rows >>= traverse rowLookupObject))
                         )
                         (Set.toAscList relationDefinition.allowedSubjects)
@@ -578,7 +606,7 @@ evalTupleToUserset candidateCheck deadline graph context revision subject object
                                         Left err -> pure (Left err)
                                         Right objects -> do
                                             let subjects = concatMap (subjectsForAllowed allowed) objects
-                                            rows <- readRowsForSubjects deadline revision objectType tuplesetRelation subjects
+                                            rows <- readRowsForSubjects state.budget.pageLimit deadline revision objectType tuplesetRelation subjects
                                             pure (rows >>= applyRows objects)
                         )
                         (Set.toAscList tuplesetDefinition.allowedSubjects)
@@ -608,12 +636,12 @@ evalTupleToUserset candidateCheck deadline graph context revision subject object
                 Nothing -> []
                 Just relation -> [SubjectSet object relation]
     expandRecursive allowed frontier seen depth
-        | depth >= maxDepth = pure (Left ResolutionLimitExceeded)
+        | depth >= state.budget.maxDepth = pure (Left ResolutionLimitExceeded)
         | null frontier = pure (Right (Map.elems seen))
         | otherwise = do
             -- Each round of the fixpoint is a unit of skippable work, like a branch.
             requireBudget deadline
-            rows <- readRowsForSubjects deadline revision objectType tuplesetRelation (concatMap (subjectsForAllowed allowed) frontier)
+            rows <- readRowsForSubjects state.budget.pageLimit deadline revision objectType tuplesetRelation (concatMap (subjectsForAllowed allowed) frontier)
             case rows of
                 Left err -> pure (Left err)
                 Right tupleRows -> do
@@ -742,15 +770,16 @@ A page boundary bounds the overshoot at one store round trip.
 -}
 readRowsForSubjects ::
     (TupleStore :> es, Error Interrupt :> es) =>
+    Int ->
     Deadline (Eff es) ->
     Revision ->
     ObjectType ->
     RelationName ->
     [Subject] ->
     Eff es (Either EnError [TupleRow])
-readRowsForSubjects _ _ _ _ [] =
+readRowsForSubjects _ _ _ _ _ [] =
     pure (Right [])
-readRowsForSubjects deadline revision objectType relation subjects =
+readRowsForSubjects pageLimit deadline revision objectType relation subjects =
     drain Nothing []
   where
     drain cursor acc = do
@@ -849,8 +878,8 @@ caveatText :: CaveatName -> Text
 caveatText (CaveatName text) =
     text
 
-pageLookup :: (Monad m) => Deadline m -> LookupLimit -> Maybe LookupCursorState -> ConsistencyToken -> [LookupObject] -> m LookupPage
-pageLookup deadline (LookupLimit rawLimit) cursorState token objects = do
+pageLookup :: (Monad m) => EvaluationBudget -> Deadline m -> LookupLimit -> Maybe LookupCursorState -> ConsistencyToken -> [LookupObject] -> m LookupPage
+pageLookup budget deadline (LookupLimit rawLimit) cursorState token objects = do
     hasBudget <- deadline.remainingBudget
     let limit = max 0 rawLimit
         startAfter = cursorState >>= (.lastObject)
@@ -858,7 +887,7 @@ pageLookup deadline (LookupLimit rawLimit) cursorState token objects = do
             case startAfter of
                 Nothing -> objects
                 Just lastSeen -> filter (\LookupObject{object} -> object > lastSeen) objects
-        visible = take (min resultCap limit) remainingObjects
+        visible = take (min budget.resultCap limit) remainingObjects
         hasMore = length visible < length remainingObjects
         nextCursor =
             LookupCursorState
