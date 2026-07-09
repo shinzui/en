@@ -145,6 +145,107 @@ Treat the built-in schema as a local smoke-test fallback. Production service
 deployments should set `EN_SCHEMA_PATH`; Haskell applications that do not need a
 shared HTTP boundary can still embed `en-core` directly.
 
+### Health and readiness probes
+
+Two unauthenticated endpoints, for orchestrators:
+
+| Path | Meaning | Responses |
+| --- | --- | --- |
+| `GET /healthz` | Liveness: the process can serve HTTP | Always `200 {"status":"ok"}` |
+| `GET /readyz` | Readiness: the process should receive traffic | `200 {"status":"ok"}`, or `503` with the error envelope |
+
+They are the only paths exempt from authentication and rate limiting, since a
+probe cannot conveniently carry credentials.
+
+`/healthz` never consults PostgreSQL. Liveness means "restart me if this stops
+answering", and restarting every replica during a database outage helps nothing.
+It answers `200` while the database is down.
+
+`/readyz` runs a `SELECT 1` through the connection pool. While PostgreSQL is
+unreachable it returns the same envelope a request would get:
+
+```json
+{"code": "store_error", "message": "database unreachable", "retryable": true}
+```
+
+The probe pings twice before reporting unready. As described under "Connection
+pooling", the first session on a connection left stale by a restart fails at the
+statement level and is returned to the pool rather than discarded; a single-shot
+probe would flap to unready against a healthy database and would spend a failure
+that a real request could have absorbed. Readiness recovers on the first probe
+after PostgreSQL comes back, with no `en-server` restart.
+
+### Graceful shutdown
+
+`SIGTERM` and `SIGINT` both mean: stop accepting connections, let in-flight
+requests finish, release the connection pool, exit `0`. The drain is capped at 30
+seconds. A request already being served completes normally; a connection opened
+after the signal is refused.
+
+```text
+en-server: drained in-flight requests; shutting down
+```
+
+`SIGINT` is handled explicitly rather than left to the GHC runtime, whose default
+throws to the main thread and aborts in-flight requests.
+
+### Request logging
+
+Every request that reaches a handler produces exactly one JSON object on stdout:
+
+```json
+{"time":"2026-07-09T01:29:12.087595Z","requestId":"test-123","caller":"dev","method":"POST","path":"/v1/check","status":200,"durationMs":2.399}
+```
+
+`caller` is the authenticated key name, or `null` when `EN_AUTH_DISABLED=true`.
+Durations come from the monotonic clock, so a clock step cannot produce a negative
+latency. Neither headers nor bodies are logged: en's request bodies name subjects
+and objects, and its `Authorization` header carries a bearer secret.
+
+Probe requests to `/healthz` and `/readyz` are not logged — they fire every few
+seconds and have nothing to correlate. The `401`, `403`, and `429` responses that
+authentication and rate limiting short-circuit are also not logged, because those
+middlewares run outside the logger; count them at your proxy.
+
+Each response carries an `X-Request-Id` header. An inbound `X-Request-Id` is
+reused so a trace survives a reverse proxy, provided it is at most 128 bytes of
+printable non-space ASCII; anything else is replaced with a fresh UUID. **If
+`en-server` is reachable by untrusted clients, strip the header at the edge** —
+a caller that chooses its own request id can make two requests look like one.
+
+### Metrics
+
+`GET /metrics` serves the Prometheus text exposition format. It is **not** exempt
+from authentication: give the scraper a read-only key.
+
+```shell
+curl -sS -H "Authorization: Bearer $EN_API_KEY" localhost:8080/metrics
+```
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `en_http_requests_total` | counter | `path`, `status` |
+| `en_http_request_duration_seconds_sum` | counter | `path`, `status` |
+| `en_http_request_duration_seconds_count` | counter | `path`, `status` |
+| `en_cache_hits_total` | counter | `cache` |
+| `en_cache_misses_total` | counter | `cache` |
+| `en_cache_inserts_total` | counter | `cache` |
+| `en_cache_evictions_total` | counter | `cache` |
+
+`path` is the route below the version prefix (`check`, `batch-check`, `lookup`,
+`expand`, `relationships`, `openapi.json`, `healthz`, `readyz`, `metrics`), or
+`other` for anything unrecognized — so a caller cannot mint unbounded time series
+by requesting random paths. `status` is the status class (`2xx`, `4xx`, `5xx`).
+`cache` is `decision` or `tuple_read`; both report zeros while the corresponding
+cache is disabled.
+
+Divide `..._duration_seconds_sum` by `..._duration_seconds_count` for mean latency.
+There are no histograms, so there are no quantiles; if you need them, the counters
+are cheap to replace with `prometheus-client`.
+
+All counters are in-process and reset when the process restarts, which is what
+Prometheus expects. They are per-replica: aggregate across replicas at query time.
+
 ## Authentication, rate limiting, and TLS
 
 `en-server` authenticates every request. It will not start without either a
@@ -414,8 +515,13 @@ that the en endpoints return them with — `400`, `422`, or `503` — not as a b
   existing consistency tokens.
 - Changing the schema changes `schemaHash`; old tokens from another schema hash
   are rejected.
-- Monitor `check` and `lookup` latency. Once adopted, `en` is on the read path
-  for protected list and object endpoints.
+- Point liveness at `/healthz` and readiness at `/readyz`; never point liveness at
+  a database-dependent probe.
+- Send `SIGTERM` to deploy. Give the process at least 30 seconds to drain before
+  `SIGKILL`, matching the shutdown cap.
+- Monitor `check` and `lookup` latency, from `/metrics` or from the `durationMs`
+  field of the request log. Once adopted, `en` is on the read path for protected
+  list and object endpoints.
 - Prefer `MinimizeLatency` and `AtLeastAsFresh` for request traffic; use
   `FullyConsistent` sparingly.
 - Treat lookup and expand cursors as opaque.

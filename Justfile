@@ -1,6 +1,5 @@
 migrationDate := `date -u '+%Y%m%d%H%M%S'`
 processComposeSocket := ".dev/process-compose.sock"
-serverLog := ".dev/en-server.log"
 
 # Show available recipes
 default:
@@ -31,25 +30,23 @@ process-down:
 start-server: run-migrations
   EN_DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" cabal run en-server
 
-# Start the standalone en server temporarily and run the local HTTP smoke test
+# Wait for the process-compose en-server to be healthy, then run the HTTP smoke test
+#
+# process-compose owns the server (see process-compose.yaml); this waits on the same
+# /healthz the orchestrator's readiness probe uses rather than spawning a second
+# server on the same port.
 [group("services")]
-start-and-test: process-up run-migrations
+start-and-test: process-up
   @set -eu; \
     url="${EN_SERVER_URL:-http://localhost:${EN_PORT:-8080}}"; \
-    cabal build -v0 en-server; \
-    EN_DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" \
-    EN_API_KEYS_READ_WRITE="dev:${EN_API_KEY:-dev-secret-0123456789}" \
-      cabal run -v0 en-server > {{serverLog}} 2>&1 & \
-    pid=$!; \
-    trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT; \
     ready=0; \
-    for _ in $(seq 1 30); do \
+    for _ in $(seq 1 60); do \
       if curl -fsS -o /dev/null "$url/healthz" 2>/dev/null; then ready=1; break; fi; \
-      sleep 1; \
+      sleep 2; \
     done; \
     if [ "$ready" -ne 1 ]; then \
       echo "en-server never answered GET /healthz with 200; last log lines:" >&2; \
-      tail -n 20 {{serverLog}} >&2; \
+      process-compose --unix-socket {{processComposeSocket}} process logs en-server --tail 20 >&2 || true; \
       exit 1; \
     fi; \
     just test-server

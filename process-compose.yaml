@@ -16,6 +16,38 @@ processes:
       postgres:
         condition: process_healthy
 
+  en-server:
+    # Migrate, build, then *exec* the binary, so the supervised pid is en-server
+    # itself. Running `just start-server` here would leave `just` and `cabal run`
+    # between process-compose and the server: SIGTERM would kill the wrappers, the
+    # recorded exit code would be 143 instead of the server's 0, and the drain would
+    # be cut off mid-line as the log pipe closed.
+    #
+    # The readiness budget below (5s + 24 x 5s) covers a cold build; a warm one is
+    # ready in a couple of seconds.
+    command: >-
+      just run-migrations &&
+      cabal build -v0 en-server &&
+      EN_DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}"
+      exec "$(cabal list-bin en-server)"
+    environment:
+      - "EN_API_KEYS_READ_WRITE=dev:dev-secret-0123456789"
+      - "EN_DECISION_CACHE_MAX_ENTRIES=1000"
+    availability:
+      restart: on_failure
+    depends_on:
+      postgres:
+        condition: process_healthy
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: 8080
+        path: /readyz
+      initial_delay_seconds: 5
+      period_seconds: 5
+      timeout_seconds: 3
+      failure_threshold: 24
+
   postgres:
     command: pg_ctl start -w -l $PGLOG -o "--unix_socket_directories='$PGHOST'" -o "-c listen_addresses=''"
     is_daemon: true
