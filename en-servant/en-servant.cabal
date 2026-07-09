@@ -21,6 +21,7 @@ common warnings
 common shared
   default-language:   GHC2024
   default-extensions:
+    BlockArguments
     DataKinds
     DeriveAnyClass
     DeriveGeneric
@@ -58,7 +59,9 @@ test-suite en-servant-tests
   hs-source-dirs: test
   main-is:        Main.hs
   build-depends:
+    , aeson
     , base
+    , bytestring
     , containers
     , effectful
     , effectful-core
@@ -67,3 +70,4 @@ test-suite en-servant-tests
     , servant
     , servant-server
     , text
+    , time

@@ -5,6 +5,7 @@ title: "Version the wire contract and type the error model"
 kind: exec-plan
 created_at: 2026-07-07T15:24:43Z
 master_plan: "docs/masterplans/6-production-harden-the-en-service.md"
+intention: intention_01kx21nk4kemtt6pjnb5tr76nk
 ---
 
 # Version the wire contract and type the error model
@@ -50,11 +51,15 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: hand-written `ToJSON`/`FromJSON` instances for every wire type in
+- [x] M1 (2026-07-08): hand-written `ToJSON`/`FromJSON` instances for every wire type in
   `en-servant/src/En/Servant/API.hs` per the JSON grammar in this plan; generic
-  derivations removed.
-- [ ] M1: golden encoding tests and decode round-trip tests added to
-  `en-servant/test/Main.hs`.
+  derivations removed. `toEncoding` written explicitly alongside `toJSON` for every
+  type, which fixes field order and skips the intermediate `Value` on the response path.
+- [x] M1 (2026-07-08): golden encoding tests (exact bytes), decode round-trip tests, and
+  a negative decode per sum type added to `en-servant/test/Main.hs`.
+- [x] M1 (2026-07-08): `Justfile` `test-server` request bodies moved to the new grammar
+  ahead of schedule (paths still unversioned) so the smoke test stays green between M1
+  and M2. `just start-and-test` prints `server smoke test passed: allowed`.
 - [ ] M2: routes moved under `/v1`; `DELETE /tuples` replaced by
   `POST /v1/relationships/delete`; writes at `POST /v1/relationships`.
 - [ ] M2: `en-client/src/En/Client.hs` and `Justfile` (`test-server`) updated; user docs
@@ -76,7 +81,30 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- **Exact-bytes goldens are stable, and no fallback was needed.** The plan anticipated
+  that `Data.Aeson.encode` might not fix object key order (aeson 2's `KeyMap` does not
+  promise one) and permitted comparing decoded `Value`s instead. Defining `toEncoding`
+  explicitly for every type removes the question: `encode` goes through `toEncoding`,
+  whose `pairs` builder emits fields in written order. All 40 golden assertions passed
+  on the first run against the bytes written into the plan's grammar. This is also a
+  small win on the response path, which no longer materializes an intermediate `Value`.
+
+- **`Data.Aeson.object` collides with the `object` record field.** `en-core`'s `Tuple`
+  and `BatchPair` export an `object` field selector (those packages do not use
+  `NoFieldSelectors`), and `En.Servant.API` imports both. Every use of aeson's `object`
+  in the new instances was ambiguous. Resolved by importing `Data.Aeson qualified as
+  Aeson` and writing `Aeson.object`; `.=`, `.:`, `.:?`, `pairs`, and `withObject` stay
+  unqualified. Any sibling plan hand-writing aeson instances in a module that imports
+  `En.Tuple` or `En.Check` will hit the same wall.
+
+- **`en-servant` lacked `BlockArguments`.** `en-core` and `en-server` enable it; the
+  `withObject "…" \o -> …` idiom needs it. Added to `default-extensions` in
+  `en-servant/en-servant.cabal`, matching the two siblings.
+
+- **`.:?` already handles explicit `null`.** `TupleWire.caveat` encodes as
+  `"caveat":null` and decodes from either an explicit `null` or an absent key, because
+  aeson's `FromJSON1 Maybe` instance maps `Null` to `Nothing`. No custom parser was
+  needed, and a test pins both spellings.
 
 
 ## Decision Log
@@ -143,6 +171,28 @@ Record every decision made while working on the plan.
   `ToSchema` instances are required so the document matches the hand-written JSON —
   and the golden tests in M1 are what keep both honest.
   Date: 2026-07-07
+- Decision: Define `toEncoding` explicitly alongside `toJSON` for every wire type,
+  rather than letting it default to `Data.Aeson.Encoding.value . toJSON`.
+  Rationale: It is what makes the exact-bytes golden tests this plan calls for both
+  possible and stable — `encode` routes through `toEncoding`, whose field order is the
+  order written. It also removes an intermediate `Value` allocation from every HTTP
+  response. The cost is that each type states its field order twice; the golden tests
+  catch any drift between the two.
+  Date: 2026-07-08
+- Decision: Move the `Justfile` `test-server` request bodies to the new JSON grammar in
+  M1, ahead of the M2 path change, instead of leaving the smoke test broken across one
+  commit.
+  Rationale: The exec-plan protocol requires each commit to leave the codebase in a
+  working state. M1 breaks the old request bodies (the server no longer accepts
+  `{"tag":…}`) while leaving the paths intact, so the bodies can move independently of
+  the paths. M2 then changes only the paths and the delete verb.
+  Date: 2026-07-08
+- Decision: Also export `CaveatPayloadWire`, `LookupStateWire`, and `ExpandStateWire`
+  from `En.Servant.API`.
+  Rationale: The golden tests must construct a value of every type whose encoding they
+  pin, and these three were reachable only through their parents. They are part of the
+  wire contract either way; hiding them made the contract untestable, not smaller.
+  Date: 2026-07-08
 - Decision: `checkMany`'s per-pair behavior (errors collapse to `Denied`,
   finding B5) is out of scope; the batch response stays a positional `decisions` array.
   Rationale: Changing batch semantics is an engine-behavior change owned by the

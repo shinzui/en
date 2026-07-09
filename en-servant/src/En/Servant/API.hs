@@ -13,6 +13,7 @@ module En.Servant.API (
     TupleWire (..),
     TupleCaveatWire (..),
     CaveatValueWire (..),
+    CaveatPayloadWire (..),
     ConsistencyWire (..),
     CaveatContextWire (..),
     CheckRequestWire (..),
@@ -24,9 +25,11 @@ module En.Servant.API (
     BatchCheckResponseWire (..),
     LookupRequestWire (..),
     LookupObjectWire (..),
+    LookupStateWire (..),
     LookupPageWire (..),
     ExpandRequestWire (..),
     ExpandNodeWire (..),
+    ExpandStateWire (..),
     ExpandTreeWire (..),
     WriteTuplesRequestWire (..),
     WriteTuplesResponseWire (..),
@@ -43,7 +46,18 @@ module En.Servant.API (
 ) where
 
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (FromJSON, ToJSON)
+import Data.Aeson (
+    FromJSON (..),
+    Object,
+    ToJSON (..),
+    pairs,
+    withObject,
+    (.:),
+    (.:?),
+    (.=),
+ )
+import Data.Aeson qualified as Aeson
+import Data.Aeson.Types (Parser)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -53,7 +67,6 @@ import Effectful (Eff, IOE)
 import Effectful qualified
 import Effectful.Error.Static (Error)
 import GHC.Clock (getMonotonicTimeNSec)
-import GHC.Generics (Generic)
 import Servant (
     Application,
     Delete,
@@ -113,19 +126,88 @@ app :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnEr
 app =
     serve apiProxy . server
 
+{- The JSON below is the public contract. Every instance in this section is written by
+hand so that the wire shape is a reviewed artifact rather than a side effect of
+generic derivation — which, for sum types, would leak Haskell constructor names as
+{"tag": "AllowedWire"}. Each sum type carries a string discriminator field naming its
+variant: `kind` for subjects and expand nodes, `mode` for consistency, `result` for
+decisions, `status` for page states, and `type` for caveat values (matching the
+storage encoding in En.Postgres.TupleStore).
+
+Both toJSON and toEncoding are defined for every type. Data.Aeson.encode goes through
+toEncoding, so writing it explicitly both skips the intermediate Value on the response
+path and fixes field order, which is what lets the golden tests in
+en-servant/test/Main.hs compare exact bytes.
+-}
+
+-- | Fail a decode with a message naming the discriminator and its legal values.
+unknownVariant :: String -> Text -> [Text] -> Parser a
+unknownVariant description value allowed =
+    fail $
+        "unknown "
+            <> description
+            <> " "
+            <> show value
+            <> "; expected "
+            <> Text.unpack (Text.intercalate ", " allowed)
+
 data ObjectRefWire = ObjectRefWire
     { objectType :: !Text
     , objectId :: !Text
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON ObjectRefWire where
+    toJSON wire = Aeson.object ["objectType" .= wire.objectType, "objectId" .= wire.objectId]
+    toEncoding wire = pairs ("objectType" .= wire.objectType <> "objectId" .= wire.objectId)
+
+instance FromJSON ObjectRefWire where
+    parseJSON = withObject "ObjectRefWire" objectRefFields
+
+-- | The @objectType@/@objectId@ pair, which subjects inline rather than nest.
+objectRefFields :: Object -> Parser ObjectRefWire
+objectRefFields o =
+    ObjectRefWire <$> o .: "objectType" <*> o .: "objectId"
 
 data SubjectWire
     = SubjectIdWire !ObjectRefWire
     | SubjectSetWire !ObjectRefWire !Text
     | SubjectWildcardWire !Text
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON SubjectWire where
+    toJSON = \case
+        SubjectIdWire ref ->
+            Aeson.object ["kind" .= ("id" :: Text), "objectType" .= ref.objectType, "objectId" .= ref.objectId]
+        SubjectSetWire ref relation ->
+            Aeson.object
+                [ "kind" .= ("set" :: Text)
+                , "objectType" .= ref.objectType
+                , "objectId" .= ref.objectId
+                , "relation" .= relation
+                ]
+        SubjectWildcardWire objectType ->
+            Aeson.object ["kind" .= ("wildcard" :: Text), "objectType" .= objectType]
+    toEncoding = \case
+        SubjectIdWire ref ->
+            pairs ("kind" .= ("id" :: Text) <> "objectType" .= ref.objectType <> "objectId" .= ref.objectId)
+        SubjectSetWire ref relation ->
+            pairs
+                ( "kind" .= ("set" :: Text)
+                    <> "objectType" .= ref.objectType
+                    <> "objectId" .= ref.objectId
+                    <> "relation" .= relation
+                )
+        SubjectWildcardWire objectType ->
+            pairs ("kind" .= ("wildcard" :: Text) <> "objectType" .= objectType)
+
+instance FromJSON SubjectWire where
+    parseJSON = withObject "SubjectWire" \o ->
+        o .: "kind" >>= \case
+            "id" -> SubjectIdWire <$> objectRefFields o
+            "set" -> SubjectSetWire <$> objectRefFields o <*> o .: "relation"
+            "wildcard" -> SubjectWildcardWire <$> o .: "objectType"
+            other -> unknownVariant "subject kind" other ["id", "set", "wildcard"]
 
 data CaveatValueWire
     = ValueTextWire !Text
@@ -133,27 +215,73 @@ data CaveatValueWire
     | ValueIntegerWire !Integer
     | ValueTimestampWire !UTCTime
     | ValueEnumWire !Text
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON CaveatValueWire where
+    toJSON = \case
+        ValueTextWire value -> Aeson.object ["type" .= ("text" :: Text), "value" .= value]
+        ValueBoolWire value -> Aeson.object ["type" .= ("bool" :: Text), "value" .= value]
+        ValueIntegerWire value -> Aeson.object ["type" .= ("integer" :: Text), "value" .= value]
+        ValueTimestampWire value -> Aeson.object ["type" .= ("timestamp" :: Text), "value" .= value]
+        ValueEnumWire value -> Aeson.object ["type" .= ("enum" :: Text), "value" .= value]
+    toEncoding = \case
+        ValueTextWire value -> pairs ("type" .= ("text" :: Text) <> "value" .= value)
+        ValueBoolWire value -> pairs ("type" .= ("bool" :: Text) <> "value" .= value)
+        ValueIntegerWire value -> pairs ("type" .= ("integer" :: Text) <> "value" .= value)
+        ValueTimestampWire value -> pairs ("type" .= ("timestamp" :: Text) <> "value" .= value)
+        ValueEnumWire value -> pairs ("type" .= ("enum" :: Text) <> "value" .= value)
+
+instance FromJSON CaveatValueWire where
+    parseJSON = withObject "CaveatValueWire" \o ->
+        o .: "type" >>= \case
+            "text" -> ValueTextWire <$> o .: "value"
+            "bool" -> ValueBoolWire <$> o .: "value"
+            "integer" -> ValueIntegerWire <$> o .: "value"
+            "timestamp" -> ValueTimestampWire <$> o .: "value"
+            "enum" -> ValueEnumWire <$> o .: "value"
+            other ->
+                unknownVariant
+                    "caveat value type"
+                    other
+                    ["text", "bool", "integer", "timestamp", "enum"]
 
 newtype CaveatPayloadWire = CaveatPayloadWire
     { values :: Map Text CaveatValueWire
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON CaveatPayloadWire where
+    toJSON wire = Aeson.object ["values" .= wire.values]
+    toEncoding wire = pairs ("values" .= wire.values)
+
+instance FromJSON CaveatPayloadWire where
+    parseJSON = withObject "CaveatPayloadWire" \o -> CaveatPayloadWire <$> o .: "values"
 
 newtype CaveatContextWire = CaveatContextWire
     { values :: Map Text CaveatValueWire
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON CaveatContextWire where
+    toJSON wire = Aeson.object ["values" .= wire.values]
+    toEncoding wire = pairs ("values" .= wire.values)
+
+instance FromJSON CaveatContextWire where
+    parseJSON = withObject "CaveatContextWire" \o -> CaveatContextWire <$> o .: "values"
 
 data TupleCaveatWire = TupleCaveatWire
     { name :: !Text
     , payload :: !CaveatPayloadWire
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON TupleCaveatWire where
+    toJSON wire = Aeson.object ["name" .= wire.name, "payload" .= wire.payload]
+    toEncoding wire = pairs ("name" .= wire.name <> "payload" .= wire.payload)
+
+instance FromJSON TupleCaveatWire where
+    parseJSON = withObject "TupleCaveatWire" \o ->
+        TupleCaveatWire <$> o .: "name" <*> o .: "payload"
 
 data TupleWire = TupleWire
     { object :: !ObjectRefWire
@@ -161,16 +289,59 @@ data TupleWire = TupleWire
     , subject :: !SubjectWire
     , caveat :: !(Maybe TupleCaveatWire)
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON TupleWire where
+    toJSON wire =
+        Aeson.object
+            [ "object" .= wire.object
+            , "relation" .= wire.relation
+            , "subject" .= wire.subject
+            , "caveat" .= wire.caveat
+            ]
+    toEncoding wire =
+        pairs
+            ( "object" .= wire.object
+                <> "relation" .= wire.relation
+                <> "subject" .= wire.subject
+                <> "caveat" .= wire.caveat
+            )
+
+instance FromJSON TupleWire where
+    parseJSON = withObject "TupleWire" \o ->
+        TupleWire <$> o .: "object" <*> o .: "relation" <*> o .: "subject" <*> o .:? "caveat"
 
 data ConsistencyWire
     = MinimizeLatencyWire
     | FullyConsistentWire
     | AtLeastAsFreshWire !Text
     | AtExactSnapshotWire !Text
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON ConsistencyWire where
+    toJSON = \case
+        MinimizeLatencyWire -> Aeson.object ["mode" .= ("minimizeLatency" :: Text)]
+        FullyConsistentWire -> Aeson.object ["mode" .= ("fullyConsistent" :: Text)]
+        AtLeastAsFreshWire token -> Aeson.object ["mode" .= ("atLeastAsFresh" :: Text), "token" .= token]
+        AtExactSnapshotWire token -> Aeson.object ["mode" .= ("atExactSnapshot" :: Text), "token" .= token]
+    toEncoding = \case
+        MinimizeLatencyWire -> pairs ("mode" .= ("minimizeLatency" :: Text))
+        FullyConsistentWire -> pairs ("mode" .= ("fullyConsistent" :: Text))
+        AtLeastAsFreshWire token -> pairs ("mode" .= ("atLeastAsFresh" :: Text) <> "token" .= token)
+        AtExactSnapshotWire token -> pairs ("mode" .= ("atExactSnapshot" :: Text) <> "token" .= token)
+
+instance FromJSON ConsistencyWire where
+    parseJSON = withObject "ConsistencyWire" \o ->
+        o .: "mode" >>= \case
+            "minimizeLatency" -> pure MinimizeLatencyWire
+            "fullyConsistent" -> pure FullyConsistentWire
+            "atLeastAsFresh" -> AtLeastAsFreshWire <$> o .: "token"
+            "atExactSnapshot" -> AtExactSnapshotWire <$> o .: "token"
+            other ->
+                unknownVariant
+                    "consistency mode"
+                    other
+                    ["minimizeLatency", "fullyConsistent", "atLeastAsFresh", "atExactSnapshot"]
 
 data CheckRequestWire = CheckRequestWire
     { consistency :: !ConsistencyWire
@@ -179,50 +350,140 @@ data CheckRequestWire = CheckRequestWire
     , permission :: !Text
     , object :: !ObjectRefWire
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON CheckRequestWire where
+    toJSON wire =
+        Aeson.object
+            [ "consistency" .= wire.consistency
+            , "context" .= wire.context
+            , "subject" .= wire.subject
+            , "permission" .= wire.permission
+            , "object" .= wire.object
+            ]
+    toEncoding wire =
+        pairs
+            ( "consistency" .= wire.consistency
+                <> "context" .= wire.context
+                <> "subject" .= wire.subject
+                <> "permission" .= wire.permission
+                <> "object" .= wire.object
+            )
+
+instance FromJSON CheckRequestWire where
+    parseJSON = withObject "CheckRequestWire" \o ->
+        CheckRequestWire
+            <$> o .: "consistency"
+            <*> o .: "context"
+            <*> o .: "subject"
+            <*> o .: "permission"
+            <*> o .: "object"
 
 data CheckDecisionWire
     = AllowedWire
     | DeniedWire
     | ConditionalWire ![CaveatObligationWire]
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON CheckDecisionWire where
+    toJSON = \case
+        AllowedWire -> Aeson.object ["result" .= ("allowed" :: Text)]
+        DeniedWire -> Aeson.object ["result" .= ("denied" :: Text)]
+        ConditionalWire obligations ->
+            Aeson.object ["result" .= ("conditional" :: Text), "obligations" .= obligations]
+    toEncoding = \case
+        AllowedWire -> pairs ("result" .= ("allowed" :: Text))
+        DeniedWire -> pairs ("result" .= ("denied" :: Text))
+        ConditionalWire obligations ->
+            pairs ("result" .= ("conditional" :: Text) <> "obligations" .= obligations)
+
+instance FromJSON CheckDecisionWire where
+    parseJSON = withObject "CheckDecisionWire" \o ->
+        o .: "result" >>= \case
+            "allowed" -> pure AllowedWire
+            "denied" -> pure DeniedWire
+            "conditional" -> ConditionalWire <$> o .: "obligations"
+            other -> unknownVariant "check result" other ["allowed", "denied", "conditional"]
 
 data CaveatObligationWire = CaveatObligationWire
     { caveat :: !Text
     , missingContext :: ![Text]
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON CaveatObligationWire where
+    toJSON wire = Aeson.object ["caveat" .= wire.caveat, "missingContext" .= wire.missingContext]
+    toEncoding wire = pairs ("caveat" .= wire.caveat <> "missingContext" .= wire.missingContext)
+
+instance FromJSON CaveatObligationWire where
+    parseJSON = withObject "CaveatObligationWire" \o ->
+        CaveatObligationWire <$> o .: "caveat" <*> o .: "missingContext"
 
 newtype CheckResponseWire = CheckResponseWire
     { decision :: CheckDecisionWire
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON CheckResponseWire where
+    toJSON wire = Aeson.object ["decision" .= wire.decision]
+    toEncoding wire = pairs ("decision" .= wire.decision)
+
+instance FromJSON CheckResponseWire where
+    parseJSON = withObject "CheckResponseWire" \o -> CheckResponseWire <$> o .: "decision"
 
 data BatchCheckPairWire = BatchCheckPairWire
     { subject :: !SubjectWire
     , permission :: !Text
     , object :: !ObjectRefWire
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON BatchCheckPairWire where
+    toJSON wire =
+        Aeson.object ["subject" .= wire.subject, "permission" .= wire.permission, "object" .= wire.object]
+    toEncoding wire =
+        pairs ("subject" .= wire.subject <> "permission" .= wire.permission <> "object" .= wire.object)
+
+instance FromJSON BatchCheckPairWire where
+    parseJSON = withObject "BatchCheckPairWire" \o ->
+        BatchCheckPairWire <$> o .: "subject" <*> o .: "permission" <*> o .: "object"
 
 data BatchCheckRequestWire = BatchCheckRequestWire
     { consistency :: !ConsistencyWire
     , context :: !CaveatContextWire
     , pairs :: ![BatchCheckPairWire]
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON BatchCheckRequestWire where
+    toJSON wire =
+        Aeson.object
+            [ "consistency" .= wire.consistency
+            , "context" .= wire.context
+            , "pairs" .= wire.pairs
+            ]
+    toEncoding wire =
+        pairs
+            ( "consistency" .= wire.consistency
+                <> "context" .= wire.context
+                <> "pairs" .= wire.pairs
+            )
+
+instance FromJSON BatchCheckRequestWire where
+    parseJSON = withObject "BatchCheckRequestWire" \o ->
+        BatchCheckRequestWire <$> o .: "consistency" <*> o .: "context" <*> o .: "pairs"
 
 newtype BatchCheckResponseWire = BatchCheckResponseWire
     { decisions :: [CheckDecisionWire]
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON BatchCheckResponseWire where
+    toJSON wire = Aeson.object ["decisions" .= wire.decisions]
+    toEncoding wire = pairs ("decisions" .= wire.decisions)
+
+instance FromJSON BatchCheckResponseWire where
+    parseJSON = withObject "BatchCheckResponseWire" \o -> BatchCheckResponseWire <$> o .: "decisions"
 
 data LookupRequestWire = LookupRequestWire
     { consistency :: !ConsistencyWire
@@ -234,29 +495,95 @@ data LookupRequestWire = LookupRequestWire
     , cursor :: !(Maybe Text)
     , deadlineMillis :: !(Maybe Int)
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON LookupRequestWire where
+    toJSON wire =
+        Aeson.object
+            [ "consistency" .= wire.consistency
+            , "subject" .= wire.subject
+            , "permission" .= wire.permission
+            , "objectType" .= wire.objectType
+            , "context" .= wire.context
+            , "limit" .= wire.limit
+            , "cursor" .= wire.cursor
+            , "deadlineMillis" .= wire.deadlineMillis
+            ]
+    toEncoding wire =
+        pairs
+            ( "consistency" .= wire.consistency
+                <> "subject" .= wire.subject
+                <> "permission" .= wire.permission
+                <> "objectType" .= wire.objectType
+                <> "context" .= wire.context
+                <> "limit" .= wire.limit
+                <> "cursor" .= wire.cursor
+                <> "deadlineMillis" .= wire.deadlineMillis
+            )
+
+instance FromJSON LookupRequestWire where
+    parseJSON = withObject "LookupRequestWire" \o ->
+        LookupRequestWire
+            <$> o .: "consistency"
+            <*> o .: "subject"
+            <*> o .: "permission"
+            <*> o .: "objectType"
+            <*> o .: "context"
+            <*> o .: "limit"
+            <*> o .:? "cursor"
+            <*> o .:? "deadlineMillis"
 
 data LookupObjectWire = LookupObjectWire
     { object :: !ObjectRefWire
     , decision :: !CheckDecisionWire
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON LookupObjectWire where
+    toJSON wire = Aeson.object ["object" .= wire.object, "decision" .= wire.decision]
+    toEncoding wire = pairs ("object" .= wire.object <> "decision" .= wire.decision)
+
+instance FromJSON LookupObjectWire where
+    parseJSON = withObject "LookupObjectWire" \o ->
+        LookupObjectWire <$> o .: "object" <*> o .: "decision"
 
 data LookupStateWire
     = LookupExhaustedWire
     | LookupHasMoreWire !Text
     | LookupTruncatedWire !Text
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON LookupStateWire where
+    toJSON = \case
+        LookupExhaustedWire -> Aeson.object ["status" .= ("exhausted" :: Text)]
+        LookupHasMoreWire cursor -> Aeson.object ["status" .= ("hasMore" :: Text), "cursor" .= cursor]
+        LookupTruncatedWire cursor -> Aeson.object ["status" .= ("truncated" :: Text), "cursor" .= cursor]
+    toEncoding = \case
+        LookupExhaustedWire -> pairs ("status" .= ("exhausted" :: Text))
+        LookupHasMoreWire cursor -> pairs ("status" .= ("hasMore" :: Text) <> "cursor" .= cursor)
+        LookupTruncatedWire cursor -> pairs ("status" .= ("truncated" :: Text) <> "cursor" .= cursor)
+
+instance FromJSON LookupStateWire where
+    parseJSON = withObject "LookupStateWire" \o ->
+        o .: "status" >>= \case
+            "exhausted" -> pure LookupExhaustedWire
+            "hasMore" -> LookupHasMoreWire <$> o .: "cursor"
+            "truncated" -> LookupTruncatedWire <$> o .: "cursor"
+            other -> unknownVariant "lookup status" other ["exhausted", "hasMore", "truncated"]
 
 data LookupPageWire = LookupPageWire
     { objects :: ![LookupObjectWire]
     , state :: !LookupStateWire
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON LookupPageWire where
+    toJSON wire = Aeson.object ["objects" .= wire.objects, "state" .= wire.state]
+    toEncoding wire = pairs ("objects" .= wire.objects <> "state" .= wire.state)
+
+instance FromJSON LookupPageWire where
+    parseJSON = withObject "LookupPageWire" \o ->
+        LookupPageWire <$> o .: "objects" <*> o .: "state"
 
 data ExpandRequestWire = ExpandRequestWire
     { consistency :: !ConsistencyWire
@@ -266,22 +593,101 @@ data ExpandRequestWire = ExpandRequestWire
     , limit :: !Int
     , cursor :: !(Maybe Text)
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON ExpandRequestWire where
+    toJSON wire =
+        Aeson.object
+            [ "consistency" .= wire.consistency
+            , "object" .= wire.object
+            , "permission" .= wire.permission
+            , "context" .= wire.context
+            , "limit" .= wire.limit
+            , "cursor" .= wire.cursor
+            ]
+    toEncoding wire =
+        pairs
+            ( "consistency" .= wire.consistency
+                <> "object" .= wire.object
+                <> "permission" .= wire.permission
+                <> "context" .= wire.context
+                <> "limit" .= wire.limit
+                <> "cursor" .= wire.cursor
+            )
+
+instance FromJSON ExpandRequestWire where
+    parseJSON = withObject "ExpandRequestWire" \o ->
+        ExpandRequestWire
+            <$> o .: "consistency"
+            <*> o .: "object"
+            <*> o .: "permission"
+            <*> o .: "context"
+            <*> o .: "limit"
+            <*> o .:? "cursor"
 
 data ExpandNodeWire
     = ExpandSubjectWire !SubjectWire
     | ExpandUsersetWire !ObjectRefWire !Text ![ExpandNodeWire]
     | ExpandCaveatedWire !Text ![ExpandNodeWire]
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON ExpandNodeWire where
+    toJSON = \case
+        ExpandSubjectWire subject ->
+            Aeson.object ["kind" .= ("subject" :: Text), "subject" .= subject]
+        ExpandUsersetWire ref relation children ->
+            Aeson.object
+                [ "kind" .= ("userset" :: Text)
+                , "object" .= ref
+                , "relation" .= relation
+                , "children" .= children
+                ]
+        ExpandCaveatedWire caveat children ->
+            Aeson.object ["kind" .= ("caveated" :: Text), "caveat" .= caveat, "children" .= children]
+    toEncoding = \case
+        ExpandSubjectWire subject ->
+            pairs ("kind" .= ("subject" :: Text) <> "subject" .= subject)
+        ExpandUsersetWire ref relation children ->
+            pairs
+                ( "kind" .= ("userset" :: Text)
+                    <> "object" .= ref
+                    <> "relation" .= relation
+                    <> "children" .= children
+                )
+        ExpandCaveatedWire caveat children ->
+            pairs ("kind" .= ("caveated" :: Text) <> "caveat" .= caveat <> "children" .= children)
+
+instance FromJSON ExpandNodeWire where
+    parseJSON = withObject "ExpandNodeWire" \o ->
+        o .: "kind" >>= \case
+            "subject" -> ExpandSubjectWire <$> o .: "subject"
+            "userset" -> ExpandUsersetWire <$> o .: "object" <*> o .: "relation" <*> o .: "children"
+            "caveated" -> ExpandCaveatedWire <$> o .: "caveat" <*> o .: "children"
+            other -> unknownVariant "expand node kind" other ["subject", "userset", "caveated"]
 
 data ExpandStateWire
     = ExpandExhaustedWire
     | ExpandHasMoreWire !Text
     | ExpandTruncatedWire !Text
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON ExpandStateWire where
+    toJSON = \case
+        ExpandExhaustedWire -> Aeson.object ["status" .= ("exhausted" :: Text)]
+        ExpandHasMoreWire cursor -> Aeson.object ["status" .= ("hasMore" :: Text), "cursor" .= cursor]
+        ExpandTruncatedWire cursor -> Aeson.object ["status" .= ("truncated" :: Text), "cursor" .= cursor]
+    toEncoding = \case
+        ExpandExhaustedWire -> pairs ("status" .= ("exhausted" :: Text))
+        ExpandHasMoreWire cursor -> pairs ("status" .= ("hasMore" :: Text) <> "cursor" .= cursor)
+        ExpandTruncatedWire cursor -> pairs ("status" .= ("truncated" :: Text) <> "cursor" .= cursor)
+
+instance FromJSON ExpandStateWire where
+    parseJSON = withObject "ExpandStateWire" \o ->
+        o .: "status" >>= \case
+            "exhausted" -> pure ExpandExhaustedWire
+            "hasMore" -> ExpandHasMoreWire <$> o .: "cursor"
+            "truncated" -> ExpandTruncatedWire <$> o .: "cursor"
+            other -> unknownVariant "expand status" other ["exhausted", "hasMore", "truncated"]
 
 data ExpandTreeWire = ExpandTreeWire
     { root :: !ObjectRefWire
@@ -289,26 +695,63 @@ data ExpandTreeWire = ExpandTreeWire
     , children :: ![ExpandNodeWire]
     , state :: !ExpandStateWire
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON ExpandTreeWire where
+    toJSON wire =
+        Aeson.object
+            [ "root" .= wire.root
+            , "permission" .= wire.permission
+            , "children" .= wire.children
+            , "state" .= wire.state
+            ]
+    toEncoding wire =
+        pairs
+            ( "root" .= wire.root
+                <> "permission" .= wire.permission
+                <> "children" .= wire.children
+                <> "state" .= wire.state
+            )
+
+instance FromJSON ExpandTreeWire where
+    parseJSON = withObject "ExpandTreeWire" \o ->
+        ExpandTreeWire <$> o .: "root" <*> o .: "permission" <*> o .: "children" <*> o .: "state"
 
 newtype WriteTuplesRequestWire = WriteTuplesRequestWire
     { tuples :: [TupleWire]
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON WriteTuplesRequestWire where
+    toJSON wire = Aeson.object ["tuples" .= wire.tuples]
+    toEncoding wire = pairs ("tuples" .= wire.tuples)
+
+instance FromJSON WriteTuplesRequestWire where
+    parseJSON = withObject "WriteTuplesRequestWire" \o -> WriteTuplesRequestWire <$> o .: "tuples"
 
 newtype DeleteTuplesRequestWire = DeleteTuplesRequestWire
     { tuples :: [TupleWire]
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON DeleteTuplesRequestWire where
+    toJSON wire = Aeson.object ["tuples" .= wire.tuples]
+    toEncoding wire = pairs ("tuples" .= wire.tuples)
+
+instance FromJSON DeleteTuplesRequestWire where
+    parseJSON = withObject "DeleteTuplesRequestWire" \o -> DeleteTuplesRequestWire <$> o .: "tuples"
 
 newtype WriteTuplesResponseWire = WriteTuplesResponseWire
     { token :: Text
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
+
+instance ToJSON WriteTuplesResponseWire where
+    toJSON wire = Aeson.object ["token" .= wire.token]
+    toEncoding wire = pairs ("token" .= wire.token)
+
+instance FromJSON WriteTuplesResponseWire where
+    parseJSON = withObject "WriteTuplesResponseWire" \o -> WriteTuplesResponseWire <$> o .: "token"
 
 writeTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> WriteTuplesRequestWire -> Handler WriteTuplesResponseWire
 writeTuplesHandler env request = do
@@ -348,7 +791,7 @@ batchCheckHandler env request = do
         else pure ()
     consistency <- either400 (consistencyFromWire request.consistency)
     context <- either400 (contextFromWire request.context)
-    pairs <- traverseOr400 pairFromWire request.pairs
+    batchPairs <- traverseOr400 pairFromWire request.pairs
     decisions <-
         runEngine
             env
@@ -356,7 +799,7 @@ batchCheckHandler env request = do
                 env.graph
                 consistency
                 context
-                pairs
+                batchPairs
             )
     pure BatchCheckResponseWire{decisions = decisionToWire <$> decisions}
   where

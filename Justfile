@@ -80,16 +80,16 @@ test-server:
     curl -sS -X DELETE "$url/tuples" \
       -H "$auth" \
       -H 'content-type: application/json' \
-      -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"tag":"SubjectIdWire","contents":{"objectType":"user","objectId":"alice"}},"caveat":null}]}' >/dev/null; \
+      -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}]}' >/dev/null; \
     token=$(curl -sS -X POST "$url/tuples" \
       -H "$auth" \
       -H 'content-type: application/json' \
-      -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"tag":"SubjectIdWire","contents":{"objectType":"user","objectId":"alice"}},"caveat":null}]}' \
+      -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}]}' \
       | jq -r '.token'); \
     decision=$(curl -sS -X POST "$url/check" \
       -H "$auth" \
       -H 'content-type: application/json' \
-      -d "{\"consistency\":{\"tag\":\"AtLeastAsFreshWire\",\"contents\":\"$token\"},\"context\":{\"values\":{}},\"subject\":{\"tag\":\"SubjectIdWire\",\"contents\":{\"objectType\":\"user\",\"objectId\":\"alice\"}},\"permission\":\"view\",\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"}}" \
-      | jq -r '.decision.tag'); \
-    test "$decision" = "AllowedWire"; \
+      -d "{\"consistency\":{\"mode\":\"atLeastAsFresh\",\"token\":\"$token\"},\"context\":{\"values\":{}},\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"permission\":\"view\",\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"}}" \
+      | jq -r '.decision.result'); \
+    test "$decision" = "allowed"; \
     echo "server smoke test passed: $decision"

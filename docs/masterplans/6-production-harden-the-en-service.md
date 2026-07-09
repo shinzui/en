@@ -72,7 +72,7 @@ merely because they touch the same lines, not because of real artifact dependenc
 |---|-------|------|-----------|-----------|--------|
 | EP-33 | Add caller authentication and rate limiting to en-server | docs/plans/33-add-caller-authentication-and-rate-limiting-to-en-server.md | None | None | Complete |
 | EP-34 | Pool database connections in en-server | docs/plans/34-pool-database-connections-in-en-server.md | None | None | Complete |
-| EP-35 | Version the wire contract and type the error model | docs/plans/35-version-the-wire-contract-and-type-the-error-model.md | None | None | Not Started |
+| EP-35 | Version the wire contract and type the error model | docs/plans/35-version-the-wire-contract-and-type-the-error-model.md | None | None | In Progress |
 | EP-36 | Add health endpoints, graceful shutdown, and observability | docs/plans/36-add-health-endpoints-graceful-shutdown-and-observability.md | None | EP-34, EP-35 | Not Started |
 | EP-37 | Schedule background maintenance for reaping and transaction pruning | docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md | None | EP-34 | Not Started |
 | EP-38 | Validate configuration and persist datastore identity | docs/plans/38-validate-configuration-and-persist-datastore-identity.md | None | None | Not Started |
