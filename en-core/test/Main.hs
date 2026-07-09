@@ -259,6 +259,7 @@ main = do
     testCacheOperations
     testCachedTupleStore
     testStorePaging
+    testDedupeObligations
     testResidualDecision
     validKikan <- either (fail . show) pure (validateSchema kikanSchema)
     validKikanManual <- either (fail . show) pure (validateSchema kikanSchemaManual)
@@ -950,6 +951,33 @@ sampleDecisionKeyWith keySchemaHash keyRevision keyContext =
         , object = space
         , context = keyContext
         }
+
+{- | Deduplication keeps first-occurrence order, and dedupes on the whole value.
+
+Both properties have a plausible wrong implementation that most assertions miss.
+@Set.toAscList . Set.fromList@ dedupes correctly and sorts, which reorders a
+'Conditional' payload a client compares; only an input whose first-occurrence
+order differs from its sorted order can see that, so @within_autonomy@ comes
+before @min_clearance@ here. And an implementation keyed on 'caveat' alone would
+collapse two obligations naming the same caveat with different missing keys,
+silently dropping one of the keys the caller must supply.
+-}
+testDedupeObligations :: IO ()
+testDedupeObligations = do
+    let obligation caveat missing = CaveatObligation{caveat = CaveatName caveat, missingContext = missing}
+    assertEqual
+        "dedupe keeps first-occurrence order rather than sorted order"
+        [obligation "within_autonomy" ["requested_autonomy"], obligation "min_clearance" ["clearance"]]
+        ( Decision.dedupeObligations
+            [ obligation "within_autonomy" ["requested_autonomy"]
+            , obligation "min_clearance" ["clearance"]
+            , obligation "within_autonomy" ["requested_autonomy"]
+            ]
+        )
+    assertEqual
+        "dedupe separates obligations that name one caveat but need different context"
+        [obligation "window" ["from"], obligation "window" ["until"]]
+        (Decision.dedupeObligations [obligation "window" ["from"], obligation "window" ["until"], obligation "window" ["from"]])
 
 {- | The in-memory conformance store pages a relation of any width without
 skipping rows.

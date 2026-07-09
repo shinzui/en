@@ -18,6 +18,7 @@ module En.Decision (
     applyGate,
 ) where
 
+import Data.Set qualified as Set
 import Data.Text (Text)
 
 import En.Caveat.Value (CaveatPayload)
@@ -28,7 +29,7 @@ data CaveatObligation = CaveatObligation
     { caveat :: !CaveatName
     , missingContext :: ![Text]
     }
-    deriving stock (Eq, Show)
+    deriving stock (Eq, Ord, Show)
 
 {- | Three-valued authorization result. 'Conditional' means the graph path exists
 but one or more caveats need request context before the caller may treat it as
@@ -184,13 +185,22 @@ applyDecisionGate :: CheckDecision -> CheckDecision -> CheckDecision
 applyDecisionGate gate decision =
     intersectionDecisions [gate, decision]
 
+{- | Drop repeated obligations, keeping each one at its first occurrence.
+
+Order is part of the contract: a 'Conditional' payload is compared in tests and
+returned to clients, and it should not depend on how the decision tree was
+folded. The old implementation kept order by scanning the accumulator with 'elem'
+and appending to its tail, which is quadratic twice over; this walks once,
+carrying a 'Set.Set' of what it has already emitted.
+-}
 dedupeObligations :: [CaveatObligation] -> [CaveatObligation]
 dedupeObligations =
-    foldl'
-        ( \acc obligation ->
-            if obligation `elem` acc then acc else acc <> [obligation]
-        )
-        []
+    go Set.empty
+  where
+    go _ [] = []
+    go seen (obligation : rest)
+        | Set.member obligation seen = go seen rest
+        | otherwise = obligation : go (Set.insert obligation seen) rest
 
 union :: [CheckDecision] -> CheckDecision
 union =

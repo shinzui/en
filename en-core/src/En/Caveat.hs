@@ -6,6 +6,7 @@ module En.Caveat (
 
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Text (Text)
 
 import En.Caveat.Value (CaveatContext (..), CaveatPayload (..), CaveatValue (..))
@@ -185,10 +186,16 @@ applyCompare =
         CmpGt -> (>)
         CmpGe -> (>=)
 
-dedupe :: (Eq a) => [a] -> [a]
+{- | Drop repeated names, keeping each at its first occurrence.
+
+The names reach a client inside a 'CaveatObligation', so first-occurrence order
+is the contract. Mirrors 'En.Decision.dedupeObligations'.
+-}
+dedupe :: (Ord a) => [a] -> [a]
 dedupe =
-    foldl'
-        ( \acc value ->
-            if value `elem` acc then acc else acc <> [value]
-        )
-        []
+    go Set.empty
+  where
+    go _ [] = []
+    go seen (value : rest)
+        | Set.member value seen = go seen rest
+        | otherwise = value : go (Set.insert value seen) rest
