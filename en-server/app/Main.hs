@@ -1,5 +1,6 @@
 module Main (main) where
 
+import Control.Concurrent.Async (withAsync)
 import Control.Exception (IOException, finally, try)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
@@ -36,6 +37,7 @@ import Hasql.Pool qualified as Pool
 import Hasql.Pool.Config qualified as Pool.Config
 import Hasql.Session qualified as Session
 import Health (healthRoutes)
+import Maintenance (describeMaintenance, loadMaintenanceConfig, runMaintenanceLoop)
 import Metrics (metricsMiddleware, metricsRoute, newMetrics)
 import Middleware (authMiddleware, describeRateLimit, loadAuthConfig, loadRateLimitConfig, rateLimitMiddleware)
 import Observability (newRequestLogger, requestIdMiddleware)
@@ -49,6 +51,7 @@ main = do
     databaseUrl <- requiredEnv "EN_DATABASE_URL"
     authConfig <- loadAuthConfig
     rateLimitConfig <- loadRateLimitConfig
+    maintenanceConfig <- loadMaintenanceConfig
     tlsConfig <- loadTlsConfig
     port <- maybe 8080 parsePort <$> lookupEnv "EN_PORT"
     gcWindow <- maybe "24 hours" Text.pack <$> lookupEnv "EN_GC_WINDOW"
@@ -193,6 +196,7 @@ main = do
     Text.putStrLn ("Tuple-read cache: " <> describeEntryCache tupleReadMaxEntries)
     Text.putStrLn ("Decision cache: " <> describeEntryCache decisionMaxEntries)
     Text.putStrLn ("Rate limit: " <> describeRateLimit rateLimitConfig)
+    Text.putStrLn ("Background maintenance: " <> describeMaintenance maintenanceConfig)
     rateLimit <- rateLimitMiddleware rateLimitConfig
     requestLogger <- newRequestLogger
     metrics <- newMetrics
@@ -217,7 +221,12 @@ main = do
                     , ("decision", cacheStats decisionCache)
                     ]
                 $ appWithOpenApi serverEnv
-    serve tlsConfig port wrappedApp `finally` Pool.release pool
+    -- `serve` returns when SIGTERM drains the server, at which point `withAsync`
+    -- cancels the maintenance thread and `finally` releases the pool. Every
+    -- maintenance batch is its own committed transaction, so cancelling mid-pass
+    -- loses only the batch in flight; the next start resumes from what was committed.
+    withAsync (runMaintenanceLoop maintenanceConfig runAppIO) \_maintenance ->
+        serve tlsConfig port wrappedApp `finally` Pool.release pool
 
 {- | Run Warp until SIGTERM or SIGINT, then drain.
 

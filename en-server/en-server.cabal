@@ -32,6 +32,7 @@ executable en-server
   main-is:        Main.hs
   other-modules:
     Health
+    Maintenance
     Metrics
     Middleware
     Observability
@@ -39,6 +40,7 @@ executable en-server
   ghc-options:    -threaded -rtsopts -with-rtsopts=-N
   build-depends:
     , aeson
+    , async
     , base            >=4.19 && <5
     , bytestring
     , containers

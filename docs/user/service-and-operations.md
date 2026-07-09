@@ -70,6 +70,8 @@ Environment variables:
 | `EN_POOL_ACQUISITION_TIMEOUT_MS` | no | How long a request waits for a free connection before failing, default `10000` |
 | `EN_POOL_IDLENESS_TIMEOUT_MS` | no | Close a connection unused for this long, default `600000` (10 minutes) |
 | `EN_POOL_MAX_LIFETIME_MS` | no | Close a connection older than this regardless of use, default `3600000` (1 hour) |
+| `EN_MAINTENANCE_INTERVAL_SECONDS` | no | Seconds between background maintenance passes, default `600`. `0` disables maintenance |
+| `EN_MAINTENANCE_BATCH_SIZE` | no | Rows deleted per maintenance statement, default `1000`. Must be at least `1` |
 
 Authentication, rate limiting, and TLS add seven more variables, documented under
 [Authentication, rate limiting, and TLS](#authentication-rate-limiting-and-tls).
@@ -245,6 +247,56 @@ are cheap to replace with `prometheus-client`.
 
 All counters are in-process and reset when the process restarts, which is what
 Prometheus expects. They are per-replica: aggregate across replicas at query time.
+
+### Background maintenance
+
+en never physically deletes on the write path. Deleting a relationship sets the row's
+`deleted_xid` — a soft delete, so a read at an older snapshot still sees it — and
+every write inserts one bookkeeping row into `en_transaction`. Both would accumulate
+without bound.
+
+`en-server` therefore runs a maintenance pass every `EN_MAINTENANCE_INTERVAL_SECONDS`
+(default 600). Each pass computes the **garbage-collection horizon** — the oldest
+transaction id still protected by `EN_GC_WINDOW` — and then deletes, in batches of
+`EN_MAINTENANCE_BATCH_SIZE`:
+
+- soft-deleted `relation_tuple` rows whose `deleted_xid` is behind the horizon, and
+- `en_transaction` rows whose `xid` is behind the horizon.
+
+Nothing inside the retention window is ever removed, so a consistency token that still
+validates can always be resolved. The horizon comes from the same query token
+validation uses, so the reaper, the pruner, and token validation cannot disagree.
+
+Each pass logs one line:
+
+```text
+maintenance: horizon=27332 reaped=38510 pruned=0 batches=40
+```
+
+A pass that fails — most plausibly because PostgreSQL is restarting — logs
+`maintenance: pass failed: …` and the schedule continues.
+
+Every batch is its own transaction. This bounds the row locks and the write-ahead log a
+single statement produces, and it makes the pass interruptible: `SIGTERM` during a pass
+cancels it immediately (the server does not wait for it to finish), every batch already
+committed stays committed, and the next pass — in this process or the next one — picks
+up the remainder.
+
+Pruning `en_transaction` is not merely housekeeping. Resolving consistency runs a
+`min(xid)` over the retention window on **every read**, and PostgreSQL answers it by
+walking the `xid` primary key until it reaches the first row inside the window. Rows
+behind the horizon are exactly the rows it must skip. With a 50,000-row backlog that
+scan touched 606 buffers and took 4.7 ms per read; with the backlog drained it touches
+2 buffers and takes 0.04 ms. **Do not run with `EN_MAINTENANCE_INTERVAL_SECONDS=0` in
+production**: read latency will grow linearly with your lifetime write count. Disable it
+only for one-shot environments and debugging.
+
+Two consequences of `EN_GC_WINDOW` worth stating plainly. It is simultaneously the
+retention window for garbage and the validity window for consistency tokens — shrinking
+it to make maintenance more aggressive also invalidates tokens sooner. And if no write
+occurs for a full window, `en_transaction` legitimately drains to zero; the horizon then
+falls back to `pg_snapshot_xmin(pg_current_snapshot())`, which is the same value the
+query would have returned with the old rows still present.
 
 ## Authentication, rate limiting, and TLS
 
@@ -519,6 +571,10 @@ that the en endpoints return them with — `400`, `422`, or `503` — not as a b
   a database-dependent probe.
 - Send `SIGTERM` to deploy. Give the process at least 30 seconds to drain before
   `SIGKILL`, matching the shutdown cap.
+- Leave background maintenance enabled. Watch the `reaped` and `pruned` counts in its
+  log line: a `reaped` that stays at the batch size every pass means the backlog is
+  growing faster than the interval drains it, so shorten the interval or raise the
+  batch size.
 - Monitor `check` and `lookup` latency, from `/metrics` or from the `durationMs`
   field of the request log. Once adopted, `en` is on the read path for protected
   list and object endpoints.
