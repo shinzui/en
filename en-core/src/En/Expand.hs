@@ -130,11 +130,14 @@ expandRelation ::
     RelationName ->
     EvalState ->
     Eff es (Either EnError [ExpandNode])
+-- Unlike check and lookup, expand reports a cycle rather than treating it as an
+-- empty result: it renders a tree for a human to audit, and quietly dropping a
+-- cyclic branch would hide data from the reviewer.
 expandRelation graph revision object relation state
     | state.depth >= maxDepth =
         pure (Left ResolutionLimitExceeded)
     | subproblem `elem` state.visited =
-        pure (Left ResolutionLimitExceeded)
+        pure (Left (CycleDetected (renderSubproblem subproblem)))
     | otherwise =
         case lookupRelation graph object.objectType relation of
             Left err -> pure (Left err)
@@ -301,3 +304,8 @@ showText =
 renderRef :: RelationRef -> Text
 renderRef RelationRef{objectType = ObjectType objectType, relation = RelationName relation} =
     objectType <> "#" <> relation
+
+-- | Render a revisited subproblem as @"space:recursive#view"@ for 'CycleDetected'.
+renderSubproblem :: Subproblem -> Text
+renderSubproblem Subproblem{object = ObjectRef{objectType = ObjectType objectType, objectId}, relation = RelationName relation} =
+    objectType <> ":" <> objectId <> "#" <> relation

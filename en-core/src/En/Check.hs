@@ -145,6 +145,24 @@ data MemoKey = MemoKey
 
 type CheckMemo = Map.Map MemoKey CheckDecision
 
+{- | Did a decision depend on cutting a cycle?
+
+A cut answers "no members" for a subproblem the evaluator is already inside. That
+answer is correct for the enclosing traversal and wrong for anyone else, so a
+'Tainted' decision may be returned but never memoized or cached.
+-}
+data CutTaint
+    = Untainted
+    | Tainted
+    deriving stock (Eq, Show)
+
+instance Semigroup CutTaint where
+    Untainted <> Untainted = Untainted
+    _ <> _ = Tainted
+
+instance Monoid CutTaint where
+    mempty = Untainted
+
 initialState :: EvalState
 initialState =
     EvalState{depth = 0, visited = []}
@@ -179,8 +197,9 @@ runCheckMemoWithCache ::
     ObjectRef ->
     CheckMemo ->
     Eff es (Either EnError CheckDecision, CheckMemo)
-runCheckMemoWithCache cacheOps graph context revision subject permission object =
-    evalRelationMemo cacheOps graph context revision subject object permission initialState
+runCheckMemoWithCache cacheOps graph context revision subject permission object memo = do
+    (result, memo', _taint) <- evalRelationMemo cacheOps graph context revision subject object permission initialState memo
+    pure (result, memo')
 
 data DecisionCacheOps es = DecisionCacheOps
     { lookupDecision :: !(Revision -> Subject -> RelationName -> ObjectRef -> Eff es (Maybe CheckDecision))
@@ -212,6 +231,24 @@ decisionCacheOps CheckCacheEnv{cacheDatastoreId, cacheDecisions} graph context =
             , context
             }
 
+{- | Evaluate @subject@'s membership in @object#relation@.
+
+A revisited subproblem contributes no members. Zanzibar's semantics for a
+membership recursion is its least fixpoint, and a cycle adds nothing to it, so
+re-entering a subproblem the evaluator is already inside yields 'Denied' -- the
+identity of 'Decision.union', which makes a cyclic branch simply drop out of a
+union, and the absorbing element of intersection, which correctly denies. This is
+what 'En.Lookup' already does on revisit.
+
+That 'Denied' is true only /inside/ the current recursion stack: evaluated on its
+own, the same subproblem may well be 'Allowed'. Any decision computed with the
+help of such a cut is therefore stack-local and must not outlive the stack, so
+this function reports whether its subtree consumed a cut, and refuses to write a
+tainted decision into the within-call memo or the cross-request decision cache.
+Without that, evaluating @Y@ where @X = Y union carol@ and @Y = X@ could memoize
+@Y = Denied@ (cut at @X@) and hand that answer to a later pair of the same
+'checkMany' batch, for which @Y@ is genuinely 'Allowed'.
+-}
 evalRelationMemo ::
     (TupleStore :> es) =>
     Maybe (DecisionCacheOps es) ->
@@ -223,27 +260,27 @@ evalRelationMemo ::
     RelationName ->
     EvalState ->
     CheckMemo ->
-    Eff es (Either EnError CheckDecision, CheckMemo)
+    Eff es (Either EnError CheckDecision, CheckMemo, CutTaint)
 evalRelationMemo cacheOps graph context revision subject object relation state memo
     | state.depth >= maxDepth =
-        pure (Left ResolutionLimitExceeded, memo)
+        pure (Left ResolutionLimitExceeded, memo, Untainted)
     | subproblem `elem` state.visited =
-        pure (Left ResolutionLimitExceeded, memo)
+        pure (Right Denied, memo, Tainted)
     | otherwise =
         case Map.lookup key memo of
             Just decision ->
-                pure (Right decision, memo)
+                pure (Right decision, memo, Untainted)
             Nothing -> do
                 external <- lookupExternalDecision
                 case external of
                     Just decision ->
-                        pure (Right decision, Map.insert key decision memo)
+                        pure (Right decision, Map.insert key decision memo, Untainted)
                     Nothing ->
                         case Map.lookup ref graph.relations of
                             Nothing ->
-                                pure (Left (UnknownRelation (renderRef ref)), memo)
+                                pure (Left (UnknownRelation (renderRef ref)), memo, Untainted)
                             Just schemaRelation -> do
-                                (result, memo') <-
+                                (result, memo', taint) <-
                                     evalRewriteMemo
                                         cacheOps
                                         graph
@@ -255,12 +292,12 @@ evalRelationMemo cacheOps graph context revision subject object relation state m
                                         schemaRelation.rewrite
                                         EvalState{depth = state.depth + 1, visited = subproblem : state.visited}
                                         memo
-                                case result of
-                                    Right decision -> do
+                                case (result, taint) of
+                                    (Right decision, Untainted) -> do
                                         insertExternalDecision decision
-                                        pure (result, Map.insert key decision memo')
-                                    Left _ ->
-                                        pure (result, memo')
+                                        pure (result, Map.insert key decision memo', Untainted)
+                                    _ ->
+                                        pure (result, memo', taint)
   where
     ref = RelationRef{objectType = object.objectType, relation}
     subproblem = Subproblem{subject, object, relation}
@@ -286,7 +323,7 @@ evalRewriteMemo ::
     Rewrite ->
     EvalState ->
     CheckMemo ->
-    Eff es (Either EnError CheckDecision, CheckMemo)
+    Eff es (Either EnError CheckDecision, CheckMemo, CutTaint)
 evalRewriteMemo cacheOps graph context revision subject object currentRelation rewrite state memo =
     case rewrite of
         This ->
@@ -295,29 +332,54 @@ evalRewriteMemo cacheOps graph context revision subject object currentRelation r
             evalRelationMemo cacheOps graph context revision subject object relation state memo
         TupleToUserset tuplesetRelation computedRelation ->
             evalTupleToUsersetMemo cacheOps graph context revision subject object tuplesetRelation computedRelation state memo
-        Union rewrites -> do
-            (decisions, memo') <-
-                evalRewriteListMemo cacheOps graph context revision subject object currentRelation rewrites state memo
-            pure (Decision.union <$> sequence decisions, memo')
-        Intersection rewrites -> do
-            (decisions, memo') <-
-                evalRewriteListMemo cacheOps graph context revision subject object currentRelation rewrites state memo
-            pure (Decision.intersection <$> sequence decisions, memo')
+        Union rewrites ->
+            evalBranchesMemo Decision.union unionSettled cacheOps graph context revision subject object currentRelation rewrites state memo
+        Intersection rewrites ->
+            evalBranchesMemo Decision.intersection intersectionSettled cacheOps graph context revision subject object currentRelation rewrites state memo
         Exclusion base subtractRewrite -> do
-            (baseDecision, memo') <- evalRewriteMemo cacheOps graph context revision subject object currentRelation base state memo
+            (baseDecision, memo', baseTaint) <- evalRewriteMemo cacheOps graph context revision subject object currentRelation base state memo
             case baseDecision of
-                Left err -> pure (Left err, memo')
-                Right Denied -> pure (Right Denied, memo')
-                Right (Conditional obligations) -> pure (Right (Conditional obligations), memo')
-                Right Allowed -> do
-                    (subtractDecision, memo'') <- evalRewriteMemo cacheOps graph context revision subject object currentRelation subtractRewrite state memo'
-                    pure (Decision.exclusion <$> subtractDecision, memo'')
+                Left err -> pure (Left err, memo', baseTaint)
+                -- Nothing can be subtracted from nothing, so the subtrahend is
+                -- never evaluated. Every other base must consult it: an
+                -- unconditional subtraction denies even a conditional base.
+                Right Denied -> pure (Right Denied, memo', baseTaint)
+                Right base' -> do
+                    (subtractDecision, memo'', subtractTaint) <- evalRewriteMemo cacheOps graph context revision subject object currentRelation subtractRewrite state memo'
+                    pure (Decision.exclusionDecisions base' <$> subtractDecision, memo'', baseTaint <> subtractTaint)
         Caveated caveat rewriteInner -> do
-            (inner, memo') <- evalRewriteMemo cacheOps graph context revision subject object currentRelation rewriteInner state memo
-            pure (applyRewriteCaveat graph context caveat =<< inner, memo')
+            (inner, memo', taint) <- evalRewriteMemo cacheOps graph context revision subject object currentRelation rewriteInner state memo
+            pure (applyRewriteCaveat graph context caveat =<< inner, memo', taint)
 
-evalRewriteListMemo ::
+{- | A branch decision that settles its combinator, letting the rest go unevaluated.
+
+'Allowed' absorbs a union and 'Denied' absorbs an intersection, so once one
+appears no later branch can change the answer -- see 'Decision.unionDecisions'
+and 'Decision.intersectionDecisions'. A conditional branch settles neither, since
+its obligations must still be merged with whatever follows.
+-}
+unionSettled :: CheckDecision -> Bool
+unionSettled = (== Allowed)
+
+intersectionSettled :: CheckDecision -> Bool
+intersectionSettled = (== Denied)
+
+{- | Evaluate branches left to right, stopping at the first that settles the
+combinator, and combine what was evaluated with @combine@.
+
+Skipping the remaining branches cannot change the answer: the settling value
+absorbs them. It does change what /errors/ are observed — a malformed branch
+after a settling one goes unseen — which is deliberate. A subject who provably
+has access should not be denied an answer because an unrelated branch of the
+same permission references a relation that no longer exists. An error before any
+settling branch still fails the whole check: with cycles no longer erroring, a
+'Left' here is a genuine failure (a store outage, an unknown relation) and
+answering around it would turn outages into data-dependent decisions.
+-}
+evalBranchesMemo ::
     (TupleStore :> es) =>
+    ([CheckDecision] -> CheckDecision) ->
+    (CheckDecision -> Bool) ->
     Maybe (DecisionCacheOps es) ->
     ReachabilityGraph ->
     CaveatContext ->
@@ -328,13 +390,20 @@ evalRewriteListMemo ::
     [Rewrite] ->
     EvalState ->
     CheckMemo ->
-    Eff es ([Either EnError CheckDecision], CheckMemo)
-evalRewriteListMemo cacheOps graph context revision subject object currentRelation rewrites state memo =
-    foldM step ([], memo) rewrites
+    Eff es (Either EnError CheckDecision, CheckMemo, CutTaint)
+evalBranchesMemo combine settles cacheOps graph context revision subject object currentRelation rewrites state memo =
+    go [] memo mempty rewrites
   where
-    step (decisions, currentMemo) rewrite = do
-        (decision, memo') <- evalRewriteMemo cacheOps graph context revision subject object currentRelation rewrite state currentMemo
-        pure (decisions <> [decision], memo')
+    go acc currentMemo taint [] =
+        pure (Right (combine (reverse acc)), currentMemo, taint)
+    go acc currentMemo taint (rewrite : rest) = do
+        (result, memo', branchTaint) <- evalRewriteMemo cacheOps graph context revision subject object currentRelation rewrite state currentMemo
+        let taint' = taint <> branchTaint
+        case result of
+            Left err -> pure (Left err, memo', taint')
+            Right decision
+                | settles decision -> pure (Right decision, memo', taint')
+                | otherwise -> go (decision : acc) memo' taint' rest
 
 evalThisMemo ::
     (TupleStore :> es) =>
@@ -347,7 +416,7 @@ evalThisMemo ::
     RelationName ->
     EvalState ->
     CheckMemo ->
-    Eff es (Either EnError CheckDecision, CheckMemo)
+    Eff es (Either EnError CheckDecision, CheckMemo, CutTaint)
 
 {- | Evaluate the directly-stored tuples of @object#relation@.
 
@@ -374,22 +443,22 @@ twenty teams.
 -}
 evalThisMemo cacheOps graph context revision subject object relation state memo
     | state.depth >= maxDepth =
-        pure (Left ResolutionLimitExceeded, memo)
+        pure (Left ResolutionLimitExceeded, memo, Untainted)
     | otherwise = do
         probedRows <- probeTuples revision object relation candidates
         let probeDecisions =
                 [applyTupleCaveat graph context tuple.caveat Allowed | TupleRow{tuple} <- probedRows]
         if Right Allowed `elem` probeDecisions
-            then pure (Right Allowed, memo)
+            then pure (Right Allowed, memo, Untainted)
             else do
                 rows <- drainObjectRelation revision object relation
                 let usersetRows = filter recursable rows
                 proven <- provenByDirectGroupMembership usersetRows
                 if proven
-                    then pure (Right Allowed, memo)
+                    then pure (Right Allowed, memo, Untainted)
                     else do
-                        (recursedDecisions, memo') <- foldM rowDecision ([], memo) usersetRows
-                        pure (Decision.union <$> sequence (probeDecisions <> recursedDecisions), memo')
+                        (recursedDecisions, memo', taint) <- foldM rowDecision ([], memo, mempty) usersetRows
+                        pure (Decision.union <$> sequence (probeDecisions <> recursedDecisions), memo', taint)
   where
     candidates = subjectsWithWildcard subject
 
@@ -447,13 +516,13 @@ evalThisMemo cacheOps graph context revision subject object relation state memo
             tuple.object `elem` groupObjects
                 && applyTupleCaveat graph context tuple.caveat Allowed == Right Allowed
 
-    rowDecision (decisions, memo') TupleRow{tuple} =
+    rowDecision (decisions, memo', taint) TupleRow{tuple} =
         case tuple.subject of
             SubjectSet subjectObject subjectRelation -> do
-                (decision, memo'') <- evalRelationMemo cacheOps graph context revision subject subjectObject subjectRelation state memo'
-                pure (decisions <> [decision >>= applyTupleCaveat graph context tuple.caveat], memo'')
+                (decision, memo'', rowTaint) <- evalRelationMemo cacheOps graph context revision subject subjectObject subjectRelation state memo'
+                pure (decisions <> [decision >>= applyTupleCaveat graph context tuple.caveat], memo'', taint <> rowTaint)
             _ ->
-                pure (decisions, memo')
+                pure (decisions, memo', taint)
 
 {- | Does @objectType#relation@ union in its directly-stored tuples?
 
@@ -484,22 +553,22 @@ evalTupleToUsersetMemo ::
     RelationName ->
     EvalState ->
     CheckMemo ->
-    Eff es (Either EnError CheckDecision, CheckMemo)
+    Eff es (Either EnError CheckDecision, CheckMemo, CutTaint)
 evalTupleToUsersetMemo cacheOps graph context revision subject object tuplesetRelation computedRelation state memo = do
     rows <- drainObjectRelation revision object tuplesetRelation
-    (decisions, memo') <- foldM rowDecision ([], memo) rows
-    pure (Decision.union <$> sequence decisions, memo')
+    (decisions, memo', taint) <- foldM rowDecision ([], memo, mempty) rows
+    pure (Decision.union <$> sequence decisions, memo', taint)
   where
-    rowDecision (decisions, memo') TupleRow{tuple} =
+    rowDecision (decisions, memo', taint) TupleRow{tuple} =
         case tuple.subject of
             SubjectId subjectObject -> do
-                (decision, memo'') <- evalRelationMemo cacheOps graph context revision subject subjectObject computedRelation state memo'
-                pure (decisions <> [applyRowGate tuple decision], memo'')
+                (decision, memo'', rowTaint) <- evalRelationMemo cacheOps graph context revision subject subjectObject computedRelation state memo'
+                pure (decisions <> [applyRowGate tuple decision], memo'', taint <> rowTaint)
             SubjectSet subjectObject subjectRelation -> do
-                (decision, memo'') <- evalRelationMemo cacheOps graph context revision subject subjectObject subjectRelation state memo'
-                pure (decisions <> [applyRowGate tuple decision], memo'')
+                (decision, memo'', rowTaint) <- evalRelationMemo cacheOps graph context revision subject subjectObject subjectRelation state memo'
+                pure (decisions <> [applyRowGate tuple decision], memo'', taint <> rowTaint)
             SubjectWildcard _ ->
-                pure (decisions <> [Right Denied], memo')
+                pure (decisions <> [Right Denied], memo', taint)
 
     applyRowGate tuple =
         (>>= applyTupleCaveat graph context tuple.caveat)

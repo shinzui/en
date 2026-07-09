@@ -256,6 +256,7 @@ errorModelTests = do
     mapsTo "MissingCaveatContext" (MissingCaveatContext ["now"]) (400, "missing_caveat_context", False)
     mapsTo "InvalidConsistencyToken" (InvalidConsistencyToken "bad token") (400, "invalid_consistency_token", False)
     mapsTo "ResolutionLimitExceeded" ResolutionLimitExceeded (422, "resolution_limit_exceeded", False)
+    mapsTo "CycleDetected" (CycleDetected "space:recursive#view") (422, "cycle_detected", False)
     mapsTo "StoreError" (StoreError secretDetail) (503, "store_error", True)
 
     -- The 503 message must never carry the SQL text and bound parameters that

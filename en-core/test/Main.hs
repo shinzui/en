@@ -36,6 +36,7 @@ import En.Cache (
 import En.Check (BatchPair (..), CaveatObligation (..), CheckCacheEnv (..), CheckDecision (..))
 import En.Check qualified as Check
 import En.Conformance.Kikan
+import En.Decision qualified as Decision
 import En.Effect.CachedTupleStore (cachedTupleStore)
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
 import En.Effect.TupleStore (
@@ -441,6 +442,21 @@ main = do
     assertEqual "self-parent cycle yields Denied via cycle-as-empty" (Right Denied) =<< check consistencyStore recursiveTupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") recursiveSpace
     deepChainGraph <- either (fail . show) pure (compileSchema deepChainSchema)
     assertEqual "acyclic chain deeper than the depth budget still errors" (Left ResolutionLimitExceeded) =<< check consistencyStore (runTupleStoreInMemory deepChainTuples) deepChainGraph MinimizeLatency requestContext (SubjectId user) (RelationName "view") (deepSpace 1)
+    assertEqual "expand reports a cycle rather than hiding the branch" (Left (CycleDetected "space:recursive-space#view")) =<< expandEngine consistencyStore recursiveTupleStore graph MinimizeLatency (expandRequest recursiveSpace (RelationName "view") requestContext (ExpandLimit 10) Nothing)
+    taintGraph <- either (fail . show) pure (compileSchema taintSchema)
+    assertEqual "a cycle-tainted decision is not memoized across batch pairs" (Right [Allowed, Allowed]) =<< checkMany consistencyStore (runTupleStoreInMemory taintTuples) taintGraph MinimizeLatency requestContext [BatchPair (SubjectId carol) (RelationName "x") taintNode, BatchPair (SubjectId carol) (RelationName "y") taintNode]
+    unionShortCircuitReads <- newIORef 0
+    assertEqual "owner check is Allowed" (Right Allowed) =<< check consistencyStore (countingTupleStore unionShortCircuitReads tupleStore) graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
+    shortCircuitReads <- readIORef unionShortCircuitReads
+    assertEqual "union stops at the first branch that proves Allowed" 1 shortCircuitReads
+    assertEqual "union is Allowed-absorbing" Allowed (Decision.union [Conditional [obligation "a" ["x"]], Allowed])
+    assertEqual "union keeps obligations when nothing is Allowed" (Conditional [obligation "a" ["x"]]) (Decision.union [Conditional [obligation "a" ["x"]], Denied])
+    assertEqual "exclusion: Denied base ignores the subtrahend" Denied (Decision.exclusionDecisions Denied Allowed)
+    assertEqual "exclusion: unconditional subtraction denies a conditional base" Denied (Decision.exclusionDecisions (Conditional [obligation "a" ["x"]]) Allowed)
+    assertEqual "exclusion: Allowed base with Denied subtrahend allows" Allowed (Decision.exclusionDecisions Allowed Denied)
+    assertEqual "exclusion: Allowed base carries the subtrahend's obligations" (Conditional [obligation "b" ["y"]]) (Decision.exclusionDecisions Allowed (Conditional [obligation "b" ["y"]]))
+    assertEqual "exclusion: conditional base with Denied subtrahend stays conditional" (Conditional [obligation "a" ["x"]]) (Decision.exclusionDecisions (Conditional [obligation "a" ["x"]]) Denied)
+    assertEqual "exclusion: two conditionals merge and deduplicate" (Conditional [obligation "a" ["x"], obligation "b" ["y"]]) (Decision.exclusionDecisions (Conditional [obligation "a" ["x"]]) (Conditional [obligation "a" ["x"], obligation "b" ["y"]]))
     assertEqual "lookup returns direct and recursive view spaces" (Right (lookupPage [allowed childSpace, allowed space] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup follows userset subjects" (Right (lookupPage [allowed guestSpace, allowed sharedItem, allowed usersetMemberSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId agencyUser) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup confirms intersection candidates" (Right (lookupPage [allowed auditedSpace, allowed exclusionSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOwner) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
@@ -1606,6 +1622,37 @@ cyclicTuples =
     , Tuple{object = docD, relation = RelationName "viewer", subject = SubjectId carol, caveat = Nothing}
     ]
 
+{- | @x = y or direct@ and @y = x@: a two-permission cycle where @x@ also has a
+branch that genuinely grants.
+
+Evaluating @x@ descends into @y@, which cuts back to @x@ and so contributes
+'Denied' -- an answer true only inside that stack, since @y@ evaluated on its own
+is 'Allowed' by way of @x@'s @direct@ branch. If that stack-local 'Denied' is
+memoized, a later pair of the same batch asking about @y@ reads it and is wrongly
+denied. This fixture is the regression test for that.
+-}
+taintSchema :: Schema
+taintSchema =
+    testSchemaOrError $ do
+        userObject <- Schema.object "user" []
+        nodeObject <-
+            Schema.object
+                "node"
+                [ Schema.relation "direct" [Schema.subject "user"] Schema.this
+                , Schema.permission "x" (Schema.anyOf (Schema.computed "y") [Schema.computed "direct"])
+                , Schema.permission "y" (Schema.computed "x")
+                ]
+        Schema.build [userObject, nodeObject]
+
+taintNode :: ObjectRef
+taintNode =
+    ObjectRef{objectType = ObjectType "node", objectId = "n"}
+
+taintTuples :: [Tuple]
+taintTuples =
+    [ Tuple{object = taintNode, relation = RelationName "direct", subject = SubjectId carol, caveat = Nothing}
+    ]
+
 {- | A chain of 26 distinct spaces, each the parent of the next: acyclic, but
 deeper than @maxDepth@ (25). This is what keeps the depth budget under test once
 cycles stop producing errors of their own.
@@ -1893,6 +1940,10 @@ showText =
 testSchemaOrError :: Either EnError Schema -> Schema
 testSchemaOrError =
     either (error . ("invalid test schema fixture: " <>) . show) id
+
+obligation :: Text -> [Text] -> CaveatObligation
+obligation name missing =
+    CaveatObligation{caveat = CaveatName name, missingContext = missing}
 
 assertValidationFails :: String -> Schema -> IO ()
 assertValidationFails label candidate =

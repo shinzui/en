@@ -118,6 +118,9 @@ enErrorToFault = \case
     ResolutionLimitExceeded ->
         UnprocessableFault
             (envelope "resolution_limit_exceeded" "the traversal exceeded its depth or breadth bound")
+    CycleDetected subproblem ->
+        UnprocessableFault
+            (envelope "cycle_detected" ("the relationship data contains a cycle at " <> subproblem))
     StoreError _detail ->
         UnavailableFault
             ErrorEnvelopeWire
