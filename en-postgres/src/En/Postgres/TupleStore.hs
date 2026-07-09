@@ -746,18 +746,56 @@ batchRowsetFromWithOrdinality =
            subject_relation, caveat_name, caveat_payload, ordinality)
     """
 
--- | The predicate matching the live row that holds a batch entry's identity.
+{- | The predicate matching the live row that holds a batch entry's identity.
+
+Written against the alias @r@ — the relation being /probed/ — because every batch
+statement reaches @relation_tuple@ through a @LATERAL@ subquery driven by the
+unnested batch, never as a bare join. See 'lateralProbe'.
+-}
 batchIdentityMatch :: Text
 batchIdentityMatch =
     """
-    t.object_type = w.object_type
-      AND t.object_id = w.object_id
-      AND t.relation = w.relation
-      AND t.subject_type = w.subject_type
-      AND t.subject_id = w.subject_id
-      AND coalesce(t.subject_relation, '') = coalesce(w.subject_relation, '')
-      AND t.deleted_xid IS NULL
+    r.object_type = w.object_type
+      AND r.object_id = w.object_id
+      AND r.relation = w.relation
+      AND r.subject_type = w.subject_type
+      AND r.subject_id = w.subject_id
+      AND coalesce(r.subject_relation, '') = coalesce(w.subject_relation, '')
+      AND r.deleted_xid IS NULL
     """
+
+{- | Probe @relation_tuple@ for one batch entry's live row, inside a @LATERAL@.
+
+Every batch statement must find its rows this way rather than by joining
+@relation_tuple@ against the unnested batch directly. A @Function Scan@ carries
+no statistics, so the planner guesses at the batch's shape; past roughly a
+thousand entries it abandons the nested loop over 'relation_tuple_live_unique'
+and picks a merge join instead, keyed on whichever index it can scan in order.
+
+That index is @relation_tuple_subject_hist_idx@, whose columns are the subject
+and the object /type/ — not the object id. So the merge condition matches every
+pair of rows that share a subject, and @object_id@ is demoted to a join filter.
+For a bulk import, where thousands of objects share one subject, that is the
+cross product: measured at 500,000,000 filtered pairs and 56 seconds for a single
+5,000-tuple statement against a 100,000-row table, against 14 milliseconds for
+the @LATERAL@ form. The crossover sat between batches of 1,000 and 2,000 — with
+@EN_MAX_BATCH_SIZE@ defaulting to 1,000, an operator raising it slightly would
+have bought a table scan per write.
+
+The @LATERAL@ removes the choice: the unnested batch is always the outer
+relation, and each entry probes the unique index once. @LIMIT 1@ is exact rather
+than defensive — @relation_tuple_live_unique@ admits one live row per identity —
+and it is also what keeps the planner from flattening the subquery back into the
+join this exists to prevent.
+-}
+lateralProbe :: Text -> Text
+lateralProbe extraPredicate =
+    Text.unlines
+        [ "SELECT r.id FROM relation_tuple r WHERE"
+        , batchIdentityMatch
+        , extraPredicate
+        , "LIMIT 1"
+        ]
 
 {- | Retire every live row that shares a batch entry's identity but carries a
 different caveat.
@@ -776,14 +814,18 @@ batchTouchReplaceStatement :: Statement BatchParams ()
 batchTouchReplaceStatement =
     Statement.preparable
         ( Text.unlines
-            [ "UPDATE relation_tuple AS t SET deleted_xid = $9::xid8"
+            [ "UPDATE relation_tuple AS t SET deleted_xid = $9::xid8 FROM ("
+            , "SELECT victim.id"
             , batchRowsetFrom
-            , "WHERE"
-            , batchIdentityMatch
-            , """
-              AND (t.caveat_name IS DISTINCT FROM w.caveat_name
-                   OR t.caveat_payload IS DISTINCT FROM w.caveat_payload)
-              """
+            , "CROSS JOIN LATERAL ("
+            , lateralProbe
+                """
+                AND (r.caveat_name IS DISTINCT FROM w.caveat_name
+                     OR r.caveat_payload IS DISTINCT FROM w.caveat_payload)
+                """
+            , ") AS victim"
+            , ") AS victims"
+            , "WHERE t.id = victims.id"
             ]
         )
         batchWriteEncoder
@@ -839,6 +881,11 @@ so this one question answers both halves of the touch protocol at once.
 @WITH ORDINALITY@ numbers the unnested rows so the caller can map an unsatisfied
 entry back to the tuple that produced it without shipping the tuple's columns
 home again.
+
+Spelled as a @LEFT JOIN LATERAL@ that keeps the misses rather than as
+@NOT EXISTS@, for the reason 'lateralProbe' gives: the planner turns the latter
+into a hash anti join that builds a hash of every live row in the table, however
+few entries the batch holds.
 -}
 batchUnconvergedStatement :: Statement BatchParams [Int64]
 batchUnconvergedStatement =
@@ -846,14 +893,15 @@ batchUnconvergedStatement =
         ( Text.unlines
             [ "SELECT w.ordinality"
             , batchRowsetFromWithOrdinality
-            , "WHERE NOT EXISTS (SELECT 1 FROM relation_tuple t WHERE"
-            , batchIdentityMatch
-            , """
-              AND t.caveat_name IS NOT DISTINCT FROM w.caveat_name
-              AND t.caveat_payload IS NOT DISTINCT FROM w.caveat_payload
-              )
-              ORDER BY w.ordinality
-              """
+            , "LEFT JOIN LATERAL ("
+            , lateralProbe
+                """
+                AND r.caveat_name IS NOT DISTINCT FROM w.caveat_name
+                AND r.caveat_payload IS NOT DISTINCT FROM w.caveat_payload
+                """
+            , ") AS satisfied ON TRUE"
+            , "WHERE satisfied.id IS NULL"
+            , "ORDER BY w.ordinality"
             ]
         )
         batchColumnsEncoder
@@ -870,6 +918,9 @@ removes from the write path.
 A duplicate identity in one batch names the same target row twice; @UPDATE …
 FROM@ reaches it once, and the @deleted_xid@ it would assign is the same either
 way. Deletes therefore need no deduplication.
+
+Driven from the unnested batch through a @LATERAL@ probe for the reason
+'lateralProbe' gives.
 -}
 batchDeleteTupleStatement :: Statement BatchParams ()
 batchDeleteTupleStatement =
@@ -877,15 +928,24 @@ batchDeleteTupleStatement =
         """
         UPDATE relation_tuple AS t
         SET deleted_xid = $7::xid8
-        FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
-          AS w(object_type, object_id, relation, subject_type, subject_id, subject_relation)
-        WHERE t.object_type = w.object_type
-          AND t.object_id = w.object_id
-          AND t.relation = w.relation
-          AND t.subject_type = w.subject_type
-          AND t.subject_id = w.subject_id
-          AND coalesce(t.subject_relation, '') = coalesce(w.subject_relation, '')
-          AND t.deleted_xid IS NULL
+        FROM (
+          SELECT victim.id
+          FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
+            AS w(object_type, object_id, relation, subject_type, subject_id, subject_relation)
+          CROSS JOIN LATERAL (
+            SELECT r.id
+            FROM relation_tuple r
+            WHERE r.object_type = w.object_type
+              AND r.object_id = w.object_id
+              AND r.relation = w.relation
+              AND r.subject_type = w.subject_type
+              AND r.subject_id = w.subject_id
+              AND coalesce(r.subject_relation, '') = coalesce(w.subject_relation, '')
+              AND r.deleted_xid IS NULL
+            LIMIT 1
+          ) AS victim
+        ) AS victims
+        WHERE t.id = victims.id
         """
         batchDeleteEncoder
         Decoders.noResult
