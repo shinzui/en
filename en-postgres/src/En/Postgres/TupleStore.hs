@@ -18,12 +18,12 @@ import Data.Aeson.Key qualified as AesonKey
 import Data.Aeson.KeyMap qualified as AesonKeyMap
 import Data.Aeson.Types qualified as Aeson
 import Data.ByteString.Lazy qualified as LazyByteString
-import Data.Foldable (traverse_)
 import Data.Functor.Contravariant ((>$<))
 import Data.Int (Int64)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust)
 import Data.Scientific (floatingOrInteger)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Time (getCurrentTime)
@@ -203,15 +203,13 @@ Writes have touch semantics. A live tuple's identity is (object, relation,
 subject); its caveat is an attribute of the grant, not part of its identity. So a
 write either inserts, does nothing (the live row is already byte-identical), or
 retires the differing live row and inserts the replacement — all inside this
-session's single transaction, so no observer ever sees both rows live. The same
-key appearing twice in one call resolves last-wins: the second tuple's touch
-retires the first tuple's row, stamping @deleted_xid = created_xid@, which is
-visible at no revision.
+session's single transaction, so no observer ever sees both rows live.
 
-The @ROLLBACK@ must be explicit. A precondition that merely matches zero rows
-leaves the transaction healthy rather than aborted, so hasql performs no
-automatic reset, and the connection would otherwise be handed back still inside
-an open transaction.
+The whole request travels in a constant number of statements regardless of how
+many tuples it names: each column of the batch is sent as one PostgreSQL array
+and expanded server-side with @unnest@. A write costs @BEGIN@, the anchor, the
+retire, the insert, the convergence check, and @COMMIT@ — six round trips for any
+number of tuples, eight on the rare contended retry. A delete costs four.
 -}
 applyTupleWritesSession :: ConsistencyConfig -> TupleWriteRequest -> Session (Either Text Anchor)
 applyTupleWritesSession config request = do
@@ -223,12 +221,107 @@ applyTupleWritesSession config request = do
             Session.script rollbackScript
             pure (Left description)
         Nothing -> do
-            traverse_ (\tuple -> Session.statement (tupleDeleteParams anchor.xid tuple) deleteTupleStatement) request.deletes
-            traverse_ (touchTuple anchor.xid) request.writes
+            batchDeleteTuples anchor.xid request.deletes
+            batchTouchTuples anchor.xid (dedupeWrites request.writes)
             Session.script commitScript
             pure (Right anchor)
   where
     SchemaHash schemaHashText = config.schemaHash
+
+{- | Keep the last write for each identity, in request order.
+
+The same key appearing twice in one call resolves last-wins, as it did when
+writes were applied one statement at a time. Applied sequentially the loser left
+a row stamped @deleted_xid = created_xid@, visible at no revision; the batch
+never inserts it. The two are indistinguishable to every reader at every
+revision.
+
+Deduplicating is not a nicety here. @ON CONFLICT DO NOTHING@ over a multi-row
+insert keeps whichever conflicting row it happens to reach first, so a batch
+carrying one identity twice would resolve arbitrary-wins rather than last-wins.
+-}
+dedupeWrites :: [Tuple] -> [Tuple]
+dedupeWrites tuples =
+    [tuple | (index, tuple) <- indexed, Map.lookup (tupleIdentity tuple) lastIndex == Just index]
+  where
+    indexed = zip [0 :: Int ..] tuples
+    lastIndex = Map.fromList [(tupleIdentity tuple, index) | (index, tuple) <- indexed]
+
+{- | The identity @relation_tuple_live_unique@ keys on: everything but the caveat.
+
+An absent subject relation is normalized to @\"\"@ so this agrees with the SQL
+predicate, which compares @coalesce(subject_relation, '')@.
+-}
+tupleIdentity :: Tuple -> (Text, Text, Text, Text, Text, Text)
+tupleIdentity tuple =
+    let (subjectObject, subjectRelation) = flattenSubject tuple.subject
+     in ( unObjectType tuple.object.objectType
+        , tuple.object.objectId
+        , unRelationName tuple.relation
+        , unObjectType subjectObject.objectType
+        , subjectObject.objectId
+        , maybe "" unRelationName subjectRelation
+        )
+
+{- | Retire the live grants the request names, whatever caveats they carry.
+
+An empty request sends nothing: an @unnest@ of empty arrays would match no row,
+at the cost of a round trip to discover it.
+-}
+batchDeleteTuples :: Text -> [Tuple] -> Session ()
+batchDeleteTuples _ [] = pure ()
+batchDeleteTuples writeXid tuples =
+    Session.statement (batchParams writeXid tuples) batchDeleteTupleStatement
+
+{- | Apply touch semantics to a whole batch.
+
+Each attempt retires every live row that shares a batch entry's identity but
+carries a different caveat, inserts the batch, then asks which entries still lack
+a byte-identical live row. An entry that has one is satisfied — whether this
+statement inserted it or it was already there — so that single set-oriented
+question subsumes the per-tuple \"inserted, or already identical?\" pair.
+
+The convergence check must observe the rows. Inferring satisfaction from
+@rowsAffected@ — \"nothing to retire and nothing to insert, so it was already
+there\" — is unsound under @READ COMMITTED@, where each statement takes its own
+snapshot: a concurrent transaction committing a /different/ caveat between the
+retire and the insert makes both report zero, and the caller's write is silently
+dropped. That is exactly the bug touch semantics exist to remove.
+
+A second attempt re-reads and retires the racer's now-committed rows. If even
+that does not converge, the final insert omits @ON CONFLICT@ so PostgreSQL raises
+@unique_violation@ and the write fails loudly instead of being dropped. Only the
+unconverged entries are retried: the rest already hold their rows, and an insert
+of a satisfied entry would raise the very violation that signals failure.
+-}
+batchTouchTuples :: Text -> [Tuple] -> Session ()
+batchTouchTuples _ [] = pure ()
+batchTouchTuples writeXid tuples = do
+    unconverged <- attempt tuples
+    case unconverged of
+        [] -> pure ()
+        contended -> do
+            stillUnconverged <- attempt contended
+            case stillUnconverged of
+                [] -> pure ()
+                doomed -> do
+                    let params = batchParams writeXid doomed
+                    Session.statement params batchTouchReplaceStatement
+                    Session.statement params batchInsertTupleStrictStatement
+  where
+    attempt batch = do
+        let params = batchParams writeXid batch
+        Session.statement params batchTouchReplaceStatement
+        Session.statement params batchInsertTupleStatement
+        ordinals <- Session.statement params batchUnconvergedStatement
+        pure (selectOrdinals batch ordinals)
+
+-- | The batch entries at the given one-based ordinals, in batch order.
+selectOrdinals :: [Tuple] -> [Int64] -> [Tuple]
+selectOrdinals batch ordinals =
+    [tuple | (index, tuple) <- zip [1 ..] batch, index `Set.member` wanted]
+  where
+    wanted = Set.fromList ordinals
 
 {- | The first precondition that does not hold, rendered; 'Nothing' when all hold.
 
@@ -275,43 +368,6 @@ preconditionHolds = \case
         isJust <$> Session.statement (tupleFilterParams tupleFilter) lockMatchingLiveTupleStatement
     TupleMustNotExist tupleFilter ->
         not <$> Session.statement (tupleFilterParams tupleFilter) matchingLiveTupleExistsStatement
-
-{- | Apply touch semantics to one tuple.
-
-Each attempt retires a live row that shares the tuple's identity but carries a
-different caveat, then inserts. An insert that affects no row means /some/ live
-row already holds the identity; that is a legitimate no-op only when the row is
-byte-identical, which is checked rather than assumed.
-
-Both statements run at their own @READ COMMITTED@ snapshot, so a concurrent
-transaction that commits a differing caveat between them can make the pair
-observe "nothing to retire" and "conflict" at once — the silent-drop bug this
-protocol exists to remove, in racing form. A second attempt re-reads and retires
-the racer's now-committed row. If even that does not converge, the final insert
-omits @ON CONFLICT@ so PostgreSQL raises @unique_violation@ and the write fails
-loudly instead of being dropped.
--}
-touchTuple :: Text -> Tuple -> Session ()
-touchTuple writeXid tuple = do
-    converged <- attempt
-    if converged
-        then pure ()
-        else do
-            convergedOnRetry <- attempt
-            if convergedOnRetry
-                then pure ()
-                else do
-                    _ <- Session.statement params touchReplaceStatement
-                    Session.statement params insertTupleStrictStatement
-  where
-    params = tupleInsertParams writeXid tuple
-
-    attempt = do
-        _ <- Session.statement params touchReplaceStatement
-        inserted <- Session.statement params insertTupleStatement
-        if inserted == 1
-            then pure True
-            else Session.statement params identicalLiveTupleStatement
 
 headRevisionSession :: Session Revision
 headRevisionSession =
@@ -618,107 +674,246 @@ tupleInsertParams createdXid tuple =
             , caveatPayload = Aeson.encode . caveatPayloadToJson <$> maybePayload
             }
 
-{- | Retire the live row that shares the tuple's identity but carries a different
-caveat, returning how many rows were retired (0 or 1, bounded by
-@relation_tuple_live_unique@).
+{- | One batch's columns, each as a PostgreSQL array.
+
+The arrays are parallel: index @i@ of every array describes tuple @i@. A
+statement rebuilds the rowset server-side with @unnest@ over all eight, which is
+why they must be transposed from the tuple list rather than built independently.
+-}
+data BatchParams = BatchParams
+    { writeXid :: !Text
+    , objectTypes :: ![Text]
+    , objectIds :: ![Text]
+    , relations :: ![Text]
+    , subjectTypes :: ![Text]
+    , subjectIds :: ![Text]
+    , subjectRelations :: ![Maybe Text]
+    , caveatNames :: ![Maybe Text]
+    , caveatPayloads :: ![Maybe LazyByteString.ByteString]
+    }
+
+batchParams :: Text -> [Tuple] -> BatchParams
+batchParams writeXid tuples =
+    let rows = tupleInsertParams writeXid <$> tuples
+     in BatchParams
+            { writeXid = writeXid
+            , objectTypes = (\row -> row.objectType) <$> rows
+            , objectIds = (\row -> row.objectId) <$> rows
+            , relations = (\row -> row.relation) <$> rows
+            , subjectTypes = (\row -> row.subjectType) <$> rows
+            , subjectIds = (\row -> row.subjectId) <$> rows
+            , subjectRelations = (\row -> row.subjectRelation) <$> rows
+            , caveatNames = (\row -> row.caveatName) <$> rows
+            , caveatPayloads = (\row -> row.caveatPayload) <$> rows
+            }
+
+{- | The @FROM@ clause every batch statement rebuilds its rowset from.
+
+Spelled once and spliced into each statement, because the eight parameter
+positions and the eight column names must agree across all of them, and a reader
+checking that they do should not have to compare four transcriptions. The
+parameter numbers are fixed: statements that also take the write xid put it last,
+so this fragment always begins at @$1@.
+
+Fragments are joined with 'Text.unlines' rather than @<>@ so that no splice can
+run two SQL tokens together.
+-}
+batchRowsetFrom :: Text
+batchRowsetFrom =
+    """
+    FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+                $6::text[], $7::text[], $8::jsonb[])
+      AS w(object_type, object_id, relation, subject_type, subject_id,
+           subject_relation, caveat_name, caveat_payload)
+    """
+
+-- | 'batchRowsetFrom' with the extra column @WITH ORDINALITY@ appends.
+batchRowsetFromWithOrdinality :: Text
+batchRowsetFromWithOrdinality =
+    """
+    FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+                $6::text[], $7::text[], $8::jsonb[]) WITH ORDINALITY
+      AS w(object_type, object_id, relation, subject_type, subject_id,
+           subject_relation, caveat_name, caveat_payload, ordinality)
+    """
+
+-- | The predicate matching the live row that holds a batch entry's identity.
+batchIdentityMatch :: Text
+batchIdentityMatch =
+    """
+    t.object_type = w.object_type
+      AND t.object_id = w.object_id
+      AND t.relation = w.relation
+      AND t.subject_type = w.subject_type
+      AND t.subject_id = w.subject_id
+      AND coalesce(t.subject_relation, '') = coalesce(w.subject_relation, '')
+      AND t.deleted_xid IS NULL
+    """
+
+{- | Retire every live row that shares a batch entry's identity but carries a
+different caveat.
 
 @IS DISTINCT FROM@ is null-safe, so an uncaveated row compares as different from
 a caveated one; @jsonb@ inequality is structural, so re-encoding an equal payload
 with different key order or whitespace does not count as a change. A live row
-identical to the tuple therefore matches nothing here and keeps its original
-@created_xid@ — an idempotent rewrite does not churn history.
+identical to its batch entry therefore matches nothing here and keeps its
+original @created_xid@ — an idempotent rewrite does not churn history.
+
+@relation_tuple_live_unique@ bounds each entry to at most one matching live row,
+and 'dedupeWrites' bounds each live row to at most one matching entry, so no
+target row is reached twice.
 -}
-touchReplaceStatement :: Statement TupleInsertParams Int64
-touchReplaceStatement =
+batchTouchReplaceStatement :: Statement BatchParams ()
+batchTouchReplaceStatement =
     Statement.preparable
-        """
-        UPDATE relation_tuple
-        SET deleted_xid = $1::xid8
-        WHERE object_type = $2
-          AND object_id = $3
-          AND relation = $4
-          AND subject_type = $5
-          AND subject_id = $6
-          AND coalesce(subject_relation, '') = coalesce($7, '')
-          AND deleted_xid IS NULL
-          AND (caveat_name IS DISTINCT FROM $8
-               OR caveat_payload IS DISTINCT FROM $9::jsonb)
-        """
-        tupleInsertEncoder
-        Decoders.rowsAffected
+        ( Text.unlines
+            [ "UPDATE relation_tuple AS t SET deleted_xid = $9::xid8"
+            , batchRowsetFrom
+            , "WHERE"
+            , batchIdentityMatch
+            , """
+              AND (t.caveat_name IS DISTINCT FROM w.caveat_name
+                   OR t.caveat_payload IS DISTINCT FROM w.caveat_payload)
+              """
+            ]
+        )
+        batchWriteEncoder
+        Decoders.noResult
 
-{- | Insert the tuple, tolerating a conflict with an identical live row.
+{- | Insert the batch, tolerating conflicts with identical live rows.
 
-After 'touchReplaceStatement' the only live row that can still conflict is one
-byte-identical to the tuple, so @DO NOTHING@ means "already present" rather than
-"silently dropped" — except under the cross-transaction race 'touchTuple'
-documents, which is why the caller verifies rather than assumes.
+After 'batchTouchReplaceStatement' the only live row that can still conflict with
+an entry is one byte-identical to it, so @DO NOTHING@ means "already present"
+rather than "silently dropped" — except under the cross-transaction race
+'batchTouchTuples' documents, which is why the caller verifies rather than
+assumes.
 -}
-insertTupleStatement :: Statement TupleInsertParams Int64
-insertTupleStatement =
+batchInsertTupleStatement :: Statement BatchParams ()
+batchInsertTupleStatement =
     Statement.preparable
-        """
-        INSERT INTO relation_tuple
-          (object_type, object_id, relation, subject_type, subject_id, subject_relation, caveat_name, caveat_payload, created_xid)
-        VALUES ($2, $3, $4, $5, $6, $7, $8, $9, $1::xid8)
-        ON CONFLICT DO NOTHING
-        """
-        tupleInsertEncoder
-        Decoders.rowsAffected
+        (Text.unlines [batchInsertSql, "ON CONFLICT DO NOTHING"])
+        batchWriteEncoder
+        Decoders.noResult
 
-{- | Insert the tuple, letting a conflict raise.
+{- | Insert the batch, letting a conflict raise.
 
-'touchTuple' falls back to this when its bounded retry has not converged: a
+'batchTouchTuples' falls back to this when its bounded retry has not converged: a
 @unique_violation@ surfaces as 'En.Error.StoreError', which is the honest report
 of a write that could not be applied. The alternative — one more @DO NOTHING@ —
 would drop the caller's write and return a success token.
 -}
-insertTupleStrictStatement :: Statement TupleInsertParams ()
-insertTupleStrictStatement =
+batchInsertTupleStrictStatement :: Statement BatchParams ()
+batchInsertTupleStrictStatement =
     Statement.preparable
-        """
-        INSERT INTO relation_tuple
-          (object_type, object_id, relation, subject_type, subject_id, subject_relation, caveat_name, caveat_payload, created_xid)
-        VALUES ($2, $3, $4, $5, $6, $7, $8, $9, $1::xid8)
-        """
-        tupleInsertEncoder
+        batchInsertSql
+        batchWriteEncoder
         Decoders.noResult
 
--- | Whether a live row byte-identical to the tuple exists, caveat included.
-identicalLiveTupleStatement :: Statement TupleInsertParams Bool
-identicalLiveTupleStatement =
+batchInsertSql :: Text
+batchInsertSql =
+    Text.unlines
+        [ """
+          INSERT INTO relation_tuple
+            (object_type, object_id, relation, subject_type, subject_id, subject_relation, caveat_name, caveat_payload, created_xid)
+          SELECT w.object_type, w.object_id, w.relation, w.subject_type, w.subject_id,
+                 w.subject_relation, w.caveat_name, w.caveat_payload, $9::xid8
+          """
+        , batchRowsetFrom
+        ]
+
+{- | The one-based ordinals of the batch entries that no live row satisfies.
+
+An entry is satisfied when a live row holds its identity /and/ its caveat. The
+entry's own insert produces such a row, and so does a pre-existing identical row,
+so this one question answers both halves of the touch protocol at once.
+
+@WITH ORDINALITY@ numbers the unnested rows so the caller can map an unsatisfied
+entry back to the tuple that produced it without shipping the tuple's columns
+home again.
+-}
+batchUnconvergedStatement :: Statement BatchParams [Int64]
+batchUnconvergedStatement =
+    Statement.preparable
+        ( Text.unlines
+            [ "SELECT w.ordinality"
+            , batchRowsetFromWithOrdinality
+            , "WHERE NOT EXISTS (SELECT 1 FROM relation_tuple t WHERE"
+            , batchIdentityMatch
+            , """
+              AND t.caveat_name IS NOT DISTINCT FROM w.caveat_name
+              AND t.caveat_payload IS NOT DISTINCT FROM w.caveat_payload
+              )
+              ORDER BY w.ordinality
+              """
+            ]
+        )
+        batchColumnsEncoder
+        (Decoders.rowList (Decoders.column (Decoders.nonNullable Decoders.int8)))
+
+{- | Retire the live grant for each batch identity, whatever caveat it carries.
+
+The request's caveats are ignored, and so are the caveat arrays: this statement
+takes only the six identity columns. With one live row per identity, matching on
+@caveat_name@ would mean a caller who supplies yesterday's caveat name deletes
+nothing and is told it succeeded — the same silent no-op that touch semantics
+removes from the write path.
+
+A duplicate identity in one batch names the same target row twice; @UPDATE …
+FROM@ reaches it once, and the @deleted_xid@ it would assign is the same either
+way. Deletes therefore need no deduplication.
+-}
+batchDeleteTupleStatement :: Statement BatchParams ()
+batchDeleteTupleStatement =
     Statement.preparable
         """
-        SELECT EXISTS (
-          SELECT 1 FROM relation_tuple
-          WHERE object_type = $2
-            AND object_id = $3
-            AND relation = $4
-            AND subject_type = $5
-            AND subject_id = $6
-            AND coalesce(subject_relation, '') = coalesce($7, '')
-            AND deleted_xid IS NULL
-            AND caveat_name IS NOT DISTINCT FROM $8
-            AND caveat_payload IS NOT DISTINCT FROM $9::jsonb
-        )
+        UPDATE relation_tuple AS t
+        SET deleted_xid = $7::xid8
+        FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
+          AS w(object_type, object_id, relation, subject_type, subject_id, subject_relation)
+        WHERE t.object_type = w.object_type
+          AND t.object_id = w.object_id
+          AND t.relation = w.relation
+          AND t.subject_type = w.subject_type
+          AND t.subject_id = w.subject_id
+          AND coalesce(t.subject_relation, '') = coalesce(w.subject_relation, '')
+          AND t.deleted_xid IS NULL
         """
-        tupleInsertEncoder
-        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.bool)))
+        batchDeleteEncoder
+        Decoders.noResult
 
-{- | Shared by every touch statement so their parameter positions cannot drift
-apart. @$1@ is the write transaction's xid; @$2@–@$9@ are the tuple's columns.
+{- | The batch's eight column arrays, @$1@–@$8@.
+
+Statements that also write take the xid as @$9@ (see 'batchWriteEncoder'); the
+convergence check reads nothing new and stops here. An unreferenced parameter has
+no inferable type, so it cannot simply be sent and ignored.
 -}
-tupleInsertEncoder :: Encoders.Params TupleInsertParams
-tupleInsertEncoder =
-    ((\params -> params.createdXid) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-        <> ((\params -> params.objectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-        <> ((\params -> params.objectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-        <> ((\params -> params.relation) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-        <> ((\params -> params.subjectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-        <> ((\params -> params.subjectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-        <> ((\params -> params.subjectRelation) >$< Encoders.param (Encoders.nullable Encoders.text))
-        <> ((\params -> params.caveatName) >$< Encoders.param (Encoders.nullable Encoders.text))
-        <> ((\params -> params.caveatPayload) >$< Encoders.param (Encoders.nullable Encoders.jsonbLazyBytes))
+batchColumnsEncoder :: Encoders.Params BatchParams
+batchColumnsEncoder =
+    ((\params -> params.objectTypes) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.objectIds) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.relations) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.subjectTypes) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.subjectIds) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.subjectRelations) >$< Encoders.param (Encoders.nonNullable nullableTextArrayEncoder))
+        <> ((\params -> params.caveatNames) >$< Encoders.param (Encoders.nonNullable nullableTextArrayEncoder))
+        <> ((\params -> params.caveatPayloads) >$< Encoders.param (Encoders.nonNullable nullableJsonbArrayEncoder))
+
+-- | 'batchColumnsEncoder' plus the write transaction's xid as @$9@.
+batchWriteEncoder :: Encoders.Params BatchParams
+batchWriteEncoder =
+    batchColumnsEncoder
+        <> ((\params -> params.writeXid) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+
+-- | The six identity arrays, @$1@–@$6@, plus the write transaction's xid as @$7@.
+batchDeleteEncoder :: Encoders.Params BatchParams
+batchDeleteEncoder =
+    ((\params -> params.objectTypes) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.objectIds) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.relations) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.subjectTypes) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.subjectIds) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+        <> ((\params -> params.subjectRelations) >$< Encoders.param (Encoders.nonNullable nullableTextArrayEncoder))
+        <> ((\params -> params.writeXid) >$< Encoders.param (Encoders.nonNullable Encoders.text))
 
 {- | A 'TupleFilter' flattened for the wire.
 
@@ -825,60 +1020,6 @@ matchingLiveTupleExistsStatement =
         """
         tupleFilterEncoder
         (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.bool)))
-
-data TupleDeleteParams = TupleDeleteParams
-    { deletedXid :: !Text
-    , objectType :: !Text
-    , objectId :: !Text
-    , relation :: !Text
-    , subjectType :: !Text
-    , subjectId :: !Text
-    , subjectRelation :: !(Maybe Text)
-    }
-
-tupleDeleteParams :: Text -> Tuple -> TupleDeleteParams
-tupleDeleteParams deletedXid tuple =
-    let (subjectObject, subjectRelation) = flattenSubject tuple.subject
-     in TupleDeleteParams
-            { deletedXid = deletedXid
-            , objectType = unObjectType tuple.object.objectType
-            , objectId = tuple.object.objectId
-            , relation = unRelationName tuple.relation
-            , subjectType = unObjectType subjectObject.objectType
-            , subjectId = subjectObject.objectId
-            , subjectRelation = unRelationName <$> subjectRelation
-            }
-
-{- | Retire the live grant for an identity, whatever caveat it carries.
-
-The request's caveat is ignored. With one live row per identity, matching on
-@caveat_name@ would mean a caller who supplies yesterday's caveat name deletes
-nothing and is told it succeeded — the same silent no-op that touch semantics
-removes from the write path.
--}
-deleteTupleStatement :: Statement TupleDeleteParams ()
-deleteTupleStatement =
-    Statement.preparable
-        """
-        UPDATE relation_tuple
-        SET deleted_xid = $1::xid8
-        WHERE object_type = $2
-          AND object_id = $3
-          AND relation = $4
-          AND subject_type = $5
-          AND subject_id = $6
-          AND coalesce(subject_relation, '') = coalesce($7, '')
-          AND deleted_xid IS NULL
-        """
-        ( ((\params -> params.deletedXid) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.objectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.objectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.relation) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.subjectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.subjectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-            <> ((\params -> params.subjectRelation) >$< Encoders.param (Encoders.nullable Encoders.text))
-        )
-        Decoders.noResult
 
 data ReadParams = ReadParams
     { revision :: !Text
@@ -1048,6 +1189,22 @@ readStartingWithUserEncoder =
 textArrayEncoder :: Encoders.Value [Text]
 textArrayEncoder =
     Encoders.foldableArray (Encoders.nonNullable Encoders.text)
+
+{- | A @text[]@ whose elements may be SQL @NULL@.
+
+The array itself is never null; its elements are. @subject_relation@ and
+@caveat_name@ are both genuinely absent for most tuples, and an absent element
+must arrive as @NULL@ rather than @''@ so the @coalesce@ and @IS DISTINCT FROM@
+predicates mean what the per-row statements meant.
+-}
+nullableTextArrayEncoder :: Encoders.Value [Maybe Text]
+nullableTextArrayEncoder =
+    Encoders.foldableArray (Encoders.nullable Encoders.text)
+
+-- | A @jsonb[]@ whose elements may be SQL @NULL@: an uncaveated tuple has no payload.
+nullableJsonbArrayEncoder :: Encoders.Value [Maybe LazyByteString.ByteString]
+nullableJsonbArrayEncoder =
+    Encoders.foldableArray (Encoders.nullable Encoders.jsonbLazyBytes)
 
 tupleRowDecoder :: Decoders.Row TupleRow
 tupleRowDecoder =

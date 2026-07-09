@@ -63,8 +63,10 @@ main = do
         runTupleStoreScenario connection
         runProbeScenario connection
         runTouchSemanticsScenario connection
+        runBatchWriteScenario connection
         runPreconditionScenario connection
         runWriteRaceScenario database connection
+        runBatchTouchRaceScenario database connection
         runDecodeStrictnessScenario connection
         runSnapshotRepeatabilityScenario database connection
         runMaintenanceBatchScenario connection
@@ -464,6 +466,145 @@ runTouchSemanticsScenario connection = do
     rowsAtDelete <- readAt deleteRevision deleteSpace
     assertEqual "delete ignores the request's caveat and retires the grant" 0 (length rowsAtDelete)
 
+{- | The batched write path, where per-tuple statements cannot hide a mistake.
+
+One @unnest@ statement applies the whole request, so every tuple's touch outcome
+is decided by the /same/ statement rather than by its own. Three things can go
+wrong there that no single-tuple test would notice.
+
+A batch whose entries need different outcomes — one already identical, one
+carrying a new caveat, one absent entirely — is the shape that catches an
+off-by-one in the convergence check's ordinality mapping: the retry would insert
+a satisfied entry and raise @unique_violation@, or skip an unsatisfied one and
+drop the write. Scenario 2 mixes all three in one call.
+
+A batch carrying one identity twice must still resolve last-wins.
+@ON CONFLICT DO NOTHING@ keeps whichever conflicting row the executor reaches
+first, so without client-side deduplication scenario 3 resolves arbitrary-wins,
+and does so nondeterministically enough to pass on most runs.
+
+Scenario 1 is the plain volume case: it fails outright if the arrays are
+transposed wrongly, since the columns would be zipped into the wrong rows.
+-}
+runBatchWriteScenario :: Connection.Connection -> IO ()
+runBatchWriteScenario connection = do
+    config <- testConfig
+    let viewer = RelationName "viewer"
+        alice = SubjectId (ObjectRef (ObjectType "user") "batch-alice")
+        spaceRef name = ObjectRef (ObjectType "space") name
+        grant object caveat = Tuple{object, relation = viewer, subject = alice, caveat}
+        untilCaveat expiry =
+            TupleCaveat
+                { name = CaveatName "within_autonomy"
+                , payload = CaveatPayload (Map.fromList [("until", ValueTimestamp expiry)])
+                }
+        july = read "2026-07-01 00:00:00 UTC"
+        december = read "2026-12-31 00:00:00 UTC"
+        readAt revision object =
+            (.rows) <$> runPgOrFail connection config (TupleStore.readObjectRelation revision object viewer 10 Nothing)
+        writeAt tuples = do
+            token <- runPgOrFail connection config (TupleStore.writeTuples tuples)
+            TokenMetadata{revision} <- either (fail . show) pure (tokenMetadataFromPayload token)
+            pure revision
+
+    -- 1. A hundred tuples in one call are all readable at the returned token.
+    let hundred =
+            [ grant (spaceRef ("batch-volume-" <> Text.pack (show index))) Nothing
+            | index <- [1 :: Int .. 100]
+            ]
+    volumeRevision <- writeAt hundred
+    volumePage <-
+        runPgOrFail connection config $
+            TupleStore.readStartingWithUser
+                volumeRevision
+                UsersetQuery
+                    { queryType = ObjectType "space"
+                    , queryRelation = viewer
+                    , querySubjects = [alice]
+                    , queryLimit = 200
+                    , queryCursor = Nothing
+                    }
+    assertEqual "a hundred-tuple batch writes a hundred live rows" 100 (length volumePage.rows)
+    assertEqual
+        "every tuple in the batch survives its columns' transposition"
+        (sort ((.object.objectId) <$> hundred))
+        (sort ((.tuple.object.objectId) <$> volumePage.rows))
+
+    -- 2. One batch whose entries need three different touch outcomes.
+    let identicalSpace = spaceRef "batch-mixed-identical"
+        replacedSpace = spaceRef "batch-mixed-replaced"
+        createdSpace = spaceRef "batch-mixed-created"
+    seedRevision <-
+        writeAt
+            [ grant identicalSpace (Just (untilCaveat july))
+            , grant replacedSpace (Just (untilCaveat july))
+            ]
+    seededIdenticalRows <- readAt seedRevision identicalSpace
+    mixedRevision <-
+        writeAt
+            [ grant identicalSpace (Just (untilCaveat july))
+            , grant replacedSpace (Just (untilCaveat december))
+            , grant createdSpace Nothing
+            ]
+    identicalRows <- readAt mixedRevision identicalSpace
+    replacedRows <- readAt mixedRevision replacedSpace
+    createdRows <- readAt mixedRevision createdSpace
+    assertEqual
+        "an identical entry in a mixed batch does not churn its row"
+        ((.rowId) <$> seededIdenticalRows)
+        ((.rowId) <$> identicalRows)
+    assertEqual "a replaced entry in a mixed batch leaves one live row" 1 (length replacedRows)
+    assertEqual
+        "a replaced entry in a mixed batch takes the new caveat"
+        [Just (untilCaveat december)]
+        ((.tuple.caveat) <$> replacedRows)
+    assertEqual
+        "a new entry in a mixed batch is created"
+        [Nothing]
+        ((.tuple.caveat) <$> createdRows)
+
+    -- 3. A duplicate identity inside a larger batch still resolves last-wins.
+    let duplicateSpace = spaceRef "batch-duplicate"
+        bystanderSpace = spaceRef "batch-duplicate-bystander"
+    duplicateRevision <-
+        writeAt
+            [ grant duplicateSpace (Just (untilCaveat july))
+            , grant bystanderSpace Nothing
+            , grant duplicateSpace (Just (untilCaveat december))
+            ]
+    duplicateRows <- readAt duplicateRevision duplicateSpace
+    bystanderRows <- readAt duplicateRevision bystanderSpace
+    assertEqual "a duplicate identity in one batch leaves one live row" 1 (length duplicateRows)
+    assertEqual
+        "a duplicate identity in one batch keeps the last write"
+        [Just (untilCaveat december)]
+        ((.tuple.caveat) <$> duplicateRows)
+    assertEqual "deduplication does not drop the batch's other entries" 1 (length bystanderRows)
+
+    -- 4. Four copies of one identity. Three would survive without deduplication:
+    --    each attempt inserts the earliest surviving copy and drops the rest, so
+    --    the retry ladder walks the batch down to the last copy and lands on
+    --    last-wins anyway. Four is where that accident stops. The convergence
+    --    check hands the fallback two copies of one identity, and the fallback's
+    --    insert omits @ON CONFLICT@ by design, so PostgreSQL raises
+    --    @unique_violation@ and a legitimate write becomes a StoreError.
+    let quadrupleSpace = spaceRef "batch-quadruple"
+        marchCaveat = untilCaveat (read "2026-03-01 00:00:00 UTC")
+        aprilCaveat = untilCaveat (read "2026-04-01 00:00:00 UTC")
+    quadrupleRevision <-
+        writeAt
+            [ grant quadrupleSpace (Just marchCaveat)
+            , grant quadrupleSpace (Just aprilCaveat)
+            , grant quadrupleSpace (Just (untilCaveat july))
+            , grant quadrupleSpace (Just (untilCaveat december))
+            ]
+    quadrupleRows <- readAt quadrupleRevision quadrupleSpace
+    assertEqual "four copies of one identity leave one live row" 1 (length quadrupleRows)
+    assertEqual
+        "four copies of one identity keep the last write"
+        [Just (untilCaveat december)]
+        ((.tuple.caveat) <$> quadrupleRows)
+
 {- | Preconditions, sequentially: what a guarded write means on its own.
 
 Four properties. A guarded revoke succeeds once and then refuses to succeed
@@ -644,6 +785,109 @@ runWriteRaceScenario database connection = do
     assertEqual "the raced grant is revoked exactly once" 0 (length survivingRows)
 
     traverse_ Connection.release [leftConnection, rightConnection, blocker]
+
+{- | The batched touch protocol's retry ladder, which only a race can reach.
+
+Inside one transaction the batch always converges on its first attempt: the only
+live row that can conflict with an entry after the retire statement is one
+byte-identical to it, and that satisfies the entry. So the convergence check, the
+ordinal bookkeeping that maps an unsatisfied entry back to its tuple, and the
+second attempt are all unreachable without a concurrent writer — and a suite that
+never establishes the overlap leaves the entire ladder unexercised while
+reporting green.
+
+The overlap is forced, not waited for. A racer opens a transaction and inserts a
+live row for the contended identity without committing. The writer's retire
+statement runs at its own @READ COMMITTED@ snapshot and cannot see that row, so
+it retires nothing; the writer's insert then collides with the racer's
+uncommitted row and blocks on it. The test /asserts/ the writer is blocked before
+releasing the racer, so a run in which the writer sailed past cannot be mistaken
+for a run in which it raced.
+
+When the racer commits, the writer's @ON CONFLICT DO NOTHING@ drops the contended
+entry — @rowsAffected@ now reports "nothing retired, nothing inserted" for a
+write that was neither applied nor already present. That is finding C1 in racing
+form, and inferring convergence from those counts would silently drop the write
+and hand back a success token. The convergence check instead observes that no
+live row carries the entry's caveat, and the second attempt retires the racer's
+row and inserts the replacement.
+
+The contended entry is deliberately the /second/ of two, so the retry acts on
+ordinal 2. An off-by-one in the ordinal mapping selects no tuple, the ladder
+concludes it converged, and the racer's caveat survives under the writer's token.
+-}
+runBatchTouchRaceScenario :: Pg.Database -> Connection.Connection -> IO ()
+runBatchTouchRaceScenario database connection = do
+    config <- testConfig
+    writerConnection <- acquire database
+    racer <- acquire database
+    let viewer = RelationName "viewer"
+        alice = SubjectId (ObjectRef (ObjectType "user") "batch-race-alice")
+        contendedSpace = ObjectRef (ObjectType "space") "batch-race"
+        bystanderSpace = ObjectRef (ObjectType "space") "batch-race-bystander"
+        december =
+            TupleCaveat
+                { name = CaveatName "within_autonomy"
+                , payload = CaveatPayload (Map.fromList [("until", ValueTimestamp (read "2026-12-31 00:00:00 UTC"))])
+                }
+        grant object caveat = Tuple{object, relation = viewer, subject = alice, caveat}
+        -- The contended identity is the last entry, so its retry ordinal is 2.
+        writerRequest = TupleStore.writeTuples [grant bystanderSpace Nothing, grant contendedSpace (Just december)]
+
+    -- The racer plants a live row for the contended identity and holds it uncommitted.
+    runSessionOrFail racer (Session.script "BEGIN")
+    runSessionOrFail racer (Session.statement () insertRacingTupleStatement)
+
+    writerResult <- newEmptyMVar
+    _ <- forkIO (putMVar writerResult =<< runPg writerConnection config writerRequest)
+
+    -- Long enough that a writer which was going to finish would have finished.
+    threadDelay 500_000
+    pendingWriter <- tryReadMVar writerResult
+    assertEqual
+        ("the writer blocks on the racer's uncommitted row; got " <> show pendingWriter)
+        Nothing
+        pendingWriter
+
+    runSessionOrFail racer (Session.script "COMMIT")
+    outcome <- takeMVar writerResult
+    assertBool ("the writer's batch commits after the race; got " <> show outcome) (isRight outcome)
+
+    headRevision <- runPgOrFail connection config TupleStore.headRevision
+    TuplePage{rows = contendedRows} <-
+        runPgOrFail connection config (TupleStore.readObjectRelation headRevision contendedSpace viewer 10 Nothing)
+    TuplePage{rows = bystanderRows} <-
+        runPgOrFail connection config (TupleStore.readObjectRelation headRevision bystanderSpace viewer 10 Nothing)
+    assertEqual "the raced identity keeps one live row" 1 (length contendedRows)
+    assertEqual
+        "the writer's caveat replaces the racer's rather than being silently dropped"
+        [Just december]
+        ((.tuple.caveat) <$> contendedRows)
+    assertEqual "the batch's uncontended entry is written too" 1 (length bystanderRows)
+
+    traverse_ Connection.release [writerConnection, racer]
+
+{- | Plant a live row for the contended identity, carrying a caveat the writer's
+batch does not.
+
+Written as raw SQL rather than through the store, because the row must stay
+uncommitted while another transaction collides with it — which is precisely what
+'En.Effect.TupleStore.applyTupleWrites' will not do.
+-}
+insertRacingTupleStatement :: Statement () ()
+insertRacingTupleStatement =
+    Statement.preparable
+        """
+        INSERT INTO relation_tuple
+          (object_type, object_id, relation, subject_type, subject_id, subject_relation,
+           caveat_name, caveat_payload, created_xid)
+        VALUES ('space', 'batch-race', 'viewer', 'user', 'batch-race-alice', NULL,
+                'within_autonomy',
+                '{"until":{"type":"timestamp","value":"2026-01-01T00:00:00Z"}}'::jsonb,
+                pg_current_xact_id())
+        """
+        Encoders.noParams
+        Decoders.noResult
 
 {- | Take the raced grant's row lock, as 'lockMatchingLiveTupleStatement' would.
 

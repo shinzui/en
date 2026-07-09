@@ -5,6 +5,7 @@ title: "Batch tuple writes and add bulk import and export"
 kind: exec-plan
 created_at: 2026-07-07T15:25:00Z
 master_plan: "docs/masterplans/8-correct-write-path-and-storage-semantics.md"
+intention: intention_01kx48hvkeemk9j4r828132s2h
 ---
 
 # Batch tuple writes and add bulk import and export
@@ -41,9 +42,10 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Verify the hard dependency on docs/plans/45 (touch statements and re-keyed unique index present) and check docs/plans/46's status to pick the write entry point (`ApplyTupleWrites` vs `WriteTuples`/`DeleteTuples`).
-- [ ] Add `batchTouchReplaceStatement`, `batchInsertTupleStatement`, `batchDeleteTupleStatement`, and the batched verify statement to `en-postgres/src/En/Postgres/TupleStore.hs`; rewrite the write session over them.
-- [ ] Prove batched-vs-sequential equivalence in `en-postgres/integration-test/Main.hs` (touch scenarios from docs/plans/45 rerun through the batched path, plus a duplicate-key-in-one-batch case).
+- [x] Verify the hard dependency on docs/plans/45 (touch statements and re-keyed unique index present) and check docs/plans/46's status to pick the write entry point (`ApplyTupleWrites` vs `WriteTuples`/`DeleteTuples`). — 2026-07-09. Both complete; the entry point is `applyTupleWritesSession`.
+- [x] Add `batchTouchReplaceStatement`, `batchInsertTupleStatement`, `batchDeleteTupleStatement`, and the batched verify statement (`batchUnconvergedStatement`) to `en-postgres/src/En/Postgres/TupleStore.hs`; rewrite the write session over them. — 2026-07-09
+- [x] Prove batched-vs-sequential equivalence in `en-postgres/integration-test/Main.hs` (docs/plans/45's five touch scenarios rerun unchanged through the batched path, plus `runBatchWriteScenario` and `runBatchTouchRaceScenario`). — 2026-07-09
+- [x] Each new scenario run once against the bug it claims to catch (see Surprises & Discoveries). — 2026-07-09
 - [ ] Add the `ReadAllTuples` effect operation to `en-core/src/En/Effect/TupleStore.hs`, implement it in the PostgreSQL and in-memory interpreters, and confirm the cached interposer passes it through.
 - [ ] Add subcommand dispatch to `en-server/app/Main.hs` and implement `import` (NDJSON in, anchored batches, final token printed) and `export` (NDJSON out at a single revision).
 - [ ] Round-trip test: export a seeded dev database, import into a fresh database, compare sorted NDJSON.
@@ -57,7 +59,67 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+**The retry ladder repairs duplicate keys, until it doesn't — and then it raises.** The
+plan justified client-side deduplication with "PostgreSQL raises `21000
+cardinality_violation` if one `UPDATE … FROM unnest` matches the same target row twice".
+It does not: `UPDATE … FROM` silently picks one arbitrary source row per target (only
+`MERGE` and `ON CONFLICT DO UPDATE` raise 21000), and `ON CONFLICT DO NOTHING` tolerates
+intra-command duplicates. Deduplication is still required, but for two other reasons.
+
+The first is determinism. `INSERT … SELECT … ON CONFLICT DO NOTHING` keeps whichever
+conflicting row the executor reaches first, so a batch carrying one identity twice
+resolves *arbitrary*-wins on the insert. The retry ladder then hides this: each attempt
+inserts the earliest surviving copy and drops the rest, so the unconverged set walks the
+batch down toward its last copy, and two or three copies land on last-wins by accident.
+
+The second is that the accident stops at four. With four copies, the convergence check
+hands the fallback two entries of one identity, and the fallback's insert omits
+`ON CONFLICT` by design — so PostgreSQL raises `unique_violation` and a legitimate
+last-wins request becomes a `503 store_error`. Verified by deleting the `dedupeWrites`
+call and running the suite:
+
+```text
+code: 23505
+message: duplicate key value violates unique constraint "relation_tuple_live_unique"
+detail: Key (object_type, object_id, relation, subject_type, subject_id,
+  COALESCE(subject_relation, ''::text))=(space, batch-quadruple, viewer, user, batch-alice, )
+  already exists.
+```
+
+The first duplicate-key scenario written for this plan used *two* copies and passed
+against the un-deduplicated code, certifying nothing. `runBatchWriteScenario`'s fourth
+sub-scenario uses four.
+
+**Within one transaction the batch always converges on the first attempt, so a
+single-connection suite leaves the retry ladder entirely untested.** After
+`batchTouchReplaceStatement`, the only live row that can still conflict with an entry is
+byte-identical to it — which satisfies the entry. So `batchUnconvergedStatement` returns
+`[]`, and the second attempt, the fallback, and the ordinal bookkeeping that maps an
+unsatisfied entry back to its tuple are unreachable. Injecting an off-by-one into
+`selectOrdinals` (`zip [0 ..]` for `zip [1 ..]`) left the whole suite green.
+
+`runBatchTouchRaceScenario` forces the overlap: a racer holds an uncommitted live row for
+the contended identity, the writer's retire statement cannot see it, the writer's insert
+blocks on it (asserted, not slept for), and only then does the racer commit. The same
+off-by-one now fails loudly, and in the exact shape finding C1 describes — the writer's
+caveat is silently dropped and a success token is returned:
+
+```text
+user error (the writer's caveat replaces the racer's rather than being silently dropped
+expected: [Just (TupleCaveat {name = CaveatName "within_autonomy", payload = ... 2026-12-31 ...})]
+actual:   [Just (TupleCaveat {name = CaveatName "within_autonomy", payload = ... 2026-01-01 ...})])
+```
+
+The contended entry is deliberately the batch's *second*, so the retry acts on ordinal 2
+and a zero-based mapping selects nothing at all.
+
+**An unreferenced bind parameter has no inferable type.** `batchUnconvergedStatement`
+reads rather than writes, so it never mentions the write xid. Sending it anyway as an
+unused `$9` fails at parse time with "could not determine data type of parameter". Hence
+three encoders over one `BatchParams` — `batchColumnsEncoder` (`$1`–`$8`),
+`batchWriteEncoder` (plus the xid at `$9`), and `batchDeleteEncoder` (the six identity
+arrays plus the xid at `$7`) — rather than one shared encoder as the per-row statements
+had.
 
 
 ## Decision Log
@@ -111,6 +173,30 @@ Record every decision made while working on the plan.
   `en-server`; the master plan scopes this plan to storage throughput, not CLI ergonomics.
   Revisit if the operator surface grows.
   Date: 2026-07-07
+- Decision: The soft dependency resolved in the affirmative — docs/plans/46 has landed, so
+  batching rewrote `applyTupleWritesSession`, which stays `Session (Either Text Anchor)`.
+  Rationale: Its Progress checklist is complete and `ApplyTupleWrites` is the effect's only
+  write constructor. Preconditions are checked unchanged, before the batched delete and the
+  batched touch; the interpreter still mints the token from the returned `Anchor`, per
+  docs/plans/47's seam. Batching is entirely interpreter-internal: the effect's constructors
+  are byte-identical to their pre-plan state.
+  Date: 2026-07-09
+- Decision: The batch's convergence check asks one set-oriented question — "which entries
+  have no byte-identical live row?" — returning ordinals via `unnest … WITH ORDINALITY`,
+  rather than reproducing the per-row pair of "did the insert affect a row?" and "is there an
+  identical row?".
+  Rationale: An entry whose insert succeeded has a byte-identical live row, and so does an
+  entry that was already present, so one question subsumes both. Ordinals map an unsatisfied
+  entry back to its tuple without shipping the tuple's columns home again, which keeps the
+  retry restricted to the unconverged subset — a retry that re-inserted a satisfied entry
+  would raise the very `unique_violation` that signals failure.
+  Date: 2026-07-09
+- Decision: The retry acts only on the unconverged subset, and the final fallback insert
+  omits `ON CONFLICT`, exactly as the per-row protocol did.
+  Rationale: This preserves docs/plans/45's contract that a write which cannot converge fails
+  loudly rather than being dropped. It also forces `dedupeWrites`: without it a four-way
+  duplicate reaches the fallback with two same-identity rows and the strict insert raises.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective
