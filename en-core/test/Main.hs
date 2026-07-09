@@ -592,7 +592,30 @@ main = do
     assertBool "expand expands userset subjects" (treeHasSubject (SubjectId agencyUser) usersetExpansion)
     intentionExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest intention (RelationName "view") requestContext (ExpandLimit 20) Nothing)
     assertBool "expand includes caveat markers" (treeHasCaveat (CaveatName "within_autonomy") intentionExpansion)
-    assertEqual "expand paginates top-level children" (Right (ExpandHasMore (ExpandCursor "1"))) =<< fmap (fmap expandState) (expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest auditedSpace (RelationName "audit") requestContext (ExpandLimit 1) Nothing))
+    assertBool "expand preserves the view union operator" (treeHasUnion spaceExpansion)
+    -- `member` is a flat This relation with two direct rows, so paging still applies to it.
+    -- `audit` no longer pages: its intersection is one atomic child (asserted just below).
+    assertEqual "expand paginates top-level children" (Right (ExpandHasMore (ExpandCursor "1"))) =<< fmap (fmap expandState) (expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest exclusionSpace (RelationName "member") requestContext (ExpandLimit 1) Nothing))
+    auditExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest auditedSpace (RelationName "audit") requestContext (ExpandLimit 20) Nothing)
+    assertBool "expand preserves the audit intersection operator" (treeHasIntersection auditExpansion)
+    assertEqual "expand renders one child per conjunct" (Right [2]) (fmap (fmap conjunctCount . (.children)) auditExpansion)
+    assertBool "expand finds both conjuncts' subjects through the intersection" (all (\relation -> treeHasUserset auditedSpace (RelationName relation) auditExpansion) ["owner", "member"])
+    -- Operator nodes are atomic under paging: a limit of 1 cannot split a conjunction.
+    assertEqual "expand never splits an operator node across pages" (Right (1, ExpandExhausted)) =<< fmap (fmap (\tree -> (length tree.children, tree.state))) (expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest auditedSpace (RelationName "audit") requestContext (ExpandLimit 1) Nothing))
+    exclusionExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest exclusionSpace (RelationName "member_not_owner") requestContext (ExpandLimit 20) Nothing)
+    let exclusionSides = treeExclusionSides exclusionExpansion
+        onEachSide predicate = fmap (\(granted, subtracted) -> (any predicate granted, any predicate subtracted)) exclusionSides
+    assertEqual "expand grants the member-only subject without subtracting it" (Just (True, False)) (onEachSide (nodeHasSubject (SubjectId memberOnly)))
+    assertEqual "expand carves the owner grant out on the subtract side alone" (Just (False, True)) (onEachSide (nodeHasUserset exclusionSpace (RelationName "owner")))
+    assertEqual "expand shows the member-and-owner subject on both sides of the exclusion" (Just (True, True)) (onEachSide (nodeHasSubject (SubjectId memberOwner)))
+    -- Every kikan conjunct expands to exactly one node, so the assertions above cannot tell
+    -- "one child per conjunct" from "all branches concatenated". `reviewer` intersects a
+    -- two-row `This` with a computed userset, which can: concatenation yields three children
+    -- where the conjunction has two.
+    branchGraph <- either (fail . show) pure (compileSchema branchSchema)
+    branchExpansion <- expandEngine consistencyStore (runTupleStoreInMemory branchTuples) branchGraph MinimizeLatency (expandRequest reviewDoc (RelationName "reviewer") requestContext (ExpandLimit 20) Nothing)
+    assertEqual "expand renders one child per conjunct, not one per row" (Just 2) (fmap length (treeConjuncts branchExpansion))
+    assertEqual "expand keeps a multi-row conjunct whole, as a union of its rows" (Just [2, 1]) (fmap (fmap branchWidth) (treeConjuncts branchExpansion))
     pure ()
 
 sampleTuple :: Tuple
@@ -1451,6 +1474,9 @@ nodeHasSubject subject =
         ExpandSubject found _ -> found == subject
         ExpandUserset _ _ children -> any (nodeHasSubject subject) children
         ExpandCaveated _ children -> any (nodeHasSubject subject) children
+        ExpandUnion children -> any (nodeHasSubject subject) children
+        ExpandIntersection children -> any (nodeHasSubject subject) children
+        ExpandExclusion granted subtracted -> any (nodeHasSubject subject) (granted <> subtracted)
 
 treeHasUserset :: ObjectRef -> RelationName -> Either EnError ExpandTree -> Bool
 treeHasUserset object relation =
@@ -1464,6 +1490,10 @@ nodeHasUserset object relation =
             (foundObject == object && foundRelation == relation)
                 || any (nodeHasUserset object relation) children
         ExpandCaveated _ children -> any (nodeHasUserset object relation) children
+        ExpandUnion children -> any (nodeHasUserset object relation) children
+        ExpandIntersection children -> any (nodeHasUserset object relation) children
+        ExpandExclusion granted subtracted ->
+            any (nodeHasUserset object relation) (granted <> subtracted)
 
 treeHasCaveat :: CaveatName -> Either EnError ExpandTree -> Bool
 treeHasCaveat caveat =
@@ -1476,6 +1506,63 @@ nodeHasCaveat caveat =
         ExpandUserset _ _ children -> any (nodeHasCaveat caveat) children
         ExpandCaveated found children ->
             found == caveat || any (nodeHasCaveat caveat) children
+        ExpandUnion children -> any (nodeHasCaveat caveat) children
+        ExpandIntersection children -> any (nodeHasCaveat caveat) children
+        ExpandExclusion granted subtracted -> any (nodeHasCaveat caveat) (granted <> subtracted)
+
+treeHasUnion :: Either EnError ExpandTree -> Bool
+treeHasUnion =
+    either (const False) (any nodeIsUnion . (.children))
+  where
+    nodeIsUnion = \case
+        ExpandUnion _ -> True
+        _ -> False
+
+-- | How many conjuncts an intersection node holds; @0@ for any other node.
+conjunctCount :: ExpandNode -> Int
+conjunctCount = \case
+    ExpandIntersection conjuncts -> length conjuncts
+    _ -> 0
+
+-- | The conjuncts of the tree's first top-level intersection node.
+treeConjuncts :: Either EnError ExpandTree -> Maybe [ExpandNode]
+treeConjuncts =
+    either (const Nothing) (firstIntersection . (.children))
+  where
+    firstIntersection nodes =
+        case [conjuncts | ExpandIntersection conjuncts <- nodes] of
+            conjuncts : _ -> Just conjuncts
+            [] -> Nothing
+
+-- | How many nodes a conjunct covers: a union's members, or the one node it already is.
+branchWidth :: ExpandNode -> Int
+branchWidth = \case
+    ExpandUnion members -> length members
+    _ -> 1
+
+treeHasIntersection :: Either EnError ExpandTree -> Bool
+treeHasIntersection =
+    either (const False) (any nodeIsIntersection . (.children))
+  where
+    nodeIsIntersection = \case
+        ExpandIntersection _ -> True
+        _ -> False
+
+{- | The two sides of the tree's first top-level exclusion node, kept apart.
+
+Returning the sides rather than a @Bool@ is deliberate: an assertion that an exclusion
+node merely /exists/ passes against an evaluator that puts every child on the granting
+side, which is the flat tree wearing a hat. Only asking which side a subject landed on
+distinguishes "granted" from "carved out".
+-}
+treeExclusionSides :: Either EnError ExpandTree -> Maybe ([ExpandNode], [ExpandNode])
+treeExclusionSides =
+    either (const Nothing) (firstExclusion . (.children))
+  where
+    firstExclusion nodes =
+        case [(granted, subtracted) | ExpandExclusion granted subtracted <- nodes] of
+            sides : _ -> Just sides
+            [] -> Nothing
 
 kikanSchemaManual :: Schema
 kikanSchemaManual =
@@ -1937,6 +2024,42 @@ publicSchema =
                 , Schema.permission "view" (Schema.computed "viewer")
                 ]
         Schema.build [userObject, org, spaceObject]
+
+{- | A schema whose intersection has a conjunct that expands to more than one node.
+
+Every kikan conjunct is a @ComputedUserset@, which expands to exactly one 'ExpandUserset'
+node — so on kikan fixtures alone, "one child per conjunct" and "all branches concatenated"
+produce identical trees, and a test over them proves nothing. @reviewer@ intersects a
+@This@ (one node per stored row) with a computed userset, which tells the two apart.
+-}
+branchSchema :: Schema
+branchSchema =
+    testSchemaOrError $ do
+        userObject <- Schema.object "user" []
+        doc <-
+            Schema.object
+                "doc"
+                [ Schema.relation "approver" [Schema.subject "user"] Schema.this
+                , Schema.relation
+                    "reviewer"
+                    [Schema.subject "user"]
+                    (Schema.allOf Schema.this [Schema.computed "approver"])
+                ]
+        Schema.build [userObject, doc]
+
+reviewDoc :: ObjectRef
+reviewDoc =
+    ObjectRef
+        { objectType = ObjectType "doc"
+        , objectId = "review-doc"
+        }
+
+branchTuples :: [Tuple]
+branchTuples =
+    [ Tuple{object = reviewDoc, relation = RelationName "reviewer", subject = SubjectId alice, caveat = Nothing}
+    , Tuple{object = reviewDoc, relation = RelationName "reviewer", subject = SubjectId bob, caveat = Nothing}
+    , Tuple{object = reviewDoc, relation = RelationName "approver", subject = SubjectId alice, caveat = Nothing}
+    ]
 
 publicTuple :: Tuple
 publicTuple =

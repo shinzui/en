@@ -395,6 +395,13 @@ instance ToSchema ExpandNodeWire where
                     , ("children", children)
                     ]
                 , objectSchema [("kind", literal "caveated"), ("caveat", textRef), ("children", children)]
+                , objectSchema [("kind", literal "union"), ("children", children)]
+                , objectSchema [("kind", literal "intersection"), ("children", children)]
+                , objectSchema
+                    [ ("kind", literal "exclusion")
+                    , ("granted", children)
+                    , ("subtracted", children)
+                    ]
                 ]
 
 instance ToSchema ExpandStateWire where

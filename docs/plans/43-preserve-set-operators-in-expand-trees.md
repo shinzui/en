@@ -43,14 +43,22 @@ the schema as the intersection `owner ∩ member`) returns, on the wire, an
 - [x] M0 (2026-07-09): baseline — `cabal build all` and `cabal test all` green before any
   edit; cited symbols confirmed, line numbers and the wire encoding drifted, and a fourth
   consumer found. Drift recorded in Surprises & Discoveries.
-- [ ] M1: failing test — expanding `space#audit` on the kikan fixtures must contain an
-  intersection node; captured red output (today: flat children).
-- [ ] M2: `ExpandNode` gains `ExpandUnion` / `ExpandIntersection` / `ExpandExclusion`;
-  `expandRewrite` stops flattening; en-core tree helpers updated; en-core tests green
-  including the reworked pagination assertion.
-- [ ] M3: wire DTO — `ExpandNodeWire` gains the three operator constructors;
-  `expandNodeToWire` extended; en-servant tests assert the intersection tag on the
-  wire; coordination note with docs/plans/35 recorded in code.
+- [x] M1 (2026-07-09): failing tests captured for both `space#audit` and
+  `space#member_not_owner` — each expands to two flat children where one operator node is
+  required. Red transcripts in Concrete Steps.
+- [x] M2 (2026-07-09): `ExpandNode` gains `ExpandUnion` / `ExpandIntersection` /
+  `ExpandExclusion`; `expandRewrite` stops flattening via `unionNode` /
+  `intersectionNode` / `asBranchNode`; en-core tree helpers recurse through the new nodes;
+  pagination assertion reworked onto `exclusionSpace#member`.
+- [x] M2 (2026-07-09): added `branchSchema`, a fixture whose intersection has a multi-node
+  conjunct — without it every assertion in this plan is vacuous (see Surprises).
+- [x] M3 (2026-07-09): `ExpandNodeWire` gains the three constructors under EP-35's `kind`
+  vocabulary (`"union"`, `"intersection"`, `"exclusion"`); `expandNodeToWire`, `ToJSON`,
+  `FromJSON`, the rejected-variant list, and `ToSchema` (OpenAPI) all extended; golden
+  byte tests plus a handler-level byte-for-byte acceptance on `audited-space#audit`.
+- [x] M2/M3 evidence (2026-07-09): both operator behaviours observed to fail against a
+  deliberately broken evaluator — a concatenating `intersectionNode` and an exclusion that
+  puts every child on the granting side. Transcripts in Concrete Steps.
 - [ ] Final: full suite green; Outcomes filled; master plan progress row updated.
 
 
@@ -129,6 +137,58 @@ is its per-node companion — the plan's Interfaces section names only the latte
 
 EP-40's `CycleDetected` revisit guard is present at `En/Expand.hs` line 140 with its
 explanatory comment, as this plan's Context and Orientation anticipated. Keep it intact.
+
+**Nothing compiler-forces the wire mapping; it only warns (M2, 2026-07-09).** This plan
+asserts twice that `expandNodeToWire` is "the total mapping the compiler will force you to
+extend", and its Idempotence section rests on the same belief. It is false. The workspace
+builds with `-Wall` but not `-Werror`, so after extending `ExpandNode` the engine compiled
+clean:
+
+```text
+src/En/Servant/API.hs:1174:5: warning: [GHC-62161] [-Wincomplete-patterns]
+    Pattern match(es) are non-exhaustive
+    In a \case alternative:
+        Patterns of type ‘Expand.ExpandNode’ not matched:
+            Expand.ExpandUnion _
+            Expand.ExpandIntersection _
+```
+
+`cabal build all` exits 0 on that. An implementer who ran only the engine's tests would
+have shipped a server that throws `Non-exhaustive patterns` on every expansion of an
+intersection — a crash, not a compile error. Together with the un-checked `ToSchema`
+hand-list, *both* of the wire's consumers are unenforced; the compiler's contribution is a
+warning one has to be reading for.
+
+This has a consequence the plan did not foresee. M2 and M3 cannot be separate green
+commits: an engine that emits operator nodes has no working wire until M3 lands. And the
+plan's stated recovery — "the immediate mitigation is reverting M3 … revert means the whole
+M3 commit" — was never achievable, because reverting M3 while keeping M2 restores exactly
+the crash above. Reverting this work means reverting both milestones together, which is
+what a single commit gives.
+
+**The kikan fixtures cannot tell a preserved conjunction from a concatenated one
+(M2, 2026-07-09).** This is the third instance of the pattern the master plan named for
+EP-43, arriving in the tests this plan *adds* rather than the ones it inherits.
+
+`audit` is `allOf owner [member]`, and both conjuncts are `ComputedUserset`s. A
+`ComputedUserset` expands to exactly one `ExpandUserset` node. So a correct
+`intersectionNode`, which emits one child per conjunct, and a broken one that concatenates
+every branch's nodes produce the *same tree* on `audited-space`: two children either way.
+`treeHasIntersection` passes against both. So does "one child per conjunct" measured on
+that fixture — the count is 2 for the right reason and 2 for the wrong one.
+
+`asBranchNode`, the function the plan calls "the difference between n conjuncts and one
+blurry pile", was therefore untested by every assertion the plan specifies. The fix is a
+fixture, not an assertion: `branchSchema` in `en-core/test/Main.hs` defines
+`doc#reviewer = allOf this [computed approver]` over a `doc` with two stored reviewers and
+one approver. The `This` conjunct expands to two nodes, so concatenation yields three
+children where the conjunction has two, and the sabotage transcript in Concrete Steps shows
+the new assertion failing `Just 2` / `Just 3` while every kikan-based assertion still
+passes.
+
+The generalization for EP-44, which will benchmark this code: a fixture where each branch
+happens to expand to one node cannot observe *branching* at all. Ask what arity the code
+under test distinguishes, then check the fixture actually exhibits more than one.
 
 **The existing pagination test is a test encoding a bug, as the master plan predicted
 (M0, 2026-07-09).** `en-core/test/Main.hs` line 595 asserts
@@ -227,15 +287,39 @@ rewrite; M0 confirms it is needed for the predicted reason rather than an incide
 - Decision: M1's red is demonstrated with assertions written in terms of the *current*
   constructors — `Right 1 == fmap (length . children) expansion` for both `audit` and
   `member_not_owner` — which fail today (`Right 2`, the flattened pair) and pass after M2.
-  M2 then strengthens them to `treeHasIntersection` / `treeHasExclusion`. M1 and M2 land as
-  one commit; M3 lands separately.
+  M2 then strengthens them to `treeHasIntersection` / `treeExclusionSides`.
   Rationale: the plan offered three techniques and asked which was used. A child-count
   assertion is the strongest statement expressible before `ExpandIntersection` exists, and
   it is a real red rather than a compile error, so it demonstrates the tests detect
-  *flattening* rather than merely detecting a missing constructor. Committing the red test
-  alone would leave the tree failing, which the exec-plan protocol forbids; the Idempotence
-  section's separate-commit requirement is about M2 versus M3 (the revertible wire change),
-  and that is honoured.
+  *flattening* rather than merely detecting a missing constructor.
+  Date: 2026-07-09
+- Decision: M1, M2, and M3 land as **one** commit, overriding the Idempotence section's
+  "land M2 and M3 as separate commits".
+  Rationale: that instruction protects a recovery path — "revert the M3 commit" — which
+  does not exist. `expandNodeToWire` is a non-exhaustive `\case` under `-Wall` without
+  `-Werror`, so an engine emitting operator nodes against a wire that lacks them *builds*
+  and then crashes at runtime on the first intersection expanded. There is no commit
+  boundary between M2 and M3 at which the tree is working, and reverting M3 alone
+  reintroduces precisely that crash. Reverting this change means reverting both milestones,
+  which one commit expresses honestly and two do not.
+  Date: 2026-07-09
+- Decision: `en-core/test/Main.hs` gains `branchSchema` /`reviewDoc` / `branchTuples`, a
+  fixture defining `doc#reviewer = allOf this [computed approver]` with two stored
+  reviewers, and the per-conjunct assertions are made against it rather than against
+  `audited-space#audit`.
+  Rationale: every kikan conjunct is a `ComputedUserset` and expands to exactly one node,
+  so on kikan alone a concatenating `intersectionNode` is observationally identical to a
+  correct one — both yield two children. The plan's specified assertions were therefore
+  vacuous with respect to `asBranchNode`, the function it identifies as the whole point of
+  B10. The sabotage transcript in Concrete Steps records that the new fixture fails
+  (`Just 2` expected, `Just 3` actual) while the kikan assertions stay green.
+  Date: 2026-07-09
+- Decision: the exclusion node's wire form uses two named keys, `granted` and `subtracted`,
+  rather than a two-element array or a `children` key plus a discriminator.
+  Rationale: the sides are the information the node exists to carry, and named keys make
+  them unmergeable by an encoder and unswappable by a careless refactor. `treeExclusionSides`
+  in the en-core suite enforces the same separation one layer down, and both were observed
+  to fail against an evaluator that piles every child onto the granting side.
   Date: 2026-07-09
 
 
@@ -513,23 +597,70 @@ cabal test en-core:en-core-conformance
 cabal test en-servant:en-servant-tests        # M3
 ```
 
-Expected M1 red (with the pre-M2 structural check):
+**M1 red, actual (2026-07-09).** Both assertions were written as child counts, since
+`ExpandIntersection` did not exist yet. Each expansion returns two flat children where one
+operator node belongs:
 
 ```text
-expand preserves the audit intersection operator
-expected: True
-actual:   False
+user error (expand preserves the audit intersection operator
+expected: Right 1
+actual:   Right 2)
+
+user error (expand separates exclusion base from subtracted children
+expected: Right 1
+actual:   Right 2)
 ```
 
-After M2, spot-check by eye in GHCi if useful:
+(The second was captured by temporarily relaxing the first to `Right 2`, since the suite
+aborts on the first failure.)
 
-```bash
-cabal repl en-core
--- ghci> import En.Expand, run expand over the kikan fixtures and Show the tree
+**M2/M3 green, actual (2026-07-09).**
+
+```text
+Test suite en-core-interface-tests: PASS
+Test suite en-core-conformance: PASS
+Test suite en-servant-tests: PASS
+Test suite en-postgres-revision-tests: PASS
+Test suite en-postgres-integration-tests: PASS
+Test suite en-biscuit-tests: PASS
+Test suite en-example-tests: PASS
 ```
 
-Update this section with real transcripts (red M1, green M2/M3, the encoded JSON
-snippet from the wire test) as evidence while working.
+**The bytes a client receives for `audited-space#audit` (2026-07-09).** Asserted exactly, in
+`en-servant/test/Main.hs`, from the real handler over the kikan fixtures. Before this plan
+these were two sibling `userset` nodes with no operator between them — byte-identical to
+what `act` (an `anyOf` over the same two relations) produces:
+
+```json
+{"root":{"objectType":"space","objectId":"audited-space"},"permission":"audit","children":[{"kind":"intersection","children":[{"kind":"userset","object":{"objectType":"space","objectId":"audited-space"},"relation":"owner","children":[{"kind":"subject","subject":{"kind":"id","objectType":"user","objectId":"member-owner"}}]},{"kind":"userset","object":{"objectType":"space","objectId":"audited-space"},"relation":"member","children":[{"kind":"subject","subject":{"kind":"id","objectType":"user","objectId":"member-owner"}}]}]}],"state":{"status":"exhausted"}}
+```
+
+**Sabotage evidence (2026-07-09).** The master plan requires that a test for this class of
+bug be observed failing against a deliberately broken implementation. Two were run.
+
+Replacing `intersectionNode branches = [ExpandIntersection (asBranchNode <$> branches)]`
+with `[ExpandIntersection (concat branches)]` — the flattening this plan removes, hidden
+one level down:
+
+```text
+user error (expand renders one child per conjunct, not one per row
+expected: Just 2
+actual:   Just 3)
+```
+
+Only the `branchSchema` assertion caught it. Every kikan-based assertion — including
+`treeHasIntersection` and the audit conjunct count — passed against the sabotage, which is
+why `branchSchema` exists.
+
+Replacing `[ExpandExclusion granted subtracted]` with
+`[ExpandExclusion (granted <> subtracted) []]` — an exclusion node that exists but carves
+nothing out, the flat tree wearing a hat:
+
+```text
+user error (expand carves the owner grant out on the subtract side alone
+expected: Just (False,True)
+actual:   Just (True,False))
+```
 
 
 ## Validation and Acceptance

@@ -54,10 +54,30 @@ data ExpandState
     | ExpandTruncated !ExpandCursor
     deriving stock (Eq, Ord, Show)
 
+{- | A node of the expansion tree.
+
+Two constructors carry data: 'ExpandSubject' is a leaf naming a concrete subject, and
+'ExpandUserset' names a subtree — everyone holding @relation@ on @object@, expanded below.
+
+The other four are wrappers over child lists, and they form one family: each says how its
+children combine. 'ExpandCaveated' is the caveat gate that has always been here; the three
+set operators say what the tree used to leave implicit. An auditor reading a flat child
+list cannot tell "all of these" from "any of these" from "these, except those", which is
+why the operators are part of the answer rather than decoration.
+-}
 data ExpandNode
-    = ExpandSubject !Subject !(Maybe TupleRow)
-    | ExpandUserset !ObjectRef !RelationName ![ExpandNode]
-    | ExpandCaveated !CaveatName ![ExpandNode]
+    = -- | A concrete subject, with the tuple row that grants it.
+      ExpandSubject !Subject !(Maybe TupleRow)
+    | -- | Everyone holding the relation on the object, expanded below.
+      ExpandUserset !ObjectRef !RelationName ![ExpandNode]
+    | -- | Caveat gate: the children grant only when the named caveat passes.
+      ExpandCaveated !CaveatName ![ExpandNode]
+    | -- | Any one child suffices.
+      ExpandUnion ![ExpandNode]
+    | -- | Every child is required. One child per conjunct.
+      ExpandIntersection ![ExpandNode]
+    | -- | The first list grants; the second subtracts from it.
+      ExpandExclusion ![ExpandNode] ![ExpandNode]
     deriving stock (Eq, Show)
 
 data ExpandTree = ExpandTree
@@ -171,18 +191,51 @@ expandRewrite graph revision object currentRelation rewrite state =
         TupleToUserset tuplesetRelation computedRelation ->
             expandTupleToUserset graph revision object tuplesetRelation computedRelation state
         Union rewrites -> do
-            children <- traverse (\current -> expandRewrite graph revision object currentRelation current state) rewrites
-            pure (concat <$> sequence children)
+            branches <- traverse (\current -> expandRewrite graph revision object currentRelation current state) rewrites
+            pure (unionNode <$> sequence branches)
         Intersection rewrites -> do
-            children <- traverse (\current -> expandRewrite graph revision object currentRelation current state) rewrites
-            pure (concat <$> sequence children)
+            branches <- traverse (\current -> expandRewrite graph revision object currentRelation current state) rewrites
+            pure (intersectionNode <$> sequence branches)
         Exclusion base subtractRewrite -> do
             baseChildren <- expandRewrite graph revision object currentRelation base state
             subtractChildren <- expandRewrite graph revision object currentRelation subtractRewrite state
-            pure ((<>) <$> baseChildren <*> subtractChildren)
+            pure ((\granted subtracted -> [ExpandExclusion granted subtracted]) <$> baseChildren <*> subtractChildren)
         Caveated caveat rewriteInner -> do
             children <- expandRewrite graph revision object currentRelation rewriteInner state
             pure (pure . ExpandCaveated caveat <$> children)
+
+{- | Combine a union's expanded branches into the caller's node list.
+
+A one-branch union says nothing the branch does not already say, so it collapses. Beyond
+that the branches merge: inside a union, a branch boundary carries no information an
+auditor can use, because any member of any branch grants on its own.
+-}
+unionNode :: [[ExpandNode]] -> [ExpandNode]
+unionNode [single] = single
+unionNode branches = [ExpandUnion (concat branches)]
+
+{- | Combine an intersection's expanded branches into the caller's node list.
+
+Branch boundaries here are precisely what the old flattening destroyed, so each conjunct
+survives as one child: @n@ conjuncts in, @n@ children out. Concatenating them instead —
+as this evaluator once did — turns "owner /and/ member" into a pile of subjects
+indistinguishable from "owner /or/ member". A one-branch intersection collapses, as a
+one-branch union does.
+-}
+intersectionNode :: [[ExpandNode]] -> [ExpandNode]
+intersectionNode [single] = single
+intersectionNode branches = [ExpandIntersection (asBranchNode <$> branches)]
+
+{- | Reduce one branch's expansion to the single node standing for that branch.
+
+A branch expanding to several nodes is union-shaped — any one of its rows grants the
+branch — so it wraps in 'ExpandUnion'. A branch expanding to none becomes an empty union,
+which grants nobody: that is a faithful conjunct and must not be dropped, because it is
+the reason the intersection denies.
+-}
+asBranchNode :: [ExpandNode] -> ExpandNode
+asBranchNode [single] = single
+asBranchNode nodes = ExpandUnion nodes
 
 expandThis ::
     (TupleStore :> es) =>

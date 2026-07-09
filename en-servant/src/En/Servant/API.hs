@@ -753,10 +753,25 @@ instance FromJSON ExpandRequestWire where
             <*> o .: "limit"
             <*> o .:? "cursor"
 
+{- | An expand-tree node on the wire.
+
+The @union@, @intersection@, and @exclusion@ kinds say how a node's children combine.
+Without them a client cannot tell "all of these" from "any of these" from "these, except
+those", which is the whole question an access review asks.
+
+Their spelling follows the @kind@ vocabulary this module already uses rather than the
+Haskell constructor names; the @…Wire@ suffix is an internal convention and never reaches
+a client. Adding kinds is additive but not free: a client that matches @kind@ exhaustively
+will reject a tree containing an operator, so the three arrived together, in one release.
+-}
 data ExpandNodeWire
     = ExpandSubjectWire !SubjectWire
     | ExpandUsersetWire !ObjectRefWire !Text ![ExpandNodeWire]
     | ExpandCaveatedWire !Text ![ExpandNodeWire]
+    | ExpandUnionWire ![ExpandNodeWire]
+    | ExpandIntersectionWire ![ExpandNodeWire]
+    | -- | Granted children first, subtracted children second.
+      ExpandExclusionWire ![ExpandNodeWire] ![ExpandNodeWire]
     deriving stock (Eq, Show)
 
 instance ToJSON ExpandNodeWire where
@@ -772,6 +787,16 @@ instance ToJSON ExpandNodeWire where
                 ]
         ExpandCaveatedWire caveat children ->
             Aeson.object ["kind" .= ("caveated" :: Text), "caveat" .= caveat, "children" .= children]
+        ExpandUnionWire children ->
+            Aeson.object ["kind" .= ("union" :: Text), "children" .= children]
+        ExpandIntersectionWire children ->
+            Aeson.object ["kind" .= ("intersection" :: Text), "children" .= children]
+        ExpandExclusionWire granted subtracted ->
+            Aeson.object
+                [ "kind" .= ("exclusion" :: Text)
+                , "granted" .= granted
+                , "subtracted" .= subtracted
+                ]
     toEncoding = \case
         ExpandSubjectWire subject ->
             pairs ("kind" .= ("subject" :: Text) <> "subject" .= subject)
@@ -784,6 +809,16 @@ instance ToJSON ExpandNodeWire where
                 )
         ExpandCaveatedWire caveat children ->
             pairs ("kind" .= ("caveated" :: Text) <> "caveat" .= caveat <> "children" .= children)
+        ExpandUnionWire children ->
+            pairs ("kind" .= ("union" :: Text) <> "children" .= children)
+        ExpandIntersectionWire children ->
+            pairs ("kind" .= ("intersection" :: Text) <> "children" .= children)
+        ExpandExclusionWire granted subtracted ->
+            pairs
+                ( "kind" .= ("exclusion" :: Text)
+                    <> "granted" .= granted
+                    <> "subtracted" .= subtracted
+                )
 
 instance FromJSON ExpandNodeWire where
     parseJSON = withObject "ExpandNodeWire" \o ->
@@ -791,7 +826,14 @@ instance FromJSON ExpandNodeWire where
             "subject" -> ExpandSubjectWire <$> o .: "subject"
             "userset" -> ExpandUsersetWire <$> o .: "object" <*> o .: "relation" <*> o .: "children"
             "caveated" -> ExpandCaveatedWire <$> o .: "caveat" <*> o .: "children"
-            other -> unknownVariant "expand node kind" other ["subject", "userset", "caveated"]
+            "union" -> ExpandUnionWire <$> o .: "children"
+            "intersection" -> ExpandIntersectionWire <$> o .: "children"
+            "exclusion" -> ExpandExclusionWire <$> o .: "granted" <*> o .: "subtracted"
+            other ->
+                unknownVariant
+                    "expand node kind"
+                    other
+                    ["subject", "userset", "caveated", "union", "intersection", "exclusion"]
 
 data ExpandStateWire
     = ExpandExhaustedWire
@@ -1177,6 +1219,10 @@ expandNodeToWire =
             ExpandUsersetWire (objectRefToWire object) relation (expandNodeToWire <$> children)
         Expand.ExpandCaveated (CaveatName caveat) children ->
             ExpandCaveatedWire caveat (expandNodeToWire <$> children)
+        Expand.ExpandUnion children -> ExpandUnionWire (expandNodeToWire <$> children)
+        Expand.ExpandIntersection children -> ExpandIntersectionWire (expandNodeToWire <$> children)
+        Expand.ExpandExclusion granted subtracted ->
+            ExpandExclusionWire (expandNodeToWire <$> granted) (expandNodeToWire <$> subtracted)
 
 expandStateToWire :: Expand.ExpandState -> ExpandStateWire
 expandStateToWire =

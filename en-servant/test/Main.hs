@@ -149,6 +149,43 @@ main = do
                     }
             )
 
+    -- B10 on the wire: `audit` is `owner AND member`. Before operator nodes the client
+    -- received a flat pair of usersets, byte-identical to what `act` (an OR of the same
+    -- two) produces — so an access review could not tell a conjunction from a disjunction.
+    let auditedSpaceRef = ObjectRefWire{objectType = "space", objectId = "audited-space"}
+        memberOwnerSubject = SubjectIdWire ObjectRefWire{objectType = "user", objectId = "member-owner"}
+        conjunct relation = ExpandUsersetWire auditedSpaceRef relation [ExpandSubjectWire memberOwnerSubject]
+        auditRequest =
+            ExpandRequestWire
+                { consistency = MinimizeLatencyWire
+                , object = auditedSpaceRef
+                , permission = "audit"
+                , context = CaveatContextWire Map.empty
+                , limit = 20
+                , cursor = Nothing
+                }
+    assertEqual
+        "expand endpoint returns the audit conjunction as one intersection node"
+        ( Right
+            ( EnOk
+                ExpandTreeWire
+                    { root = auditedSpaceRef
+                    , permission = "audit"
+                    , children = [ExpandIntersectionWire [conjunct "owner", conjunct "member"]]
+                    , state = ExpandExhaustedWire
+                    }
+            )
+        )
+        =<< runHandler (expandHandler env auditRequest)
+    -- And the same tree as the bytes a real client parses, not merely as a Haskell value.
+    runHandler (expandHandler env auditRequest) >>= \case
+        Right (EnOk tree) ->
+            assertEqual
+                "the audit tree a client receives, byte for byte"
+                "{\"root\":{\"objectType\":\"space\",\"objectId\":\"audited-space\"},\"permission\":\"audit\",\"children\":[{\"kind\":\"intersection\",\"children\":[{\"kind\":\"userset\",\"object\":{\"objectType\":\"space\",\"objectId\":\"audited-space\"},\"relation\":\"owner\",\"children\":[{\"kind\":\"subject\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"member-owner\"}}]},{\"kind\":\"userset\",\"object\":{\"objectType\":\"space\",\"objectId\":\"audited-space\"},\"relation\":\"member\",\"children\":[{\"kind\":\"subject\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"member-owner\"}}]}]}],\"state\":{\"status\":\"exhausted\"}}"
+                (encode tree)
+        other -> fail ("expand endpoint did not answer: " <> show other)
+
     cachedCheckEnv <- newCheckCacheEnv
     let cachedEnv =
             env
@@ -474,6 +511,19 @@ wireContractTests = do
         "ExpandNodeWire/caveated"
         "{\"kind\":\"caveated\",\"caveat\":\"business_hours\",\"children\":[]}"
         (ExpandCaveatedWire "business_hours" [])
+    golden
+        "ExpandNodeWire/union"
+        "{\"kind\":\"union\",\"children\":[{\"kind\":\"subject\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"}}]}"
+        (ExpandUnionWire [ExpandSubjectWire aliceSubject])
+    golden
+        "ExpandNodeWire/intersection"
+        "{\"kind\":\"intersection\",\"children\":[{\"kind\":\"subject\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"}}]}"
+        (ExpandIntersectionWire [ExpandSubjectWire aliceSubject])
+    -- The two sides are distinct keys, so no encoder can quietly merge them.
+    golden
+        "ExpandNodeWire/exclusion"
+        "{\"kind\":\"exclusion\",\"granted\":[{\"kind\":\"subject\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"}}],\"subtracted\":[]}"
+        (ExpandExclusionWire [ExpandSubjectWire aliceSubject] [])
     rejects "ExpandNodeWire" (decode "{\"kind\":\"group\"}" :: Maybe ExpandNodeWire)
     golden "ExpandStateWire/exhausted" "{\"status\":\"exhausted\"}" ExpandExhaustedWire
     golden "ExpandStateWire/hasMore" "{\"status\":\"hasMore\",\"cursor\":\"c1\"}" (ExpandHasMoreWire "c1")
@@ -581,6 +631,17 @@ lookupHandler env =
         :<|> _batch
         :<|> lookupEndpoint
         :<|> _expand = server env
+
+expandHandler :: Env TestEffects -> ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
+expandHandler env =
+    expandEndpoint
+  where
+    _write
+        :<|> _delete
+        :<|> _check
+        :<|> _batch
+        :<|> _lookup
+        :<|> expandEndpoint = server env
 
 -- | Did the engine stop early because its deadline had elapsed?
 isTruncated :: EnResult LookupPageWire -> Bool
