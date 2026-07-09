@@ -45,16 +45,18 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Create the new migration file with `just make-migration touch-semantics-live-unique` and write the duplicate-resolution UPDATE plus the `relation_tuple_live_unique` redefinition into it.
-- [ ] Add the new migration's guard stanza to the `run-migrations` recipe in `Justfile`.
-- [ ] Mirror the new unique-index definition into the inline `schemaSql` of `en-postgres/integration-test/Main.hs`.
-- [ ] Add `touchReplaceStatement` and the rows-affected variant of `insertTupleStatement` to `en-postgres/src/En/Postgres/TupleStore.hs`; rewrite `writeTuplesSession` around the touch loop.
-- [ ] Drop the caveat-name predicate from `deleteTupleStatement` and remove `caveatName` from `TupleDeleteParams`.
-- [ ] Make `runTupleStoreInMemory` in `en-core/src/En/Conformance/Kikan.hs` stateful and implement the same touch semantics with pure helpers.
-- [ ] Add the payload-update, caveat-tightening, idempotent-rewrite, and old-token-history integration scenarios to `en-postgres/integration-test/Main.hs`.
-- [ ] Add the pre-migration duplicate-resolution scenario (old schema, seeded duplicates, migration SQL applied, newest-created_xid winner asserted).
-- [ ] Update `docs/spec/0001-en-overview.md` §7 wording from "Upsert inserts a new row" to describe touch semantics.
-- [ ] Run `cabal build all`, `cabal test all`, and `just start-and-test`; record transcripts.
+All milestones are complete; the plan is delivered.
+
+- [x] Create the new migration file with `just make-migration touch-semantics-live-unique` and write the duplicate-resolution UPDATE plus the `relation_tuple_live_unique` redefinition into it. (`en-migrations/db/migrations/20260709202037_touch-semantics-live-unique.sql`)
+- [x] Add the new migration's guard stanza to the `run-migrations` recipe in `Justfile`.
+- [x] Mirror the new unique-index definition into the inline `schemaSql` of `en-postgres/integration-test/Main.hs`.
+- [x] Add `touchReplaceStatement` and the rows-affected variant of `insertTupleStatement` to `en-postgres/src/En/Postgres/TupleStore.hs`; rewrite `writeTuplesSession` around the touch loop. (Also added `identicalLiveTupleStatement` and `insertTupleStrictStatement` — see the Decision Log.)
+- [x] Drop the caveat-name predicate from `deleteTupleStatement` and remove `caveatName` from `TupleDeleteParams`.
+- [x] Make `runTupleStoreInMemory` in `en-core/src/En/Conformance/Kikan.hs` stateful and implement the same touch semantics with pure helpers.
+- [x] Add the payload-update, caveat-tightening, idempotent-rewrite, and old-token-history integration scenarios to `en-postgres/integration-test/Main.hs`. (Also added same-key-twice-in-one-call and delete-ignores-caveat.)
+- [x] Add the pre-migration duplicate-resolution scenario (old schema, seeded duplicates, migration SQL applied, newest-created_xid winner asserted).
+- [x] Update `docs/spec/0001-en-overview.md` §7 wording from "Upsert inserts a new row" to describe touch semantics. (Also added a "Write semantics" section to `docs/user/queries-and-writes.md`.)
+- [x] Run `cabal build all`, `cabal test all`, and `just start-and-test`; record transcripts. (See Surprises & Discoveries.)
 
 
 ## Surprises & Discoveries
@@ -62,7 +64,63 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+**The plan's (0,0)-means-identical inference is not sound; it was replaced by an explicit
+check.** The plan proposed concluding "the live row is identical" from the pair
+(touch-delete affected 0 rows, insert affected 0 rows) after a bounded retry. But those two
+statements take separate `READ COMMITTED` snapshots, so a racer committing a *differing*
+caveat between them produces (0, 0) on every iteration, and the bounded loop would exit
+having silently dropped the write — reintroducing C1 in racing form, which is precisely what
+the retry existed to prevent. The implementation instead *observes* the identical row with
+`identicalLiveTupleStatement` (a `SELECT EXISTS` on the full key including caveat name and
+payload) and only treats the no-op as legitimate when that returns true. See the Decision Log.
+
+**Failing-then-passing transcript.** With the new scenarios in place and the write path and
+`schemaSql` index reverted to their pre-plan state (`git checkout 00e5aed -- en-postgres/src/En/Postgres/TupleStore.hs`),
+`cabal test en-postgres-integration-tests` fails on review scenario 1:
+
+```text
+user error (payload update takes effect at the write's token
+expected: [Just (TupleCaveat {name = CaveatName "within_autonomy", payload = CaveatPayload (fromList [("until",ValueTimestamp 2026-12-31 00:00:00 UTC)])})]
+actual:   [Just (TupleCaveat {name = CaveatName "within_autonomy", payload = CaveatPayload (fromList [("until",ValueTimestamp 2026-07-01 00:00:00 UTC)])})])
+Test suite en-postgres-integration-tests: FAIL
+```
+
+Relaxing scenario 1's expectation to the buggy value so execution reaches scenario 2 yields
+exactly the diff the plan predicted:
+
+```text
+user error (caveat tightening leaves one live row
+expected: 1
+actual:   2)
+Test suite en-postgres-integration-tests: FAIL
+```
+
+With the fix applied, all seven suites pass (`cabal test all`): `en-biscuit-tests`,
+`en-core-conformance`, `en-core-interface-tests`, `en-example-tests`,
+`en-postgres-integration-tests`, `en-postgres-revision-tests`, `en-servant-tests` — each
+`1 of 1 test suites (1 of 1 test cases) passed`.
+
+**The plan's description of the repository had drifted in three places**, all harmless:
+
+- `Justfile`'s `run-migrations` had *three* guard stanzas, not two; a
+  `20260709023019_datastore-metadata.sql` migration landed after this plan was written. The
+  new guard was appended as the fourth.
+- The write endpoints are `POST /v1/relationships` and `POST /v1/relationships/delete`, not
+  `POST /tuples` / `DELETE /tuples` as the master plan's Integration Points section says —
+  docs/plans/35 (wire versioning) has already landed. This affects docs/plans/46's wire work,
+  not this plan.
+- `just start-and-test` prints `server smoke test passed: allowed`, not
+  `...: AllowedWire`; the wire DTO now serializes lowercase.
+
+**`foldl'` is in `Prelude` on GHC 9.12**, so importing it from `Data.Foldable` is a
+`-Wunused-imports` warning rather than a necessity.
+
+**The in-memory store's touch was subtler than the plan's sketch.** The plan gave
+`touchTuple` as "drop any tuple sharing the key, then append". Done literally, an identical
+rewrite moves the tuple to the end of the list — and `pageTuples` cursors are list ordinals,
+so a rewrite during pagination would shift rows across page boundaries. `touchTuple` therefore
+short-circuits on an identical tuple and leaves the list untouched, which also matches the
+PostgreSQL store leaving an identical live row's `created_xid` alone.
 
 
 ## Decision Log
@@ -127,13 +185,101 @@ Record every decision made while working on the plan.
   for read-only fixtures.
   Date: 2026-07-07
 
+Decisions made during implementation:
+
+- Decision: The touch loop verifies an identical live row with an explicit
+  `identicalLiveTupleStatement` (`SELECT EXISTS` over the full key including caveat name and
+  payload) instead of inferring identity from "touch-delete affected 0 rows and insert
+  affected 0 rows", as the plan's Milestone 2 step 3 proposed.
+  Rationale: The inference is unsound. Both statements take their own `READ COMMITTED`
+  snapshot, so a concurrent writer that commits a *different* caveat for the same identity
+  between them yields (0 retired, 0 inserted) on every iteration — the bounded loop would then
+  exit reporting success while having dropped the caller's write, which is finding C1 in
+  racing form. Observing the identical row directly cannot be fooled this way: the loop only
+  stops when it has *seen* the row it would have written.
+  Date: 2026-07-09
+- Decision: When the bounded retry does not converge, the final insert is
+  `insertTupleStrictStatement` — the same INSERT with the `ON CONFLICT DO NOTHING` clause
+  omitted — so PostgreSQL raises `unique_violation`, which surfaces through the existing
+  `Hasql.toDetailedText` path as `StoreError`.
+  Rationale: The plan wanted the unreachable case to fail loudly, but hasql's `SessionError`
+  has no constructor meaning "the application gave up": `DriverSessionError` documents itself
+  as a hasql bug to be reported, and `ConnectionSessionError` is flagged transient and
+  retryable. Letting the database raise its own error is honest, needs no synthetic error
+  value, and requires no new vocabulary in `EnError`. A third attempt that happens to find the
+  race resolved simply succeeds.
+  Date: 2026-07-09
+- Decision: `touchTuple` (in-memory) returns the tuple list unchanged when the tuple is
+  already present, rather than removing and re-appending it.
+  Rationale: `pageTuples` derives its cursor from a tuple's *ordinal* in the list, so
+  re-appending an identical tuple would move it across page boundaries mid-pagination. This
+  also mirrors the PostgreSQL store, where an identical live row matches neither the
+  touch-delete predicate nor the insert and so keeps its original `created_xid`.
+  Date: 2026-07-09
+- Decision: The integration scenarios read with `readObjectRelation` rather than
+  `readStartingWithUser` as the plan's scenario sketches suggested.
+  Rationale: `readStartingWithUser` filters on object *type*, relation, and subject, so the
+  six sub-scenarios (which share a subject) would see each other's rows;
+  `readObjectRelation` filters on the object id, giving each sub-scenario its own namespace
+  without inventing a distinct subject per case.
+  Date: 2026-07-09
+- Decision: The migration-dedupe scenario runs after a second `resetSchema` at the end of
+  `main`, rather than against a second throwaway database.
+  Rationale: `resetSchema` already drops and recreates both tables, which is all the scenario
+  needs to install the pre-migration index shape; `ephemeral-pg` is started once per suite
+  run and a second instance would double the suite's startup cost for no isolation gain.
+  Date: 2026-07-09
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+**Delivered, and the purpose is met as written.** Finding C1's two authorization traps are
+closed and proven closed by tests that demonstrably fail against the pre-plan code. A live
+tuple's identity is now (object, relation, subject); a write that collides with a differing
+live grant retires it and inserts the replacement in one transaction; identical rewrites are
+no-ops that do not churn history; earlier tokens still see the grants they were minted
+against; and deletes target the identity rather than requiring the caller to know the current
+caveat.
+
+Every acceptance criterion in Validation and Acceptance was checked:
+
+- The new scenarios fail on pre-plan code (both review scenarios) and pass with the fix; the
+  transcript is in Surprises & Discoveries.
+- `SELECT indexdef FROM pg_indexes WHERE indexname = 'relation_tuple_live_unique'` returns a
+  definition with no `caveat_name`.
+- `cabal test all` passes all seven suites, including `en-core-conformance` under
+  `runPureEff`, so the stateful in-memory store did not compromise purity.
+- `just start-and-test` passes (`server smoke test passed: allowed`).
+- `docs/spec/0001-en-overview.md` §7 describes touch semantics, and
+  `docs/user/queries-and-writes.md` gained a "Write semantics" section.
+
+**The one design change worth carrying forward.** The plan's touch protocol inferred "the live
+row is identical" from two zero-row statement results. That inference is unsound under
+`READ COMMITTED`, and the failure mode it admits is exactly the bug the plan set out to fix,
+only harder to see: a racing writer makes the write vanish while the caller receives a success
+token. The implemented protocol observes the identical row instead of deducing it, and fails
+loudly (via PostgreSQL's own `unique_violation`) when it cannot converge. The general lesson:
+when a plan's correctness argument rests on the *absence* of a row, verify the row's absence
+rather than inferring it from a statement's row count — the two differ precisely when
+concurrency is involved, which is when it matters.
+
+**Gaps and things left for later plans, all intentional.**
+
+- Two same-key writers with different caveats, neither seeing a pre-existing live row, can
+  still race the insert itself. The loser now fails loudly with `StoreError` rather than
+  silently dropping its write. Callers who need to *arbitrate* such races need preconditions,
+  which docs/plans/46 owns.
+- The `TupleStore` effect signature is untouched, as the master plan requires: no
+  created-vs-replaced result was added. Touch semantics are fully observable through reads.
+- `writeVisibleSnapshot` / `tokenFromAnchor` were not modified (docs/plans/47 owns them), and
+  no index other than `relation_tuple_live_unique` was touched (docs/plans/49 owns those).
+- The touch write path costs two to three statements per tuple. docs/plans/48 must reproduce
+  these semantics in `unnest`-based multi-row statements; the two-statement shape (retire,
+  then insert) was chosen partly because it ports to a batch cleanly, but the identical-row
+  verification will need a set-oriented equivalent rather than a per-tuple `SELECT EXISTS`.
 
 
 ## Context and Orientation

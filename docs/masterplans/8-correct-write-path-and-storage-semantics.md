@@ -69,7 +69,7 @@ that en-core consumers embed against).
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-45 | Adopt touch semantics for tuple writes | docs/plans/45-adopt-touch-semantics-for-tuple-writes.md | None | None | In Progress |
+| EP-45 | Adopt touch semantics for tuple writes | docs/plans/45-adopt-touch-semantics-for-tuple-writes.md | None | None | Complete |
 | EP-46 | Add write preconditions and atomic mixed writes | docs/plans/46-add-write-preconditions-and-atomic-mixed-writes.md | EP-45 | None | Not Started |
 | EP-47 | Fail loudly on storage decode errors and tighten write snapshots | docs/plans/47-fail-loudly-on-storage-decode-errors-and-tighten-write-snapshots.md | None | None | Not Started |
 | EP-48 | Batch tuple writes and add bulk import and export | docs/plans/48-batch-tuple-writes-and-add-bulk-import-and-export.md | EP-45 | EP-46 | Not Started |
@@ -131,8 +131,8 @@ the current DTOs and EP-35 absorbs them.
 
 ## Progress
 
-- [ ] EP-45: uniqueness keyed on object/relation/subject; caveat changes replace atomically
-- [ ] EP-45: integration tests prove payload updates and caveat additions take effect (no silent no-op, no duplicate live rows)
+- [x] EP-45: uniqueness keyed on object/relation/subject; caveat changes replace atomically
+- [x] EP-45: integration tests prove payload updates and caveat additions take effect (no silent no-op, no duplicate live rows)
 - [ ] EP-46: preconditions enforced transactionally; precondition failure is a typed error
 - [ ] EP-46: atomic mixed write-and-delete in one request/token
 - [ ] EP-47: undecodable caveat payloads and malformed cursors are errors, not defaults
@@ -144,7 +144,40 @@ the current DTOs and EP-35 absorbs them.
 
 ## Surprises & Discoveries
 
-(None yet.)
+**The wire contract is already versioned (affects EP-46).** This master plan's Integration
+Points section names `POST /tuples` and `DELETE /tuples` as the endpoints EP-46 extends, and
+poses the "if EP-35 has landed" conditional. It has landed: the endpoints are
+`POST /v1/relationships` and `POST /v1/relationships/delete` (see the `test-server` recipe in
+`Justfile`). EP-46's precondition fields therefore go into the v1 envelope, and the
+conditional in Integration Points is resolved — no coordination with docs/plans/35 is needed.
+Discovered while implementing EP-45, 2026-07-09.
+
+**Zero-row statement results cannot stand in for a row's absence (affects EP-48).** EP-45's
+plan specified the touch protocol as "soft-delete a differing live row, then insert with
+`ON CONFLICT DO NOTHING`", inferring an idempotent no-op when both statements affect zero
+rows. Under `READ COMMITTED` each statement takes its own snapshot, so a writer committing a
+*different* caveat between them produces (0, 0) indefinitely and the write is silently
+dropped — finding C1 again, in racing form. The delivered protocol instead observes the
+identical live row with an explicit `SELECT EXISTS` over the full key, and falls back to an
+`INSERT` without `ON CONFLICT` so PostgreSQL raises `unique_violation` when it cannot
+converge. **EP-48 must carry this forward:** an `unnest`-based multi-row touch cannot verify
+per-tuple with `SELECT EXISTS` and needs a set-oriented equivalent (for example, `RETURNING`
+the inserted keys and comparing against the requested set). A batched statement that merely
+reproduces "retire, then insert … DO NOTHING" would reintroduce the silent drop across the
+whole batch. Discovered while implementing EP-45, 2026-07-09.
+
+**Racing same-key writers now fail loudly rather than silently (affects EP-46).** Two writers
+inserting different caveats for one identity, neither seeing a pre-existing live row, race the
+unique index; the loser surfaces `StoreError`. This is the honest outcome, but it is not an
+*arbitration* mechanism — a caller cannot say "write this only if that tuple still exists".
+EP-46's preconditions remain the typed tool for that, and EP-46 should specify what a
+precondition failure returns versus what this unique-violation `StoreError` returns, so the
+two are distinguishable by callers. Discovered while implementing EP-45, 2026-07-09.
+
+**`Justfile`'s `run-migrations` has grown a third guard stanza.** A
+`20260709023019_datastore-metadata.sql` migration landed after this master plan was written.
+EP-45 appended its guard as the fourth. EP-47 and EP-49, which also add migrations, should
+expect to append rather than assume the plan-time stanza count.
 
 
 ## Decision Log
@@ -158,6 +191,12 @@ the current DTOs and EP-35 absorbs them.
 - Decision: EP-49 must coordinate with the watch API plan before dropping relation_tuple_created_xid_idx.
   Rationale: A changelog feed ordered by created_xid is the one plausible consumer of that index; dropping and re-adding an index on a large table is avoidable churn.
   Date: 2026-07-07
+- Decision: The touch protocol verifies an identical live row by observing it, not by inferring it from zero-row statement counts; a non-converging retry falls back to an INSERT without ON CONFLICT so PostgreSQL raises unique_violation.
+  Rationale: The inference is unsound under READ COMMITTED and its failure mode is finding C1 itself, in racing form. EP-48 inherits this constraint for its batched statements.
+  Date: 2026-07-09
+- Decision: EP-45 left the TupleStore effect signature untouched, as planned; EP-46 still owns the final write signature.
+  Rationale: Touch semantics are observable through reads, so no created-vs-replaced result was needed; changing the signature twice in consecutive plans would churn every interpreter for no behavioral gain.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective
