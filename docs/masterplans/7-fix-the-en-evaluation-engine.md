@@ -76,7 +76,7 @@ store implementation, which is risky enough to deserve its own validation cycle.
 |---|-------|------|-----------|-----------|--------|
 | EP-39 | Add a point-membership probe and probe-first check evaluation | docs/plans/39-add-a-point-membership-probe-and-probe-first-check-evaluation.md | None | None | Complete |
 | EP-40 | Adopt Zanzibar cycle and exclusion semantics in check | docs/plans/40-adopt-zanzibar-cycle-and-exclusion-semantics-in-check.md | None | EP-39 | Complete |
-| EP-41 | Cache context-free check subproblems | docs/plans/41-cache-context-free-check-subproblems.md | None | EP-39, EP-40 | In Progress |
+| EP-41 | Cache context-free check subproblems | docs/plans/41-cache-context-free-check-subproblems.md | None | EP-39, EP-40 | Complete |
 | EP-42 | Stream lookup pages with validated cursors and a real deadline | docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md | None | EP-39 | Not Started |
 | EP-43 | Preserve set operators in expand trees | docs/plans/43-preserve-set-operators-in-expand-trees.md | None | None | Not Started |
 | EP-44 | Make evaluation budgets configurable and trim hot-path overhead | docs/plans/44-make-evaluation-budgets-configurable-and-trim-hot-path-overhead.md | None | EP-39, EP-40, EP-42 | Not Started |
@@ -110,19 +110,26 @@ The `TupleStore` effect (`en-core/src/En/Effect/TupleStore.hs`) gains a point-me
 probe operation in EP-39. EP-39 defines it and updates all interpreters: the PostgreSQL
 store (`en-postgres/src/En/Postgres/TupleStore.hs`), the cached interposer
 (`en-core/src/En/Effect/CachedTupleStore.hs`), and the in-memory conformance store
-(`en-core/src/En/Conformance/Kikan.hs`). EP-41 decides how the cached interposer caches
-probe results (single-tuple entries vs page reuse); it consumes EP-39's definition and
-must not redefine it. Cross-master-plan: the same effect gains write preconditions in
+(`en-core/src/En/Conformance/Kikan.hs`). **Settled by EP-41 (2026-07-08):** the cached
+interposer caches probes under a dedicated `ProbeReadKey !Revision !ObjectRef
+!RelationName ![Subject]` in `En.Cache.TupleReadKey`, storing the row list as an
+`Exhausted` `TuplePage`. Page reuse across read shapes was rejected. The subject list is
+part of the key and must stay there: omitting it returns one subject's rows to another.
+Cross-master-plan: the same effect gains write preconditions in
 docs/plans/46-add-write-preconditions-and-atomic-mixed-writes.md (master plan 8); the
 read-side and write-side extensions are disjoint operations on the same GADT, so
 coordinate constructor naming but nothing else.
 
 The check evaluation state (memo table, visited set, depth budget in
 `en-core/src/En/Check.hs`) is reshaped by EP-39 (probe-first paths), EP-40
-(cycle-as-empty, short-circuit union), EP-41 (what gets memoized: a context-free
-decision plus residual caveat obligations), and EP-44 (configurable budgets replace the
-`maxDepth`/`pageLimit` constants). Later plans in that order own reconciling with
-earlier ones.
+(cycle-as-empty, short-circuit union), EP-41 (what gets memoized), and EP-44 (configurable
+budgets replace the `maxDepth`/`pageLimit` constants). Later plans in that order own
+reconciling with earlier ones. **Settled by EP-41 (2026-07-08):** what gets memoized is a
+`ResidualDecision` — a *tree* of named caveat gates joined by union/intersection/exclusion,
+not a flat list of obligations, because a flat list cannot say whether two residual caveats
+are joined by AND or by OR and rejoining them wrongly grants access. The memo, the
+cross-request cache, and every internal evaluator now hold that one context-free type;
+`CaveatContext` appears only in the three public entry points.
 
 `EnError` (`en-core/src/En/Error.hs`) is extended by EP-40 (distinct "cycle detected" vs
 "depth exceeded" — both currently collapse into `ResolutionLimitExceeded`). EP-42
@@ -150,7 +157,8 @@ established by docs/plans/38-validate-configuration-and-persist-datastore-identi
 - [x] EP-39 (2026-07-08): check answers direct membership without full-relation scans; wide-relation checks no longer error
 - [x] EP-40 (2026-07-08): data cycles yield empty results, not failures; union short-circuits on Allowed
 - [x] EP-40 (2026-07-08): exclusion over a Conditional base evaluates the subtrahend; checkMany surfaces per-pair errors
-- [ ] EP-41: decision cache keyed without caveat context; caveats re-applied on hit; cross-request hit rate demonstrated
+- [x] EP-41 (2026-07-08): decision cache keyed without caveat context; caveats re-applied on hit; cross-request hit rate demonstrated
+- [x] EP-41 (2026-07-08): check evaluates symbolically; probe results cached in the tuple-read interposer
 - [ ] EP-42: lookup pages resume incrementally from cursors instead of recomputing the traversal
 - [ ] EP-42: cursors validated like consistency tokens; deadline interrupts expansion
 - [ ] EP-43: expand tree preserves union/intersection/exclusion operators end-to-end to the wire
@@ -248,6 +256,85 @@ unevaluable pair is still a denial on the wire — but the engine no longer dest
 error. It also does *not* take an `Error EnError` constraint, contrary to its own plan's
 Decision Log: it raises nothing, and `-Wredundant-constraints` rejects the addition.
 
+**EP-41 made the check evaluator symbolic, which is a bigger change than "re-key the cache"
+(2026-07-08).** `En/Check.hs` no longer sees the caveat context anywhere below its three
+public entry points. Every internal evaluator returns `ResidualDecision` — the traversed
+answer with its caveats left as named gates joined by the union/intersection/exclusion
+structure the traversal found — and `En.Caveat.applyResidual` folds the request's context
+through it once, at the top. The within-call memo and the cross-request cache both store
+that context-free value. EP-42 and EP-44 will read a `En/Check.hs` whose evaluators have no
+`CaveatContext` parameter at all; do not add one back.
+
+Three consequences fall out of the traversal losing the ability to ask "does this caveat
+pass?", and EP-44's hot-path work will encounter all three. A caveated probe hit no longer
+short-circuits a union (`unionSettled` tests for `RAllowed`, an *unconditional* allow, and a
+caveated allow is an `RCaveat`, which settles nothing). The nested-group accelerator now
+requires *uncaveated* edges — this **tightens** the `relationUnionsThis` soundness guard
+this master plan flagged, and EP-44 must not "restore" the old context-sensitive test as an
+optimization: it would cache a satisfied caveat as an unconditional allow. And `Exclusion`
+evaluates its subtrahend whenever the base is not *symbolically* `RDenied`, which costs
+reads the old evaluator skipped but cannot change an answer.
+
+**EP-40's cut-taint precondition survived EP-41 intact (2026-07-08).** `evalRelationMemo`
+still threads `CutTaint` and still refuses to memoize or cache a `Tainted` residual.
+Making a decision context-free did not make one derived under a cycle cut any safer to
+cache, exactly as the Decision Log anticipated. EP-44 inherits the same precondition.
+
+**Lookup barely uses the decision cache, and EP-42 should know why before it changes the
+seam (2026-07-08).** `En.Lookup.evalRewrite` calls `confirmCandidates` — and therefore
+`checkCached` — only for `Intersection` and `Exclusion` rewrites. Union, `This`,
+`ComputedUserset`, and arrows resolve candidates straight from the reverse index and never
+confirm. EP-41's first attempt at a cached-lookup cross-context test used
+`intention#view` (a `ComputedUserset` over `This`), asserted decision-cache hits, and
+failed, because that lookup performs zero cached checks. The test now uses `room#enter`, an
+exclusion over a time-bounded grant. This is the EP-41/EP-42 seam the Dependency Graph
+predicted: EP-42 changes how lookup confirmation calls `checkCached`, so it must re-verify
+`cached lookup hits the decision cache across caveat contexts` in `en-core/test/Main.hs` —
+and if it widens confirmation to more rewrite kinds, the decision cache suddenly matters far
+more to lookup than it does today.
+
+EP-42 should also note that a repeated cached lookup does **not** perform zero store reads,
+because lookup re-runs its whole candidate traversal every call. That is finding B7, EP-42's
+own subject. EP-41's test therefore asserts only that a *differing caveat context* costs no
+extra reads over repeating the identical request. Once EP-42 lands incremental paging, that
+assertion can be strengthened.
+
+**A testing rule this initiative should adopt beyond the decision cache (2026-07-08).** The
+master plan's existing rule — a memo or caching test is not accepted until it has been seen
+to fail against a deliberately broken implementation — caught two would-be-vacuous tests in
+EP-41, and both failures were instructive rather than pedantic.
+
+A cross-context cache test that asserts only the *hit* passes against a cache that stores
+the answer computed under the inserting request's context, which is the precise bug B6's fix
+could introduce, and which serves expired grants as `Allowed`. Every pre-existing assertion
+in the suite passed against that sabotage. Only an assertion that the answer still tracks
+the context caught it.
+
+A probe read-cache test that asserts only the *read count* passes against a `ProbeReadKey`
+whose `Ord` instance omits the subject list — which returns one subject's rows to another,
+a privilege escalation, and which makes the read count look *better*. Only asserting the
+returned rows caught it.
+
+The rule should be read as covering read caches and pure algebra, not just the decision
+cache it was written for. The generalization: when a test's subject is "X was reused", the
+assertion must be about the *value* reuse produced, never about reuse having occurred.
+
+**EP-41 owns `ProbeReadKey`; EP-44 should leave it alone (2026-07-08).** The integration
+point the master plan assigned to EP-41 is settled: `TupleReadKey` gained
+`ProbeReadKey !Revision !ObjectRef !RelationName ![Subject]`, and `cachedTupleStore` stores
+probe rows as an `Exhausted` `TuplePage` so probes share the one cache and its bound. Page
+reuse across shapes was rejected — reconstructing probe answers from cached
+`ReadObjectRelation` pages would couple the interposer to paging semantics and only pay off
+when a full page for the same `object#relation` at the same revision is already cached,
+which is rare precisely in the wide-relation case probes exist for.
+
+**`En.Cache.DecisionKey` is dead, and EP-44 now has the evidence to delete it
+(2026-07-08).** EP-41's staleness sweep found exactly two caches in the workspace,
+`Cache TupleReadKey TuplePage` and `Cache SubproblemKey ResidualDecision`. `DecisionKey`'s
+only consumer is `en-core/test/Main.hs`, which caches `Text` under it. It still carries a
+`context` field, which is harmless (a context-bearing key is safe, merely useless) but is
+now the last place in en where a cache key mentions caveat context.
+
 **EP-44's `EntryPoint` question has a partial answer already (2026-07-08).** EP-39 needed
 "does this relation union in its directly-stored tuples?" and answered it by walking the
 `Rewrite` tree (`relationUnionsThis`), not by consulting the reachability graph's unused
@@ -279,6 +366,15 @@ should weigh that when it makes the call.
 - Decision: A test for a memoization or caching bug is not accepted until it has been observed to fail against a deliberately broken implementation.
   Rationale: EP-40's first cut-taint regression test passed against an evaluator with the guard removed — its two batch pairs used different subjects, and memo keys include the subject, so no entry was ever shared. It looked correct and proved nothing. Cheap to check, and the failure mode it guards against is silent.
   Date: 2026-07-08
+- Decision: The rule above extends to read caches and pure algebra, and it is sharpened: when a test's subject is "X was reused", the assertion must be about the *value* the reuse produced, never about reuse having occurred.
+  Rationale: EP-41 found two plausible implementations that pass reuse-shaped assertions while being badly wrong. A cross-context decision cache that stores the answer computed under the inserting request's context passes every "did it hit?" assertion in the suite and serves expired grants as `Allowed`. A `ProbeReadKey` whose `Ord` omits the subject list passes every "did reads drop?" assertion, makes the read count look better, and returns one subject's rows to another. Both were caught only by assertions about returned values.
+  Date: 2026-07-08
+- Decision: The check evaluator is symbolic throughout; `CaveatContext` does not appear below `check`/`checkCached`/`checkMany`, and the nested-group accelerator requires uncaveated edges.
+  Rationale: caching a context-free decision requires that the traversal never consult the context, or only leaves could be cached. The accelerator's conclusion is an unconditional allow and cannot carry a gate, so a caveated edge must fall back to recursion. This tightens the `relationUnionsThis` guard rather than weakening it. EP-44 must not reintroduce a context-sensitive accelerator test as an optimization: it would cache a satisfied caveat as an unconditional allow, which is the same class of bug as B6's inverse.
+  Date: 2026-07-08
+- Decision: An undefined caveat name beside a *satisfied caveated* grant now fails the check instead of returning `Allowed`; beside an *unconditional* grant it is still absorbed by the short-circuit.
+  Rationale: symbolic evaluation cannot know the good row's caveat passes, and deferring name validation to re-application does not recover the old answer (the fold is a `traverse` and fails on the first `Left` in the union). Failing closed on data referencing a caveat the schema no longer declares is the defensible reading, and eager validation guarantees a cached residual names only definable caveats. This refines, and does not contradict, the case EP-39 introduced and EP-40 blessed.
+  Date: 2026-07-08
 
 
 ## Outcomes & Retrospective
@@ -287,6 +383,39 @@ should weigh that when it makes the call.
 
 
 ---
+
+Revision note (2026-07-08, third): EP-41 is complete. Registry, Progress, Integration
+Points, Surprises & Discoveries, and Decision Log updated. Finding B6 is fixed: a caveated
+grant checked under four contexts now reads the tuple store once, where the second context
+previously re-traversed the graph.
+
+The mechanism turned out to be larger than the plan's title suggests, and later plans must
+know it. `En/Check.hs` is now a *symbolic* evaluator: no internal function takes a
+`CaveatContext`, every subproblem yields a `ResidualDecision`, and the request's context is
+folded in once at the top. EP-42 and EP-44 will read that file; they must not thread a
+context back down. Two Integration Points are now settled rather than pending: what gets
+memoized (a residual *tree*, not a flat obligation list) and how the interposer caches
+probes (`ProbeReadKey`, subject list included — omitting it is a privilege escalation).
+EP-40's cut-taint precondition survived unchanged; a context-free decision derived under a
+cycle cut is no safer to cache than a context-bearing one, exactly as predicted.
+
+Three findings change what other children should expect. EP-44 must not "optimize" the
+nested-group accelerator back to a context-sensitive test — EP-41 tightened it to require
+uncaveated edges, and loosening it would cache a satisfied caveat as an unconditional
+allow. EP-42 should know that `En.Lookup` reaches the decision cache only through
+`Intersection` and `Exclusion` rewrites, which made EP-41's first cached-lookup test
+vacuous, and that a repeated cached lookup still performs store reads because lookup
+recomputes its traversal — B7, EP-42's own subject. And EP-44 now has the evidence it wanted
+about `En.Cache.DecisionKey`: it is dead in production and is the last cache key in en that
+mentions caveat context.
+
+The master plan's testing rule gained a sharper form, promoted to the Decision Log because
+it is an initiative-level invariant rather than an EP-41 detail: when a test's subject is
+"X was reused", the assertion must be about the *value* the reuse produced, never about
+reuse having occurred. EP-41 found two plausible implementations that pass every
+reuse-shaped assertion in the suite while serving expired grants as `Allowed` and one
+subject's rows to another. No decomposition change: EP-42 through EP-44 keep their scopes,
+dependencies, and ordering.
 
 Revision note (2026-07-08, second): EP-40 is complete. Registry, Progress, Surprises &
 Discoveries, and Decision Log updated. The initiative-level consequence is a new invariant,
