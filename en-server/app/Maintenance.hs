@@ -20,7 +20,6 @@ Draining them keeps that scan at its first row.
 -}
 module Maintenance (
     MaintenanceConfig (..),
-    loadMaintenanceConfig,
     describeMaintenance,
     runMaintenanceLoop,
 ) where
@@ -33,8 +32,6 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Effectful (Eff)
-import System.Environment (lookupEnv)
-import Text.Read (readMaybe)
 
 import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError)
@@ -55,18 +52,6 @@ data MaintenanceConfig = MaintenanceConfig
 per session through it, exactly as a request handler does.
 -}
 type RunApp = forall a. Eff AppEffects a -> IO (Either EnError a)
-
-{- | Read @EN_MAINTENANCE_INTERVAL_SECONDS@ (default 600) and
-@EN_MAINTENANCE_BATCH_SIZE@ (default 1000).
-
-Enabled by default. The finding this module fixes is that cleanup never ran; defaulting
-to off would recreate it for every operator who misses a variable.
--}
-loadMaintenanceConfig :: IO MaintenanceConfig
-loadMaintenanceConfig = do
-    intervalSeconds <- optionalNonNegativeIntEnv "EN_MAINTENANCE_INTERVAL_SECONDS" 600
-    batchSize <- optionalPositiveIntEnv "EN_MAINTENANCE_BATCH_SIZE" 1000
-    pure MaintenanceConfig{intervalSeconds, batchSize}
 
 describeMaintenance :: MaintenanceConfig -> Text
 describeMaintenance config
@@ -162,23 +147,3 @@ renderEnError = Text.pack . show
 logLine :: Text -> IO ()
 logLine message =
     Text.putStrLn ("maintenance: " <> message)
-
-optionalNonNegativeIntEnv :: String -> Int -> IO Int
-optionalNonNegativeIntEnv name fallback =
-    lookupEnv name >>= \case
-        Nothing -> pure fallback
-        Just "" -> fail ("Invalid " <> name <> ": expected a non-negative integer")
-        Just value ->
-            case readMaybe value of
-                Just parsed | parsed >= 0 -> pure parsed
-                _ -> fail ("Invalid " <> name <> ": expected a non-negative integer")
-
-optionalPositiveIntEnv :: String -> Int -> IO Int
-optionalPositiveIntEnv name fallback =
-    lookupEnv name >>= \case
-        Nothing -> pure fallback
-        Just "" -> fail ("Invalid " <> name <> ": expected a positive integer")
-        Just value ->
-            case readMaybe value of
-                Just parsed | parsed >= 1 -> pure parsed
-                _ -> fail ("Invalid " <> name <> ": expected a positive integer")

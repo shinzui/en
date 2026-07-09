@@ -74,6 +74,11 @@ run-migrations: create-database
     else \
       echo "historical-read indexes already applied"; \
     fi
+  @if [ "$(psql "$PG_CONNECTION_STRING" -tAc "SELECT to_regclass('public.en_datastore_metadata') IS NOT NULL")" = "f" ]; then \
+      psql "$PG_CONNECTION_STRING" -v ON_ERROR_STOP=1 -f en-migrations/db/migrations/20260709023019_datastore-metadata.sql; \
+    else \
+      echo "datastore metadata already applied"; \
+    fi
 
 # Run a write-token-check HTTP smoke test against a running en-server
 [group("testing")]

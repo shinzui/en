@@ -32,6 +32,7 @@ library
   hs-source-dirs:  src
   exposed-modules:
     En.Postgres.Database
+    En.Postgres.Datastore
     En.Postgres.Revision
     En.Postgres.TupleStore
 

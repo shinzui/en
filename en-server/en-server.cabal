@@ -31,6 +31,7 @@ executable en-server
   hs-source-dirs: app
   main-is:        Main.hs
   other-modules:
+    Config
     Health
     Maintenance
     Metrics

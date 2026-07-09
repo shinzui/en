@@ -63,6 +63,7 @@ import Data.Aeson (
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Types (Parser)
 import Data.Map.Strict (Map)
+import Data.Maybe (fromMaybe)
 import Data.SOP (I (..), NS (..))
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -957,7 +958,7 @@ lookupHandler env request = enHandler do
     consistency <- orInvalid (consistencyFromWire request.consistency)
     context <- orInvalid (contextFromWire request.context)
     subject <- orInvalid (subjectFromWire request.subject)
-    deadline <- lift (lookupDeadline request.deadlineMillis)
+    deadline <- lift (lookupDeadline env request.deadlineMillis)
     page <-
         engine
             env
@@ -976,11 +977,20 @@ lookupHandler env request = enHandler do
             )
     pure (lookupPageToWire page)
 
-lookupDeadline :: (IOE Effectful.:> es) => Maybe Int -> Handler (Lookup.Deadline (Eff es))
-lookupDeadline maybeDeadlineMillis = do
+{- | The time budget for one lookup, measured on the monotonic clock.
+
+The server owns the ceiling. An unbounded client-supplied budget is a hostage problem:
+@deadlineMillis: 86400000@ would pin a worker for a day. A request above
+'deadlineMaxMillis' is clamped down to it rather than rejected, so a client asking for
+more time than it can have still gets an answer.
+-}
+lookupDeadline :: (IOE Effectful.:> es) => Env es' -> Maybe Int -> Handler (Lookup.Deadline (Eff es))
+lookupDeadline env maybeDeadlineMillis = do
     startedAt <- liftIO getMonotonicTimeNSec
-    let budgetNs :: Word64
-        budgetNs = fromIntegral (max 0 (maybe 3000 id maybeDeadlineMillis)) * 1000000
+    let requestedMillis = fromMaybe env.deadlineDefaultMillis maybeDeadlineMillis
+        budgetMillis = min env.deadlineMaxMillis (max 0 requestedMillis)
+        budgetNs :: Word64
+        budgetNs = fromIntegral budgetMillis * 1000000
     pure $
         Lookup.Deadline $ do
             now <- Effectful.liftIO getMonotonicTimeNSec

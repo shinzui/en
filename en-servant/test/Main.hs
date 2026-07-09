@@ -89,6 +89,8 @@ main = do
                 , checkOperation = check
                 , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
                 , maxBatchSize = 10
+                , deadlineDefaultMillis = 3000
+                , deadlineMaxMillis = 30000
                 }
         batch = batchHandler env
         request =
@@ -173,6 +175,25 @@ main = do
     assertOk "cached lookup endpoint returns a page second" =<< runHandler (lookupEndpoint lookupRequest)
     lookupStatsAfterSecond <- cacheStats cachedLookupEnv.cacheDecisions
     assertBool "cached lookup endpoint uses decision cache for confirmations" (lookupStatsAfterSecond.hits > lookupStatsAfterFirst.hits)
+
+    -- The server owns the lookup budget, not the caller. A `deadlineMaxMillis` of zero
+    -- is an already-expired budget, so if the clamp reaches the engine the page reports
+    -- `truncated` no matter how much time the client asked for.
+    --
+    -- The two runs differ only in `deadlineMaxMillis`, and `limit = 1` against a subject
+    -- with two auditable spaces guarantees a next page -- which is what makes the
+    -- distinction observable at all. `pageLookup` reports `hasMore` when the budget
+    -- survives and `truncated` when it does not; an exhausted page would say neither.
+    let greedyRequest = lookupRequest{deadlineMillis = Just 86400000, limit = 1}
+        clampedEnv = env{deadlineMaxMillis = 0}
+    assertEqual
+        "the server clamps a client-supplied lookup deadline"
+        (Right True)
+        =<< fmap (fmap isTruncated) (runHandler (lookupHandler clampedEnv greedyRequest))
+    assertEqual
+        "the same request under the default ceiling keeps its budget"
+        (Right True)
+        =<< fmap (fmap hasMore) (runHandler (lookupHandler env greedyRequest))
 
 {- | The generated document describes the API that is actually served.
 
@@ -527,6 +548,24 @@ lookupHandler env =
         :<|> _batch
         :<|> lookupEndpoint
         :<|> _expand = server env
+
+-- | Did the engine stop early because its deadline had elapsed?
+isTruncated :: EnResult LookupPageWire -> Bool
+isTruncated = \case
+    EnOk page ->
+        case page.state of
+            LookupTruncatedWire _ -> True
+            _ -> False
+    _ -> False
+
+-- | Did the engine leave a next page with budget to spare?
+hasMore :: EnResult LookupPageWire -> Bool
+hasMore = \case
+    EnOk page ->
+        case page.state of
+            LookupHasMoreWire _ -> True
+            _ -> False
+    _ -> False
 
 pair :: Text -> Text -> Text -> BatchCheckPairWire
 pair userId permission objectId =

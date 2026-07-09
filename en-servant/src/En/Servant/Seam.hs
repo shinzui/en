@@ -51,6 +51,13 @@ data Env es = Env
     , checkOperation :: !(ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckDecision)
     , lookupWithDeadlineOperation :: !(Lookup.Deadline (Eff es) -> ReachabilityGraph -> Consistency -> Lookup.LookupRequest -> Eff es Lookup.LookupPage)
     , maxBatchSize :: !Int
+    , deadlineDefaultMillis :: !Int
+    -- ^ Lookup budget when the client omits @deadlineMillis@.
+    , deadlineMaxMillis :: !Int
+    {- ^ Ceiling the server imposes on a client-supplied @deadlineMillis@. A larger
+    request is clamped, not rejected: asking for "as long as you'll give me" is
+    reasonable, and the server -- not the caller -- decides how long that is.
+    -}
     }
 
 type EnServer = Env AppEffects

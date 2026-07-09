@@ -61,11 +61,14 @@ Environment variables:
 | --- | --- | --- |
 | `EN_DATABASE_URL` | yes | PostgreSQL connection string passed to Hasql |
 | `EN_SCHEMA_PATH` | no | Path to a text schema file. When set, the server loads, parses, validates, hashes, and compiles this schema at startup. When unset, the server warns and serves the built-in demo schema. |
-| `EN_PORT` | no | HTTP port, default `8080` |
-| `EN_GC_WINDOW` | no | Consistency-token garbage-collection window, default `24 hours` |
+| `EN_PORT` | no | HTTP port, default `8080`. Must be `1..65535` |
+| `EN_GC_WINDOW` | no | Consistency-token garbage-collection window, default `24 hours`. Must be a positive PostgreSQL interval |
 | `EN_OPTIMIZED_REVISION_CACHE_TTL_MS` | no | Positive TTL in milliseconds for the optimized-revision cache; missing or `0` disables it |
 | `EN_TUPLE_READ_CACHE_MAX_ENTRIES` | no | Positive maximum tuple-read cache entries; missing or `0` disables it |
 | `EN_DECISION_CACHE_MAX_ENTRIES` | no | Positive maximum decision/subproblem cache entries; missing or `0` disables it |
+| `EN_MAX_BATCH_SIZE` | no | Maximum pairs in one `batch-check`, default `1000`. Must be at least `1` |
+| `EN_LOOKUP_DEADLINE_DEFAULT_MS` | no | Lookup time budget when the client omits `deadlineMillis`, default `3000` |
+| `EN_LOOKUP_DEADLINE_MAX_MS` | no | Ceiling on a client-supplied `deadlineMillis`, default `30000`. Must be at least the default |
 | `EN_POOL_SIZE` | no | Maximum pooled PostgreSQL connections, default `10`. Must be at least `1` |
 | `EN_POOL_ACQUISITION_TIMEOUT_MS` | no | How long a request waits for a free connection before failing, default `10000` |
 | `EN_POOL_IDLENESS_TIMEOUT_MS` | no | Close a connection unused for this long, default `600000` (10 minutes) |
@@ -76,6 +79,103 @@ Environment variables:
 Authentication, rate limiting, and TLS add seven more variables, documented under
 [Authentication, rate limiting, and TLS](#authentication-rate-limiting-and-tls).
 At least one API key is required for startup.
+
+### Configuration is validated at startup
+
+Every variable is read and checked before the server binds its port, opens a connection,
+or loads a schema. An invalid value prints one line naming the variable, the value it
+was given, and the form expected, then exits `1`:
+
+```text
+$ EN_PORT=70000 en-server
+en-server: Invalid EN_PORT=70000: expected an integer in 1..65535
+$ echo $?
+1
+```
+
+An empty value is a mistake, not a request for the default: `EN_PORT=` fails.
+
+`EN_GC_WINDOW` is validated by PostgreSQL rather than by en, because PostgreSQL's
+interval grammar is the authority and its only consumer. This one check therefore runs
+after the database is reachable — still before the port is bound:
+
+```text
+en-server: Invalid EN_GC_WINDOW=24 hoursss: PostgreSQL rejected it: ...
+  message: invalid input syntax for type interval: "24 hoursss"
+Expected a positive PostgreSQL interval, e.g. '24 hours' or '7 days'.
+```
+
+A zero or negative window is also rejected: it would place every consistency token
+behind the garbage-collection horizon the moment it was minted.
+
+**Behavior change.** `EN_PORT` previously fell back to `8080` on any unparseable value,
+so a typo silently served the wrong port. It now fails startup.
+
+### Datastore identity
+
+Every consistency token embeds a datastore id, and token validation rejects a token
+whose id does not match the serving datastore. On first startup against a database,
+`en-server` mints a random UUID and persists it in `en_datastore_metadata`; every later
+startup reads the same id back and logs it:
+
+```text
+Datastore id: 76efe58d-24e3-4ee2-8242-99050e3c348a
+```
+
+The id lives with the data it identifies, so two deployments cannot share one. A token
+minted against a different database is rejected before its snapshot is ever interpreted:
+
+```json
+{"code": "invalid_consistency_token", "message": "token datastore does not match this en datastore", "retryable": false}
+```
+
+There is deliberately **no environment override.** An `EN_DATASTORE_ID` variable would
+reintroduce the collision the first time two deployments copied one systemd unit. The
+only supported way to change identity is deleting the row, which is a deliberate,
+audited act — see the runbook below.
+
+Startup against a database missing the `en_datastore_metadata` migration fails with a
+pointer to the migrations directory rather than serving under a fallback identity.
+
+**Upgrading.** Before this change every deployment used the hardcoded id `en-server`.
+The first startup after upgrading mints a real id, so **consistency tokens minted by the
+previous build stop validating**, exactly as a schema change invalidates them. Clients
+that hold tokens should retry; a retry re-reads at `minimizeLatency` or mints a fresh
+token on the next write.
+
+### Operational warning: backup, restore, and datastore identity
+
+`xid8` is PostgreSQL's 64-bit transaction id — a 32-bit epoch plus the 32-bit `xid`
+counter — so it never wraps within one cluster's lifetime. But the counter is
+*per-cluster state*. Restoring a dump into a **new** cluster restarts it near zero.
+
+en's consistency tokens embed `xid8`-based snapshots. After such a restore, an old
+token's `xmax` compares against a young counter: it may validate when it should not,
+silently answering from the wrong point in history. Nothing inside a single identity can
+detect this.
+
+Because identity is persisted *in* the dump, a restored database keeps its old id and
+would honor those tokens. Therefore:
+
+> **After restoring a dump into a fresh PostgreSQL cluster, run
+> `DELETE FROM en_datastore_metadata;` before starting `en-server`.**
+
+The next startup mints a new id, and every pre-restore token fails the datastore-id
+check with a clear error instead of validating against a reset counter. The cost is
+precisely that all outstanding tokens become invalid — the safe failure mode, and the
+same one a schema change produces.
+
+Point-in-time recovery *within the same cluster* does not reset the counter and needs no
+rotation.
+
+### Migrations
+
+`en-migrations` ships codd-compatible plain SQL under
+`en-migrations/db/migrations/`, named with UTC timestamps. The dev shell has no codd
+binary; `just run-migrations` applies each file with a `to_regclass`-guarded `psql`
+invocation, so re-running it is a no-op. `en-server` does not verify migration state at
+startup in general — but it does read `en_datastore_metadata`, so a database missing the
+most recent migration fails loudly rather than serving.
 
 ### Connection pooling
 
@@ -535,9 +635,26 @@ runCheck request =
     enClient.check request
 ```
 
+### Lookup deadlines and batch size
+
+`POST /v1/lookup` accepts an optional `deadlineMillis`. The **server** owns the ceiling:
+a request above `EN_LOOKUP_DEADLINE_MAX_MS` is clamped down to it, not rejected, so a
+client asking for more time than it can have still gets an answer. Omitting the field
+uses `EN_LOOKUP_DEADLINE_DEFAULT_MS`.
+
+When the budget elapses before the result set is drained, the page comes back with
+`"status": "truncated"` and a cursor, rather than the `"hasMore"` a well-budgeted
+request would get. Both carry a cursor; `truncated` means "resume soon", `hasMore` means
+"resume at your leisure".
+
+`batch-check` rejects a batch larger than `EN_MAX_BATCH_SIZE` with
+`400 batch_too_large`.
+
 ## Authorization helper for host routes
 
-Servant applications can use `requirePermission` to fail closed in handlers:
+`requirePermission` is a **handler helper**, not a Servant combinator: it is invoked by
+call discipline inside a handler, and a handler that never calls it is never gated. It
+fails closed when it is called.
 
 ```haskell
 requirePermission

@@ -115,6 +115,8 @@ mkEnv cStore tStore =
         , checkOperation = check
         , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
         , maxBatchSize = 400
+        , deadlineDefaultMillis = 3000
+        , deadlineMaxMillis = 30000
         }
 
 server :: Env ExampleEffects -> Subject -> Server GuardedAPI

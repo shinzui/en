@@ -13,8 +13,6 @@ module Middleware (
     ApiKey (..),
     AuthConfig (..),
     RateLimitConfig (..),
-    loadAuthConfig,
-    loadRateLimitConfig,
     authMiddleware,
     rateLimitMiddleware,
     describeRateLimit,
@@ -30,17 +28,13 @@ import Data.IORef (atomicModifyIORef', newIORef)
 import Data.List (find)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
-import Data.Text.IO qualified as Text
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Network.HTTP.Types (HeaderName, hAuthorization, hContentType, methodPost, status401, status403, status429)
 import Network.Wai (Middleware, Request (..), Response, responseLBS)
-import System.Environment (lookupEnv)
-import Text.Read (readMaybe)
 
 -- | What a key is allowed to do. 'ReadOnly' keys are rejected on write routes.
 data KeyRole = ReadOnly | ReadWrite
@@ -89,110 +83,6 @@ isWriteRequest request =
     case pathInfo request of
         "v1" : "relationships" : _ -> requestMethod request == methodPost
         _ -> False
-
-{- | Read @EN_API_KEYS_READ_WRITE@, @EN_API_KEYS_READ_ONLY@, and
-@EN_AUTH_DISABLED@. Fails closed: with no keys and no explicit opt-out this
-aborts startup before the port is bound.
--}
-loadAuthConfig :: IO AuthConfig
-loadAuthConfig = do
-    readWrite <- keysFromEnv "EN_API_KEYS_READ_WRITE" ReadWrite
-    readOnly <- keysFromEnv "EN_API_KEYS_READ_ONLY" ReadOnly
-    disabled <- authDisabledRequested
-    case readWrite <> readOnly of
-        [] | disabled -> do
-            Text.putStrLn
-                "WARNING: authentication is DISABLED (EN_AUTH_DISABLED=true). Every caller may read and write. Never run this way outside local development."
-            pure AuthDisabled
-        [] -> fail noKeysConfigured
-        keys -> do
-            rejectDuplicateNames keys
-            if disabled
-                then do
-                    Text.putStrLn
-                        "WARNING: EN_AUTH_DISABLED=true is ignored because API keys are configured; authentication stays enabled."
-                    pure (AuthKeys keys)
-                else pure (AuthKeys keys)
-
-authDisabledRequested :: IO Bool
-authDisabledRequested =
-    maybe False ((== "true") . map toLower) <$> lookupEnv "EN_AUTH_DISABLED"
-
-noKeysConfigured :: String
-noKeysConfigured =
-    unlines
-        [ "No API keys configured; refusing to start an unauthenticated authorization service."
-        , "Set EN_API_KEYS_READ_WRITE and/or EN_API_KEYS_READ_ONLY to a comma-separated list"
-        , "of name:secret entries, where each secret is at least 16 bytes. For example:"
-        , ""
-        , "    EN_API_KEYS_READ_WRITE='deployer:S3cret-value-at-least-16'"
-        , "    EN_API_KEYS_READ_ONLY='reader:another-secret-at-least-16'"
-        , ""
-        , "For local development only, set EN_AUTH_DISABLED=true to serve without authentication."
-        ]
-
-{- | Parse one @name:secret@ list. A malformed entry aborts startup rather than
-being skipped: authentication configuration must never partially parse.
--}
-keysFromEnv :: String -> KeyRole -> IO [ApiKey]
-keysFromEnv name role =
-    lookupEnv name >>= \case
-        Nothing -> pure []
-        Just raw
-            | Text.null (Text.strip (Text.pack raw)) -> pure []
-            | otherwise ->
-                traverse
-                    (parseKeyEntry name role)
-                    (map Text.strip (Text.splitOn "," (Text.pack raw)))
-
-parseKeyEntry :: String -> KeyRole -> Text -> IO ApiKey
-parseKeyEntry envName role entry
-    | Text.null entry = invalid "empty entry (check for a stray comma)"
-    | otherwise =
-        case Text.breakOn ":" entry of
-            (_, "") -> invalid ("entry " <> show entry <> " has no ':' separator")
-            (name, rest)
-                | Text.null name -> invalid ("entry " <> show entry <> " has an empty name")
-                | otherwise -> do
-                    let secret = Text.drop 1 rest
-                        secretBytes = Text.encodeUtf8 secret
-                    if Char8.length secretBytes < minimumSecretBytes
-                        then
-                            invalid $
-                                "secret for name "
-                                    <> show name
-                                    <> " is shorter than "
-                                    <> show minimumSecretBytes
-                                    <> " bytes"
-                        else
-                            pure
-                                ApiKey
-                                    { keyName = name
-                                    , keySecret = secretBytes
-                                    , keyRole = role
-                                    }
-  where
-    invalid reason = fail ("Invalid " <> envName <> ": " <> reason)
-
-minimumSecretBytes :: Int
-minimumSecretBytes = 16
-
-{- | Names identify callers in logs and rate-limit buckets, so they must be
-unique across both tiers.
--}
-rejectDuplicateNames :: [ApiKey] -> IO ()
-rejectDuplicateNames keys =
-    case duplicates of
-        [] -> pure ()
-        names ->
-            fail $
-                "Duplicate API key name(s) across EN_API_KEYS_READ_WRITE and EN_API_KEYS_READ_ONLY: "
-                    <> Text.unpack (Text.intercalate ", " names)
-  where
-    duplicates = reverse (snd (foldl' step (Set.empty, []) keys))
-    step (seen, dups) key
-        | Set.member key.keyName seen = (seen, key.keyName : dups)
-        | otherwise = (Set.insert key.keyName seen, dups)
 
 {- | Reject every request that does not present a configured bearer key, and
 every write attempted with a 'ReadOnly' key.
@@ -269,29 +159,6 @@ data Bucket = Bucket
     { tokens :: !Double
     , lastRefillNs :: !Word64
     }
-
--- | Read @EN_RATE_LIMIT_RPS@ and @EN_RATE_LIMIT_BURST@. Both default to 0 (off).
-loadRateLimitConfig :: IO RateLimitConfig
-loadRateLimitConfig = do
-    rps <- optionalNonNegativeDoubleEnv "EN_RATE_LIMIT_RPS"
-    configuredBurst <- optionalNonNegativeDoubleEnv "EN_RATE_LIMIT_BURST"
-    let effectiveBurst = if configuredBurst > 0 then configuredBurst else rps
-    if rps > 0 && effectiveBurst < 1
-        then
-            fail $
-                "Invalid EN_RATE_LIMIT_BURST: a bucket capacity of "
-                    <> show effectiveBurst
-                    <> " can never admit a request. Set EN_RATE_LIMIT_BURST to at least 1."
-        else pure RateLimitConfig{ratePerSecond = rps, burst = effectiveBurst}
-
-optionalNonNegativeDoubleEnv :: String -> IO Double
-optionalNonNegativeDoubleEnv name =
-    lookupEnv name >>= \case
-        Nothing -> pure 0
-        Just value ->
-            case readMaybe value of
-                Just parsed | parsed >= 0 -> pure parsed
-                _ -> fail ("Invalid " <> name <> ": expected a non-negative number")
 
 describeRateLimit :: RateLimitConfig -> Text
 describeRateLimit config

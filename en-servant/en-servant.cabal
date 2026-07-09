@@ -1,12 +1,13 @@
 cabal-version: 3.0
 name:          en-servant
 version:       0.1.0.0
-synopsis:      Servant API and authorization combinators for en
+synopsis:      Servant API and a fail-closed authorization helper for en
 description:
-  The en HTTP API (check / lookup / expand / write) as a Servant API type, plus a
-  RequirePermission/Authorize combinator that gates a host route on en.check
-  against the caller's verified shomei identity (kikan C11) and an object derived
-  from the request. Mirrors shomei-servant.
+  The en HTTP API (check / lookup / expand / write) as a Servant API type, plus
+  requirePermission: a fail-closed Handler helper that gates host-route logic on
+  en.check, returning () when the decision is Allowed and throwing a 403 otherwise.
+  It is invoked by call discipline inside a handler, not enforced by the route's
+  type; a handler that never calls it is never gated.
 
 license:       MIT
 author:        Nadeem Bitar
