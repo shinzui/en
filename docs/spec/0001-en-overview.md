@@ -239,10 +239,22 @@ PostgreSQL datastore, this is **mostly Postgres MVCC + a codec**, not a consiste
 - **The token** (`ConsistencyToken`) is an opaque, versioned string wrapping the revision string +
   a datastore-id prefix + a schema hash + an optional ISO-8601 expiry (so a token from a different
   datastore/schema is detected).
+- **A write token names an exact snapshot.** Minting raises the anchor snapshot's `xmax` past the
+  write's own xid so the token sees its own write, and lists every *other* xid in the raised gap
+  in `xip`. Those xids were assigned but uncommitted when the anchor was taken; leaving them
+  unlisted would declare them visible, and a read at the token would return different results
+  before and after they commit. A snapshot that cannot be parsed at mint time is an error, never
+  a degraded token.
 - **The four modes** (`En.Revision.Consistency`): `MinimizeLatency` (a **quantized** revision —
   floor-now-to-window, pick first txn, so many requests share a snapshot and caches hit),
   `FullyConsistent` (head / `pg_current_snapshot()`), `AtLeastAsFresh token` (the new-enemy fix:
   `max(optimized, token)`), `AtExactSnapshot token` (the token's revision, GC-window checked).
+
+**The GC window MUST exceed the longest request by orders of magnitude.** Token validation reads
+the garbage-collection horizon once, before the tuple read runs; the reaper may physically delete
+soft-deleted rows in between. A deployment that violates this invariant gets a silently incomplete
+read rather than `InvalidConsistencyToken`. `EN_GC_WINDOW` defaults to `24 hours`; a pagination
+session held at `AtExactSnapshot` must complete well inside it.
 
 **The load-bearing correctness subtlety — comparison is a PARTIAL order.** Two Postgres
 snapshots can be *concurrent* (incomparable). `En.Revision.RevisionOrder` is therefore

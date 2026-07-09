@@ -62,7 +62,7 @@ Environment variables:
 | `EN_DATABASE_URL` | yes | PostgreSQL connection string passed to Hasql |
 | `EN_SCHEMA_PATH` | no | Path to a text schema file. When set, the server loads, parses, validates, hashes, and compiles this schema at startup. When unset, the server warns and serves the built-in demo schema. |
 | `EN_PORT` | no | HTTP port, default `8080`. Must be `1..65535` |
-| `EN_GC_WINDOW` | no | Consistency-token garbage-collection window, default `24 hours`. Must be a positive PostgreSQL interval |
+| `EN_GC_WINDOW` | no | Consistency-token garbage-collection window, default `24 hours`. Must be a positive PostgreSQL interval, and must exceed the longest request or pagination session by orders of magnitude — see [The GC window bounds token lifetime](production-deployment-and-performance.md#the-gc-window-bounds-token-lifetime--keep-it-much-longer-than-any-request) |
 | `EN_OPTIMIZED_REVISION_CACHE_TTL_MS` | no | Positive TTL in milliseconds for the optimized-revision cache; missing or `0` disables it |
 | `EN_TUPLE_READ_CACHE_MAX_ENTRIES` | no | Positive maximum tuple-read cache entries; missing or `0` disables it |
 | `EN_DECISION_CACHE_MAX_ENTRIES` | no | Positive maximum decision/subproblem cache entries; missing or `0` disables it |

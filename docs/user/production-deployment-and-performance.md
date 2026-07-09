@@ -201,6 +201,38 @@ decision <-
         object
 ```
 
+### The GC window bounds token lifetime — keep it much longer than any request
+
+A consistency token is valid only while the history it names still exists. en
+enforces this by comparing the token against the garbage-collection horizon:
+the oldest transaction id whose soft-deleted rows the reaper has not yet
+physically removed. A token older than the horizon is rejected with
+`invalid_consistency_token`.
+
+That check happens **once, before the read**. The reaper runs concurrently, so
+between the moment a token is validated and the moment the read executes, rows
+the token was entitled to see can be physically deleted. The read then returns an
+answer that is quietly incomplete — a grant the token should have seen is simply
+absent — rather than reporting `invalid_consistency_token`. Nothing detects this
+after the fact.
+
+en is correct in the presence of that race only because the window is enormous
+compared to the gap it opens. `EN_GC_WINDOW` (default `24 hours`) must exceed the
+longest possible request by orders of magnitude:
+
+- Never set the window below a few minutes. A window measured in seconds makes the
+  race reachable under ordinary load.
+- When paginating with `AtExactSnapshot` across user think-time, the window must
+  cover the **entire pagination session**, not one page fetch. A user who leaves a
+  results page open over lunch and then clicks "next" is resuming a read at a token
+  minted an hour ago.
+- Shrinking the window to make maintenance more aggressive shortens token validity
+  by exactly the same amount. The two are the same knob; see
+  [Service and Operations](service-and-operations.md).
+
+The failure mode if the invariant is violated is a silently incomplete read, not
+an error. Treat the window as a correctness parameter, not a storage-tuning one.
+
 ## List Endpoints
 
 List endpoints are where ReBAC systems most often become slow. Avoid one
