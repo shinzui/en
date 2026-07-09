@@ -916,13 +916,35 @@ testCacheOperations = do
         CacheStats{hits = 1, misses = 2, inserts = 3, evictions = 1}
         =<< cacheStats cache
 
+    {- A disabled cache writes nothing at all, so its stats stay zero. Counting the
+    miss meant a compare-and-swap on one shared cell per read of a feature nobody
+    enabled -- pure contention, and a hit rate with no operational meaning. -}
     disabledCache <- newCache CacheConfig{enabled = False, maxEntries = 2} :: IO (Cache Text Int)
     insertCache disabledCache "a" 1
     assertEqual "disabled cache always misses" Nothing =<< lookupCache disabledCache "a"
     assertEqual
-        "disabled cache records misses but not inserts"
-        CacheStats{hits = 0, misses = 1, inserts = 0, evictions = 0}
+        "disabled cache records nothing at all"
+        CacheStats{hits = 0, misses = 0, inserts = 0, evictions = 0}
         =<< cacheStats disabledCache
+
+    {- Eviction is FIFO on insertion ordinal, and re-inserting a key must retire that
+    key's previous ordinal.
+
+    The order matters, and most orders cannot see the bug. Here "a" is written at
+    ordinal 0 and rewritten at ordinal 2, so a stale index holds both 0 -> "a" and
+    2 -> "a". Inserting "c" then evicts the minimum ordinal, finds 0 -> "a", and
+    throws away the entry just refreshed -- while "b", genuinely the oldest at
+    ordinal 1, survives. Asserting the cache stayed bounded would not notice: it is
+    bounded either way, and exactly one entry is gone. Only asking *which* entry
+    survived catches it. -}
+    reinsertCache <- newCache CacheConfig{enabled = True, maxEntries = 2} :: IO (Cache Text Int)
+    insertCache reinsertCache "a" 1
+    insertCache reinsertCache "b" 2
+    insertCache reinsertCache "a" 10
+    insertCache reinsertCache "c" 3
+    assertEqual "a re-inserted key is not evicted ahead of an older one" (Just 10) =<< lookupCache reinsertCache "a"
+    assertEqual "the genuinely oldest entry is the victim" Nothing =<< lookupCache reinsertCache "b"
+    assertEqual "the newest entry survives" (Just 3) =<< lookupCache reinsertCache "c"
 
     decisionCache <- newCache CacheConfig{enabled = True, maxEntries = 10} :: IO (Cache DecisionKey Text)
     let baseKey = sampleDecisionKey
