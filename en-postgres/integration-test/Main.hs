@@ -6,6 +6,7 @@ module Main (main) where
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
+import Control.Exception (finally)
 import Data.Either (isRight)
 import Data.Foldable (traverse_)
 import Data.Functor.Contravariant ((>$<))
@@ -26,6 +27,7 @@ import En.Effect.ConsistencyStore qualified as ConsistencyStore
 import En.Effect.TupleStore (
     PageState (..),
     Precondition (..),
+    StoreCursor (..),
     TuplePage (..),
     TupleRow (..),
     TupleStore,
@@ -63,6 +65,8 @@ main = do
         runTouchSemanticsScenario connection
         runPreconditionScenario connection
         runWriteRaceScenario database connection
+        runDecodeStrictnessScenario connection
+        runSnapshotRepeatabilityScenario database connection
         runMaintenanceBatchScenario connection
         resetSchema connection
         runMigrationDedupeScenario connection
@@ -659,9 +663,161 @@ lockRacedRowStatement =
         Encoders.noParams
         (Decoders.rowList (Decoders.column (Decoders.nonNullable Decoders.int8)))
 
+{- | Storage refuses to answer rather than answering wrongly.
+
+Three ways the store used to lie, each now a typed error or a harmless no-op: a
+cursor it never issued restarted the scan from the beginning (duplicating every
+row the caller had already seen); a caveat payload that no longer decodes came
+back as an /empty/ payload, which is a different authorization fact rather than a
+degraded one; and a zero-limit page returned no rows while advancing its cursor
+past the first of them, losing that row from the scan forever.
+-}
+runDecodeStrictnessScenario :: Connection.Connection -> IO ()
+runDecodeStrictnessScenario connection = do
+    config <- testConfig
+    let viewer = RelationName "viewer"
+        pageSpace = ObjectRef (ObjectType "space") "decode-page"
+        grant subjectId =
+            Tuple
+                { object = pageSpace
+                , relation = viewer
+                , subject = SubjectId (ObjectRef (ObjectType "user") subjectId)
+                , caveat = Nothing
+                }
+        corruptQuery =
+            UsersetQuery
+                { queryType = ObjectType "space"
+                , queryRelation = viewer
+                , querySubjects = [SubjectId (ObjectRef (ObjectType "user") "decode-victim")]
+                , queryLimit = 10
+                , queryCursor = Nothing
+                }
+
+    pageToken <- runPgOrFail connection config (TupleStore.writeTuples [grant "decode-alice", grant "decode-bob"])
+    TokenMetadata{revision = pageRevision} <- either (fail . show) pure (tokenMetadataFromPayload pageToken)
+
+    -- 1. A cursor this store never issued is a client fault, not a fresh scan.
+    malformed <-
+        runPg connection config (TupleStore.readObjectRelation pageRevision pageSpace viewer 10 (Just (StoreCursor "not-a-number")))
+    assertEqual
+        "malformed cursor is rejected"
+        (Left (InvalidCursor "not-a-number"))
+        (fmap (.rows) malformed)
+
+    -- 2. A payload that cannot decode fails the read instead of reading as empty.
+    runSessionOrFail connection (Session.script corruptPayloadSql)
+    corruptRevision <- runPgOrFail connection config TupleStore.headRevision
+    corrupt <- runPg connection config (TupleStore.readStartingWithUser corruptRevision corruptQuery)
+    assertBool
+        ("malformed caveat payload is a StoreError; got " <> show (fmap (.rows) corrupt))
+        (isStoreError corrupt)
+
+    -- 3. A zero-limit page returns nothing and skips nothing.
+    TuplePage{rows = emptyRows, state = emptyState} <-
+        runPgOrFail connection config (TupleStore.readObjectRelation pageRevision pageSpace viewer 0 Nothing)
+    assertEqual "limit-0 page returns no rows" 0 (length emptyRows)
+    zeroCursor <- case emptyState of
+        HasMore cursor -> pure cursor
+        other -> fail ("limit-0 page should have more; got " <> show other)
+    TuplePage{rows = resumedRows} <-
+        runPgOrFail connection config (TupleStore.readObjectRelation pageRevision pageSpace viewer 10 (Just zeroCursor))
+    assertEqual "limit-0 page makes no progress" 2 (length resumedRows)
+
+{- | A live row whose @caveat_payload@ is valid @jsonb@ of the wrong shape.
+
+The column type forbids invalid JSON, so corruption in the field can only ever be
+JSON that no longer decodes to a payload — here an integer-tagged value whose
+@value@ is a string.
+-}
+corruptPayloadSql :: Text
+corruptPayloadSql =
+    """
+    INSERT INTO relation_tuple
+      (object_type, object_id, relation, subject_type, subject_id, caveat_name, caveat_payload, created_xid)
+    VALUES
+      ( 'space', 'decode-corrupt', 'viewer', 'user', 'decode-victim'
+      , 'within_autonomy'
+      , '{"level":{"type":"integer","value":"not-a-number"}}'::jsonb
+      , pg_current_xact_id()
+      );
+    """
+
+{- | A write token names one state of the world, and keeps naming it.
+
+@pg_current_snapshot()@ reports @xmax@ as one past the latest /completed/ xid, so
+a transaction that was assigned an xid but had not committed when the anchor was
+taken sits at or above that @xmax@. The write token raises @xmax@ past its own
+xid to see its own write; unless the xids it steps over are marked in progress,
+they become visible the instant they commit -- and the token means something
+different before and after.
+
+The holder connection is that transaction. It takes an xid and inserts a matching
+grant /before/ the write anchor runs, so its xid lands in the gap the write token
+raises over, and it commits between the two reads. Pre-fix the second read
+returns both grants and this scenario fails with a 1-vs-2 diff.
+-}
+runSnapshotRepeatabilityScenario :: Pg.Database -> Connection.Connection -> IO ()
+runSnapshotRepeatabilityScenario database connection = do
+    config <- testConfig
+    holder <- acquire database
+    flip finally (Connection.release holder) do
+        let alice = SubjectId (ObjectRef (ObjectType "user") "snapshot-alice")
+            ownSpace = ObjectRef (ObjectType "space") "snapshot-own"
+            ownTuple =
+                Tuple
+                    { object = ownSpace
+                    , relation = RelationName "viewer"
+                    , subject = alice
+                    , caveat = Nothing
+                    }
+            query =
+                UsersetQuery
+                    { queryType = ObjectType "space"
+                    , queryRelation = RelationName "viewer"
+                    , querySubjects = [alice]
+                    , queryLimit = 10
+                    , queryCursor = Nothing
+                    }
+
+        -- A concurrent writer takes an xid and stays uncommitted.
+        runSessionOrFail holder (Session.script "BEGIN")
+        runSessionOrFail holder (Session.script concurrentGrantSql)
+
+        writeToken <- runPgOrFail connection config (TupleStore.writeTuples [ownTuple])
+        TokenMetadata{revision = writeRevision} <- either (fail . show) pure (tokenMetadataFromPayload writeToken)
+
+        TuplePage{rows = beforeCommit} <- runPgOrFail connection config (TupleStore.readStartingWithUser writeRevision query)
+        assertEqual "the write token sees its own write" [ownTuple] ((.tuple) <$> beforeCommit)
+
+        runSessionOrFail holder (Session.script "COMMIT")
+
+        TuplePage{rows = afterCommit} <- runPgOrFail connection config (TupleStore.readStartingWithUser writeRevision query)
+        assertEqual
+            "reads at one write token are repeatable across a concurrent commit"
+            (length beforeCommit)
+            (length afterCommit)
+        assertEqual
+            "the concurrent commit is invisible at the write token"
+            ((.tuple) <$> beforeCommit)
+            ((.tuple) <$> afterCommit)
+
+-- | The concurrent writer's grant. The @INSERT@ is what assigns it an xid.
+concurrentGrantSql :: Text
+concurrentGrantSql =
+    """
+    INSERT INTO relation_tuple
+      (object_type, object_id, relation, subject_type, subject_id, created_xid)
+    VALUES ('space', 'snapshot-concurrent', 'viewer', 'user', 'snapshot-alice', pg_current_xact_id());
+    """
+
 isPreconditionFailure :: Either EnError a -> Bool
 isPreconditionFailure = \case
     Left (WritePreconditionFailed _) -> True
+    _ -> False
+
+isStoreError :: Either EnError a -> Bool
+isStoreError = \case
+    Left (StoreError _) -> True
     _ -> False
 
 -- | The 'ConsistencyConfig' every scenario shares.

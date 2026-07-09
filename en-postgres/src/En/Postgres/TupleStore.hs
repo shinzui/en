@@ -17,13 +17,12 @@ import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as AesonKey
 import Data.Aeson.KeyMap qualified as AesonKeyMap
 import Data.Aeson.Types qualified as Aeson
-import Data.ByteString qualified as ByteString
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.Foldable (traverse_)
 import Data.Functor.Contravariant ((>$<))
 import Data.Int (Int64)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Scientific (floatingOrInteger)
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -120,15 +119,18 @@ interpretTupleStorePostgres ::
     Eff es a
 interpretTupleStorePostgres config readOptimizedRevision =
     interpret_ \case
-        ReadObjectRelation revision object relation limit cursor ->
-            orThrow =<< runSession (readObjectRelationSession revision object relation limit cursor)
-        ReadStartingWithUser revision query ->
-            orThrow =<< runSession (readStartingWithUserSession revision query)
+        ReadObjectRelation revision object relation limit cursor -> do
+            cursorId <- resolveCursor cursor
+            orThrow =<< runSession (readObjectRelationSession revision object relation limit cursorId)
+        ReadStartingWithUser revision query -> do
+            cursorId <- resolveCursor query.queryCursor
+            orThrow =<< runSession (readStartingWithUserSession revision query cursorId)
         ProbeTuples revision object relation subjects ->
             orThrow =<< runSession (probeTuplesSession revision object relation subjects)
         ApplyTupleWrites request -> do
             outcome <- orThrow =<< runSession (applyTupleWritesSession config request)
-            either (throwError . WritePreconditionFailed) pure outcome
+            anchor <- either (throwError . WritePreconditionFailed) pure outcome
+            mintToken config anchor
         HeadRevision ->
             orThrow =<< runSession headRevisionSession
         OptimizedRevision ->
@@ -140,6 +142,28 @@ interpretTupleStorePostgres config readOptimizedRevision =
   where
     orThrow =
         either (throwError . StoreError . Hasql.toDetailedText) pure
+
+{- | Resolve a caller's cursor to the row id it names, rejecting a malformed one.
+
+Absent means "from the start"; malformed means the caller is not resuming a page
+this store issued, and continuing would silently restart the scan and duplicate
+its results. Resolved here rather than inside the session so the read sessions
+stay infallible and the fault stays typed.
+-}
+resolveCursor :: (Error EnError :> es) => Maybe StoreCursor -> Eff es Int64
+resolveCursor =
+    maybe (pure 0) (either throwError pure . decodeCursor)
+
+{- | Mint the write token for a committed transaction's anchor.
+
+Minting happens here, outside the write 'Session', because a snapshot that does
+not parse is not a database error and hasql offers a 'Session' no ergonomic
+channel for one. Failing loudly matters: the alternative is handing the caller a
+token that cannot see the write it was minted for.
+-}
+mintToken :: (Error EnError :> es) => ConsistencyConfig -> Anchor -> Eff es ConsistencyToken
+mintToken config anchor =
+    either (throwError . StoreError . ("could not mint write token: " <>)) pure (tokenFromAnchor config anchor)
 
 uncachedOptimizedRevision ::
     (Database :> es, Error EnError :> es) =>
@@ -163,11 +187,14 @@ cachedOptimizedRevision cache = do
             liftIO (storeOptimizedRevisionCache cache revision)
             pure revision
 
-{- | Apply one atomic write request, then mint a token for it.
+{- | Apply one atomic write request, returning the transaction's anchor.
 
 The transaction checks every precondition, applies the deletes, applies the
 writes, and commits. A failing precondition rolls back and returns @Left@
 describing it: nothing was written and no token is minted.
+
+The caller mints the token from the anchor (see 'mintToken'), so a snapshot that
+does not parse can be a typed error rather than a silently degraded token.
 
 Deletes run before writes so that "replace the grant on this key" is one natural
 request rather than a self-cancelling one.
@@ -186,7 +213,7 @@ leaves the transaction healthy rather than aborted, so hasql performs no
 automatic reset, and the connection would otherwise be handed back still inside
 an open transaction.
 -}
-applyTupleWritesSession :: ConsistencyConfig -> TupleWriteRequest -> Session (Either Text ConsistencyToken)
+applyTupleWritesSession :: ConsistencyConfig -> TupleWriteRequest -> Session (Either Text Anchor)
 applyTupleWritesSession config request = do
     Session.script beginScript
     anchor <- Session.statement schemaHashText anchorTransactionStatement
@@ -199,7 +226,7 @@ applyTupleWritesSession config request = do
             traverse_ (\tuple -> Session.statement (tupleDeleteParams anchor.xid tuple) deleteTupleStatement) request.deletes
             traverse_ (touchTuple anchor.xid) request.writes
             Session.script commitScript
-            pure (Right (tokenFromAnchor config anchor))
+            pure (Right anchor)
   where
     SchemaHash schemaHashText = config.schemaHash
 
@@ -334,19 +361,17 @@ pruneTransactionsBatchSession :: Word64 -> Int -> Session Int64
 pruneTransactionsBatchSession horizon batch =
     Session.statement (Text.pack (show horizon), fromIntegral batch) pruneTransactionsBatchStatement
 
-readStartingWithUserSession :: Revision -> UsersetQuery -> Session TuplePage
-readStartingWithUserSession revision query = do
+readStartingWithUserSession :: Revision -> UsersetQuery -> Int64 -> Session TuplePage
+readStartingWithUserSession revision query cursorId = do
     let limitPlusOne = fromIntegral (max 0 query.queryLimit + 1)
-        cursorId = maybe 0 decodeCursor query.queryCursor
     rows <- Session.statement (readParams revision query limitPlusOne cursorId) readStartingWithUserStatement
-    pure (pageFromRows query.queryLimit rows)
+    pure (pageFromRows cursorId query.queryLimit rows)
 
-readObjectRelationSession :: Revision -> ObjectRef -> RelationName -> Int -> Maybe StoreCursor -> Session TuplePage
-readObjectRelationSession revision object relation limit maybeCursor = do
+readObjectRelationSession :: Revision -> ObjectRef -> RelationName -> Int -> Int64 -> Session TuplePage
+readObjectRelationSession revision object relation limit cursorId = do
     let limitPlusOne = fromIntegral (max 0 limit + 1)
-        cursorId = maybe 0 decodeCursor maybeCursor
     rows <- Session.statement (objectReadParams revision object relation limitPlusOne cursorId) readObjectRelationStatement
-    pure (pageFromRows limit rows)
+    pure (pageFromRows cursorId limit rows)
 
 {- | Answer a point-membership question with one indexed read.
 
@@ -359,18 +384,23 @@ probeTuplesSession _ _ _ [] =
 probeTuplesSession revision object relation subjects =
     Session.statement (probeParams revision object relation subjects) probeTuplesStatement
 
-pageFromRows :: Int -> [TupleRow] -> TuplePage
-pageFromRows limit rows =
+{- | Split the @limit + 1@ fetched rows into a page and the cursor that resumes it.
+
+The cursor is the last returned row's id, because the read statements resume with
+@id > cursor@. A page that returns no rows — only reachable at @limit <= 0@ —
+therefore has to hand back the caller's own cursor: naming the first unreturned
+row would skip that row forever, losing it from an otherwise complete scan.
+-}
+pageFromRows :: Int64 -> Int -> [TupleRow] -> TuplePage
+pageFromRows cursorId limit rows =
     let (visibleRows, extraRows) = splitAt (max 0 limit) rows
         pageState =
             case extraRows of
                 [] -> Exhausted
-                nextRow : _ ->
-                    let cursorRow =
-                            case visibleRows of
-                                [] -> nextRow
-                                _ -> last visibleRows
-                     in HasMore (StoreCursor cursorRow.rowId.rowIdEncoding)
+                _ : _ ->
+                    case visibleRows of
+                        [] -> HasMore (StoreCursor (Text.pack (show cursorId)))
+                        _ -> HasMore (StoreCursor (last visibleRows).rowId.rowIdEncoding)
      in TuplePage{rows = visibleRows, state = pageState}
 
 data Anchor = Anchor
@@ -379,26 +409,53 @@ data Anchor = Anchor
     }
     deriving stock (Eq, Show)
 
-tokenFromAnchor :: ConsistencyConfig -> Anchor -> ConsistencyToken
-tokenFromAnchor config anchor =
-    encodeToken
-        TokenPayload
-            { datastoreId = config.datastoreId
-            , schemaHash = config.schemaHash
-            , revision = Revision (writeVisibleSnapshot anchor)
-            , expiresAt = Nothing
-            }
+tokenFromAnchor :: ConsistencyConfig -> Anchor -> Either Text ConsistencyToken
+tokenFromAnchor config anchor = do
+    snapshot <- writeVisibleSnapshot anchor
+    pure
+        ( encodeToken
+            TokenPayload
+                { datastoreId = config.datastoreId
+                , schemaHash = config.schemaHash
+                , revision = Revision snapshot
+                , expiresAt = Nothing
+                }
+        )
 
-writeVisibleSnapshot :: Anchor -> Text
+{- | The anchor's snapshot, adjusted so it sees the write and nothing else new.
+
+Read-your-writes needs the write's own xid visible, and @pg_current_snapshot()@
+was taken before that xid committed, so @xmax@ has to be raised past it.
+
+But @xmax@ is the latest /completed/ xid plus one, so other transactions that had
+been assigned an xid without committing can sit anywhere in
+@[snapshot.xmax, xid)@. Raising @xmax@ over them without a word declares them
+visible — not immediately (they contribute no rows while uncommitted) but the
+moment they commit, at which point two reads at this one token disagree. A
+snapshot names a fixed state of the world; its meaning cannot depend on when it
+is read. So every xid in the raised gap except our own is listed in-progress,
+which is exactly what it was when the anchor was taken.
+
+@xmin@ is deliberately untouched: raising it would declare xids below it visible,
+and the comparator only asks @xmax@ and @xip@ whether a transaction is in doubt.
+'renderPgSnapshot' sorts and dedupes @xip@. When @xid < snapshot.xmax@ the gap is
+empty and this reduces to filtering our own xid out of @xip@.
+-}
+writeVisibleSnapshot :: Anchor -> Either Text Text
 writeVisibleSnapshot anchor =
     case (parsePgSnapshot anchor.snapshot, parseWord64 anchor.xid) of
         (Right snapshot, Just xid) ->
-            renderPgSnapshot
-                snapshot
-                    { xmax = max snapshot.xmax (succBounded xid)
-                    , xip = filter (/= xid) snapshot.xip
-                    }
-        _ -> anchor.snapshot
+            let raisedXmax = max snapshot.xmax (succBounded xid)
+                gap = [txid | txid <- [snapshot.xmax .. raisedXmax - 1], txid /= xid]
+             in Right
+                    ( renderPgSnapshot
+                        snapshot
+                            { xmax = raisedXmax
+                            , xip = filter (/= xid) snapshot.xip <> gap
+                            }
+                    )
+        (Left err, _) -> Left ("write anchor snapshot did not parse: " <> err)
+        (_, Nothing) -> Left ("write anchor xid did not parse: " <> anchor.xid)
 
 succBounded :: Word64 -> Word64
 succBounded value
@@ -1003,9 +1060,32 @@ tupleRowDecoder =
         <*> Decoders.column (Decoders.nonNullable Decoders.text)
         <*> Decoders.column (Decoders.nullable Decoders.text)
         <*> Decoders.column (Decoders.nullable Decoders.text)
-        <*> Decoders.column (Decoders.nullable (Decoders.jsonbBytes Right))
+        <*> Decoders.column (Decoders.nullable caveatPayloadDecoder)
         <*> Decoders.column (Decoders.nonNullable Decoders.text)
         <*> Decoders.column (Decoders.nullable Decoders.text)
+
+{- | Decode @caveat_payload@ all the way to its typed form, failing the statement
+when it cannot.
+
+A payload that no longer decodes is a corrupted authorization fact. Reading it as
+an /empty/ payload — the previous behavior — does not degrade the answer, it
+changes it: the caveat evaluator sees a grant whose parameters are all missing
+and either demands them from the caller or evaluates a different condition than
+the one that was written. Storage that cannot answer faithfully must refuse to
+answer.
+
+The check lives in the column decoder because that is the choke point every read
+of the column passes through; a @Left@ here becomes a hasql @SessionError@, which
+'interpretTupleStorePostgres' already surfaces as 'En.Error.StoreError'.
+-}
+caveatPayloadDecoder :: Decoders.Value (Map.Map Text CaveatValue)
+caveatPayloadDecoder =
+    Decoders.jsonbBytes
+        ( \bytes ->
+            case Aeson.decodeStrict bytes >>= decodeCaveatPayload of
+                Just decoded -> Right decoded
+                Nothing -> Left "undecodable caveat_payload"
+        )
 
 rowFromColumns ::
     Int64 ->
@@ -1016,7 +1096,7 @@ rowFromColumns ::
     Text ->
     Maybe Text ->
     Maybe Text ->
-    Maybe ByteString.ByteString ->
+    Maybe (Map.Map Text CaveatValue) ->
     Text ->
     Maybe Text ->
     TupleRow
@@ -1040,17 +1120,19 @@ rowFromColumns idValue objectType objectId relation subjectType subjectId subjec
   where
     subjectObject = ObjectRef{objectType = ObjectType subjectType, objectId = subjectId}
 
-decodeTupleCaveat :: Maybe Text -> Maybe ByteString.ByteString -> Maybe TupleCaveat
+{- | Pair a caveat name with its payload.
+
+A SQL @NULL@ payload is a caveat with no write-time arguments — a legitimately
+empty payload, not a missing one. An /undecodable/ payload never reaches here:
+'caveatPayloadDecoder' has already failed the statement.
+-}
+decodeTupleCaveat :: Maybe Text -> Maybe (Map.Map Text CaveatValue) -> Maybe TupleCaveat
 decodeTupleCaveat Nothing _ = Nothing
 decodeTupleCaveat (Just caveatName) maybePayload =
     Just
         TupleCaveat
             { name = CaveatName caveatName
-            , payload =
-                CaveatPayload $
-                    case maybePayload >>= Aeson.decodeStrict >>= decodeCaveatPayload of
-                        Just decoded -> decoded
-                        Nothing -> Map.empty
+            , payload = CaveatPayload (fromMaybe Map.empty maybePayload)
             }
 
 flattenSubject :: Subject -> (ObjectRef, Maybe RelationName)
@@ -1133,11 +1215,12 @@ parseWord64 text =
         [(value, "")] -> Just value
         _ -> Nothing
 
-decodeCursor :: StoreCursor -> Int64
+-- | The row id a cursor names. Only this store's own encoding is accepted.
+decodeCursor :: StoreCursor -> Either EnError Int64
 decodeCursor (StoreCursor cursorText) =
     case reads (Text.unpack cursorText) of
-        [(value, "")] -> value
-        _ -> 0
+        [(value, "")] -> Right value
+        _ -> Left (InvalidCursor cursorText)
 
 unObjectType :: ObjectType -> Text
 unObjectType (ObjectType text) = text

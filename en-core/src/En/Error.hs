@@ -17,6 +17,16 @@ data EnError
       MissingCaveatContext [Text]
     | -- | The supplied consistency token is invalid or outside the GC window.
       InvalidConsistencyToken Text
+    | {- | A pagination cursor was malformed or does not belong to this store.
+      Carries the cursor's rendering.
+
+      Distinct from 'InvalidConsistencyToken' (a different artifact, obtained a
+      different way) and from 'StoreError' (an outage, and retryable). Resuming a
+      page is only meaningful with a cursor the store itself issued; anything
+      else is a client fault, and restarting the scan from the beginning in its
+      place would silently duplicate results.
+      -}
+      InvalidCursor Text
     | -- | A configured evaluation budget (depth, breadth) was exhausted.
       ResolutionLimitExceeded
     | {- | The traversal re-entered a subproblem it is already evaluating: the

@@ -127,6 +127,8 @@ enErrorToFault = \case
             (envelope "missing_caveat_context" ("missing caveat context: " <> Text.intercalate ", " names))
     InvalidConsistencyToken detail ->
         BadRequestFault (envelope "invalid_consistency_token" detail)
+    InvalidCursor cursor ->
+        BadRequestFault (envelope "invalid_cursor" ("malformed pagination cursor: " <> cursor))
     ResolutionLimitExceeded ->
         UnprocessableFault
             (envelope "resolution_limit_exceeded" "the traversal exceeded its depth or breadth bound")
