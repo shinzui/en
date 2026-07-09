@@ -45,6 +45,7 @@ library
     , en-core
     , en-migrations
     , hasql
+    , hasql-pool      ^>=1.4
     , scientific
     , text
     , time

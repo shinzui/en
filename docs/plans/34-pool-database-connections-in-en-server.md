@@ -41,9 +41,12 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: `runDatabasePool` runner added to `en-postgres/src/En/Postgres/Database.hs`;
-  `hasql-pool` added to `en-postgres/en-postgres.cabal`; `cabal build en-postgres`
-  green.
+- [x] M1 (2026-07-08): `runDatabasePool` runner added to
+  `en-postgres/src/En/Postgres/Database.hs`; `hasql-pool ^>=1.4` added to
+  `en-postgres/en-postgres.cabal`; `cabal build en-postgres` green (cabal resolved
+  `hasql-pool-1.4.2` from Hackage against the pinned `hasql-1.10.3.5`, no
+  `cabal.project` constraint needed). `cabal test en-postgres` passes both suites
+  (`en-postgres-revision-tests`, `en-postgres-integration-tests`).
 - [ ] M2: `en-server/app/Main.hs` acquires a `Pool` from env-configured settings,
   performs a fail-fast startup ping, removes the inert bracket, and releases the pool
   on exit; `en-server/en-server.cabal` gains `hasql-pool`.
