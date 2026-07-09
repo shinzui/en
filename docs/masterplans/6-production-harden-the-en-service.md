@@ -74,7 +74,7 @@ merely because they touch the same lines, not because of real artifact dependenc
 | EP-34 | Pool database connections in en-server | docs/plans/34-pool-database-connections-in-en-server.md | None | None | Complete |
 | EP-35 | Version the wire contract and type the error model | docs/plans/35-version-the-wire-contract-and-type-the-error-model.md | None | None | Complete |
 | EP-36 | Add health endpoints, graceful shutdown, and observability | docs/plans/36-add-health-endpoints-graceful-shutdown-and-observability.md | None | EP-34, EP-35 | Complete |
-| EP-37 | Schedule background maintenance for reaping and transaction pruning | docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md | None | EP-34 | In Progress |
+| EP-37 | Schedule background maintenance for reaping and transaction pruning | docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md | None | EP-34 | Complete |
 | EP-38 | Validate configuration and persist datastore identity | docs/plans/38-validate-configuration-and-persist-datastore-identity.md | None | None | Not Started |
 
 
@@ -131,10 +131,11 @@ EP-33's own response builders. Any new endpoint added by
 `docs/masterplans/9-complete-the-en-api-surface.md` should be a `MultiVerb` endpoint
 over EP-35's shared `EnResponses` list.
 
-codd migrations under `en-migrations/db/migrations/` are added by EP-37 (index on
-`en_transaction (created_at, xid)`) and EP-38 (new datastore-metadata table). Timestamped
-filenames prevent collisions; each plan owns its own migration file and must not edit
-the other's.
+codd migrations under `en-migrations/db/migrations/` were to be added by EP-37 (index on
+`en_transaction (created_at, xid)`) and EP-38 (new datastore-metadata table).
+**EP-37 added none**: measurement showed the planner never chooses that index, and
+pruning fixes the horizon query instead (see EP-37's Decision Log). EP-38 is therefore
+the only child adding a migration, and the collision concern is moot.
 
 Cross-master-plan: EP-35's versioned wire contract is the surface that
 `docs/masterplans/9-complete-the-en-api-surface.md` extends with new endpoints; new
@@ -154,8 +155,9 @@ recovery by the same horizon.
 - [x] EP-35: handler errors are MultiVerb response alternatives, documented per operation in OpenAPI
 - [x] EP-36: /healthz and /readyz respond correctly; SIGTERM drains in-flight requests
 - [x] EP-36: structured request logs and a metrics endpoint (including cache stats) exposed
-- [ ] EP-37: reaper and en_transaction pruning run on a schedule with batched deletes
-- [ ] EP-37: en_transaction horizon query served by an index
+- [x] EP-37: reaper and en_transaction pruning run on a schedule with batched deletes
+- [x] EP-37: en_transaction horizon query no longer scans lifetime writes — achieved by
+  pruning, not by an index; the planned index was proven dead weight and cancelled
 - [ ] EP-38: datastore identity minted once, persisted, and used in tokens
 - [ ] EP-38: all config validated at startup with clear failures; deadlines and batch limits configurable
 
@@ -374,6 +376,46 @@ From EP-36 (2026-07-08), affecting sibling plans:
   client branches on. It remains open, and cheap, for whoever wants uniformity.
 
 
+From EP-37 (2026-07-08), affecting sibling plans:
+
+- **EP-37 added no migration.** The planned index on `en_transaction (created_at, xid)` is
+  never chosen by the planner: PostgreSQL rewrites `min(xid)` into a `Limit 1` over the
+  `xid` primary key and prefers it even with one in-window row among 50,001. Pruning is
+  what fixes the horizon query (606 buffers / 4.7 ms against a 50k backlog → 2 buffers /
+  0.04 ms drained, identical with and without the index). **EP-38 now owns the only
+  migration in this master plan**, so the timestamped-filename collision concern is moot.
+  If `docs/plans/53-add-a-watch-changelog-api.md` later filters `en_transaction` by
+  `created_at` *without* a `min`/`max` aggregate, the index is worth reconsidering on that
+  query's own evidence.
+
+- **A background loop must re-throw asynchronous exceptions.** `withAsync`'s `cancel` throws
+  `AsyncCancelled`, whose `Exception` instance routes through `asyncExceptionToException`. A
+  bare `try @SomeException` around a loop body — which EP-37's plan text specified — catches
+  it, logs it, and keeps looping, so the server hangs on shutdown. `Maintenance.hs` filters
+  on `fromException @SomeAsyncException` and re-throws. Any later plan adding a background
+  thread should copy that shape.
+
+- **EP-36's `finally` is now genuinely load-bearing.** `main` ends in
+  ``withAsync (runMaintenanceLoop …) \_ -> serve … `finally` Pool.release pool``. Warp's
+  `runSettings` returns on SIGTERM, `withAsync` cancels the loop, and the pool is released.
+  Measured: SIGTERM with a maintenance pass mid-flight exits in 0.03 s with status 0.
+
+- **`EN_MAINTENANCE_INTERVAL_SECONDS` and `EN_MAINTENANCE_BATCH_SIZE` are the contract**
+  EP-38's `ServerConfig` absorbs. Defaults 600 and 1000; interval `0` disables. Both are
+  parsed with the same fail-fast style as the pool knobs, and both currently `fail` — which
+  is the uncaught-`IOException` wart EP-38 owns.
+
+- **`en_transaction` can legitimately drain to zero** when no write occurs for a full
+  `EN_GC_WINDOW`. The horizon then falls back to `pg_snapshot_xmin(pg_current_snapshot())`,
+  which is exactly the value the query returned before the rows were removed — pruning
+  cannot move the horizon, because the horizon is computed only from in-window rows. Any
+  plan reading history from `en_transaction` (notably the watch API) must not assume the
+  table is non-empty.
+
+- **`Statement.preparable` takes `Text`, not `ByteString`.** Trivial, but it is the second
+  time a plan's stated dependency signature was wrong (see EP-36 and `wai-extra`).
+
+
 ## Decision Log
 
 - Decision: Group error typing, wire versioning, and OpenAPI generation into one plan (EP-35).
@@ -435,6 +477,21 @@ From EP-36 (2026-07-08), affecting sibling plans:
   pid the server. Separately, adding the process while `start-and-test` still spawned its
   own server would have bound port 8080 twice; reusing the supervised server is also what
   makes the readiness probe load-bearing rather than decorative.
+  Date: 2026-07-08
+
+- Decision: Cancel EP-37's `en_transaction (created_at, xid)` index; let pruning fix
+  finding C2 on its own.
+  Rationale: The index is never used. PostgreSQL rewrites `min(xid)` into a `Limit 1` over
+  the `xid` primary key and prefers that plan at every selectivity measured, down to one
+  in-window row among 50,001. The cost of that plan is precisely the number of rows behind
+  the horizon, which is what pruning removes: 606 buffers and 4.7 ms with a 50,000-row
+  backlog, 2 buffers and 0.04 ms once drained — and the drained plan is byte-identical with
+  the index present or absent. Forcing the index (which requires defeating the min/max
+  rewrite) would make every read scan all in-window index entries, turning an `O(1)` lookup
+  into `O(window)`. Keeping it would cost one index entry per write transaction for a plan
+  the optimizer never selects. Recorded alternatives: keep it as a hedge for a future
+  `created_at`-filtering query (rejected — add it then, on that query's evidence); force it
+  with a `FILTER` clause (rejected — slower in steady state).
   Date: 2026-07-08
 
 

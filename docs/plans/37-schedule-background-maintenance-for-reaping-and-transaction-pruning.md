@@ -45,18 +45,20 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: migration `en-migrations/db/migrations/<timestamp>_en-transaction-horizon-index.sql`
-  created (btree on `(created_at, xid)`); Justfile `run-migrations` guard added;
-  EXPLAIN before/after captured.
-- [ ] M2: batched sessions `reapDeletedTuplesBatchSession` and
+- [x] M1 **cancelled** (2026-07-08): the `(created_at, xid)` index is dead weight.
+  PostgreSQL rewrites `min(xid)` into a `Limit 1` over the `xid` primary key and never
+  chooses the composite index, at any selectivity. EXPLAIN evidence in Surprises &
+  Discoveries; decision recorded in the Decision Log. No migration, no Justfile guard.
+  **Pruning (M3) is the fix for C2**, and it is verified as such.
+- [x] M2 (2026-07-08): batched sessions `reapDeletedTuplesBatchSession` and
   `pruneTransactionsBatchSession` added to `en-postgres/src/En/Postgres/TupleStore.hs`
-  and exported; unit/integration coverage extended.
-- [ ] M3: maintenance loop in `en-server/app/Maintenance.hs`; env vars
-  `EN_MAINTENANCE_INTERVAL_SECONDS` / `EN_MAINTENANCE_BATCH_SIZE`; per-run log line;
-  clean-shutdown interaction verified.
-- [ ] M4: end-to-end validation with a tiny GC window — backlog created, reaped, and
-  pruned on schedule; transcript recorded in Outcomes.
-- [ ] Docs: maintenance section added to `docs/user/service-and-operations.md`.
+  and exported; integration coverage extended and mutation-checked.
+- [x] M3 (2026-07-08): maintenance loop in `en-server/app/Maintenance.hs`; env vars
+  `EN_MAINTENANCE_INTERVAL_SECONDS` / `EN_MAINTENANCE_BATCH_SIZE`; per-pass log line;
+  clean-shutdown interaction verified (0.03 s to exit with a pass mid-flight).
+- [x] M4 (2026-07-08): end-to-end validation with a tiny GC window — backlog created,
+  reaped, and pruned on schedule; transcript recorded in Outcomes.
+- [x] Docs: maintenance section added to `docs/user/service-and-operations.md`.
 
 
 ## Surprises & Discoveries
@@ -64,7 +66,79 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- **The horizon query was never a `Seq Scan`, and the planned index never fixes it.**
+  M1 predicted `Seq Scan on en_transaction` before the index and an `Index Only Scan`
+  after. Neither happens. PostgreSQL applies its MIN/MAX rewrite: `min(xid)` becomes a
+  `Limit 1` over an ascending scan of the `xid` primary key, with `created_at` as a
+  filter. Its cost is the number of rows it must *skip* — exactly the rows behind the
+  horizon. Seeded with 50,000 out-of-window rows and 100 in-window (xid correlated with
+  `created_at`, as real writes are):
+
+  ```text
+  Result (actual time=4.717..4.719 rows=1 loops=1)
+    Buffers: shared hit=606
+    InitPlan 1
+      ->  Limit (actual time=4.704..4.705 rows=1 loops=1)
+            ->  Index Scan using en_transaction_pkey on en_transaction
+                  Filter: (created_at >= (now() - '24:00:00'::interval))
+                  Rows Removed by Filter: 50000
+  ```
+
+  Creating `en_transaction_created_at_xid_idx` changed **nothing** — byte-identical plan,
+  same 606 buffers. Forcing it (`SET enable_indexscan=off; SET enable_seqscan=off`) does
+  produce a bitmap scan on it at 4 buffers / 0.062 ms, but the planner *estimates* that
+  path at cost 487.96 against 5.80 for the primary-key path: an 84× misestimate, because
+  the `Limit 1` cost model assumes matching rows are spread uniformly through `xid` order
+  when in fact they are all at the far end. The planner still chose the primary key with
+  only **one** in-window row among 50,001 — the worst possible selectivity. It is never
+  chosen.
+
+- **Pruning alone fixes finding C2, and does so better than the index would have.** With
+  the backlog drained, every remaining row is in-window, so the `Limit 1` stops at the
+  first row it reads:
+
+  ```text
+  Result (actual time=0.019..0.021 rows=1 loops=1)
+    Buffers: shared hit=2
+      ->  Limit  ->  Index Scan using en_transaction_pkey   (no rows removed by filter)
+  ```
+
+  2 buffers, 0.036–0.046 ms, **identical whether the composite index exists or not**.
+  Better still, this is `O(1)` in the retained window, whereas forcing the composite
+  index would make every read scan all in-window index entries — `O(window)`, worse at
+  scale. The index would have cost one entry per write for a plan never chosen and, if
+  forced, a slower steady state. It was cancelled; see the Decision Log.
+
+- **`en_transaction` can legitimately drain to zero, and this does not move the horizon.**
+  With `EN_GC_WINDOW='1 second'` and no writes in the last second, `min(xid)` over the
+  window is `NULL`, `coalesce` falls back to `pg_snapshot_xmin(pg_current_snapshot())`,
+  and the pruner deletes every committed row. Observed: `en_transaction` 53 → 0. This is
+  safe and, importantly, *not a change in behavior*: the horizon is computed only from
+  in-window rows, so removing out-of-window rows cannot alter it. The `coalesce` fallback
+  yields the same value with the table full or empty. Documented for operators, who will
+  otherwise find an empty table alarming.
+
+- **Cancellation is prompt, not deferred to the end of a pass.** With a 60,000-row backlog
+  and `EN_MAINTENANCE_BATCH_SIZE=1`, `SIGTERM` arrived with 38,868 rows still to go and the
+  process exited **0.03 s** later with status 0 and no exception output. The 21,490 rows
+  already deleted stayed deleted, and the next process's first pass removed the remaining
+  38,510 in 40 batches. This is the property that makes batching worth its round trips.
+
+- **`try @SomeException` around the pass would have swallowed cancellation.**
+  `Control.Concurrent.Async.cancel` throws `AsyncCancelled`, whose `Exception` instance
+  routes through `asyncExceptionToException`. Catching and logging it would leave the
+  maintenance thread looping after `withAsync` believed it dead, so the server would hang
+  on shutdown. `runMaintenanceLoop` re-throws anything that is a `SomeAsyncException` and
+  logs only synchronous failures. **Any sibling plan adding a background loop must do the
+  same.**
+
+- **A batch size of 1 consumes one transaction id per row.** The `horizon` in consecutive
+  log lines jumped from 840 to 5840 while reaping 5,000 rows with `EN_MAINTENANCE_BATCH_SIZE=1`.
+  Harmless at `xid8`'s 64-bit width and irrelevant at the default batch of 1000, but it is
+  a reason not to set the batch size very low on a large backlog.
+
+- **`Statement.preparable` takes `Text`, not `ByteString`.** A small thing, but it cost a
+  compile cycle and a spurious `bytestring` dependency on the integration test suite.
 
 
 ## Decision Log
@@ -87,6 +161,20 @@ Record every decision made while working on the plan.
   per write transaction) is the acceptable price for turning every read's helper query
   into an index scan.
   Date: 2026-07-07
+  **Reversed 2026-07-08 — no index is created at all.** The reasoning above compares a
+  btree against a BRIN and never questions whether the planner would use *either*. It
+  does not. PostgreSQL rewrites `min(xid)` into a `Limit 1` over the `xid` primary key
+  and prefers it at every selectivity tested, including one in-window row among 50,001.
+  Measurements are in Surprises & Discoveries. The premise that the aggregate "can
+  complete from index tuples alone" is true but irrelevant, because that plan is never
+  chosen; and forcing it would make each read scan every in-window index entry —
+  `O(window)` rather than the `O(1)` the primary-key path delivers once pruning keeps
+  the backlog empty. Since `min(xid)`'s cost is precisely the count of rows behind the
+  horizon, **pruning is the fix for C2, and the index would have added one entry per
+  write for nothing.** M1 is cancelled; the migration and Justfile guard were deleted
+  before landing. If a future query filters `en_transaction` by `created_at` without a
+  `min`/`max` aggregate (the watch API is the candidate), reconsider the index then, on
+  that query's evidence.
 - Decision: Batch both deletes with a `LIMIT`-ed CTE loop (delete up to N, repeat until
   a short batch), N default 1000, statements committing between batches.
   Rationale: One unbounded `DELETE` holds locks on every doomed row for the statement's
@@ -143,13 +231,159 @@ Record every decision made while working on the plan.
   conformance/demo flows, which never write enough to matter).
   Date: 2026-07-07
 
+- Decision: The maintenance loop re-throws asynchronous exceptions and logs only
+  synchronous ones, rather than wrapping each pass in a bare `try @SomeException`.
+  Rationale: The plan's M3 says "one pass wrapped in `try @SomeException` — a failed pass
+  logs and continues". Taken literally that catches `AsyncCancelled`, which is exactly how
+  `withAsync` stops the thread on shutdown; the loop would log the cancellation, sleep, and
+  keep running, and the server would hang. `AsyncCancelled`'s `Exception` instance routes
+  through `asyncExceptionToException`, so `fromException @SomeAsyncException` distinguishes
+  it from a database failure. Recorded alternative: depend on `safe-exceptions` for
+  `tryAny`, rejected as a dependency for six lines.
+  Date: 2026-07-08
+
+- Decision: `runMaintenanceLoop` returns immediately when the interval is zero; `Main.hs`
+  logs `Background maintenance: disabled` at startup rather than the loop logging
+  `maintenance: disabled`.
+  Rationale: The plan asked for the latter, but every other subsystem announces itself in
+  the same startup block (`Rate limit: …`, `Decision cache: …`), and an operator reads that
+  block to learn how the process is configured. A lone line from a thread that then exits is
+  the wrong shape. The observable requirement — startup says maintenance is off, and counts
+  never change — is met.
+  Date: 2026-07-08
+
+- Decision: Prove the batched sessions with a scenario that seeds a synthetic backlog and a
+  literal horizon (`1000`), rather than deriving the horizon from real writes.
+  Rationale: The interesting boundary is `xid < horizon` versus `xid = horizon`, and a
+  derived horizon cannot place a row exactly on it. The scenario seeds 25 reapable tuples,
+  one deleted at exactly the horizon, and one live tuple; likewise 25 prunable transactions
+  plus two at or after the horizon. The assertions were mutation-checked (expected 25 → 26
+  fails with the right diagnostic) to prove they are not vacuous.
+  Date: 2026-07-08
+
 
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Completed 2026-07-08 in two commits (batched sessions; the scheduled loop plus docs).
+Four milestones planned, three landed: **M1 was cancelled on evidence** — see the Decision
+Log — and its goal, an efficient horizon query, is delivered by M3's pruning instead.
+
+**Against the original purpose.** Soft-deleted tuples and `en_transaction` rows are now
+removed on a schedule, in bounded batches, behind a horizon shared with token validation.
+The reaper is called for the first time. The horizon query, which every read pays for,
+went from 606 buffers / 4.7 ms against a 50,000-row backlog to 2 buffers / 0.04 ms once
+drained. An operator can watch both counts shrink, with proof below.
+
+### Validation transcript
+
+Reap, prune, and steady state (M3/M4), with `EN_GC_WINDOW='1 second'`,
+`EN_MAINTENANCE_INTERVAL_SECONDS=5`, `EN_MAINTENANCE_BATCH_SIZE=100`, after `just test-server`
+created garbage:
+
+```text
+Background maintenance: enabled, intervalSeconds=5, batchSize=100
+
+maintenance: horizon=836 reaped=23 pruned=53 batches=2
+maintenance: horizon=838 reaped=0 pruned=0 batches=2
+maintenance: horizon=839 reaped=0 pruned=0 batches=2
+
+soft_deleted=23 -> 0
+en_transaction=53 -> 0
+live=1                       # the live tuple is untouched
+```
+
+Batching and bounded work (M2), from the integration suite: no call of either session
+removes more than its batch, drained counts sum to the backlog (25 in batches of 10 →
+`[10,10,5]`), a drained backlog returns `0`, and rows *at* the horizon survive
+(`xid = 1000` is not `< 1000`). Mutation-checked: changing the expected sum to 26 fails.
+
+Interruption mid-pass and resumption (acceptance 5). 60,000-row backlog,
+`EN_MAINTENANCE_BATCH_SIZE=1` so a pass takes thousands of round trips:
+
+```text
+backlog before        = 60000
+backlog mid-pass      = 38868      # pass demonstrably still running
+EXIT_CODE=0  shutdown_seconds=0.03 # SIGTERM; cancellation is immediate
+backlog after SIGTERM = 38510      # 21490 committed deletions stayed done
+```
+
+Restarting with `EN_MAINTENANCE_BATCH_SIZE=1000`:
+
+```text
+maintenance: horizon=27332 reaped=38510 pruned=0 batches=40
+maintenance: horizon=27371 reaped=0 pruned=0 batches=2
+backlog = 0     live tuples = 1
+```
+
+Safety under the default window (acceptance 4). `EN_GC_WINDOW` unset (24 hours),
+maintenance every 2 s, `just test-server` three times:
+
+```text
+server smoke test passed: allowed     (x3)
+maintenance: horizon=27371 reaped=0 pruned=0 batches=2   (x3)
+en_transaction retained = 6      soft-deleted retained = 3
+```
+
+Nothing inside the window is touched, and every consistency token resolves. Disabled
+(`EN_MAINTENANCE_INTERVAL_SECONDS=0`) with a 1-second window — where an enabled loop would
+have wiped both tables:
+
+```text
+Background maintenance: disabled
+maintenance pass lines: 0
+en_transaction: 6 -> 6   soft_deleted: 3 -> 3
+```
+
+Bad configuration fails at startup, before the port is bound:
+
+```text
+user error (Invalid EN_MAINTENANCE_BATCH_SIZE: expected a positive integer)
+user error (Invalid EN_MAINTENANCE_INTERVAL_SECONDS: expected a non-negative integer)
+```
+
+Regressions (acceptance 6): `cabal build all` clean; `cabal test en-core`,
+`cabal test en-postgres` (both suites), and `cabal test en-servant` PASS;
+`just start-and-test` passes against the process-compose server, which logs
+`Background maintenance: enabled, intervalSeconds=600, batchSize=1000`.
+
+### Gaps
+
+- **No metric for maintenance.** EP-36 added `/metrics`, and reaped/pruned counts belong
+  there — an operator should be able to alert on "reaped equals batch size every pass",
+  which means the backlog is outgrowing the schedule. Today that signal exists only in the
+  log line. Deliberately not added: it would need a counter store shared between
+  `Maintenance.hs` and `Metrics.hs`, which is a small design question and not this plan's
+  purpose.
+- **The pass is serial and single-threaded.** Reap fully drains before prune begins. For a
+  very large first pass on an old database this means the transaction table is not pruned
+  until the tuple backlog is gone. Both are bounded work per batch, so the server stays
+  responsive; only the ordering is arbitrary.
+- **`ReapDeletedTuples` on the `TupleStore` effect remains unbatched**, as the plan
+  intended. Embedded consumers calling it against a large backlog get the original
+  one-unbounded-`DELETE` behavior. Its haddock now points at the batched session.
+- **A pass that fails is retried only at the next interval.** With a 600-second default and
+  a PostgreSQL restart, up to ten minutes of maintenance is skipped. Harmless — the next
+  pass does the accumulated work — but it means the log can go quiet for an interval after
+  a database blip.
+
+### Lessons
+
+The plan's most confident section was its most wrong. Its Decision Log spends a paragraph
+adjudicating btree versus BRIN — correlation, index-only scans, block-range degradation
+under pruning — and every word of it is sound in isolation. It simply never asked whether
+the planner would choose an index at all. `EXPLAIN (ANALYZE, BUFFERS)` answered in one
+command what the argument could not. A plan that names an expected query plan should be
+read as a hypothesis to test, not a specification to implement; the acceptance criterion
+that said "the EXPLAIN transcript flips from `Seq Scan` to `Index Only Scan`" is what
+caught it, because it was falsifiable.
+
+Second, the seed data matters as much as the query. The first measurement showed the index
+being ignored *and* the primary-key path being fast — because the synthetic rows had
+larger `xid` for older `created_at`, the opposite of how real writes land. Anti-correlated
+data made a pathological plan look healthy. Correlating them reproduced the finding.
 
 
 ## Context and Orientation
