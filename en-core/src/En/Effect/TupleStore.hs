@@ -12,6 +12,7 @@ module En.Effect.TupleStore (
     TupleStore (..),
     readObjectRelation,
     readStartingWithUser,
+    readAllTuples,
     probeTuples,
     applyTupleWrites,
     writeTuples,
@@ -211,6 +212,19 @@ writes return a 'ConsistencyToken' for read-your-writes.
 data TupleStore :: Effect where
     ReadObjectRelation :: Revision -> ObjectRef -> RelationName -> Int -> Maybe StoreCursor -> TupleStore m TuplePage
     ReadStartingWithUser :: Revision -> UsersetQuery -> TupleStore m TuplePage
+    {- | Every tuple live at @revision@, ordered by internal row id and
+    keyset-paginated: the whole graph, page by page.
+
+    The engine never issues this — a check or a lookup that scanned the store
+    would be a bug — but bulk export does, and so does any consumer migrating
+    the graph out. Anchoring every page to one caller-held 'Revision' makes the
+    drain a consistent snapshot: writers may proceed throughout, and none of
+    their rows appear.
+
+    Ordering is by row id rather than by any tuple field so the scan is a
+    primary-key range scan needing no index of its own.
+    -}
+    ReadAllTuples :: Revision -> Int -> Maybe StoreCursor -> TupleStore m TuplePage
     {- | Point-membership probe: the live tuples at @revision@ on
     @object#relation@ whose subject is one of the given candidates.
 
@@ -243,6 +257,10 @@ readObjectRelation revision object relation limit cursor =
 readStartingWithUser :: (TupleStore :> es) => Revision -> UsersetQuery -> Eff es TuplePage
 readStartingWithUser revision query =
     send (ReadStartingWithUser revision query)
+
+readAllTuples :: (TupleStore :> es) => Revision -> Int -> Maybe StoreCursor -> Eff es TuplePage
+readAllTuples revision limit cursor =
+    send (ReadAllTuples revision limit cursor)
 
 probeTuples :: (TupleStore :> es) => Revision -> ObjectRef -> RelationName -> [Subject] -> Eff es [TupleRow]
 probeTuples revision object relation subjects =

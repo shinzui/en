@@ -71,6 +71,8 @@ main = do
         runSnapshotRepeatabilityScenario database connection
         runMaintenanceBatchScenario connection
         resetSchema connection
+        runReadAllTuplesScenario connection
+        resetSchema connection
         runMigrationDedupeScenario connection
         Connection.release connection
     case result of
@@ -785,6 +787,73 @@ runWriteRaceScenario database connection = do
     assertEqual "the raced grant is revoked exactly once" 0 (length survivingRows)
 
     traverse_ Connection.release [leftConnection, rightConnection, blocker]
+
+{- | Draining the whole graph at one revision: the primitive bulk export is built on.
+
+Runs against a freshly reset schema, because 'TupleStore.readAllTuples' returns
+every live tuple in the store and any row an earlier scenario left behind would
+be indistinguishable from a paging bug.
+
+Two properties. The drain is /complete/: 1,500 tuples written in one batch come
+back across four pages of 400 with no row seen twice and no row missed, ending
+'Exhausted' rather than at a cursor that resumes forever. And the drain is a
+/snapshot/: a tuple written after the revision was captured is invisible to a
+page fetched afterwards, so an export that takes minutes still describes the
+graph as it stood when it began, rather than smearing concurrent writers across
+its pages.
+-}
+runReadAllTuplesScenario :: Connection.Connection -> IO ()
+runReadAllTuplesScenario connection = do
+    config <- testConfig
+    let viewer = RelationName "viewer"
+        alice = SubjectId (ObjectRef (ObjectType "user") "drain-alice")
+        drainTuples =
+            [ Tuple
+                { object = ObjectRef{objectType = ObjectType "space", objectId = "drain-" <> showText index}
+                , relation = viewer
+                , subject = alice
+                , caveat = Nothing
+                }
+            | index <- [1 :: Int .. 1500]
+            ]
+        drainFrom revision =
+            let step cursor seen = do
+                    TuplePage{rows, state} <- runPgOrFail connection config (TupleStore.readAllTuples revision 400 cursor)
+                    let seenNow = seen <> ((.tuple) <$> rows)
+                    case state of
+                        Exhausted -> pure seenNow
+                        HasMore next -> step (Just next) seenNow
+                        Truncated next -> step (Just next) seenNow
+             in step Nothing []
+
+    writeToken <- runPgOrFail connection config (TupleStore.writeTuples drainTuples)
+    TokenMetadata{revision = drainRevision} <- either (fail . show) pure (tokenMetadataFromPayload writeToken)
+
+    drained <- drainFrom drainRevision
+    assertEqual "the drain returns every live tuple" 1500 (length drained)
+    assertEqual "the drain returns no tuple twice" 1500 (Set.size (Set.fromList drained))
+    assertEqual "the drain returns exactly what was written" (sort drainTuples) (sort drained)
+
+    -- A writer proceeding during the export contributes nothing to it.
+    _ <-
+        runPgOrFail
+            connection
+            config
+            ( TupleStore.writeTuples
+                [ Tuple
+                    { object = ObjectRef{objectType = ObjectType "space", objectId = "drain-latecomer"}
+                    , relation = viewer
+                    , subject = alice
+                    , caveat = Nothing
+                    }
+                ]
+            )
+    drainedAgain <- drainFrom drainRevision
+    assertEqual "a tuple written after the revision is invisible to the drain" 1500 (length drainedAgain)
+
+    headRevision <- runPgOrFail connection config TupleStore.headRevision
+    drainedAtHead <- drainFrom headRevision
+    assertEqual "the latecomer is visible at a later revision" 1501 (length drainedAtHead)
 
 {- | The batched touch protocol's retry ladder, which only a race can reach.
 

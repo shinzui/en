@@ -11,12 +11,17 @@ import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleStore (..))
 
 {- | Cache tuple-store read pages by resolved revision and read parameters.
 
-The interposer is intentionally narrow: it caches only the three read shapes --
-'ReadObjectRelation', 'ReadStartingWithUser', and 'ProbeTuples'. Writes, revision
-reads, and maintenance operations are forwarded to the upstream 'TupleStore'
-handler unchanged. Entries are safe to reuse because every key includes the
-resolved revision supplied by the engine, so an entry can never serve rows from a
-different snapshot.
+The interposer is intentionally narrow: it caches only the three read shapes the
+engine issues on the check and lookup paths -- 'ReadObjectRelation',
+'ReadStartingWithUser', and 'ProbeTuples'. Writes, revision reads, maintenance
+operations, and the bulk drain 'ReadAllTuples' are forwarded to the upstream
+'TupleStore' handler unchanged. Entries are safe to reuse because every key
+includes the resolved revision supplied by the engine, so an entry can never
+serve rows from a different snapshot.
+
+'ReadAllTuples' is deliberately uncached rather than merely unhandled: an export
+reads each of its pages exactly once, so caching them buys nothing and would
+evict the hot check-path entries this cache exists to hold.
 
 A probe returns a bare row list rather than a page, because it is unpaginated by
 construction: it asks for the rows naming specific subjects, and there are as many

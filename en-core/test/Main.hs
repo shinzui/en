@@ -2175,6 +2175,9 @@ interpretFixtureTupleStore countRef errorObject tuples =
                     , tuple.subject `elem` query.querySubjects
                     ]
                 )
+        ReadAllTuples _ limit cursor -> do
+            countRead
+            pure (pageTuples limit cursor tuples)
         ProbeTuples _ object relation subjects -> do
             countRead
             if Just object == errorObject

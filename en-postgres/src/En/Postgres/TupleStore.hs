@@ -125,6 +125,9 @@ interpretTupleStorePostgres config readOptimizedRevision =
         ReadStartingWithUser revision query -> do
             cursorId <- resolveCursor query.queryCursor
             orThrow =<< runSession (readStartingWithUserSession revision query cursorId)
+        ReadAllTuples revision limit cursor -> do
+            cursorId <- resolveCursor cursor
+            orThrow =<< runSession (readAllTuplesSession revision limit cursorId)
         ProbeTuples revision object relation subjects ->
             orThrow =<< runSession (probeTuplesSession revision object relation subjects)
         ApplyTupleWrites request -> do
@@ -427,6 +430,12 @@ readObjectRelationSession :: Revision -> ObjectRef -> RelationName -> Int -> Int
 readObjectRelationSession revision object relation limit cursorId = do
     let limitPlusOne = fromIntegral (max 0 limit + 1)
     rows <- Session.statement (objectReadParams revision object relation limitPlusOne cursorId) readObjectRelationStatement
+    pure (pageFromRows cursorId limit rows)
+
+readAllTuplesSession :: Revision -> Int -> Int64 -> Session TuplePage
+readAllTuplesSession revision limit cursorId = do
+    let limitPlusOne = fromIntegral (max 0 limit + 1)
+    rows <- Session.statement (allReadParams revision limitPlusOne cursorId) readAllTuplesStatement
     pure (pageFromRows cursorId limit rows)
 
 {- | Answer a point-membership question with one indexed read.
@@ -1093,6 +1102,49 @@ readObjectRelationEncoder =
         <> ((\params -> params.relation) >$< Encoders.param (Encoders.nonNullable Encoders.text))
         <> ((\params -> params.limit) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
         <> ((\params -> params.cursor) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+
+data AllReadParams = AllReadParams
+    { revision :: !Text
+    , limit :: !Int64
+    , cursor :: !Int64
+    }
+
+allReadParams :: Revision -> Int64 -> Int64 -> AllReadParams
+allReadParams revision limitPlusOne cursorId =
+    AllReadParams
+        { revision = revision.revisionEncoding
+        , limit = limitPlusOne
+        , cursor = cursorId
+        }
+
+{- | Every tuple live at the revision, one keyset page at a time.
+
+'readObjectRelationStatement' without the object and relation predicates. What is
+left is a range scan over @relation_tuple@'s primary key, so the drain needs no
+index of its own and none of the ones docs/plans/49 is reviewing.
+
+Visibility is the same @pg_visible_in_snapshot@ pair every read uses, so a page
+taken long after the revision was resolved still excludes every row committed
+since — which is what makes a paged export a snapshot rather than a smear.
+-}
+readAllTuplesStatement :: Statement AllReadParams [TupleRow]
+readAllTuplesStatement =
+    Statement.preparable
+        """
+        SELECT id, object_type, object_id, relation, subject_type, subject_id, subject_relation,
+               caveat_name, caveat_payload, created_xid::text, deleted_xid::text
+        FROM relation_tuple
+        WHERE id > $3
+          AND pg_visible_in_snapshot(created_xid, $1::pg_snapshot)
+          AND (deleted_xid IS NULL OR NOT pg_visible_in_snapshot(deleted_xid, $1::pg_snapshot))
+        ORDER BY id ASC
+        LIMIT $2
+        """
+        ( ((\params -> params.revision) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+            <> ((\params -> params.limit) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+            <> ((\params -> params.cursor) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+        )
+        (Decoders.rowList tupleRowDecoder)
 
 data ProbeParams = ProbeParams
     { revision :: !Text

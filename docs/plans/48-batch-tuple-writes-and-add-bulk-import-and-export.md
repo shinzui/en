@@ -46,7 +46,7 @@ This section must always reflect the actual current state of the work.
 - [x] Add `batchTouchReplaceStatement`, `batchInsertTupleStatement`, `batchDeleteTupleStatement`, and the batched verify statement (`batchUnconvergedStatement`) to `en-postgres/src/En/Postgres/TupleStore.hs`; rewrite the write session over them. — 2026-07-09
 - [x] Prove batched-vs-sequential equivalence in `en-postgres/integration-test/Main.hs` (docs/plans/45's five touch scenarios rerun unchanged through the batched path, plus `runBatchWriteScenario` and `runBatchTouchRaceScenario`). — 2026-07-09
 - [x] Each new scenario run once against the bug it claims to catch (see Surprises & Discoveries). — 2026-07-09
-- [ ] Add the `ReadAllTuples` effect operation to `en-core/src/En/Effect/TupleStore.hs`, implement it in the PostgreSQL and in-memory interpreters, and confirm the cached interposer passes it through.
+- [x] Add the `ReadAllTuples` effect operation to `en-core/src/En/Effect/TupleStore.hs`, implement it in the PostgreSQL and in-memory interpreters, and confirm the cached interposer passes it through. — 2026-07-09. `runReadAllTuplesScenario` proves the drain is complete and snapshot-isolated; the write constructors are byte-identical to their pre-plan state (`git diff bf9cd88 -- en-core/src/En/Effect/TupleStore.hs`).
 - [ ] Add subcommand dispatch to `en-server/app/Main.hs` and implement `import` (NDJSON in, anchored batches, final token printed) and `export` (NDJSON out at a single revision).
 - [ ] Round-trip test: export a seeded dev database, import into a fresh database, compare sorted NDJSON.
 - [ ] Measure: statement-log counts for a 100-tuple write before/after; 100k-tuple import wall-clock and rate; record both in Outcomes & Retrospective.
