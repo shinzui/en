@@ -664,7 +664,7 @@ evalThisMemo cacheOps graph revision subject object relation state memo
                     then pure (Right RAllowed, memo, Untainted)
                     else do
                         (recursedResiduals, memo', taint) <- foldM rowResidual ([], memo, mempty) usersetRows
-                        pure (Decision.rUnion <$> sequence (probeResiduals <> recursedResiduals), memo', taint)
+                        pure (Decision.rUnion <$> sequence (probeResiduals <> reverse recursedResiduals), memo', taint)
   where
     candidates = subjectsWithWildcard subject
 
@@ -723,11 +723,14 @@ evalThisMemo cacheOps graph revision subject object relation state memo
             tuple.object `elem` groupObjects
                 && isNothing tuple.caveat
 
+    -- Residuals accumulate reversed and are flipped back by the caller: appending
+    -- one row at a time to the tail copies the list per row, and a relation
+    -- attached to n groups then costs n^2 conses to fold.
     rowResidual (residuals, memo', taint) TupleRow{tuple} =
         case tuple.subject of
             SubjectSet subjectObject subjectRelation -> do
                 (residual, memo'', rowTaint) <- evalRelationMemo cacheOps graph revision subject subjectObject subjectRelation state memo'
-                pure (residuals <> [residual >>= residualGate graph tuple.caveat], memo'', taint <> rowTaint)
+                pure ((residual >>= residualGate graph tuple.caveat) : residuals, memo'', taint <> rowTaint)
             _ ->
                 pure (residuals, memo', taint)
 
@@ -763,18 +766,21 @@ evalTupleToUsersetMemo ::
 evalTupleToUsersetMemo cacheOps graph revision subject object tuplesetRelation computedRelation state memo = do
     rows <- drainObjectRelation state.budget.pageLimit revision object tuplesetRelation
     (residuals, memo', taint) <- foldM rowResidual ([], memo, mempty) rows
-    pure (Decision.rUnion <$> sequence residuals, memo', taint)
+    pure (Decision.rUnion <$> sequence (reverse residuals), memo', taint)
   where
+    -- Reversed accumulation, as in 'evalThisMemo'. Row order is restored before
+    -- 'sequence' runs, because 'sequence' reports the first 'Left' it meets and
+    -- which row that is should not depend on how the list was built.
     rowResidual (residuals, memo', taint) TupleRow{tuple} =
         case tuple.subject of
             SubjectId subjectObject -> do
                 (residual, memo'', rowTaint) <- evalRelationMemo cacheOps graph revision subject subjectObject computedRelation state memo'
-                pure (residuals <> [applyRowGate tuple residual], memo'', taint <> rowTaint)
+                pure (applyRowGate tuple residual : residuals, memo'', taint <> rowTaint)
             SubjectSet subjectObject subjectRelation -> do
                 (residual, memo'', rowTaint) <- evalRelationMemo cacheOps graph revision subject subjectObject subjectRelation state memo'
-                pure (residuals <> [applyRowGate tuple residual], memo'', taint <> rowTaint)
+                pure (applyRowGate tuple residual : residuals, memo'', taint <> rowTaint)
             SubjectWildcard _ ->
-                pure (residuals <> [Right RDenied], memo', taint)
+                pure (Right RDenied : residuals, memo', taint)
 
     applyRowGate tuple =
         (>>= residualGate graph tuple.caveat)
@@ -828,11 +834,14 @@ drainObjectRelation ::
 drainObjectRelation pageLimit revision object relation =
     drain Nothing []
   where
+    -- Pages accumulate reversed and are flattened once. Appending each page to the
+    -- tail copies everything read so far, so draining k pages copies O(k^2) rows --
+    -- exactly the wide relations the probe exists to make cheap.
     drain cursor acc = do
         page <- readObjectRelation revision object relation pageLimit cursor
-        let acc' = acc <> page.rows
+        let acc' = page.rows : acc
         case page.state of
-            Exhausted -> pure acc'
+            Exhausted -> pure (concat (reverse acc'))
             HasMore next -> drain (Just next) acc'
             Truncated next -> drain (Just next) acc'
 
@@ -865,9 +874,9 @@ drainStartingWithUser pageLimit revision objectType relation subjects =
                     , queryLimit = pageLimit
                     , queryCursor = cursor
                     }
-        let acc' = acc <> page.rows
+        let acc' = page.rows : acc
         case page.state of
-            Exhausted -> pure acc'
+            Exhausted -> pure (concat (reverse acc'))
             HasMore next -> drain (Just next) acc'
             Truncated next -> drain (Just next) acc'
 

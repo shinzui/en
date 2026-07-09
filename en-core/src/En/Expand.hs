@@ -325,12 +325,15 @@ readObjectRows ::
 readObjectRows pageLimit revision object relation =
     drain Nothing []
   where
+    -- Reversed page accumulation, flattened once. Mirrors the drain loops in
+    -- "En.Check" and "En.Lookup".
     drain cursor acc = do
         page <- readObjectRelation revision object relation pageLimit cursor
+        let acc' = page.rows : acc
         case page.state of
-            Exhausted -> pure (Right (acc <> page.rows))
-            HasMore next -> drain (Just next) (acc <> page.rows)
-            Truncated next -> drain (Just next) (acc <> page.rows)
+            Exhausted -> pure (Right (concat (reverse acc')))
+            HasMore next -> drain (Just next) acc'
+            Truncated next -> drain (Just next) acc'
 
 lookupRelation :: ReachabilityGraph -> ObjectType -> RelationName -> Either EnError Relation
 lookupRelation graph objectType relation =

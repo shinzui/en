@@ -782,6 +782,8 @@ readRowsForSubjects _ _ _ _ _ [] =
 readRowsForSubjects pageLimit deadline revision objectType relation subjects =
     drain Nothing []
   where
+    -- Reversed page accumulation, flattened once. Mirrors the drain loops in
+    -- "En.Check" and "En.Expand".
     drain cursor acc = do
         page <-
             readStartingWithUser
@@ -793,10 +795,11 @@ readRowsForSubjects pageLimit deadline revision objectType relation subjects =
                     , queryLimit = pageLimit
                     , queryCursor = cursor
                     }
+        let acc' = page.rows : acc
         case page.state of
-            Exhausted -> pure (Right (acc <> page.rows))
-            HasMore next -> continue next (acc <> page.rows)
-            Truncated next -> continue next (acc <> page.rows)
+            Exhausted -> pure (Right (concat (reverse acc')))
+            HasMore next -> continue next acc'
+            Truncated next -> continue next acc'
 
     continue next acc = do
         requireBudget deadline
