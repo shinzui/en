@@ -73,7 +73,7 @@ merely because they touch the same lines, not because of real artifact dependenc
 | EP-33 | Add caller authentication and rate limiting to en-server | docs/plans/33-add-caller-authentication-and-rate-limiting-to-en-server.md | None | None | Complete |
 | EP-34 | Pool database connections in en-server | docs/plans/34-pool-database-connections-in-en-server.md | None | None | Complete |
 | EP-35 | Version the wire contract and type the error model | docs/plans/35-version-the-wire-contract-and-type-the-error-model.md | None | None | Complete |
-| EP-36 | Add health endpoints, graceful shutdown, and observability | docs/plans/36-add-health-endpoints-graceful-shutdown-and-observability.md | None | EP-34, EP-35 | In Progress |
+| EP-36 | Add health endpoints, graceful shutdown, and observability | docs/plans/36-add-health-endpoints-graceful-shutdown-and-observability.md | None | EP-34, EP-35 | Complete |
 | EP-37 | Schedule background maintenance for reaping and transaction pruning | docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md | None | EP-34 | Not Started |
 | EP-38 | Validate configuration and persist datastore identity | docs/plans/38-validate-configuration-and-persist-datastore-identity.md | None | None | Not Started |
 
@@ -152,8 +152,8 @@ recovery by the same horizon.
 - [x] EP-35: versioned path prefix and stable field names on all endpoints; constructor tags gone
 - [x] EP-35: typed error envelope with machine-readable codes; 4xx/5xx split correct; OpenAPI document served
 - [x] EP-35: handler errors are MultiVerb response alternatives, documented per operation in OpenAPI
-- [ ] EP-36: /healthz and /readyz respond correctly; SIGTERM drains in-flight requests
-- [ ] EP-36: structured request logs and a metrics endpoint (including cache stats) exposed
+- [x] EP-36: /healthz and /readyz respond correctly; SIGTERM drains in-flight requests
+- [x] EP-36: structured request logs and a metrics endpoint (including cache stats) exposed
 - [ ] EP-37: reaper and en_transaction pruning run on a schedule with batched deletes
 - [ ] EP-37: en_transaction horizon query served by an index
 - [ ] EP-38: datastore identity minted once, persisted, and used in tokens
@@ -310,6 +310,70 @@ From EP-35 (2026-07-08), affecting sibling plans:
   A scraper must authenticate. EP-36 should not add the document route to the exempt set.
 
 
+From EP-36 (2026-07-08), affecting sibling plans:
+
+- **`Warp.runSettings` now returns on SIGTERM/SIGINT, and the `finally` in
+  `en-server/app/Main.hs` is live.** `serve` installs a shutdown handler through
+  `Warp.setInstallShutdownHandler` and caps the drain at 30 s; `main` still ends with
+  ``serve tlsConfig port wrappedApp `finally` Pool.release pool``. EP-34 predicted this
+  moment: the pool release actually runs now. **EP-37 must cancel its maintenance thread
+  in that same `finally`**, or a drained server will sit waiting on a background loop.
+
+- **The middleware stack is fixed and ordered, outermost first:** `authMiddleware` →
+  `rateLimit` → `requestIdMiddleware` → `requestLogger` → `metricsMiddleware` →
+  `healthRoutes` → `metricsRoute` → `appWithOpenApi serverEnv`. Anything EP-38 adds
+  should read its knobs at startup and not insert a layer without deciding where it sits
+  relative to authentication. Note the consequence EP-33 anticipated: the `401`/`403`/`429`
+  that auth and rate limiting short-circuit are outside the logger and the metrics
+  recorder, so they are neither logged nor counted.
+
+- **`en-server` gained three modules and two dependencies — but not `wai-extra`.**
+  `app/Health.hs`, `app/Observability.hs`, `app/Metrics.hs`; `unix` (signals) and `uuid`
+  (request ids). EP-36's plan text called for `wai-extra`'s `RequestLogger`; it was
+  rejected on inspection because `formatAsJSON` serializes **every request header**,
+  redacting only `Cookie`, which would have written each caller's
+  `Authorization: Bearer <secret>` to stdout on every request — and because the carrier
+  behind `CustomOutputFormatWithDetails` buffers the entire request body and response.
+  **Any sibling plan reaching for `wai-extra`'s request logger should not.** The
+  hand-rolled logger in `Observability.hs` is ~30 lines.
+
+- **`hSetBuffering stdout LineBuffering` is done**, discharging the warning EP-33 raised
+  and EP-34 confirmed. Startup lines and request logs now survive redirection to a file
+  and a SIGTERM. Any plan adding startup output can rely on it.
+
+- **The stale-connection cost EP-34 documented is real, and one retry hides it.**
+  `checkReady` pings PostgreSQL twice before reporting unready. Verified: after
+  `pg_ctl stop` then `pg_ctl start`, the very first `/readyz` returned `200`. **EP-37's
+  maintenance loop should expect the same failure on its first session after a database
+  restart** and simply run again at its next interval rather than treating one failure
+  as fatal.
+
+- **Supervise a pid, not a wrapper.** `process-compose.yaml` now runs `en-server` by
+  `exec`ing the binary (`… && exec "$(cabal list-bin en-server)"`). With
+  `command: "just start-server"`, process-compose signalled the process group, `just` and
+  `cabal run` died first, the recorded exit code was the wrapper's `143` instead of the
+  server's `0`, and the drain line was truncated mid-write. **Any plan adding a
+  supervised process should exec its binary.** Also: `.dev/process-compose.log` stays
+  empty in detached mode — read process output with
+  `process-compose … process logs <name>`.
+
+- **`just start-and-test` no longer starts a server**; it waits on `/healthz` and drives
+  the process-compose `en-server`. Adding the supervised process made the old recipe bind
+  port 8080 twice. `just start-server` still runs a standalone server. **EP-38 uses
+  `just start-and-test` as a regression gate** and should know its dev key is
+  `dev:dev-secret-0123456789`, now set in `process-compose.yaml` rather than the recipe.
+
+- **`En.Cache` sets `NoFieldSelectors`**, so `stats.hits` requires
+  `import En.Cache (CacheStats (..))`, not `(CacheStats)`. Importing only the type gives
+  a confusing `No instance for HasField "hits"`. The same trap waits in any module that
+  disables field selectors.
+
+- **`405` and `415` still return empty bodies.** EP-35 handed this to EP-36 as the owner
+  of the middleware stack; EP-36 declined it deliberately. An outermost rewrite of
+  bodyless 4xx would catch any future bodyless response too, and neither status is one a
+  client branches on. It remains open, and cheap, for whoever wants uniformity.
+
+
 ## Decision Log
 
 - Decision: Group error typing, wire versioning, and OpenAPI generation into one plan (EP-35).
@@ -346,6 +410,31 @@ From EP-35 (2026-07-08), affecting sibling plans:
   (`shinzui/servant-openapi-hs`) carries a MultiVerb `HasOpenApi` port. `MultiVerb` does
   not subsume EP-33's middleware errors or Servant's routing errors, so the envelope and
   `ErrorFormatters` remain load-bearing.
+  Date: 2026-07-08
+
+- Decision: Reject `wai-extra`'s `RequestLogger` for EP-36 and hand-roll the request
+  logger instead, contrary to that plan's Interfaces and Dependencies section.
+  Rationale: `formatAsJSON` serializes every request header and redacts only `Cookie`,
+  so en — which authenticates with `Authorization: Bearer <secret>` — would have written
+  a working credential to stdout on every request. It also logs full request bodies, which
+  name subjects and objects. Independently, `customMiddlewareWithDetails`, the carrier a
+  custom formatter runs under, slurps the request body into a list and accumulates the
+  entire response into an `IORef Builder` before responding; neither is configurable, and
+  both are a full copy of every request and response on the authorization hot path. The
+  line en wants — time, request id, caller, method, path, status, duration — is ~30 lines
+  of `Middleware`, so the dependency bought nothing and cost a credential leak.
+  Date: 2026-07-08
+
+- Decision: Supervise the `en-server` binary directly in `process-compose.yaml` rather
+  than through `just start-server`, and let `just start-and-test` drive the supervised
+  server rather than starting its own.
+  Rationale: A process supervisor's contract is with a pid. Nesting the server under
+  `just` and `cabal run` meant SIGTERM killed the wrappers first: process-compose recorded
+  the wrapper's exit code `143` instead of the server's `0`, and closed the log pipe while
+  the server was still writing its drain line. `exec`ing the binary makes the supervised
+  pid the server. Separately, adding the process while `start-and-test` still spawned its
+  own server would have bound port 8080 twice; reusing the supervised server is also what
+  makes the readiness probe load-bearing rather than decorative.
   Date: 2026-07-08
 
 

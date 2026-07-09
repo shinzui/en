@@ -44,18 +44,21 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: `/healthz` and `/readyz` served from a WAI layer in
+- [x] M1 (2026-07-08): `/healthz` and `/readyz` served from a WAI layer in
   `en-server/app/Health.hs`; readiness pings PostgreSQL through the `Database` effect;
   Justfile readiness loop switched to `/healthz`.
-- [ ] M2: graceful shutdown via `setGracefulShutdownTimeout` +
-  `setInstallShutdownHandler` + a SIGTERM handler; clean-exit transcript captured.
-- [ ] M3: request-id middleware and JSON request logging (wai-extra) wired in the
-  master-plan middleware order.
-- [ ] M4: `/metrics` endpoint with request counters, latency sum/count, and cache
-  stats; `en-server/app/Metrics.hs`.
-- [ ] M5: `en-server` process added to `process-compose.yaml` with an `http_get`
-  readiness probe on `/readyz`; docs updated.
-- [ ] Final validation transcript recorded in Outcomes.
+- [x] M2 (2026-07-08): graceful shutdown via `setGracefulShutdownTimeout` +
+  `setInstallShutdownHandler` + SIGTERM/SIGINT handlers; clean-exit transcript
+  captured in Outcomes.
+- [x] M3 (2026-07-08): request-id middleware and JSON request logging wired in the
+  master-plan middleware order. Logger is hand-rolled, **not** wai-extra — see
+  Surprises & Discoveries.
+- [x] M4 (2026-07-08): `/metrics` endpoint with request counters, latency sum/count,
+  and cache stats; `en-server/app/Metrics.hs`.
+- [x] M5 (2026-07-08): `en-server` process added to `process-compose.yaml` with an
+  `http_get` readiness probe on `/readyz`; `start-and-test` reworked to use it; docs
+  updated.
+- [x] Final validation transcript recorded in Outcomes.
 
 
 ## Surprises & Discoveries
@@ -63,7 +66,71 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- **wai-extra's `formatAsJSON` would have logged every caller's bearer secret.** M3
+  told the implementer to check whether the formatter emits request headers and, if
+  *absent*, fall back to a custom formatter. Headers turned out to be *present* — and
+  that is the problem, not the fix. `Network.Wai.Middleware.RequestLogger.JSON`
+  serializes all request headers through `requestHeadersToJSON`, whose only redaction
+  is `hToJ ("Cookie", _) = … "-RDCT-"`. en authenticates with
+  `Authorization: Bearer <secret>`, so every request would have written a working
+  credential to stdout. The same formatter also logs the full request body (`"body"
+  .= … S8.concat reqBody`) — en request bodies name subjects and objects — and the
+  response body for any status ≥ 400.
+
+- **wai-extra's custom-formatter carrier buffers both bodies.** Independently of the
+  leak, `customMiddlewareWithDetails` (the function `CustomOutputFormatWithDetails`
+  selects) calls `getRequestBody` to slurp the request into a `[ByteString]` and
+  `recordChunks` to accumulate the *entire response* into an `IORef Builder` before
+  responding. Neither is configurable. On an authorization hot path that is a full
+  copy of every request and response, to produce a line that needs neither.
+
+  Both findings together made the plan's fallback branch the only viable one, and made
+  the wai-extra dependency pointless: `Observability.hs` hand-rolls a ~30-line logger
+  with no new dependency. `wai-extra` was therefore never added to `en-server`'s
+  `build-depends`, contrary to the plan's Interfaces and Dependencies section.
+
+- **The double-ping readiness probe was necessary and sufficient.** EP-34 warned that
+  after a PostgreSQL restart the first session on each stale pooled connection fails at
+  the statement level and returns to the pool. `checkReady` pings twice before
+  reporting unready. Verified: with the server up and warm connections established,
+  `pg_ctl stop` → `readyz=503`; `pg_ctl start` → the very first `/readyz` returned
+  `200`, and the next real `/v1/check` returned `200`. A single-shot probe would have
+  reported unready against a healthy database and consumed the free failure.
+
+- **`process-compose` supervising `just start-server` breaks graceful shutdown.** With
+  `command: "just start-server"`, process-compose signals the process group; `just` and
+  `cabal run` die instantly, process-compose records the *wrapper's* exit code `143`,
+  and it stops draining the log pipe while en-server is mid-write — the captured
+  output ended at the two characters `en`, the start of
+  `en-server: drained in-flight requests`. Changing the process command to
+  `just run-migrations && cabal build -v0 en-server && … exec "$(cabal list-bin en-server)"`
+  makes the supervised pid the server itself: exit code `0`, full drain line present in
+  `process-compose process logs en-server`. **Any sibling plan adding a supervised
+  process should exec its binary rather than nesting it under `just`/`cabal run`.**
+
+- **`.dev/process-compose.log` does not contain process stdout in detached mode.** It
+  stayed zero-length across a full run while `process-compose … process logs en-server`
+  showed everything. Use the latter to inspect a supervised process; the file is not a
+  reliable signal, which is why `start-and-test` reports failures through
+  `process logs` rather than by `tail`ing a file.
+
+- **Adding `en-server` to `process-compose.yaml` collided with `just start-and-test`,**
+  which called `process-up` and then bound its own server to the same port. Rather than
+  disabling the supervised process, `start-and-test` now waits on `/healthz` and drives
+  the supervised server. This is what M5's Decision Log intended when it said the probe
+  should replace "the current curl-accepts-404 loop"; the plan text simply did not
+  notice the two servers would coexist.
+
+- **`En.Cache` sets `NoFieldSelectors`, so `stats.hits` needs the fields imported.**
+  `import En.Cache (CacheStats)` compiles but yields
+  `No instance for HasField "hits" CacheStats Int`; `CacheStats (..)` is required to
+  bring the field names into scope. Relevant to any plan reading a record from a module
+  that disables field selectors.
+
+- **The metrics scrape never counts itself.** `metricsRoute` reads the counter `IORef`
+  before it responds, and `metricsMiddleware` records after. So
+  `en_http_requests_total{path="metrics"}` lags by exactly one scrape. Harmless, but it
+  looks like an off-by-one if you compare a single scrape against the request log.
 
 
 ## Decision Log
@@ -135,6 +202,64 @@ Record every decision made while working on the plan.
   current curl-accepts-404 loop in `Justfile:start-and-test` (which this plan also
   fixes to hit `/healthz` and require 200).
   Date: 2026-07-07
+  **Superseded 2026-07-08**: the probe and `restart: on_failure` stand, but the command
+  is now `just run-migrations && cabal build -v0 en-server && … exec "$(cabal list-bin
+  en-server)"`. Supervising `just` meant SIGTERM killed a wrapper, not the server: the
+  recorded exit code was `143` and the drain line was truncated mid-write. See
+  Surprises & Discoveries.
+
+- Decision: Hand-roll the request logger; do not depend on `wai-extra`.
+  Rationale: The plan's M3 offered a custom `OutputFormatterWithDetails` as a fallback
+  if `formatAsJSON` omitted headers. It does not omit them — it emits *all* of them,
+  redacting only `Cookie`, which would publish every caller's
+  `Authorization: Bearer <secret>` to stdout. It also logs full request bodies. And the
+  carrier that a custom formatter runs under, `customMiddlewareWithDetails`,
+  unconditionally buffers the request body and accumulates the whole response into an
+  `IORef Builder`. The wanted line — time, request id, caller, method, path, status,
+  duration — is ~30 lines of `Middleware` with no new dependency, no body buffering,
+  and no credential in the log. Recorded alternative: `wai-extra` with a custom
+  formatter, rejected for the buffering alone.
+  Date: 2026-07-08
+
+- Decision: `checkReady` pings PostgreSQL twice before reporting unready, rather than
+  tracking probe failures across calls.
+  Rationale: EP-34 recorded that a stale pooled connection fails a *statement*-level
+  error on its first use, which `hasql-pool` does not treat as grounds to discard it.
+  A single-shot probe therefore reports unready against a healthy database after a
+  restart, and burns the failure a real request would otherwise have absorbed. Retrying
+  inside one probe is stateless, bounded at two sessions, and keeps `/readyz` a pure
+  function of current database reachability. Recorded alternative: a failure counter in
+  an `IORef` that flips unready only after N consecutive failures — more state, and it
+  would delay the true-negative case (database genuinely down) by N probe periods.
+  Date: 2026-07-08
+
+- Decision: `metricsRoute` takes `[(Text, IO CacheStats)]` rather than the two concrete
+  `Cache` types named in the plan's Interfaces section.
+  Rationale: The renderer needs only a name and a way to read four counters. The
+  concrete signature would drag `En.Check.CheckDecision`, `En.Cache.SubproblemKey`,
+  `En.Cache.TupleReadKey`, and `En.Effect.TupleStore.TuplePage` into `Metrics.hs` to
+  say nothing extra, and would need editing every time a cache is added. `Main.hs`
+  passes `[("tuple_read", cacheStats tupleReadCache), ("decision", cacheStats
+  decisionCache)]`.
+  Date: 2026-07-08
+
+- Decision: An inbound `X-Request-Id` is accepted only if it is 1–128 bytes of
+  printable non-space ASCII; otherwise it is replaced with a fresh UUID.
+  Rationale: The plan said to reuse an inbound id and to tell operators to strip it at
+  an untrusted edge. Both still hold, but the value lands verbatim in a JSON log line,
+  and a caller who can put a newline in it can forge log entries in any line-oriented
+  consumer. Validating is cheap and cannot break a legitimate proxy: UUIDs, hex, and
+  base64url ids all pass.
+  Date: 2026-07-08
+
+- Decision: `just start-and-test` drives the process-compose `en-server` instead of
+  spawning its own.
+  Rationale: Adding `en-server` to `process-compose.yaml` while `start-and-test` still
+  called `process-up` and then bound port 8080 itself made the two collide. Reusing the
+  supervised server is what makes the readiness probe load-bearing rather than
+  decorative, and it deletes the `.dev/en-server.log` side channel. `just start-server`
+  remains for running a server outside the supervisor.
+  Date: 2026-07-08
 
 
 ## Outcomes & Retrospective
@@ -142,7 +267,147 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Completed 2026-07-08. All five milestones landed, in two commits: the modules and
+`Main.hs` wiring, then the orchestration and documentation. Every acceptance criterion
+in Validation and Acceptance was exercised against a running server.
+
+**Against the original purpose.** An orchestrator can now ask both questions and get
+distinct answers; SIGTERM drains instead of dropping in-flight authorization checks;
+every request produces a correlatable structured log line; and the cache counters the
+engine already maintained are exported. The one behavior the plan did not anticipate is
+that it *removed* a credential leak it would otherwise have introduced (see Surprises).
+
+### Validation transcript
+
+Probes, and readiness across a PostgreSQL restart (M1):
+
+```text
+$ curl -s localhost:8080/healthz
+{"status":"ok"}
+$ curl -s -o /dev/null -w "readyz=%{http_code}\n" localhost:8080/readyz
+readyz=200
+$ pg_ctl stop -D "$PGDATA"
+$ curl -s -w "\nbody: %{http_code}\n" localhost:8080/readyz
+{"code":"store_error","message":"database unreachable","retryable":true}
+body: 503
+$ curl -s -o /dev/null -w "healthz_while_db_down=%{http_code}\n" localhost:8080/healthz
+healthz_while_db_down=200
+$ pg_ctl start -w -l "$PGLOG" …
+$ for i in 1 2 3; do curl -s -o /dev/null -w "readyz_attempt$i=%{http_code}\n" localhost:8080/readyz; done
+readyz_attempt1=200
+readyz_attempt2=200
+readyz_attempt3=200
+```
+
+Readiness recovered on the *first* probe: the double ping absorbed the stale-connection
+failure EP-34 predicted. `/metrics` without a key returns `401`, confirming it is not
+in the exempt set.
+
+Graceful shutdown, SIGTERM sent 20 ms into a ~45 ms 1000-pair `batch-check` (M2):
+
+```text
+$ kill -TERM "$PID"    # 20ms after the request was issued
+SIGTERM sent mid-flight
+new_request_after_sigterm=refused
+in-flight result: inflight=200 time=0.042939s
+$ tail -1 server.log
+en-server: drained in-flight requests; shutting down
+$ wait "$PID"; echo "EXIT_CODE=$?"
+EXIT_CODE=0
+```
+
+The in-flight request completed with `200` while a connection opened after the signal
+was refused. Under process-compose, `process stop en-server` records `exit=0` and
+`process logs en-server` ends with the drain line.
+
+Request logging and request ids (M3). Two requests, one carrying
+`X-Request-Id: test-123`:
+
+```text
+{"caller":"dev","durationMs":2.399,"method":"POST","path":"/v1/check","requestId":"test-123","status":200,"time":"2026-07-09T01:29:12.087595Z"}
+{"caller":"dev","durationMs":2.573,"method":"GET","path":"/v1/openapi.json","requestId":"b0b5657e-58f2-4bd3-8fdb-e1031a39ba79","status":200,"time":"2026-07-09T01:29:12.11255Z"}
+```
+
+Both `X-Request-Id` values were echoed in the response headers (`test-123` verbatim,
+the UUID as generated). Probe requests produced zero log lines, and
+`grep -c 'dev-secret' server.log` returned `0` — the bearer secret never reaches the
+log.
+
+Metrics (M4), after the smoke test plus a repeated `check` with the decision cache
+enabled:
+
+```text
+# TYPE en_http_requests_total counter
+en_http_requests_total{path="check",status="2xx"} 1
+en_http_requests_total{path="healthz",status="2xx"} 1
+en_http_requests_total{path="openapi.json",status="2xx"} 1
+en_http_requests_total{path="readyz",status="2xx"} 1
+…
+en_cache_hits_total{cache="decision"} 1
+en_cache_misses_total{cache="decision"} 2
+en_cache_inserts_total{cache="decision"} 2
+en_cache_evictions_total{cache="decision"} 0
+```
+
+The decision-cache hit appeared only after the check was repeated, as acceptance 5
+requires.
+
+Orchestration (M5), from a clean state:
+
+```text
+$ just process-down && just process-up
+$ process-compose --unix-socket .dev/process-compose.sock process list
+create_schema   status=Completed  ready=-
+en-server       status=Running    ready=Ready
+postgres        status=Launched   ready=Ready
+sanity_check    status=Completed  ready=-
+$ just start-and-test
+server smoke test passed: allowed
+```
+
+The wait loop's failure path was exercised too — pointed at a dead port, the recipe
+prints the server's last log lines and exits non-zero rather than proceeding into a
+smoke test that would fail confusingly:
+
+```text
+$ EN_SERVER_URL=http://localhost:9999 just start-and-test
+EXIT=1
+error: recipe `start-and-test` failed on line 52 with exit code 1
+```
+
+Regressions (acceptance 7): `cabal build all` clean, `cabal test en-servant` PASS,
+`just start-and-test` passes.
+
+### Gaps
+
+- **`405` and `415` still return empty bodies.** EP-35 left these for whoever owns the
+  middleware stack, which is this plan. Not fixed: an outermost WAI middleware that
+  rewrites bodyless 4xx into the envelope would also rewrite any future bodyless
+  response, and both statuses mean the caller used the wrong verb or content type — a
+  class of error no client branches on. Deliberately deferred, not overlooked.
+- **`401`/`403`/`429` are neither logged nor counted**, since EP-33's middlewares
+  short-circuit outside this plan's logger and metrics layers. Documented in
+  `docs/user/service-and-operations.md`. Moving the metrics layer outside auth would
+  fix the counting at the cost of letting an unauthenticated caller drive the
+  `path` label; the current split was kept for that reason.
+- **No latency histogram**, so no quantiles — only a sum and a count. `prometheus-client`
+  remains the named upgrade path.
+- **Request-id trust is a deployment property.** The header is validated but still
+  honored; the ops doc says to strip it at an untrusted edge.
+
+### Lessons
+
+Two of the plan's prescriptions were wrong in ways only contact with the code revealed,
+and both were about a dependency the plan named rather than about en. `wai-extra`'s JSON
+logger would have leaked bearer secrets; its custom-formatter carrier buffers both
+bodies. The plan's instruction to "verify this against the actual output" is what caught
+it — a plan that asserts a library's behavior should say how to check, and this one did.
+
+The other was structural: adding `en-server` to `process-compose.yaml` silently
+conflicted with a Justfile recipe that started its own server on the same port, and
+supervising `just start-server` rather than the binary made the exit code and the drain
+log lie. Both are the same lesson — a process supervisor's contract is with a *pid*, and
+wrappers break it.
 
 
 ## Context and Orientation
