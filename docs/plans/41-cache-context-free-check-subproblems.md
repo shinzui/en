@@ -71,10 +71,12 @@ context still gets `Conditional` from that same cached entry.
   `TuplePage`. Repeat probes hit; other revisions and other subject lists miss; a disabled
   cache is transparent. Verified by dropping the subject list from the key, which serves
   one subject's rows to another.
-- [ ] M5: stats and staleness proofs — hits across contexts asserted via `cacheStats`;
-  never-stale property tests; existing "context separates cache" test inverted
-  deliberately with a Decision Log entry.
-- [ ] Final: full suite green; Outcomes filled; master plan progress row updated.
+- [x] M5 (2026-07-08): `cacheStats` asserts hits across contexts on both the check and the
+  lookup path; never-stale asserted on both (expired ⇒ `Denied` / dropped from the page);
+  the "context separates cache" assertion inverted with a Decision Log entry; staleness
+  sweep done — no `CheckDecision` is stored anywhere in the workspace.
+- [x] Final (2026-07-08): `cabal build all && cabal test all` green across all seven suites.
+  Outcomes filled; master plan updated.
 
 
 ## Surprises & Discoveries
@@ -243,6 +245,50 @@ That is a privilege escalation through a read cache. Asserting only the read *co
 have missed it entirely (the count would have dropped to 2 and looked like a better cache).
 The test asserts the returned rows for every probe, which is why it catches it.
 
+**Most of lookup never touches the decision cache, which nearly made M5's consumer test
+vacuous (2026-07-08).** The plan says to assert that two cached lookups under different
+contexts show decision-cache hits. The first attempt used `intention#view` — the caveated
+relation everything else in this plan exercises — and failed:
+
+```text
+user error (cached lookup hits the decision cache across caveat contexts
+actual:   False)
+```
+
+`En.Lookup.evalRewrite` calls `confirmCandidates` (and hence `checkCached`) only for
+`Intersection` and `Exclusion` rewrites. Union, `This`, `ComputedUserset`, and arrows
+resolve candidates from the reverse index without ever confirming, so they never reach the
+decision cache. `intention#view` is `ComputedUserset "delegate"` over a bare `This`; its
+lookup performs zero cached checks, and a test asserting hits across contexts on it was
+asserting nothing.
+
+The fixture that actually proves the property is `room#enter = allowed - banned` (EP-40's
+exclusion fixture): an `Exclusion`, so candidates are confirmed, and `frank`'s grant is
+gated by the time-bounded `within_autonomy` caveat, so his answer genuinely varies with the
+request context. The test now shows `frank` admitted under two live contexts — the second
+hitting the decision cache, costing no more store reads than repeating the first — and
+dropped from the page entirely once his grant has expired, from those same entries.
+
+Two notes for later plans. Lookup's store reads do *not* fall to zero on a repeat, because
+lookup re-runs its whole candidate traversal every call; that is finding B7 and belongs to
+docs/plans/42. And EP-42, which changes how lookup confirmation calls `checkCached`, should
+re-verify `cached lookup hits the decision cache across caveat contexts` — this is the
+EP-41/EP-42 seam the master plan's Dependency Graph flags.
+
+**Staleness sweep: the workspace holds exactly two caches, and neither can go stale
+(2026-07-08).** Grepping every `Cache _ _` instantiation across `en-core/src`,
+`en-servant/src`, `en-server/app`, and `en-postgres/src` finds
+`Cache TupleReadKey TuplePage` and `Cache SubproblemKey ResidualDecision`. No
+`CheckDecision` is stored anywhere. Both key types pin the resolved revision, and neither
+key nor value now carries a caveat context, so there is no configuration in which a
+decision computed under one context is returned under another — a reviewer can confirm it
+by reading the two type definitions rather than by tracing control flow.
+
+One loose end, deliberately left: `En.Cache.DecisionKey` still has a `context` field. It is
+dead in production — its only consumer is `en-core/test/Main.hs`, which caches `Text` under
+it. It is not a staleness risk (a context-bearing key is safe, merely useless), and
+deleting it is docs/plans/44's call, as this plan's Decision Log already records.
+
 
 ## Decision Log
 
@@ -335,7 +381,63 @@ The test asserts the returned rows for every probe, which is why it catches it.
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Finding B6 is fixed. `en`'s decision cache no longer keys on the request's caveat context,
+so two requests that differ only in `current_time` share one entry. In the headline test,
+a caveated grant checked under four different contexts reads the tuple store exactly once:
+the second, third, and fourth contexts perform zero store reads and hit the cache. Before
+this plan the second context re-traversed the graph (4 reads where 2 sufficed), and since
+the canonical caveat is a time-bounded grant, virtually every real request missed.
+
+The mechanism is a symbolic evaluator. `En.Check` no longer sees the caveat context at all;
+every subproblem yields a `ResidualDecision` — the traversed answer with its caveats left as
+named gates joined by the union/intersection/exclusion structure the traversal found — and
+`En.Caveat.applyResidual` folds one request's context through it, once, at the top of
+`check`/`checkCached`/`checkMany`. The within-call memo and the cross-request cache store
+the same context-free value, so hits compose at any depth.
+
+Staleness is structurally impossible rather than merely avoided: no context-bearing value is
+stored under a context-free key, which a reviewer can verify by reading `SubproblemKey` and
+`ResidualDecision`. The tests assert both halves — the hit *and* that the answer still
+tracks the context. From one shared entry, a live context gets `Allowed`, an expired one
+gets `Denied`, and one missing the caveat's parameter gets its `Conditional` obligation. The
+same holds through lookup: `frank` may enter the room now and drops out of the lookup page
+once his grant expires.
+
+Along the way the tuple-read interposer learned to cache `ProbeTuples`, the integration
+point the master plan assigned here. A dedicated `ProbeReadKey` carrying revision, object,
+relation, and subject list; probe rows stored as an `Exhausted` `TuplePage` so probes share
+the one cache and its bound.
+
+What this cost, and it is worth stating plainly. Symbolic evaluation gives up the ability to
+ask "does this caveat pass?" mid-traversal, and three things follow. A caveated probe hit no
+longer short-circuits a union, so a caveated direct grant reads more than a bare one. The
+nested-group accelerator now demands uncaveated edges, falling back to recursion otherwise.
+And `Exclusion` evaluates its subtrahend unless the base is *symbolically* denied. None
+changes an answer. One answer does change: a relation holding a satisfied caveated grant
+beside a row naming a caveat the schema never declared now fails closed instead of returning
+`Allowed`. That is unrecoverable symbolically, and eager caveat-name validation buys the
+invariant that a cached residual names only definable caveats.
+
+The lesson worth carrying forward is about tests, not code. Every claim here was checked
+against a deliberately broken implementation, and twice the obvious test proved nothing. A
+cross-context cache test that asserts only the *hit* passes against a cache that stores the
+answer computed under the inserting request's context — the exact bug — and serves expired
+grants as `Allowed`. A probe-cache test that asserts only the *read count* passes against a
+key that omits the subject list, which returns one subject's rows to another; dropping the
+subject even makes the count look *better*. In both cases the sabotage is a plausible
+implementation, not a strawman, and only an assertion about the returned value catches it.
+The master plan's rule — a memo or cache test is not accepted until it has been observed to
+fail — earned its keep three times in one plan, and should be read to cover read caches and
+pure algebra too, not just the decision cache it was written for.
+
+What remains for later plans: lookup still recomputes its candidate traversal on every page
+(B7, docs/plans/42), which is why its store reads do not fall to zero on a repeat. EP-42
+changes how lookup confirmation calls `checkCached` and must re-verify
+`cached lookup hits the decision cache across caveat contexts`. `En.Cache.DecisionKey` is
+dead in production and still carries a `context` field; deleting it is docs/plans/44's call.
+And the `Untainted` precondition EP-40 established survives intact here — `evalRelationMemo`
+still refuses to memoize or cache a residual computed under a cycle cut, and making that
+residual context-free did not make it safer to cache.
 
 
 ## Context and Orientation
@@ -678,17 +780,29 @@ cabal test en-core:en-core-conformance
 cabal test en-servant:en-servant-tests          # M3/M5 consumer guard
 ```
 
-Expected shape of the M3 red run (before the re-keying, on the M2 tree the second
-context misses and re-reads):
+The M3 red run, as actually observed on the M2 tree before the re-keying. The second
+context missed and re-traversed the graph:
 
 ```text
-second context performs no store reads
-expected: 3
-actual:   6
+user error (different caveat context hits the decision cache
+expected: 2
+actual:   4)
 ```
 
-(Exact read counts depend on the post-EP-39 evaluator; record the real numbers.) Update
-this section with true transcripts as evidence while working.
+After the re-keying, that assertion and the four cross-context assertions beside it pass:
+one traversal, four contexts, four correct and distinct answers.
+
+The Final run, 2026-07-08:
+
+```text
+Test suite en-core-interface-tests: PASS
+Test suite en-core-conformance: PASS
+Test suite en-servant-tests: PASS
+Test suite en-biscuit-tests: PASS
+Test suite en-example-tests: PASS
+Test suite en-postgres-revision-tests: PASS
+Test suite en-postgres-integration-tests: PASS
+```
 
 
 ## Validation and Acceptance
@@ -755,3 +869,37 @@ algebra must mirror them exactly). Consumed by:
 docs/plans/44-make-evaluation-budgets-configurable-and-trim-hot-path-overhead.md
 (cache eviction/stat mechanics, potential `DecisionKey` deletion) and any future
 explain/trace work that wants the residual tree as its evidence structure.
+
+
+---
+
+Revision note (2026-07-08): EP-41 is implemented. All milestones are complete and the
+living sections record what actually happened rather than what was planned. Four changes to
+the plan as written, each with a Decision Log entry.
+
+The cache *value* type moved from M3 into M2, because no total
+`CheckDecision -> ResidualDecision` exists and a symbolic evaluator cannot consume a cache
+that stores `CheckDecision`; M2 does not compile without it. M3 kept only the key change,
+which turned out to be the cleaner review boundary anyway.
+
+`applyResidual` lives in `En.Caveat`, not `En.Decision`, exactly as M1's cycle note
+anticipated: it needs `evaluateCaveat`, and `En.Caveat` already imports `En.Decision`.
+`ResidualDecision` and its smart constructors are in `En.Decision`. No `.cabal` change was
+needed.
+
+Symbolic evaluation forced three deliberate behavior changes (caveated probe hits no longer
+short-circuit; the nested-group accelerator requires uncaveated edges; `Exclusion` evaluates
+its subtrahend unless the base is symbolically denied) and one deliberate answer change (an
+undefined caveat name beside a satisfied caveated grant now fails closed). None of the three
+changes an answer. The fourth is recorded in the Decision Log and pinned by two tests, and
+it does not disturb the case EP-39 introduced and EP-40 blessed.
+
+M5's lookup assertion had to change fixture. `intention#view` never reaches the decision
+cache at all, because `En.Lookup` confirms candidates only for `Intersection` and
+`Exclusion` rewrites; the assertion as planned was vacuous and failed. It now uses
+`room#enter`, an exclusion over a caveated grant, which demonstrates the property the plan
+wanted and a stronger one besides: an expired grant drops out of the lookup page. The
+plan's expectation that a repeated cached lookup performs "no new store reads" was simply
+wrong — lookup re-runs its candidate traversal every call, which is finding B7 and belongs
+to docs/plans/42. The assertion now pins what is true: a differing caveat context costs no
+*extra* reads over repeating the identical request.

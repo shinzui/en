@@ -1127,6 +1127,41 @@ testDecisionCache graph = do
     lookupStatsAfterSecond <- cacheStats cacheDecisions
     assertBool "cached lookup reuses decision cache for confirmations" (lookupStatsAfterSecond.hits > lookupStatsAfterFirst.hits)
 
+    {- Lookup confirms its candidates through 'checkCached', so it inherits
+    cross-context sharing -- and must inherit never-staleness with it.
+
+    The fixture is @room#enter = allowed - banned@, an exclusion, because only
+    'Intersection' and 'Exclusion' rewrites reach 'confirmCandidates' and therefore
+    the decision cache at all. @frank@ is conditionally allowed by a time-bounded
+    caveat and banned by nothing, so his answer genuinely varies with the request's
+    context: he may enter now and not once the grant expires.
+
+    Lookup still re-runs its own candidate traversal on every call (finding B7, which
+    docs/plans/42 fixes), so its store reads do not fall to zero the way a repeated
+    check's do. What must hold is narrower and still worth pinning: a request whose
+    caveat context differs costs no more store reads than repeating the identical
+    request, it hits the decision cache, and the shared entries still answer each
+    context on its own terms -- so an expired grant drops out of the page. -}
+    roomGraphForCache <- either (fail . show) pure (compileSchema roomSchema)
+    crossLookupEnv <- newCheckCacheEnv
+    crossLookupReads <- newIORef 0
+    let crossLookup context =
+            lookupCachedEngine consistencyStore (countingStoreFor crossLookupReads roomTuples) crossLookupEnv roomGraphForCache MinimizeLatency (lookupRequest (SubjectId frank) (RelationName "enter") (ObjectType "room") context (LookupLimit 10) Nothing)
+    assertEqual "cached lookup under context A admits frank" (Right (lookupPage [allowed roomR] LookupExhausted)) =<< crossLookup requestContext
+    lookupReadsAfterFirst <- readIORef crossLookupReads
+    assertEqual "cached lookup repeating context A admits frank" (Right (lookupPage [allowed roomR] LookupExhausted)) =<< crossLookup requestContext
+    lookupReadsAfterRepeat <- readIORef crossLookupReads
+    crossLookupStatsBefore <- cacheStats crossLookupEnv.cacheDecisions
+    assertEqual "cached lookup under a later context still admits frank" (Right (lookupPage [allowed roomR] LookupExhausted)) =<< crossLookup laterRequestContext
+    lookupReadsAfterContextChange <- readIORef crossLookupReads
+    crossLookupStatsAfter <- cacheStats crossLookupEnv.cacheDecisions
+    assertBool "cached lookup hits the decision cache across caveat contexts" (crossLookupStatsAfter.hits > crossLookupStatsBefore.hits)
+    assertEqual
+        "a different caveat context costs a cached lookup no extra store reads"
+        (lookupReadsAfterRepeat - lookupReadsAfterFirst)
+        (lookupReadsAfterContextChange - lookupReadsAfterRepeat)
+    assertEqual "an expired context drops frank from the shared entries" (Right (lookupPage [] LookupExhausted)) =<< crossLookup expiredContext
+
 newCheckCacheEnv :: IO CheckCacheEnv
 newCheckCacheEnv = do
     cache <- newCache CacheConfig{enabled = True, maxEntries = 100} :: IO (Cache SubproblemKey ResidualDecision)
