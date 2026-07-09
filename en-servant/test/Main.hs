@@ -4,6 +4,7 @@ module Main (main) where
 
 import Data.Aeson (FromJSON, ToJSON, decode, encode)
 import Data.ByteString.Lazy (ByteString)
+import Data.Functor ((<&>))
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -40,6 +41,7 @@ import En.Servant.API (
     CheckResponseWire (..),
     ConsistencyWire (..),
     DeleteTuplesRequestWire (..),
+    EnResult (..),
     Env (..),
     ExpandNodeWire (..),
     ExpandRequestWire (..),
@@ -92,11 +94,34 @@ main = do
                     , pair "bob" "view" "project-x"
                     ]
                 }
-    assertEqual "batch endpoint returns decisions in order" (Right BatchCheckResponseWire{decisions = [AllowedWire, DeniedWire]}) =<< runHandler (batch request)
+    assertEqual
+        "batch endpoint returns decisions in order"
+        (Right (EnOk BatchCheckResponseWire{decisions = [AllowedWire, DeniedWire]}))
+        =<< runHandler (batch request)
 
+    -- The oversized batch is a returned value, not a thrown ServerError: that is the
+    -- point of the MultiVerb response list.
     let smallEnv = env{maxBatchSize = 1}
         oversized = request{pairs = [pair "alice" "view" "project-x", pair "bob" "view" "project-x"]}
-    assertEqual "oversized batch returns 400" (Just 400) =<< httpCodeOf (batchHandler smallEnv oversized)
+    assertEqual
+        "oversized batch returns a typed batch_too_large"
+        (Just "batch_too_large")
+        =<< clientErrorCodeOf (batchHandler smallEnv oversized)
+
+    assertEqual
+        "an unknown permission returns a typed unknown_relation"
+        (Just "unknown_relation")
+        =<< clientErrorCodeOf
+            ( checkHandler
+                env
+                CheckRequestWire
+                    { consistency = MinimizeLatencyWire
+                    , context = CaveatContextWire Map.empty
+                    , subject = SubjectIdWire ObjectRefWire{objectType = "user", objectId = "alice"}
+                    , permission = "not_a_permission"
+                    , object = ObjectRefWire{objectType = "space", objectId = "project-x"}
+                    }
+            )
 
     cachedCheckEnv <- newCheckCacheEnv
     let cachedEnv =
@@ -113,9 +138,9 @@ main = do
                 , permission = "view"
                 , object = ObjectRefWire{objectType = "space", objectId = "project-x"}
                 }
-    assertEqual "cached check endpoint returns Allowed first" (Right CheckResponseWire{decision = AllowedWire}) =<< runHandler (checkEndpoint checkRequest)
+    assertEqual "cached check endpoint returns Allowed first" (Right (EnOk CheckResponseWire{decision = AllowedWire})) =<< runHandler (checkEndpoint checkRequest)
     checkStatsAfterFirst <- cacheStats cachedCheckEnv.cacheDecisions
-    assertEqual "cached check endpoint returns Allowed second" (Right CheckResponseWire{decision = AllowedWire}) =<< runHandler (checkEndpoint checkRequest)
+    assertEqual "cached check endpoint returns Allowed second" (Right (EnOk CheckResponseWire{decision = AllowedWire})) =<< runHandler (checkEndpoint checkRequest)
     checkStatsAfterSecond <- cacheStats cachedCheckEnv.cacheDecisions
     assertBool "cached check endpoint uses decision cache" (checkStatsAfterSecond.hits > checkStatsAfterFirst.hits)
 
@@ -137,9 +162,9 @@ main = do
                 , cursor = Nothing
                 , deadlineMillis = Nothing
                 }
-    assertRight "cached lookup endpoint returns a page first" =<< runHandler (lookupEndpoint lookupRequest)
+    assertOk "cached lookup endpoint returns a page first" =<< runHandler (lookupEndpoint lookupRequest)
     lookupStatsAfterFirst <- cacheStats cachedLookupEnv.cacheDecisions
-    assertRight "cached lookup endpoint returns a page second" =<< runHandler (lookupEndpoint lookupRequest)
+    assertOk "cached lookup endpoint returns a page second" =<< runHandler (lookupEndpoint lookupRequest)
     lookupStatsAfterSecond <- cacheStats cachedLookupEnv.cacheDecisions
     assertBool "cached lookup endpoint uses decision cache for confirmations" (lookupStatsAfterSecond.hits > lookupStatsAfterFirst.hits)
 
@@ -416,7 +441,7 @@ newCheckCacheEnv = do
     cache <- newCache CacheConfig{enabled = True, maxEntries = 100} :: IO (Cache SubproblemKey CheckDecision)
     pure CheckCacheEnv{cacheDatastoreId = DatastoreId "test", cacheDecisions = cache}
 
-batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler BatchCheckResponseWire
+batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
 batchHandler env =
     batch
   where
@@ -427,7 +452,7 @@ batchHandler env =
         :<|> _lookup
         :<|> _expand = server env
 
-checkHandler :: Env TestEffects -> CheckRequestWire -> Handler CheckResponseWire
+checkHandler :: Env TestEffects -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
 checkHandler env =
     checkEndpoint
   where
@@ -438,7 +463,7 @@ checkHandler env =
         :<|> _lookup
         :<|> _expand = server env
 
-lookupHandler :: Env TestEffects -> LookupRequestWire -> Handler LookupPageWire
+lookupHandler :: Env TestEffects -> LookupRequestWire -> Handler (EnResult LookupPageWire)
 lookupHandler env =
     lookupEndpoint
   where
@@ -461,9 +486,16 @@ objectToWire :: ObjectRef -> ObjectRefWire
 objectToWire ObjectRef{objectType = ObjectType objectType, objectId} =
     ObjectRefWire{objectType, objectId}
 
-httpCodeOf :: Handler a -> IO (Maybe Int)
-httpCodeOf handler =
-    either (Just . errHTTPCode) (const Nothing) <$> runHandler handler
+{- | The @code@ of a handler's 400 response, if it produced one.
+
+'Nothing' covers every other outcome — success, a non-400 fault, or a thrown
+'ServerError' — so a test asserting @Just "…"@ pins both the status and the code.
+-}
+clientErrorCodeOf :: Handler (EnResult a) -> IO (Maybe Text)
+clientErrorCodeOf handler =
+    runHandler handler <&> \case
+        Right (EnClientError envelope) -> Just envelope.code
+        _ -> Nothing
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
 assertEqual label expected actual
@@ -481,7 +513,15 @@ assertBool label condition
     | condition = pure ()
     | otherwise = fail label
 
-assertRight :: (Show err) => String -> Either err value -> IO ()
-assertRight _ (Right _) = pure ()
-assertRight label (Left err) =
+{- | The handler neither threw nor returned a fault.
+
+Weaker than 'assertEqual' on the payload, and used where the payload is a page whose
+exact contents are not the property under test — but strictly stronger than checking
+for 'Right', which an 'EnClientError' would also satisfy.
+-}
+assertOk :: (Show err, Show value) => String -> Either err (EnResult value) -> IO ()
+assertOk _ (Right (EnOk _)) = pure ()
+assertOk label (Right fault) =
+    fail (label <> "\nexpected EnOk, got: " <> show fault)
+assertOk label (Left err) =
     fail (label <> "\nexpected Right, got Left: " <> show err)

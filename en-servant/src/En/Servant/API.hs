@@ -8,6 +8,8 @@ module En.Servant.API (
     Env (..),
     server,
     app,
+    EnResponses,
+    EnResult (..),
     ObjectRefWire (..),
     SubjectWire (..),
     TupleWire (..),
@@ -45,6 +47,8 @@ module En.Servant.API (
 ) where
 
 import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Except (ExceptT (..), runExceptT, throwE)
 import Data.Aeson (
     FromJSON (..),
     Object,
@@ -58,6 +62,7 @@ import Data.Aeson (
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Types (Parser)
 import Data.Map.Strict (Map)
+import Data.SOP (I (..), NS (..))
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Time (UTCTime)
@@ -66,20 +71,21 @@ import Effectful (Eff, IOE)
 import Effectful qualified
 import Effectful.Error.Static (Error)
 import GHC.Clock (getMonotonicTimeNSec)
+import GHC.TypeLits (Symbol)
 import Servant (
     Application,
     Context (..),
     Handler,
     JSON,
-    Post,
     Proxy (..),
     ReqBody,
     Server,
+    StdMethod (..),
     serveWithContext,
-    throwError,
     type (:<|>) (..),
     type (:>),
  )
+import Servant.API.MultiVerb (AsUnion (..), MultiVerb, Respond)
 import Servant.Server (ErrorFormatter, ErrorFormatters (..), defaultErrorFormatters)
 
 import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..), checkMany)
@@ -91,13 +97,15 @@ import En.Lookup qualified as Lookup
 import En.Revision (Consistency (..), ConsistencyToken (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
 import En.Servant.Seam (
+    EnFault (..),
     EnServer,
     Env (..),
+    ErrorEnvelopeWire (..),
     badRequest,
     batchTooLarge,
     faultToServerError,
     invalidRequest,
-    runEngine,
+    runEngineEither,
  )
 import En.Servant.Seam qualified as Seam
 import En.Tuple (
@@ -110,6 +118,72 @@ import En.Tuple (
     TupleCaveat (..),
  )
 
+{- | The statuses any en operation can answer with, as response alternatives of the
+API type. Making them part of the type is what puts them in the generated OpenAPI
+document and in @en-client@'s result type, instead of leaving them as untyped
+'Servant.ServerError's thrown from a handler.
+
+All six operations share this list even though a write cannot in practice exceed a
+traversal bound (422). 'En.Error.EnError' is one closed sum shared by every operation,
+so the type system cannot prove the write path never yields 'ResolutionLimitExceeded';
+a narrower list for writes would make 'faultToResult' partial. A total conversion is
+worth a slightly over-broad document.
+
+Not covered here: errors raised before a handler runs. A malformed body or an unmatched
+route comes from Servant's routing layer ('envelopeFormatters'), and
+authentication/rate-limit rejections come from WAI middleware in @en-server@. All of
+them still carry 'ErrorEnvelopeWire'.
+-}
+type EnResponses (description :: Symbol) a =
+    '[ Respond 200 description a
+     , Respond 400 "Invalid request" ErrorEnvelopeWire
+     , Respond 422 "Resolution limit exceeded" ErrorEnvelopeWire
+     , Respond 503 "Tuple store unavailable" ErrorEnvelopeWire
+     ]
+
+-- | What an en handler returns. 'AsUnion' maps it onto 'EnResponses' positionally.
+data EnResult a
+    = EnOk a
+    | -- | 400
+      EnClientError !ErrorEnvelopeWire
+    | -- | 422
+      EnUnprocessable !ErrorEnvelopeWire
+    | -- | 503
+      EnUnavailable !ErrorEnvelopeWire
+    deriving stock (Eq, Show)
+
+{- | Written by hand rather than derived through 'GenericAsUnion': the correspondence
+between constructor and response alternative is the thing worth stating explicitly,
+and a change to 'EnResponses' should break this instance loudly.
+-}
+instance
+    AsUnion
+        '[ Respond 200 description a
+         , Respond 400 "Invalid request" ErrorEnvelopeWire
+         , Respond 422 "Resolution limit exceeded" ErrorEnvelopeWire
+         , Respond 503 "Tuple store unavailable" ErrorEnvelopeWire
+         ]
+        (EnResult a)
+    where
+    toUnion = \case
+        EnOk value -> Z (I value)
+        EnClientError envelope -> S (Z (I envelope))
+        EnUnprocessable envelope -> S (S (Z (I envelope)))
+        EnUnavailable envelope -> S (S (S (Z (I envelope))))
+    fromUnion = \case
+        Z (I value) -> EnOk value
+        S (Z (I envelope)) -> EnClientError envelope
+        S (S (Z (I envelope))) -> EnUnprocessable envelope
+        S (S (S (Z (I envelope)))) -> EnUnavailable envelope
+        S (S (S (S impossible))) -> case impossible of {}
+
+-- | Every 'EnFault' has a home in 'EnResponses'. This totality is why the list is shared.
+faultToResult :: EnFault -> EnResult a
+faultToResult = \case
+    BadRequestFault envelope -> EnClientError envelope
+    UnprocessableFault envelope -> EnUnprocessable envelope
+    UnavailableFault envelope -> EnUnavailable envelope
+
 {- | The wire contract is versioned by path. @\/v1@ is current; a future breaking
 change ships as @\/v2@ served alongside it, rather than mutating these operations.
 
@@ -118,12 +192,25 @@ request body: HTTP intermediaries are permitted to drop a @DELETE@ body.
 -}
 type EnAPI =
     "v1"
-        :> ( "relationships" :> ReqBody '[JSON] WriteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
-                :<|> "relationships" :> "delete" :> ReqBody '[JSON] DeleteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
-                :<|> "check" :> ReqBody '[JSON] CheckRequestWire :> Post '[JSON] CheckResponseWire
-                :<|> "batch-check" :> ReqBody '[JSON] BatchCheckRequestWire :> Post '[JSON] BatchCheckResponseWire
-                :<|> "lookup" :> ReqBody '[JSON] LookupRequestWire :> Post '[JSON] LookupPageWire
-                :<|> "expand" :> ReqBody '[JSON] ExpandRequestWire :> Post '[JSON] ExpandTreeWire
+        :> ( "relationships"
+                :> ReqBody '[JSON] WriteTuplesRequestWire
+                :> MultiVerb 'POST '[JSON] (EnResponses "Consistency token for the write" WriteTuplesResponseWire) (EnResult WriteTuplesResponseWire)
+                :<|> "relationships"
+                    :> "delete"
+                    :> ReqBody '[JSON] DeleteTuplesRequestWire
+                    :> MultiVerb 'POST '[JSON] (EnResponses "Consistency token for the deletion" WriteTuplesResponseWire) (EnResult WriteTuplesResponseWire)
+                :<|> "check"
+                    :> ReqBody '[JSON] CheckRequestWire
+                    :> MultiVerb 'POST '[JSON] (EnResponses "The authorization decision" CheckResponseWire) (EnResult CheckResponseWire)
+                :<|> "batch-check"
+                    :> ReqBody '[JSON] BatchCheckRequestWire
+                    :> MultiVerb 'POST '[JSON] (EnResponses "One decision per requested pair, in order" BatchCheckResponseWire) (EnResult BatchCheckResponseWire)
+                :<|> "lookup"
+                    :> ReqBody '[JSON] LookupRequestWire
+                    :> MultiVerb 'POST '[JSON] (EnResponses "A page of authorized objects" LookupPageWire) (EnResult LookupPageWire)
+                :<|> "expand"
+                    :> ReqBody '[JSON] ExpandRequestWire
+                    :> MultiVerb 'POST '[JSON] (EnResponses "The permission's subject tree" ExpandTreeWire) (EnResult ExpandTreeWire)
            )
 
 apiProxy :: Proxy EnAPI
@@ -792,26 +879,36 @@ instance ToJSON WriteTuplesResponseWire where
 instance FromJSON WriteTuplesResponseWire where
     parseJSON = withObject "WriteTuplesResponseWire" \o -> WriteTuplesResponseWire <$> o .: "token"
 
-writeTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> WriteTuplesRequestWire -> Handler WriteTuplesResponseWire
-writeTuplesHandler env request = do
-    tuples <- traverseOr400 tupleFromWire request.tuples
-    token <- runEngine env (writeTuples tuples)
+{- | Run a handler body that may fail with an 'EnFault', turning either outcome into
+the 'EnResult' the operation's 'MultiVerb' response list expects.
+
+Handlers return faults rather than throwing them, which is what keeps every status
+they can produce visible in 'EnAPI'.
+-}
+enHandler :: ExceptT EnFault Handler a -> Handler (EnResult a)
+enHandler body =
+    either faultToResult EnOk <$> runExceptT body
+
+writeTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> WriteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
+writeTuplesHandler env request = enHandler do
+    tuples <- traverseOrInvalid tupleFromWire request.tuples
+    token <- engine env (writeTuples tuples)
     pure (tokenToWire token)
 
-deleteTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> DeleteTuplesRequestWire -> Handler WriteTuplesResponseWire
-deleteTuplesHandler env request = do
-    tuples <- traverseOr400 tupleFromWire request.tuples
-    token <- runEngine env (deleteTuples tuples)
+deleteTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> DeleteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
+deleteTuplesHandler env request = enHandler do
+    tuples <- traverseOrInvalid tupleFromWire request.tuples
+    token <- engine env (deleteTuples tuples)
     pure (tokenToWire token)
 
-checkHandler :: Env es -> CheckRequestWire -> Handler CheckResponseWire
-checkHandler env request = do
-    consistency <- either400 (consistencyFromWire request.consistency)
-    context <- either400 (contextFromWire request.context)
-    subject <- either400 (subjectFromWire request.subject)
-    object <- either400 (objectRefFromWire request.object)
+checkHandler :: Env es -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
+checkHandler env request = enHandler do
+    consistency <- orInvalid (consistencyFromWire request.consistency)
+    context <- orInvalid (contextFromWire request.context)
+    subject <- orInvalid (subjectFromWire request.subject)
+    object <- orInvalid (objectRefFromWire request.object)
     decision <-
-        runEngine
+        engine
             env
             ( env.checkOperation
                 env.graph
@@ -823,20 +920,18 @@ checkHandler env request = do
             )
     pure CheckResponseWire{decision = decisionToWire decision}
 
-batchCheckHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) => Env es -> BatchCheckRequestWire -> Handler BatchCheckResponseWire
-batchCheckHandler env request = do
+batchCheckHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) => Env es -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
+batchCheckHandler env request = enHandler do
     if length request.pairs > env.maxBatchSize
         then
-            throwError
-                ( faultToServerError
-                    (batchTooLarge ("batch exceeds the maximum of " <> Text.pack (show env.maxBatchSize) <> " pairs"))
-                )
+            throwE
+                (batchTooLarge ("batch exceeds the maximum of " <> Text.pack (show env.maxBatchSize) <> " pairs"))
         else pure ()
-    consistency <- either400 (consistencyFromWire request.consistency)
-    context <- either400 (contextFromWire request.context)
-    batchPairs <- traverseOr400 pairFromWire request.pairs
+    consistency <- orInvalid (consistencyFromWire request.consistency)
+    context <- orInvalid (contextFromWire request.context)
+    batchPairs <- traverseOrInvalid pairFromWire request.pairs
     decisions <-
-        runEngine
+        engine
             env
             ( checkMany
                 env.graph
@@ -856,14 +951,14 @@ batchCheckHandler env request = do
                 )
             <*> objectRefFromWire wire.object
 
-lookupHandler :: (IOE Effectful.:> es) => Env es -> LookupRequestWire -> Handler LookupPageWire
-lookupHandler env request = do
-    consistency <- either400 (consistencyFromWire request.consistency)
-    context <- either400 (contextFromWire request.context)
-    subject <- either400 (subjectFromWire request.subject)
-    deadline <- lookupDeadline request.deadlineMillis
+lookupHandler :: (IOE Effectful.:> es) => Env es -> LookupRequestWire -> Handler (EnResult LookupPageWire)
+lookupHandler env request = enHandler do
+    consistency <- orInvalid (consistencyFromWire request.consistency)
+    context <- orInvalid (contextFromWire request.context)
+    subject <- orInvalid (subjectFromWire request.subject)
+    deadline <- lift (lookupDeadline request.deadlineMillis)
     page <-
-        runEngine
+        engine
             env
             ( env.lookupWithDeadlineOperation
                 deadline
@@ -890,13 +985,13 @@ lookupDeadline maybeDeadlineMillis = do
             now <- Effectful.liftIO getMonotonicTimeNSec
             pure (now - startedAt <= budgetNs)
 
-expandHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es) => Env es -> ExpandRequestWire -> Handler ExpandTreeWire
-expandHandler env request = do
-    consistency <- either400 (consistencyFromWire request.consistency)
-    context <- either400 (contextFromWire request.context)
-    object <- either400 (objectRefFromWire request.object)
+expandHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es) => Env es -> ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
+expandHandler env request = enHandler do
+    consistency <- orInvalid (consistencyFromWire request.consistency)
+    context <- orInvalid (contextFromWire request.context)
+    object <- orInvalid (objectRefFromWire request.object)
     tree <-
-        runEngine
+        engine
             env
             ( Expand.expand
                 env.graph
@@ -1075,10 +1170,16 @@ expandStateToWire =
         Expand.ExpandHasMore (Expand.ExpandCursor cursor) -> ExpandHasMoreWire cursor
         Expand.ExpandTruncated (Expand.ExpandCursor cursor) -> ExpandTruncatedWire cursor
 
-traverseOr400 :: (a -> Either Text b) -> [a] -> Handler [b]
-traverseOr400 convert values =
-    either400 (traverse convert values)
+-- | Run an engine action, surfacing an 'En.Error.EnError' as an 'EnFault'.
+engine :: Env es -> Eff es a -> ExceptT EnFault Handler a
+engine env action =
+    ExceptT (runEngineEither env action)
 
-either400 :: Either Text a -> Handler a
-either400 =
-    either (throwError . faultToServerError . invalidRequest) pure
+-- | A wire-to-engine conversion failure is a client fault, not an engine error.
+orInvalid :: Either Text a -> ExceptT EnFault Handler a
+orInvalid =
+    either (throwE . invalidRequest) pure
+
+traverseOrInvalid :: (a -> Either Text b) -> [a] -> ExceptT EnFault Handler [b]
+traverseOrInvalid convert values =
+    orInvalid (traverse convert values)

@@ -50,8 +50,10 @@ library
     , en-postgres
     , servant
     , servant-server
+    , sop-core
     , text
     , time
+    , transformers
 
 test-suite en-servant-tests
   import:         warnings, shared

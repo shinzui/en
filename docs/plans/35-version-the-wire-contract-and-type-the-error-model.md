@@ -87,11 +87,16 @@ This section must always reflect the actual current state of the work.
   `ErrorFormatters` and `serveWithContext`; 405 observed to return an empty body (see
   Surprises). Verified with PostgreSQL stopped: `503`, `store_error`,
   `"retryable":true`, generic message, SQL detail on stderr only.
-- [ ] M3b: the six operations become `MultiVerb` endpoints over the shared response list
-  `EnResponses`; handlers return `EnResult` instead of throwing; `AsUnion` instance
-  written by hand.
-- [ ] M3b: `en-client/src/En/Client.hs` operations re-typed to `ClientM (EnResult …)`;
-  `en-servant/test/Main.hs` assertions moved onto `EnResult`.
+- [x] M3b (2026-07-08): the six operations became `MultiVerb` endpoints over the shared
+  response list `EnResponses`; handlers return `EnResult` via `ExceptT EnFault Handler`
+  instead of throwing; `AsUnion` instance written by hand.
+- [x] M3b (2026-07-08): `en-client/src/En/Client.hs` operations re-typed to
+  `ClientM (EnResult …)`; `en-servant/test/Main.hs` assertions moved onto `EnResult`
+  (`assertRight` tightened to `assertOk`, `httpCodeOf` replaced by
+  `clientErrorCodeOf`).
+- [x] M3b (2026-07-08): **no-wire-change claim verified.** Captured the error transcript
+  against the M3 commit (`059fbd4`) and against the M3b tree, and `diff` reported them
+  identical — same statuses, same bodies, including the empty-bodied 405 and 415.
 - [ ] M4: OpenAPI document generated with servant-openapi-hs and served at
   `GET /v1/openapi.json`; `ToSchema` instances hand-written to match the JSON grammar;
   every operation documents its 400/422/503 responses.
@@ -176,6 +181,25 @@ implementation. Provide concise evidence.
   message text, exactly as EP-34 warned it must. Verified by stopping PostgreSQL under
   load: four consecutive probes all returned the same retryable envelope, and the
   underlying socket error appeared only on the server's stderr.
+
+- **`MultiVerb`, `Respond`, and `AsUnion` are not re-exported from `Servant`.** They must
+  be imported from `Servant.API.MultiVerb`. `Servant` re-exports `Union` but nothing else
+  from that module, and the error message unhelpfully suggests `Union` when you ask for
+  `AsUnion`.
+
+- **`Union` is `Data.SOP.NS I`, so the hand-written `AsUnion` instance needs
+  `sop-core`.** The instance body is `Z`/`S`/`I` constructors; `en-servant` gained
+  `sop-core` and `transformers` (for `ExceptT`) as library dependencies.
+
+- **The 415 body is empty too, for the same reason as 405.** Content-type mismatches are
+  raised by Servant's routing layer outside `ErrorFormatters`. Confirmed with
+  `curl -H 'content-type: text/plain'`: `415` with a zero-length body.
+
+- **MultiVerb changed no byte on the wire, and this was checked rather than assumed.**
+  The full error transcript (200, 400 × 4 distinct codes, 404, 405, 415) was captured
+  against the M3 commit `059fbd4` and again against the M3b tree; `diff` reported them
+  identical. That is the property the whole decision rested on, so it is now a recorded
+  measurement and not an argument.
 
 - **`.:?` already handles explicit `null`.** `TupleWire.caveat` encodes as
   `"caveat":null` and decodes from either an explicit `null` or an absent key, because

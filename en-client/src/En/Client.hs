@@ -3,6 +3,24 @@
 The operations live under the @\/v1@ path prefix, which is carried in the API type
 rather than in the 'Servant.Client.BaseUrl'. Point the 'Servant.Client.ClientEnv' at
 the host root (e.g. @http:\/\/localhost:8080@) and the client appends @\/v1@ itself.
+
+Every operation answers with an 'EnResult'. Engine and validation failures arrive as
+'EnClientError', 'EnUnprocessable', or 'EnUnavailable' — values to pattern-match, each
+carrying an 'En.Servant.Seam.ErrorEnvelopeWire' whose @code@ is stable and whose
+@retryable@ says whether retrying can help. They are /not/ raised as
+'Servant.Client.ClientError'; that is reserved for transport failures and for errors
+raised before a handler runs (an unmatched route, a malformed body, a rejected API
+key), which are not part of the API type.
+
+@
+result <- runClientM (enClient.check request) clientEnv
+case result of
+    Left transportError -> …
+    Right (EnOk response) -> …
+    Right (EnUnavailable envelope) | envelope.retryable -> retryLater
+    Right (EnClientError envelope) -> reportBug envelope.code
+    …
+@
 -}
 module En.Client (
     EnClient (..),
@@ -18,12 +36,12 @@ import Servant.Client (ClientM, client)
 import En.Servant.API
 
 data EnClient = EnClient
-    { writeTuples :: WriteTuplesRequestWire -> ClientM WriteTuplesResponseWire
-    , deleteTuples :: DeleteTuplesRequestWire -> ClientM WriteTuplesResponseWire
-    , check :: CheckRequestWire -> ClientM CheckResponseWire
-    , batchCheck :: BatchCheckRequestWire -> ClientM BatchCheckResponseWire
-    , lookup :: LookupRequestWire -> ClientM LookupPageWire
-    , expand :: ExpandRequestWire -> ClientM ExpandTreeWire
+    { writeTuples :: WriteTuplesRequestWire -> ClientM (EnResult WriteTuplesResponseWire)
+    , deleteTuples :: DeleteTuplesRequestWire -> ClientM (EnResult WriteTuplesResponseWire)
+    , check :: CheckRequestWire -> ClientM (EnResult CheckResponseWire)
+    , batchCheck :: BatchCheckRequestWire -> ClientM (EnResult BatchCheckResponseWire)
+    , lookup :: LookupRequestWire -> ClientM (EnResult LookupPageWire)
+    , expand :: ExpandRequestWire -> ClientM (EnResult ExpandTreeWire)
     }
 
 enClient :: EnClient
