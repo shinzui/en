@@ -69,7 +69,6 @@ import Effectful.Error.Static (Error)
 import GHC.Clock (getMonotonicTimeNSec)
 import Servant (
     Application,
-    Delete,
     Handler,
     JSON,
     Post,
@@ -102,13 +101,21 @@ import En.Tuple (
     TupleCaveat (..),
  )
 
+{- | The wire contract is versioned by path. @\/v1@ is current; a future breaking
+change ships as @\/v2@ served alongside it, rather than mutating these operations.
+
+Deletion is a @POST@ to @\/v1\/relationships\/delete@, not a @DELETE@ carrying a
+request body: HTTP intermediaries are permitted to drop a @DELETE@ body.
+-}
 type EnAPI =
-    "tuples" :> ReqBody '[JSON] WriteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
-        :<|> "tuples" :> ReqBody '[JSON] DeleteTuplesRequestWire :> Delete '[JSON] WriteTuplesResponseWire
-        :<|> "check" :> ReqBody '[JSON] CheckRequestWire :> Post '[JSON] CheckResponseWire
-        :<|> "batch-check" :> ReqBody '[JSON] BatchCheckRequestWire :> Post '[JSON] BatchCheckResponseWire
-        :<|> "lookup" :> ReqBody '[JSON] LookupRequestWire :> Post '[JSON] LookupPageWire
-        :<|> "expand" :> ReqBody '[JSON] ExpandRequestWire :> Post '[JSON] ExpandTreeWire
+    "v1"
+        :> ( "relationships" :> ReqBody '[JSON] WriteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
+                :<|> "relationships" :> "delete" :> ReqBody '[JSON] DeleteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
+                :<|> "check" :> ReqBody '[JSON] CheckRequestWire :> Post '[JSON] CheckResponseWire
+                :<|> "batch-check" :> ReqBody '[JSON] BatchCheckRequestWire :> Post '[JSON] BatchCheckResponseWire
+                :<|> "lookup" :> ReqBody '[JSON] LookupRequestWire :> Post '[JSON] LookupPageWire
+                :<|> "expand" :> ReqBody '[JSON] ExpandRequestWire :> Post '[JSON] ExpandTreeWire
+           )
 
 apiProxy :: Proxy EnAPI
 apiProxy = Proxy

@@ -310,7 +310,7 @@ Missing values and `0` disable the cache.
 | --- | --- |
 | `EN_OPTIMIZED_REVISION_CACHE_TTL_MS` | Positive TTL in milliseconds for sharing optimized revisions. |
 | `EN_TUPLE_READ_CACHE_MAX_ENTRIES` | Maximum tuple-read cache entries. |
-| `EN_DECISION_CACHE_MAX_ENTRIES` | Maximum decision/subproblem cache entries for `/check` and `/lookup` confirmations. |
+| `EN_DECISION_CACHE_MAX_ENTRIES` | Maximum decision/subproblem cache entries for `/v1/check` and `/v1/lookup` confirmations. |
 
 Malformed cache values fail startup. At startup, `en-server` logs whether each
 cache is disabled or enabled and its configured size/window.
@@ -341,7 +341,7 @@ in this repository yet. Load balancing affects hit rate; a small, stable pool
 of larger instances can have better cache behavior than a large pool of tiny
 instances.
 
-The `/batch-check` endpoint uses `checkMany`, which resolves consistency once
+The `/v1/batch-check` endpoint uses `checkMany`, which resolves consistency once
 and shares subproblem work within the request. It does not yet use the
 cross-request decision cache directly. It still benefits from the optimized
 revision and tuple-read caches when those are enabled.

@@ -60,10 +60,16 @@ This section must always reflect the actual current state of the work.
 - [x] M1 (2026-07-08): `Justfile` `test-server` request bodies moved to the new grammar
   ahead of schedule (paths still unversioned) so the smoke test stays green between M1
   and M2. `just start-and-test` prints `server smoke test passed: allowed`.
-- [ ] M2: routes moved under `/v1`; `DELETE /tuples` replaced by
-  `POST /v1/relationships/delete`; writes at `POST /v1/relationships`.
-- [ ] M2: `en-client/src/En/Client.hs` and `Justfile` (`test-server`) updated; user docs
-  under `docs/user/` swept for old shapes.
+- [x] M2 (2026-07-08): routes moved under `/v1`; `DELETE /tuples` replaced by
+  `POST /v1/relationships/delete`; writes at `POST /v1/relationships`. Verified: old
+  paths return `404`, `DELETE /v1/relationships` returns `405` without consuming a body.
+- [x] M2 (2026-07-08): `isWriteRequest` in `en-server/app/Middleware.hs` re-pointed at
+  the `/v1/relationships` prefix; a read-only key gets `403` on both write routes and
+  `200` on `/v1/check`.
+- [x] M2 (2026-07-08): `en-client/src/En/Client.hs` comment and `Justfile`
+  (`test-server`) updated; `docs/user/service-and-operations.md` and
+  `docs/user/production-deployment-and-performance.md` swept for old shapes; an "API
+  versioning" section added documenting the discriminators and the one-time break.
 - [ ] M3: typed error envelope (`ErrorEnvelopeWire`) in Seam.hs with the
   `EnError -> (status, code, retryable)` mapping; `requirePermission` and handler 400s
   migrated onto it.
@@ -100,6 +106,21 @@ implementation. Provide concise evidence.
 - **`en-servant` lacked `BlockArguments`.** `en-core` and `en-server` enable it; the
   `withObject "…" \o -> …` idiom needs it. Added to `default-extensions` in
   `en-servant/en-servant.cabal`, matching the two siblings.
+
+- **`DELETE /v1/relationships` returns 405, not 404.** The plan's acceptance criterion
+  allowed either. Servant matches the path, finds no `DELETE` verb, and returns
+  `405 Method Not Allowed` with an empty body — importantly, without consuming the
+  request body, which was the point of retiring `DELETE`-with-body. Old unversioned
+  paths (`/tuples`, `/check`) return `404`. Both bodies are currently non-JSON; M3's
+  `ErrorFormatters` reach the 404 but not the 405.
+
+- **`isWriteRequest` is now a prefix match, not an equality test.** EP-33's predicate
+  compared `pathInfo == ["tuples"]`; the replacement matches
+  `"v1" : "relationships" : _` with `POST`, so it covers both `/v1/relationships` and
+  `/v1/relationships/delete` and will cover any future write sub-route added under that
+  prefix. Verified with a read-only key: `403` on both write routes, `200` on
+  `/v1/check`. `methodDelete` is no longer imported in
+  `en-server/app/Middleware.hs`.
 
 - **`.:?` already handles explicit `null`.** `TupleWire.caveat` encodes as
   `"caveat":null` and decodes from either an explicit `null` or an absent key, because

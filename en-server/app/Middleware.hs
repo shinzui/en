@@ -37,7 +37,7 @@ import Data.Text.Encoding qualified as Text
 import Data.Text.IO qualified as Text
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import Network.HTTP.Types (HeaderName, hAuthorization, hContentType, methodDelete, methodPost, status401, status403, status429)
+import Network.HTTP.Types (HeaderName, hAuthorization, hContentType, methodPost, status401, status403, status429)
 import Network.Wai (Middleware, Request (..), Response, responseLBS)
 import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
@@ -80,14 +80,15 @@ isExemptPath request =
 
 {- | Routes that mutate the relationship graph, and so require a 'ReadWrite' key.
 
-EP-35 (@docs/plans/35-version-the-wire-contract-and-type-the-error-model.md@)
-moves these to @POST \/v1\/relationships@ and @POST \/v1\/relationships\/delete@;
-whichever plan lands second updates this predicate.
+Any new write route must be added here, or a read-only key silently gains write
+access. The prefix match on @v1\/relationships@ covers both the write route and
+its @delete@ sub-route.
 -}
 isWriteRequest :: Request -> Bool
 isWriteRequest request =
-    pathInfo request == ["tuples"]
-        && requestMethod request `elem` [methodPost, methodDelete]
+    case pathInfo request of
+        "v1" : "relationships" : _ -> requestMethod request == methodPost
+        _ -> False
 
 {- | Read @EN_API_KEYS_READ_WRITE@, @EN_API_KEYS_READ_ONLY@, and
 @EN_AUTH_DISABLED@. Fails closed: with no keys and no explicit opt-out this

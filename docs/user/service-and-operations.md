@@ -178,7 +178,7 @@ EN_RATE_LIMIT_BURST=400 \
 Callers present their secret as a bearer token:
 
 ```shell
-curl -X POST https://en.internal:8080/check \
+curl -X POST https://en.internal:8080/v1/check \
   -H 'Authorization: Bearer a-long-random-read-secret' \
   -H 'content-type: application/json' \
   -d '{ ... }'
@@ -189,11 +189,11 @@ Three failures are reported with a machine-readable `code`:
 | Status | `code` | Cause |
 | --- | --- | --- |
 | `401` | `unauthenticated` | No `Authorization` header, a non-bearer scheme, or an unknown secret. The response carries `WWW-Authenticate: Bearer` |
-| `403` | `permission_denied` | A read-only key called `POST /tuples` or `DELETE /tuples` |
+| `403` | `permission_denied` | A read-only key called a write route under `/v1/relationships` |
 | `429` | `rate_limited` | The caller exhausted its token bucket. The response carries `Retry-After` |
 
 ```text
-$ curl -si localhost:8080/check -H 'content-type: application/json' -d '{}'
+$ curl -si localhost:8080/v1/check -H 'content-type: application/json' -d '{}'
 HTTP/1.1 401 Unauthorized
 Content-Type: application/json
 WWW-Authenticate: Bearer
@@ -241,15 +241,67 @@ credential check inside that middleware without touching any handler or route.
 
 | Method | Path | Request type | Response type |
 | --- | --- | --- | --- |
-| `POST` | `/tuples` | `WriteTuplesRequestWire` | `WriteTuplesResponseWire` |
-| `DELETE` | `/tuples` | `DeleteTuplesRequestWire` | `WriteTuplesResponseWire` |
-| `POST` | `/check` | `CheckRequestWire` | `CheckResponseWire` |
-| `POST` | `/lookup` | `LookupRequestWire` | `LookupPageWire` |
-| `POST` | `/expand` | `ExpandRequestWire` | `ExpandTreeWire` |
+| `POST` | `/v1/relationships` | `WriteTuplesRequestWire` | `WriteTuplesResponseWire` |
+| `POST` | `/v1/relationships/delete` | `DeleteTuplesRequestWire` | `WriteTuplesResponseWire` |
+| `POST` | `/v1/check` | `CheckRequestWire` | `CheckResponseWire` |
+| `POST` | `/v1/batch-check` | `BatchCheckRequestWire` | `BatchCheckResponseWire` |
+| `POST` | `/v1/lookup` | `LookupRequestWire` | `LookupPageWire` |
+| `POST` | `/v1/expand` | `ExpandRequestWire` | `ExpandTreeWire` |
 
-The current wire types use derived Aeson encodings from the Haskell
-constructors in `En.Servant.API`. Prefer the typed Haskell client from
-`en-client` until the project commits to a stable hand-designed JSON format.
+Deletion is a `POST` to `/v1/relationships/delete` rather than a `DELETE` carrying
+a request body, because HTTP intermediaries are permitted to drop a `DELETE` body.
+
+### API versioning
+
+The wire contract is versioned by path, and `/v1` is current. The JSON encodings
+are hand-written and stable: every sum type carries a named string discriminator
+rather than a Haskell constructor name.
+
+| Type | Discriminator | Values |
+| --- | --- | --- |
+| subject | `kind` | `id`, `set`, `wildcard` |
+| consistency | `mode` | `minimizeLatency`, `fullyConsistent`, `atLeastAsFresh`, `atExactSnapshot` |
+| decision | `result` | `allowed`, `denied`, `conditional` |
+| page state | `status` | `exhausted`, `hasMore`, `truncated` |
+| caveat value | `type` | `text`, `bool`, `integer`, `timestamp`, `enum` |
+| expand node | `kind` | `subject`, `userset`, `caveated` |
+
+An unrecognized discriminator value is rejected with `400 malformed_request_body`;
+it never falls through to a default.
+
+**This was a one-time breaking change.** Earlier builds served the same operations
+on unversioned paths (`POST /tuples`, `DELETE /tuples`, `POST /check`, …) with
+aeson's generic sum encoding, so a subject was written `{"tag":"SubjectIdWire",
+"contents":{…}}` and a decision read back as `{"tag":"AllowedWire"}`. Those paths
+now return `404`. Future breaking changes ship as `/v2` served alongside `/v1`,
+rather than mutating an existing operation.
+
+A worked exchange, writing a tuple and then checking against the token it returns:
+
+```shell
+curl -sS -X POST localhost:8080/v1/relationships \
+  -H 'Authorization: Bearer a-long-random-write-secret' \
+  -H 'content-type: application/json' \
+  -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},
+                  "relation":"viewer",
+                  "subject":{"kind":"id","objectType":"user","objectId":"alice"},
+                  "caveat":null}]}'
+# {"token":"en1.…"}
+
+curl -sS -X POST localhost:8080/v1/check \
+  -H 'Authorization: Bearer a-long-random-read-secret' \
+  -H 'content-type: application/json' \
+  -d '{"consistency":{"mode":"atLeastAsFresh","token":"en1.…"},
+       "context":{"values":{}},
+       "subject":{"kind":"id","objectType":"user","objectId":"alice"},
+       "permission":"view",
+       "object":{"objectType":"space","objectId":"project-x"}}'
+# {"decision":{"result":"allowed"}}
+```
+
+The typed Haskell client in `en-client` is derived from the same Servant API type,
+so it tracks this surface automatically. Point its `BaseUrl` at the host root; the
+`/v1` prefix lives in the API type, not the base URL.
 
 ```haskell
 import En.Client

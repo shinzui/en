@@ -1,4 +1,9 @@
--- | Typed Haskell client for the standalone en service.
+{- | Typed Haskell client for the standalone en service.
+
+The operations live under the @\/v1@ path prefix, which is carried in the API type
+rather than in the 'Servant.Client.BaseUrl'. Point the 'Servant.Client.ClientEnv' at
+the host root (e.g. @http:\/\/localhost:8080@) and the client appends @\/v1@ itself.
+-}
 module En.Client (
     EnClient (..),
     enClient,

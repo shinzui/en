@@ -77,16 +77,16 @@ test-server:
   @set -eu; \
     url="${EN_SERVER_URL:-http://localhost:${EN_PORT:-8080}}"; \
     auth="Authorization: Bearer ${EN_API_KEY:-dev-secret-0123456789}"; \
-    curl -sS -X DELETE "$url/tuples" \
+    curl -sS -X POST "$url/v1/relationships/delete" \
       -H "$auth" \
       -H 'content-type: application/json' \
       -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}]}' >/dev/null; \
-    token=$(curl -sS -X POST "$url/tuples" \
+    token=$(curl -sS -X POST "$url/v1/relationships" \
       -H "$auth" \
       -H 'content-type: application/json' \
       -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}]}' \
       | jq -r '.token'); \
-    decision=$(curl -sS -X POST "$url/check" \
+    decision=$(curl -sS -X POST "$url/v1/check" \
       -H "$auth" \
       -H 'content-type: application/json' \
       -d "{\"consistency\":{\"mode\":\"atLeastAsFresh\",\"token\":\"$token\"},\"context\":{\"values\":{}},\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"permission\":\"view\",\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"}}" \
