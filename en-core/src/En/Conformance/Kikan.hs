@@ -2,6 +2,8 @@ module En.Conformance.Kikan (
     kikanSchema,
     kikanGraph,
     runTupleStoreInMemory,
+    runConsistencyStoreInMemoryStrict,
+    inMemoryToken,
     pageTuples,
     tupleRow,
     runConsistencyStoreInMemory,
@@ -38,10 +40,11 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Time (UTCTime, defaultTimeLocale, parseTimeOrError)
-import Effectful (Eff)
+import Effectful (Eff, (:>))
 import Effectful.Dispatch.Dynamic (interpret_)
+import Effectful.Error.Static (Error, throwError)
 
-import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
+import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (..))
 import En.Effect.TupleStore (
     PageState (..),
     StoreCursor (..),
@@ -51,7 +54,7 @@ import En.Effect.TupleStore (
     TupleStore (..),
     UsersetQuery (..),
  )
-import En.Error (EnError)
+import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph, compileSchema)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (CaveatName (..), CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
@@ -217,11 +220,29 @@ decodeTestCursor (StoreCursor cursorText) =
         [(value, "")] -> value
         _ -> 0
 
+{- | The permissive in-memory consistency store.
+
+It accepts every token and always resolves to 'testRevision'. 'MintToken' emits
+'inMemoryToken', and 'DecodeToken' reverses that encoding when it recognizes it so
+a minted token round-trips to the revision it pins. Anything else it does not
+recognize still decodes -- permissively -- to 'testRevision', which keeps the many
+tests that pass literal token text working.
+
+Use 'runConsistencyStoreInMemoryStrict' when a test needs a validator that can say
+no.
+-}
 runConsistencyStoreInMemory :: Eff (ConsistencyStore : es) a -> Eff es a
 runConsistencyStoreInMemory =
     interpret_ \case
         DecodeToken token ->
-            pure (TokenMetadata token testRevision (DatastoreId "test") (SchemaHash "schema") Nothing)
+            pure
+                TokenMetadata
+                    { token
+                    , revision = maybe testRevision snd (parseInMemoryToken token)
+                    , datastoreId = maybe inMemoryDatastore fst (parseInMemoryToken token)
+                    , schemaHash = SchemaHash "schema"
+                    , expiresAt = Nothing
+                    }
         ValidateToken _ ->
             pure ()
         ResolveConsistency consistency ->
@@ -230,6 +251,67 @@ runConsistencyStoreInMemory =
                     { consistency = consistency
                     , revision = testRevision
                     }
+        MintToken revision ->
+            pure (inMemoryToken inMemoryDatastore revision)
+
+{- | An in-memory consistency store that actually validates.
+
+'DecodeToken' rejects any text it did not mint, and 'ValidateToken' rejects a
+token minted by a different datastore. This is what a cursor-validation test needs:
+the permissive interpreter above accepts a forged cursor and would certify the very
+hole it is meant to prove closed.
+
+Both rejections raise 'InvalidConsistencyToken' through the ambient @Error EnError@,
+which is how 'En.Postgres.Revision.runConsistencyStorePostgres' surfaces them too.
+-}
+runConsistencyStoreInMemoryStrict ::
+    (Error EnError :> es) =>
+    DatastoreId ->
+    Eff (ConsistencyStore : es) a ->
+    Eff es a
+runConsistencyStoreInMemoryStrict datastoreId =
+    interpret_ \case
+        DecodeToken token ->
+            case parseInMemoryToken token of
+                Nothing ->
+                    throwError (InvalidConsistencyToken "token is not an in-memory token")
+                Just (tokenDatastore, revision) ->
+                    pure
+                        TokenMetadata
+                            { token
+                            , revision
+                            , datastoreId = tokenDatastore
+                            , schemaHash = SchemaHash "schema"
+                            , expiresAt = Nothing
+                            }
+        ValidateToken metadata
+            | metadata.datastoreId /= datastoreId ->
+                throwError (InvalidConsistencyToken "token datastore does not match this en datastore")
+            | otherwise ->
+                pure ()
+        ResolveConsistency consistency ->
+            pure ResolvedConsistency{consistency, revision = testRevision}
+        MintToken revision ->
+            pure (inMemoryToken datastoreId revision)
+
+inMemoryDatastore :: DatastoreId
+inMemoryDatastore =
+    DatastoreId "test"
+
+{- | @in-memory:\<datastore\>:\<revision\>@. Deliberately trivial: it carries the two
+things a cursor test must be able to vary -- who minted it, and what revision it
+pins.
+-}
+inMemoryToken :: DatastoreId -> Revision -> ConsistencyToken
+inMemoryToken (DatastoreId datastoreId) revision =
+    ConsistencyToken ("in-memory:" <> datastoreId <> ":" <> revision.revisionEncoding)
+
+parseInMemoryToken :: ConsistencyToken -> Maybe (DatastoreId, Revision)
+parseInMemoryToken (ConsistencyToken tokenText) = do
+    body <- Text.stripPrefix "in-memory:" tokenText
+    let (datastoreId, rest) = Text.breakOn ":" body
+    revisionText <- Text.stripPrefix ":" rest
+    pure (DatastoreId datastoreId, Revision revisionText)
 
 fixtureTuples :: [Tuple]
 fixtureTuples =

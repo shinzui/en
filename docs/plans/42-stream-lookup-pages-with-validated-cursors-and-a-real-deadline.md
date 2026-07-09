@@ -61,11 +61,15 @@ completion.
 
 ## Progress
 
-- [ ] M0: baseline — build/test; verify cited symbols/lines in `En.Lookup`, `En.Check`,
-  `En.Effect.ConsistencyStore`, and the in-memory interpreters; record drift.
-- [ ] M1: `MintToken` on the `ConsistencyStore` effect + both interpreters; cursor codec
-  v2 carrying the token; decode validates via `decodeToken`/`validateToken`; forged and
-  legacy-v1 cursors rejected with `InvalidConsistencyToken`; red-then-green tests.
+- [x] M0 (2026-07-08): baseline `cabal build all && cabal test all` green (7 suites);
+  EP-39, EP-40, and EP-41 all confirmed landed; cited symbols verified and drift recorded
+  below, including the one that changes this plan's M2.
+- [x] M1 (2026-07-08): `MintToken` on `ConsistencyStore` + all four interpreters (permissive
+  in-memory, new strict in-memory, PostgreSQL, en-example); cursor codec v2 carrying a
+  token and a reserved frontier; `resolveCursor` validates via `decodeToken`/`validateToken`;
+  forged v1, malformed v2, foreign-datastore, and unmintable-token cursors all rejected.
+  Red evidence captured. `En.Lookup` now imports `Revision` without its constructor, so it
+  *cannot* build a revision from client text.
 - [ ] M2: single consistency resolution per lookup — `En.Check.checkAtRevision` (and
   cached variant) added; `CheckForCandidate` takes the pinned revision; shared memo
   across confirmations; counting-store tests.
@@ -83,7 +87,90 @@ completion.
 
 ## Surprises & Discoveries
 
-(None yet.)
+**M0: baseline green, and all three sibling plans have landed (2026-07-08).**
+`cabal build all && cabal test all` passes across seven suites. EP-39 (probe), EP-40
+(cycle/exclusion semantics), and EP-41 (context-free caching) are all Complete, so this
+plan is the last to touch `En/Check.hs` before EP-44. The rebase the master plan's
+Dependency Graph warned about is therefore not a rebase at all: this plan writes
+`checkAtRevision` against the *final* shape of that module.
+
+**M0: EP-41 changed what `checkAtRevision` has to do, and the plan half-anticipated it
+(2026-07-08).** `En.Check` is now a symbolic evaluator. `runCheckMemoWithCache` returns
+`Either EnError ResidualDecision`, not `Either EnError CheckDecision`, and
+`CheckMemo = Map MemoKey ResidualDecision` (`en-core/src/En/Check.hs:182`). M2 step 1 says
+"if EP-41 has landed, the internal result is a residual — apply the context at this
+boundary exactly as `checkCached` does; the signature above stays." That is exactly right
+and is what this plan will do.
+
+Two consequences the plan did not foresee, both favourable. The memo is now *context-free*,
+so threading one memo across a lookup's confirmations is sound for a stronger reason than
+"one lookup has one context" — the entries do not mention context at all. And EP-41 already
+established that a residual computed under a cycle cut is never memoized, so the shared memo
+this plan introduces cannot inherit a stack-local answer.
+
+**M0 line drift (2026-07-08).** `En/Lookup.hs` is untouched by the sibling plans and every
+citation in this document is exact: `lookupWithDeadlineWithChecker` at 154–176 (the B9 hole
+at 170–176), `runLookup` at 178–190, `CheckForCandidate` at 150–152, `confirmCandidates` at
+462–481, `readRowsForSubjects` at 483–509, `mergeLookupObjects` at 538–552, `pageLookup` at
+587–608, `decodeLookupCursor` at 628–641, the `encodeField`/`parseFields` codec at 643–663,
+and the over-promising haddock at 105–108.
+
+`En/Check.hs` moved: `check` is at :64 (plan said 57–68), `checkCached` at :89 (plan said
+73–86), `runCheckMemoWithCache` at :224 (plan said 215–227).
+
+The test-file citations are the ones that drifted badly, so record them properly:
+`countingConsistencyStore` is at `en-core/test/Main.hs:1620` (plan said ~345),
+`budgetedDeadline` at `:1302` (plan said ~969–978), `collectAllLookupPages` at `:1270`, the
+cursor round-trip assertion at `:389-390` (plan said ~384–385), the deterministic-pagination
+cursor at `:481`, and the deadline truncate-and-resume tests at `:406-408`. In `en-servant`,
+`lookupHandler` is at `en-servant/src/En/Servant/API.hs:960` (plan said 373–395) and
+`lookupDeadline` at `:991` (plan said 397–405). `runConsistencyStoreInMemory` is at
+`en-core/src/En/Conformance/Kikan.hs:220` (plan said 211–223).
+
+**B9, measured (2026-07-08).** A hand-written v1 cursor naming a revision the client chose,
+fed to a lookup running under a *strict* validator that rejects foreign tokens. The engine
+obeyed it and returned a full page:
+
+```text
+user error (a forged lookup cursor is rejected, not obeyed
+expected: Left (InvalidConsistencyToken "lookup cursor")
+actual:   Right (LookupPage {objects = [LookupObject {object = ObjectRef {objectType =
+          ObjectType "space", objectId = "child-space"}, decision = Allowed},
+          LookupObject {object = ObjectRef {objectType = ObjectType "space", objectId =
+          "project-x"}, decision = Allowed}], state = LookupExhausted}))
+```
+
+Note what the strict validator bought: nothing. The old cursor path never called
+`decodeToken` or `validateToken` at all, so no validator, however strict, could refuse it.
+That is the finding: not "validation was too weak" but "validation was absent".
+
+**The interpreters had to grow before the fix could be tested (2026-07-08).** `MintToken` is
+a new operation on a GADT-based effect, so *every* interpreter must implement it or the
+compiler warns. There were four, not two: the permissive in-memory store and the PostgreSQL
+one the plan names, plus `runConsistencyStoreInMemory` and `runConsistencyStoreFailing` in
+`en-example/src/En/Example/Host.hs`. GHC's `-Wincomplete-patterns` found the last two.
+
+The new `runConsistencyStoreInMemoryStrict` exists because the permissive interpreter
+*cannot* fail a token, and a test asserting that a forged cursor is rejected proves nothing
+if the validator it runs against accepts everything. Its in-memory token format is
+`in-memory:<datastore>:<revision>` — deliberately trivial, but it carries the two things a
+cursor test must vary: who minted it and what revision it pins.
+
+**PostgreSQL's `MintToken` sets `expiresAt = Nothing`, matching write tokens (2026-07-08).**
+That looks wrong for something the plan describes as "expiring with the GC window", so it is
+worth stating why it is right. `En.Postgres.TupleStore.tokenFromAnchor` mints write tokens
+with no expiry, and `validateTokenMetadata` enforces the GC window not from a wall-clock
+stamp but by comparing the token's snapshot `xmax` against `oldestRetainedXid`. A cursor
+therefore expires exactly when the rows it could still read are reaped — which is the
+property that matters — rather than at an arbitrary timestamp chosen at mint time.
+
+**B9's acceptance is now a compile-time property, not a grep (2026-07-08).** The plan's
+Validation section proposes verifying "no code path reads at a revision taken from client
+text" by grepping `En.Lookup` for `Revision`. Better: the module now imports the type
+*without its constructor* (`import En.Revision (Consistency, ConsistencyToken (..),
+Revision)`). Every `Revision` in `En/Lookup.hs` is a type in a signature; the module has no
+way to build one. A future edit that tries to resurrect `Revision cursorText` does not pass
+review — it does not compile.
 
 
 ## Decision Log

@@ -324,6 +324,22 @@ runConsistencyStorePostgres config =
                     tokenMetadataFromPayload
                     (validateTokenMetadata config now oldestXid)
                     request
+        -- 'expiresAt' is 'Nothing', exactly as write tokens are minted
+        -- ('En.Postgres.TupleStore.tokenFromAnchor'). The garbage-collection
+        -- window is not a wall-clock stamp on the token; it is enforced at
+        -- validation time by comparing the token's snapshot against
+        -- 'oldestRetainedXid'. A minted token therefore expires when the rows it
+        -- could read are reaped, which is the property that matters.
+        MintToken revision ->
+            pure
+                ( encodeToken
+                    TokenPayload
+                        { datastoreId = config.datastoreId
+                        , schemaHash = config.schemaHash
+                        , revision
+                        , expiresAt = Nothing
+                        }
+                )
 
 snapshotIncludes :: PgSnapshot -> PgSnapshot -> Bool
 snapshotIncludes candidate required =

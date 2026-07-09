@@ -4,6 +4,7 @@
 module En.Lookup (
     LookupCursor (..),
     LookupCursorState (..),
+    FrontierEntry (..),
     LookupLimit (..),
     LookupRequest (..),
     LookupObject (..),
@@ -13,6 +14,7 @@ module En.Lookup (
     noDeadline,
     encodeLookupCursor,
     decodeLookupCursor,
+    resolveCursor,
     lookup,
     lookupCached,
     lookupWithDeadline,
@@ -34,11 +36,11 @@ import Text.Read (readMaybe)
 import En.Caveat (evaluateCaveat)
 import En.Check (CheckCacheEnv, CheckDecision (..), check, checkCached)
 import En.Decision qualified as Decision
-import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
-import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, UsersetQuery (..), readStartingWithUser)
+import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), TokenMetadata (..), decodeToken, mintToken, resolveConsistency, validateToken)
+import En.Effect.TupleStore (PageState (..), StoreCursor (..), TuplePage (..), TupleRow (..), TupleStore, UsersetQuery (..), readStartingWithUser)
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
-import En.Revision (Consistency, Revision (..))
+import En.Revision (Consistency, ConsistencyToken (..), Revision)
 import En.Schema (AllowedSubject (..), CaveatName (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..))
 import En.Tuple (
     CaveatContext (..),
@@ -54,10 +56,46 @@ newtype LookupCursor = LookupCursor
     }
     deriving stock (Eq, Ord, Show)
 
+{- | The state a lookup cursor carries between pages.
+
+The snapshot is pinned by a 'ConsistencyToken', not by raw revision text. A cursor
+is client-supplied input, and the revision inside it decides which snapshot the
+continuation reads; taking that revision on trust let a forged cursor read at an
+arbitrary revision, including past the garbage-collection horizon where deleted
+rows have been physically reaped. A token is the one thing the datastore can
+verify -- identity, schema hash, GC window -- so the cursor carries one and
+'resolveCursor' checks it.
+
+'lastObject' is the watermark: the greatest object key emitted so far. Results are
+merged and sorted by object key, so "everything strictly after the watermark"
+is exactly "everything not yet emitted", regardless of how much of the traversal a
+continuation recomputes. This is what keeps pages free of duplicates and gaps.
+
+'frontier' records per-branch progress for the direct-read stage so a continuation
+can resume the underlying store scans instead of restarting them.
+-}
 data LookupCursorState = LookupCursorState
     { version :: !Int
-    , revision :: !Revision
+    , token :: !ConsistencyToken
     , lastObject :: !(Maybe ObjectRef)
+    , frontier :: ![FrontierEntry]
+    }
+    deriving stock (Eq, Show)
+
+{- | How far one direct-read branch of the traversal has been consumed.
+
+A branch is named by the @readStartingWithUser@ query it issues -- the
+@(ObjectType, RelationName)@ pair -- plus an ordinal distinguishing repeats of the
+same pair. Branch enumeration is deterministic (the rewrite tree is walked
+structurally and allowed subjects come from @Set.toAscList@), so the same ordinal
+names the same branch on every page.
+-}
+data FrontierEntry = FrontierEntry
+    { branchType :: !ObjectType
+    , branchRelation :: !RelationName
+    , branchOrdinal :: !Int
+    , branchCursor :: !(Maybe StoreCursor)
+    , branchExhausted :: !Bool
     }
     deriving stock (Eq, Show)
 
@@ -151,6 +189,14 @@ newtype CheckForCandidate es = CheckForCandidate
     { runCandidateCheck :: ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckDecision
     }
 
+{- | Resolve the snapshot this request reads at, then walk it.
+
+Without a cursor the snapshot comes from the caller's 'Consistency', and the
+outgoing cursor pins it with a freshly minted token so the next page continues on
+the same snapshot. With a cursor the snapshot comes from that cursor's /validated/
+token; the same token is threaded back out so a lookup stays on one snapshot for
+its whole life, however many pages it takes.
+-}
 lookupWithDeadlineWithChecker ::
     (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
     CheckForCandidate es ->
@@ -159,21 +205,19 @@ lookupWithDeadlineWithChecker ::
     Consistency ->
     LookupRequest ->
     Eff es LookupPage
-lookupWithDeadlineWithChecker candidateCheck deadline graph consistency request = do
-    resolved <- resolveLookupRevision
-    revision <- either throwError pure resolved
-    either throwError pure =<< runLookup candidateCheck deadline graph revision consistency cursorState request
+lookupWithDeadlineWithChecker candidateCheck deadline graph consistency request =
+    case request.cursor of
+        Just cursor -> do
+            resolved <- resolveCursor cursor
+            (revision, cursorState) <- either throwError pure resolved
+            run revision cursorState.token (Just cursorState)
+        Nothing -> do
+            ResolvedConsistency{revision} <- resolveConsistency consistency
+            token <- mintToken revision
+            run revision token Nothing
   where
-    cursorState =
-        request.cursor >>= either (const Nothing) Just . decodeLookupCursor
-
-    resolveLookupRevision =
-        case request.cursor of
-            Just cursor ->
-                pure (decodeLookupCursor cursor >>= Right . (.revision))
-            Nothing -> do
-                ResolvedConsistency{revision} <- resolveConsistency consistency
-                pure (Right revision)
+    run revision token cursorState =
+        either throwError pure =<< runLookup candidateCheck deadline graph revision token consistency cursorState request
 
 runLookup ::
     (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>
@@ -181,13 +225,14 @@ runLookup ::
     Deadline (Eff es) ->
     ReachabilityGraph ->
     Revision ->
+    ConsistencyToken ->
     Consistency ->
     Maybe LookupCursorState ->
     LookupRequest ->
     Eff es (Either EnError LookupPage)
-runLookup candidateCheck deadline graph revision consistency cursorState request = do
+runLookup candidateCheck deadline graph revision token consistency cursorState request = do
     candidates <- evalRelation candidateCheck graph request.context revision consistency request.subject request.objectType request.permission initialState
-    traverse (pageLookup deadline request.limit cursorState revision) candidates
+    traverse (pageLookup deadline request.limit cursorState token) candidates
 
 data EvalState = EvalState
     { depth :: !Int
@@ -584,8 +629,8 @@ caveatText :: CaveatName -> Text
 caveatText (CaveatName text) =
     text
 
-pageLookup :: (Monad m) => Deadline m -> LookupLimit -> Maybe LookupCursorState -> Revision -> [LookupObject] -> m LookupPage
-pageLookup deadline (LookupLimit rawLimit) cursorState revision objects = do
+pageLookup :: (Monad m) => Deadline m -> LookupLimit -> Maybe LookupCursorState -> ConsistencyToken -> [LookupObject] -> m LookupPage
+pageLookup deadline (LookupLimit rawLimit) cursorState token objects = do
     hasBudget <- deadline.remainingBudget
     let limit = max 0 rawLimit
         startAfter = cursorState >>= (.lastObject)
@@ -597,9 +642,10 @@ pageLookup deadline (LookupLimit rawLimit) cursorState revision objects = do
         hasMore = length visible < length remainingObjects
         nextCursor =
             LookupCursorState
-                { version = 1
-                , revision
+                { version = 2
+                , token
                 , lastObject = (.object) <$> lastMaybe visible
+                , frontier = []
                 }
         state
             | hasMore && hasBudget = LookupHasMore (encodeLookupCursor nextCursor)
@@ -613,41 +659,126 @@ lastMaybe =
         [] -> Nothing
         values -> Just (last values)
 
-encodeLookupCursor :: LookupCursorState -> LookupCursor
-encodeLookupCursor LookupCursorState{revision, lastObject} =
-    LookupCursor $
-        Text.intercalate
-            ""
-            ( ("lookup-v1" :)
-                [ encodeField revision.revisionEncoding
-                , encodeField (maybe "" (objectText . (.objectType)) lastObject)
-                , encodeField (maybe "" (.objectId) lastObject)
-                ]
-            )
+{- | Encode cursor state as opaque text.
 
+Format v2 is the v1 length-prefixed field codec with the raw revision replaced by a
+consistency token, and a trailing, variable-length frontier:
+
+@
+lookup-v2 |token |lastObjectType |lastObjectId |branchCount ( |type |relation |ordinal |storeCursor |exhausted )*
+@
+
+The branch records are appended flat rather than nested inside one field, so no
+escaping is needed: the count says how many follow.
+-}
+encodeLookupCursor :: LookupCursorState -> LookupCursor
+encodeLookupCursor LookupCursorState{token, lastObject, frontier} =
+    LookupCursor $
+        Text.concat
+            ( "lookup-v2"
+                : encodeField tokenText
+                : encodeField (maybe "" (objectText . (.objectType)) lastObject)
+                : encodeField (maybe "" (.objectId) lastObject)
+                : encodeField (showText (length frontier))
+                : concatMap encodeFrontierEntry frontier
+            )
+  where
+    ConsistencyToken tokenText = token
+
+encodeFrontierEntry :: FrontierEntry -> [Text]
+encodeFrontierEntry FrontierEntry{branchType, branchRelation, branchOrdinal, branchCursor, branchExhausted} =
+    [ encodeField (objectText branchType)
+    , encodeField (relationText branchRelation)
+    , encodeField (showText branchOrdinal)
+    , encodeField (maybe "" (.cursorEncoding) branchCursor)
+    , encodeField (if branchExhausted then "1" else "0")
+    ]
+
+{- | Parse cursor text. This is /parsing only/ -- it does not validate the embedded
+token, and its 'Right' therefore does not mean the cursor may be obeyed. Callers
+inside the engine go through 'resolveCursor'.
+
+A @lookup-v1@ cursor is rejected rather than migrated. Its revision field is
+precisely the forgeable value v2 exists to remove, so honoring old cursors would
+preserve the hole for exactly the clients most likely to be replaying one. Cursors
+are short-lived pagination state; a client recovers by restarting the lookup with
+no cursor, which is the same recovery path as any invalid cursor.
+-}
 decodeLookupCursor :: LookupCursor -> Either EnError LookupCursorState
 decodeLookupCursor (LookupCursor cursorText) =
-    case Text.stripPrefix "lookup-v1" cursorText >>= parseFields 3 of
-        Just [revisionText, objectTypeText, objectId] ->
-            Right
-                LookupCursorState
-                    { version = 1
-                    , revision = Revision revisionText
-                    , lastObject =
-                        if Text.null objectTypeText && Text.null objectId
-                            then Nothing
-                            else Just ObjectRef{objectType = ObjectType objectTypeText, objectId}
-                    }
-        _ -> Left (InvalidConsistencyToken "lookup cursor")
+    maybe (Left (InvalidConsistencyToken "lookup cursor")) Right do
+        body <- Text.stripPrefix "lookup-v2" cursorText
+        ([tokenText, objectTypeText, objectId, countText], afterFixed) <- parseFieldsPrefix 4 body
+        branchCount <- readMaybe (Text.unpack countText)
+        if branchCount < 0 then Nothing else Just ()
+        (entries, rest) <- parseFrontier branchCount afterFixed
+        if Text.null rest then Just () else Nothing
+        pure
+            LookupCursorState
+                { version = 2
+                , token = ConsistencyToken tokenText
+                , lastObject =
+                    if Text.null objectTypeText && Text.null objectId
+                        then Nothing
+                        else Just ObjectRef{objectType = ObjectType objectTypeText, objectId}
+                , frontier = entries
+                }
+
+parseFrontier :: Int -> Text -> Maybe ([FrontierEntry], Text)
+parseFrontier 0 rest =
+    Just ([], rest)
+parseFrontier remaining text = do
+    ([typeText, relationName, ordinalText, cursorText, exhaustedText], rest) <- parseFieldsPrefix 5 text
+    ordinal <- readMaybe (Text.unpack ordinalText)
+    exhausted <-
+        case exhaustedText of
+            "1" -> Just True
+            "0" -> Just False
+            _ -> Nothing
+    let entry =
+            FrontierEntry
+                { branchType = ObjectType typeText
+                , branchRelation = RelationName relationName
+                , branchOrdinal = ordinal
+                , branchCursor = if Text.null cursorText then Nothing else Just (StoreCursor cursorText)
+                , branchExhausted = exhausted
+                }
+    (entries, finalRest) <- parseFrontier (remaining - 1) rest
+    pure (entry : entries, finalRest)
+
+{- | Parse, then verify, an incoming cursor, returning the snapshot it pins.
+
+A cursor arrives as client text. Its token is decoded and validated by the
+datastore exactly as any consistency token presented on a read would be -- same
+datastore identity, same schema hash, same garbage-collection horizon -- and the
+revision the continuation reads at comes from the /validated/ token metadata,
+never from the cursor's own bytes.
+
+A malformed cursor is 'Left' here. A well-formed cursor carrying a token the
+datastore rejects raises through the ambient error effect, exactly as
+'resolveConsistency' does for a bad 'En.Revision.AtExactSnapshot' token; the two
+failures are the same kind of failure and both reach the caller as
+'InvalidConsistencyToken'.
+-}
+resolveCursor ::
+    (ConsistencyStore :> es) =>
+    LookupCursor ->
+    Eff es (Either EnError (Revision, LookupCursorState))
+resolveCursor cursor =
+    case decodeLookupCursor cursor of
+        Left err -> pure (Left err)
+        Right cursorState -> do
+            metadata <- decodeToken cursorState.token
+            validateToken metadata
+            pure (Right (metadata.revision, cursorState))
 
 encodeField :: Text -> Text
 encodeField value =
     "|" <> showText (Text.length value) <> ":" <> value
 
-parseFields :: Int -> Text -> Maybe [Text]
-parseFields expected text = do
-    (fields, rest) <- go expected text
-    if Text.null rest then Just fields else Nothing
+-- | Parse @expected@ length-prefixed fields, returning them and whatever follows.
+parseFieldsPrefix :: Int -> Text -> Maybe ([Text], Text)
+parseFieldsPrefix = go
   where
     go 0 rest = Just ([], rest)
     go remaining rest = do
@@ -672,4 +803,8 @@ renderRef RelationRef{objectType = ObjectType objectType, relation = RelationNam
 
 objectText :: ObjectType -> Text
 objectText (ObjectType text) =
+    text
+
+relationText :: RelationName -> Text
+relationText (RelationName text) =
     text

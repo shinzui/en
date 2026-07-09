@@ -16,6 +16,7 @@ module En.Effect.ConsistencyStore (
     decodeToken,
     validateToken,
     resolveConsistency,
+    mintToken,
 ) where
 
 import Data.Time (UTCTime)
@@ -51,6 +52,17 @@ data ConsistencyStore :: Effect where
     DecodeToken :: ConsistencyToken -> ConsistencyStore m TokenMetadata
     ValidateToken :: TokenMetadata -> ConsistencyStore m ()
     ResolveConsistency :: Consistency -> ConsistencyStore m ResolvedConsistency
+    {- | Mint a token pinning the given revision, stamped with this datastore's
+    identity and schema hash and expiring with the garbage-collection window.
+
+    This is the inverse of 'DecodeToken', and only the datastore can perform
+    it: the token encoding belongs to the storage layer, so an engine that
+    assembled its own "token-equivalent" would fork the format and, worse,
+    would not be checkable by 'ValidateToken'. Anything that wants to hand a
+    revision back to a client and later trust it on the way in -- a lookup
+    cursor, a read response's @checked_at@ -- mints here.
+    -}
+    MintToken :: Revision -> ConsistencyStore m ConsistencyToken
 
 type instance DispatchOf ConsistencyStore = Dynamic
 
@@ -65,3 +77,7 @@ validateToken =
 resolveConsistency :: (ConsistencyStore :> es) => Consistency -> Eff es ResolvedConsistency
 resolveConsistency =
     send . ResolveConsistency
+
+mintToken :: (ConsistencyStore :> es) => Revision -> Eff es ConsistencyToken
+mintToken =
+    send . MintToken

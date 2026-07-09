@@ -61,6 +61,7 @@ import En.Expand (ExpandCursor (..), ExpandLimit (..), ExpandNode (..), ExpandRe
 import En.Expand qualified as Expand
 import En.Lookup (
     Deadline (..),
+    FrontierEntry (..),
     LookupCursor (..),
     LookupCursorState (..),
     LookupLimit (..),
@@ -386,8 +387,26 @@ main = do
     assertEqual "generic integer caveat allows sufficient clearance" (Right Allowed) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelAllowedContext (SubjectId user) (RelationName "view") minLevelDocument
     assertEqual "generic integer caveat denies insufficient clearance" (Right Denied) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency minLevelDeniedContext (SubjectId user) (RelationName "view") minLevelDocument
     assertEqual "generic integer caveat reports missing context" (Right (Conditional [CaveatObligation{caveat = CaveatName "min_level", missingContext = ["clearance"]}])) =<< check consistencyStore minLevelStore minLevelGraph MinimizeLatency (CaveatContext Map.empty) (SubjectId user) (RelationName "view") minLevelDocument
-    let cursorState = LookupCursorState{version = 1, revision = testRevision, lastObject = Just childSpace}
+    let cursorState = LookupCursorState{version = 2, token = testToken, lastObject = Just childSpace, frontier = []}
+        frontierCursorState =
+            cursorState
+                { frontier =
+                    [ FrontierEntry{branchType = ObjectType "space", branchRelation = RelationName "member", branchOrdinal = 0, branchCursor = Just (StoreCursor "17"), branchExhausted = False}
+                    , FrontierEntry{branchType = ObjectType "org", branchRelation = RelationName "member", branchOrdinal = 1, branchCursor = Nothing, branchExhausted = True}
+                    ]
+                }
     assertEqual "lookup cursor codec round-trips" (Right cursorState) (decodeLookupCursor (encodeLookupCursor cursorState))
+    assertEqual "lookup cursor codec round-trips a frontier" (Right frontierCursorState) (decodeLookupCursor (encodeLookupCursor frontierCursorState))
+    -- B9: a cursor is client-supplied text. Nothing may read at a revision taken
+    -- from it without decode+validate.
+    let strictLookupWithCursor cursor =
+            lookupEngine noDeadline strictConsistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) (Just cursor))
+    assertEqual "a forged v1 lookup cursor is rejected, not obeyed" (Left (InvalidConsistencyToken "lookup cursor")) =<< strictLookupWithCursor forgedLookupCursor
+    assertEqual "a malformed v2 lookup cursor is rejected" (Left (InvalidConsistencyToken "lookup cursor")) =<< strictLookupWithCursor garbageLookupCursor
+    assertEqual "a lookup cursor minted by another datastore is rejected" (Left (InvalidConsistencyToken "token datastore does not match this en datastore")) =<< strictLookupWithCursor foreignLookupCursor
+    assertEqual "a lookup cursor carrying an unmintable token is rejected" (Left (InvalidConsistencyToken "token is not an in-memory token")) =<< strictLookupWithCursor tamperedTokenLookupCursor
+    -- The happy path still pages: a cursor this datastore minted is obeyed.
+    assertEqual "a validly minted lookup cursor is obeyed" (Right (lookupPage [allowed space] LookupExhausted)) =<< strictLookupWithCursor (encodeLookupCursor LookupCursorState{version = 2, token = testToken, lastObject = Just childSpace, frontier = []})
     publicGraph <- either (fail . show) pure (compileSchema publicSchema)
     let publicStore = runTupleStoreInMemory [publicTuple]
     assertBool "public view has a wildcard user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing True) Reachability.Direct False publicGraph)
@@ -478,7 +497,7 @@ main = do
     assertEqual "lookup omits denied intersection candidates" (Right (lookupPage [] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOnly) (RelationName "audit") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup confirms exclusion candidates" (Right (lookupPage [allowed exclusionSpace] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId memberOnly) (RelationName "member_not_owner") (ObjectType "space") requestContext (LookupLimit 10) Nothing)
     assertEqual "lookup preserves caveat obligations" (Right (lookupPage [conditional intention [CaveatObligation{caveat = CaveatName "within_autonomy", missingContext = ["requested_autonomy"]}]] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "intention") missingAutonomyContext (LookupLimit 10) Nothing)
-    let childCursor = encodeLookupCursor LookupCursorState{version = 1, revision = testRevision, lastObject = Just childSpace}
+    let childCursor = encodeLookupCursor LookupCursorState{version = 2, token = testToken, lastObject = Just childSpace, frontier = []}
     assertEqual "lookup paginates deterministically first page" (Right (lookupPage [allowed childSpace] (LookupHasMore childCursor))) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) Nothing)
     assertEqual "lookup paginates deterministically second page" (Right (lookupPage [allowed space] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) (Just childCursor))
     spaceExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest space (RelationName "view") requestContext (ExpandLimit 20) Nothing)
@@ -1606,6 +1625,40 @@ recursiveTupleStore =
 consistencyStore :: ConsistencyInterpreter
 consistencyStore =
     runConsistencyStoreInMemory
+
+{- | A consistency store that actually validates tokens, so a cursor test can
+observe a rejection. The permissive 'consistencyStore' accepts anything.
+-}
+strictConsistencyStore :: ConsistencyInterpreter
+strictConsistencyStore =
+    runConsistencyStoreInMemoryStrict (DatastoreId "test")
+
+-- | A token this datastore minted, pinning 'testRevision'.
+testToken :: ConsistencyToken
+testToken =
+    inMemoryToken (DatastoreId "test") testRevision
+
+{- | A hand-written v1 cursor: the format en used to emit, whose revision field is
+raw client-supplied text. This is the forgery B9 describes.
+-}
+forgedLookupCursor :: LookupCursor
+forgedLookupCursor =
+    LookupCursor "lookup-v1|13:test-revision|0:|0:"
+
+-- | Well-formed v2 framing, but the body is not a cursor at all.
+garbageLookupCursor :: LookupCursor
+garbageLookupCursor =
+    LookupCursor "lookup-v2|4:oops"
+
+-- | A structurally valid v2 cursor whose token another datastore minted.
+foreignLookupCursor :: LookupCursor
+foreignLookupCursor =
+    encodeLookupCursor LookupCursorState{version = 2, token = inMemoryToken (DatastoreId "somebody-else") testRevision, lastObject = Nothing, frontier = []}
+
+-- | A structurally valid v2 cursor whose token the datastore never minted.
+tamperedTokenLookupCursor :: LookupCursor
+tamperedTokenLookupCursor =
+    encodeLookupCursor LookupCursorState{version = 2, token = ConsistencyToken "not-a-token", lastObject = Nothing, frontier = []}
 
 fixedRevisionConsistencyStore :: Revision -> ConsistencyInterpreter
 fixedRevisionConsistencyStore revision =

@@ -52,7 +52,7 @@ import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
 import En.Reachability (compileSchema)
-import En.Revision (Consistency (..), DatastoreId (..), Revision (..), SchemaHash (..))
+import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
 import En.Schema.Builder qualified as Schema
 import En.Servant.Authorize (requirePermission)
@@ -170,6 +170,8 @@ runConsistencyStoreInMemory =
             pure ()
         ResolveConsistency consistency ->
             pure ResolvedConsistency{consistency, revision = testRevision}
+        MintToken revision ->
+            pure (ConsistencyToken ("en-example:" <> revision.revisionEncoding))
 
 runConsistencyStoreFailing :: (Error EnError Effectful.:> es) => Eff (ConsistencyStore : es) a -> Eff es a
 runConsistencyStoreFailing =
@@ -179,6 +181,8 @@ runConsistencyStoreFailing =
         ValidateToken _ ->
             pure ()
         ResolveConsistency _ ->
+            throwError (StoreError "injected")
+        MintToken _ ->
             throwError (StoreError "injected")
 
 viewerTuple :: Text -> ObjectRef -> Tuple
