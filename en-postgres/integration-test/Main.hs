@@ -1555,15 +1555,6 @@ schemaSql =
         (object_type, object_id, relation, subject_type, subject_id, coalesce(subject_relation, ''))
       WHERE deleted_xid IS NULL;
 
-    CREATE INDEX relation_tuple_object_live_idx
-      ON relation_tuple (object_type, object_id, relation, id)
-      WHERE deleted_xid IS NULL;
-
-    CREATE INDEX relation_tuple_subject_live_idx
-      ON relation_tuple
-        (subject_type, subject_id, coalesce(subject_relation, ''), object_type, relation, id)
-      WHERE deleted_xid IS NULL;
-
     CREATE INDEX relation_tuple_object_hist_idx
       ON relation_tuple (object_type, object_id, relation, id);
 

@@ -84,6 +84,11 @@ run-migrations: create-database
     else \
       echo "touch-semantics unique index already applied"; \
     fi
+  @if [ "$(psql "$PG_CONNECTION_STRING" -tAc "SELECT to_regclass('public.relation_tuple_object_live_idx') IS NOT NULL")" = "t" ]; then \
+      psql "$PG_CONNECTION_STRING" -v ON_ERROR_STOP=1 -f en-migrations/db/migrations/20260709232320_drop-dead-live-indexes.sql; \
+    else \
+      echo "dead live indexes already dropped"; \
+    fi
 
 # Run a write-token-check HTTP smoke test against a running en-server
 [group("testing")]

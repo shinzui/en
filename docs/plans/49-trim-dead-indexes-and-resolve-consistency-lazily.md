@@ -43,14 +43,14 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Enumerate every `Statement` in `en-postgres/src/En/Postgres/TupleStore.hs` as of the working tree (sibling plans may have reshaped the write path) and prepare the EXPLAIN harness for each.
-- [ ] Seed the dev database and capture `EXPLAIN (ANALYZE, BUFFERS)` for every statement; record which indexes each uses.
-- [ ] Confirm `relation_tuple_object_live_idx` and `relation_tuple_subject_live_idx` appear in no plan; check `pg_stat_user_indexes.idx_scan` stays zero across a driven workload.
-- [ ] Check docs/plans/53-add-a-watch-changelog-api.md status; decide keep-vs-drop for `relation_tuple_created_xid_idx`; record the outcome in BOTH Decision Logs.
-- [ ] Create the drop migration with `just make-migration drop-dead-live-indexes`; add its Justfile guard; mirror the removal in the integration test's `schemaSql`.
+- [x] Enumerate every `Statement` in `en-postgres/src/En/Postgres/TupleStore.hs` as of the working tree (sibling plans may have reshaped the write path) and prepare the EXPLAIN harness for each.
+- [x] Seed the dev database and capture `EXPLAIN (ANALYZE, BUFFERS)` for every statement; record which indexes each uses.
+- [x] Confirm `relation_tuple_object_live_idx` and `relation_tuple_subject_live_idx` appear in no plan; check `pg_stat_user_indexes.idx_scan` stays zero across a driven workload. — **object_live_idx confirmed dead (0 scans). subject_live_idx is NOT dead: it serves EP-46's subject-scoped precondition filter. Resolved by counterfactual — see Surprises & Discoveries and the 2026-07-09 Decision Log entry.**
+- [x] Check docs/plans/53-add-a-watch-changelog-api.md status; decide keep-vs-drop for `relation_tuple_created_xid_idx`; record the outcome in BOTH Decision Logs. — **KEEP; mirrored in both logs.**
+- [x] Create the drop migration with `just make-migration drop-dead-live-indexes`; add its Justfile guard; mirror the removal in the integration test's `schemaSql`. — `20260709232320_drop-dead-live-indexes.sql`; drops **both** `*_live_idx`; guard is the fifth stanza; idempotence confirmed ("dead live indexes already dropped").
+- [x] Re-run the EXPLAIN sweep post-drop to confirm no plan regressed to a sequential scan. — no regressions; the reaper's plan flip was proven (by counterfactual re-creation of the indexes) to be an autovacuum statistics effect, not a consequence of the drop.
 - [ ] Refactor `ResolveConsistency` in `en-postgres/src/En/Postgres/Revision.hs` to fetch per mode; generalize the TTL cache and put the horizon behind it.
 - [ ] Add the operation-counting integration assertion (per-mode fetch counts) and record before/after counts.
-- [ ] Re-run the EXPLAIN sweep post-drop to confirm no plan regressed to a sequential scan.
 - [ ] Run `cabal build all`, `cabal test all`, `just start-and-test`; record transcripts.
 
 
@@ -59,7 +59,156 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+**`relation_tuple_subject_live_idx` is used, and dropping it still makes every plan
+faster.** This plan predicted both `*_live_idx` indexes would appear in no plan, and
+installed a gate: "if a plan *does* use a supposedly dead index, stop … keep that index."
+The gate fired. EP-46 (docs/plans/46) added `matchingLiveTupleExistsStatement` and
+`lockMatchingLiveTupleStatement`, whose `TupleFilter` makes `objectId` optional while
+`objectType` is mandatory. A subject-scoped precondition — `{objectType: "space",
+subjectType: "user", subjectId: "bob"}`, reachable straight over
+`POST /v1/relationships` — filters `deleted_xid IS NULL` with a subject-leading key, and
+the planner picks `relation_tuple_subject_live_idx` for it. A driven workload through the
+real server recorded `idx_scan = 1` on it (and `0` on `relation_tuple_object_live_idx`,
+which stayed dead even under an object-scoped precondition).
+
+But "used" is not "needed". Dropping the index inside a rolled-back transaction and
+re-EXPLAINing the same statement shows `relation_tuple_subject_hist_idx` — the non-partial
+twin — taking over with the **identical index condition**, fewer buffers, and lower
+latency:
+
+```text
+-- baseline (subject_live_idx present)
+->  Index Only Scan using relation_tuple_subject_live_idx on relation_tuple (actual rows=0 loops=1)
+      Index Cond: ((subject_type = 'user') AND (subject_id = 'nobody-here') AND (object_type = 'space'))
+      Heap Fetches: 0
+      Buffers: shared hit=3
+    Execution Time: 0.059 ms
+
+-- counterfactual (subject_live_idx dropped)
+->  Index Scan using relation_tuple_subject_hist_idx on relation_tuple (actual rows=0 loops=1)
+      Index Cond: ((subject_type = 'user') AND (subject_id = 'nobody-here') AND (object_type = 'space'))
+      Buffers: shared hit=3
+    Execution Time: 0.018 ms
+```
+
+The partial index wins an index-only scan but loses on wall clock and ties on buffers; the
+hist twin's key is a superset prefix for this predicate. So the gate's *purpose* (do not
+regress a plan) is satisfied by dropping it, even though the gate's *text* (an index that
+appears in a plan is load-bearing) says keep. Measured write amplification for the pair, on
+a 20,000-row insert into the 250k-row seeded table, median of three trials:
+
+```text
+all indexes ....................... 0.573 s
+both *_live_idx dropped ........... 0.378 s   (-34%)
+object_live_idx dropped only ...... 0.586 s   (within noise of baseline)
+```
+
+The write win requires dropping *both* — removing `object_live_idx` alone is unmeasurable.
+Discovered 2026-07-09; the keep-vs-drop call was escalated and resolved as "drop both".
+
+**`relation_tuple_live_unique` subsumes `relation_tuple_object_live_idx` outright.** The
+dead index's key is `(object_type, object_id, relation, id)` partial on
+`deleted_xid IS NULL`; the unique index's key begins `(object_type, object_id, relation,
+subject_type, …)` under the same predicate. Every object-scoped precondition the API admits
+binds a prefix of those three columns, so the unique index answers it — as an *Index Only
+Scan* when the filter is a prefix. That is why `object_live_idx` records zero scans even
+when the workload contains exactly the query it was built for. Its only unique capability,
+ordering by `id` within an object key, has no consumer: the read path filters visibility
+through `pg_visible_in_snapshot(...)`, never `deleted_xid IS NULL`, so it cannot use a
+partial index predicated on the latter — the original C9 reasoning, confirmed.
+
+**The precondition statements are fast only because PostgreSQL re-plans them per
+execution.** `lockMatchingLiveTupleStatement` and `matchingLiveTupleExistsStatement` are
+`Statement.preparable`, and their `($n::text IS NULL OR col = $n)` idiom is sargable only
+after the planner folds a known-NULL parameter away — which a *custom* plan does and a
+*generic* plan cannot. Forcing `plan_cache_mode = force_generic_plan` collapses both to a
+sequential scan of the whole table:
+
+```text
+->  Parallel Seq Scan on relation_tuple (actual rows=0 loops=2)
+      Filter: ((deleted_xid IS NULL) AND (($2 IS NULL) OR (object_id = $2)) AND …)
+      Rows Removed by Filter: 250019
+      Buffers: shared hit=3035
+    Execution Time: 19.284 ms      -- vs 0.059 ms on the custom plan
+```
+
+This is not a live defect: PostgreSQL only adopts a generic plan when its estimated cost is
+no worse than the custom average, and here the generic plan is ~500× dearer, so the custom
+plan is chosen forever. The driven-workload counters confirm it — the real server, going
+through hasql's prepared statements, took the index. It is recorded because the safety
+margin is the planner's cost comparison rather than anything in the SQL, and because a
+future edit that makes the generic plan look cheap would silently put a full-table lock scan
+inside a write transaction. Discovered 2026-07-09.
+
+**`reapDeletedTuplesBatchStatement` hash-joins a full table scan to delete 1,000 rows
+(out of scope here; for docs/plans/37).** The post-drop sweep showed the reaper's batch
+statement planning as a `Hash Join` whose outer side is a `Seq Scan on relation_tuple`
+(250,023 rows, 3,035 buffers) to reap a `LIMIT 1000` victim set — 23.7 ms. It looked at
+first like a regression this plan had caused. It is not: recreating both dropped indexes
+inside a transaction and re-EXPLAINing yields a *byte-identical* plan, same cost
+(`202.11..6684.93`), same `Seq Scan`. The flip happened between the pre- and post-drop
+sweeps because autovacuum ran over the driven workload and moved the `deleted_xid`
+statistics, not because an index disappeared.
+
+The underlying defect is real. `SET LOCAL enable_seqscan = off` gets the obvious plan —
+a nested loop probing `relation_tuple_pkey` once per victim — at **1.233 ms, a 19×
+improvement**:
+
+```text
+-- planner's choice
+->  Hash Join  (cost=202.11..6684.93 rows=1000)
+      ->  Seq Scan on relation_tuple t  (cost=0.00..5535.23 rows=250023)
+    Execution Time: 23.706 ms
+
+-- enable_seqscan = off
+->  Nested Loop  (cost=0.71..6903.11 rows=1000)
+      ->  Index Scan using relation_tuple_pkey on relation_tuple t (loops=1000)
+    Execution Time: 1.233 ms
+```
+
+The estimates are nearly tied (6684.93 vs 6903.11) and PostgreSQL picks the slower one,
+because it costs 1,000 cached primary-key probes as if they were random I/O. The seq-scan
+side grows linearly with the table while the nested loop does not, so this gets *worse*
+with scale, and it is precisely the master plan's standing rule — a batched statement's
+cost is argued from its EXPLAIN plan, not from its round-trip count. The reaper is owned
+by docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md
+(master plan 6), and `en_transaction` pruning and reaper scheduling are explicitly out of
+this master plan's scope, so it is recorded here rather than fixed. A `LATERAL` probe
+driven from the victims CTE — the same shape EP-48's Decision Log mandates for every
+batched statement over `relation_tuple` — is the natural remedy. Discovered 2026-07-09.
+
+**`readStartingWithUserStatement` at large fan-in does not sort all matches (the review's
+side-note, resolved).** Milestone 1 asked whether the global `ORDER BY id LIMIT` sorts every
+match before applying the limit at high subject-key fan-in. At 1,000 subject keys it does
+not: the plan is a bounded `top-N heapsort` (36 kB) over a nested loop that probes
+`relation_tuple_subject_hist_idx` once per key.
+
+```text
+Limit (actual rows=51 loops=1)
+  ->  Sort (actual rows=51 loops=1)
+        Sort Method: top-N heapsort  Memory: 36kB
+        ->  Nested Loop (actual rows=800 loops=1)
+              ->  HashAggregate (actual rows=1000 loops=1)
+                    ->  Function Scan on unnest (actual rows=1000 loops=1)
+              ->  Index Scan using relation_tuple_subject_hist_idx (loops=1000)
+    Execution Time: 8.554 ms
+```
+
+The heapsort is bounded by the limit, so memory does not grow with the match count. The
+nested loop below it *does* materialize every match (800 rows here) before the limit bites,
+so the work is linear in total matches rather than in the page size — for a subject set
+whose members each hold many grants, that is real but not pathological, and no sort spills.
+No fix is warranted; recorded so a future plan need not re-measure. Discovered 2026-07-09.
+
+**The plan's seed script cannot produce the table it describes.** As scripted it sets
+`subject_id = 'user-' || (g % 20000)` and `object_id = 'obj-' || (g % 4000)`; since
+`4000 | 20000`, the whole identity key is a function of `g % 20000`, so each of the 20,000
+identities repeats ~12 times and `ON CONFLICT DO NOTHING` collapses them to one live row.
+The result is ~16k live rows, not the 200k the EXPLAIN work needs to make index scans win.
+Using `subject_id = 'user-' || g` gives 250,019 rows / 200,006 live / 4,006 objects.
+A seed whose row count is an artifact of its own conflict clause would have produced an
+empty-fixture EXPLAIN sweep — the exact failure mode the master plan's EP-48 entry warns
+about. Discovered 2026-07-09.
 
 
 ## Decision Log
@@ -115,6 +264,43 @@ Record every decision made while working on the plan.
   token there is nothing to validate. This is the "token-less requests don't need the GC
   horizon" half of finding C3.
   Date: 2026-07-07
+- Decision: `relation_tuple_created_xid_idx` is KEPT, reserved for the watch/changelog feed
+  of docs/plans/53-add-a-watch-changelog-api.md. The mirror entry is recorded in that plan's
+  Decision Log. The EXPLAIN sweep confirms it serves no statement today (`idx_scan = 0`
+  across a driven workload), so the reservation is the only thing keeping it.
+  Rationale: This is the coordination the master plan
+  (`docs/masterplans/8-correct-write-path-and-storage-semantics.md`, Integration Points and
+  Decision Log) mandates. docs/plans/53 is entirely Not Started, but its Decision Log already
+  commits to bounding each changelog arm with `created_xid >= $start_xmin::xid8` precisely so
+  this index is load-bearing, and states "this plan is the consumer that keeps it". That is
+  the affirmative claim the gate looks for; dropping and re-adding an index on a large table
+  is avoidable churn. A `-- reserved …` comment next to the index records the reservation on
+  the SQL side. If docs/plans/53 later abandons the xmin-bounded design, it owns the drop.
+  Date: 2026-07-09
+- Decision: `relation_tuple_subject_live_idx` is dropped despite appearing in a live query
+  plan, overriding this plan's Milestone 1 gate ("keep that index").
+  Rationale: The gate exists to prevent a plan regression, and encodes the assumption that an
+  index the planner *chooses* is an index the planner *needs*. The counterfactual falsifies
+  the assumption here: with the index dropped, `relation_tuple_subject_hist_idx` serves the
+  same subject-scoped precondition with a byte-identical index condition, equal buffer count,
+  and lower measured latency (0.018 ms vs 0.059 ms on a miss; 0.041 ms vs 0.125 ms on a hit).
+  Nothing regresses, so the gate's purpose is met. Against that, keeping it costs a 20 MB
+  index maintained on every insert and soft-delete: dropping both `*_live_idx` indexes cuts a
+  20,000-row insert from 0.573 s to 0.378 s (-34%), while dropping `object_live_idx` alone is
+  within measurement noise — the write win exists only if both go. Recovery is a
+  `CREATE INDEX CONCURRENTLY` away and loses no data. Escalated to the user before acting.
+  Date: 2026-07-09
+- Decision: `relation_tuple_object_live_idx` is dropped as strictly subsumed, not merely
+  unused.
+  Rationale: Its key `(object_type, object_id, relation, id)` under `WHERE deleted_xid IS
+  NULL` shares its first three columns with `relation_tuple_live_unique` under the same
+  predicate, so every object-scoped precondition binds a prefix the unique index already
+  covers — often as an Index Only Scan. Its one unique capability, `id` ordering within an
+  object key, has no consumer, because the read path expresses visibility as
+  `pg_visible_in_snapshot(...)` and can never use a partial index predicated on
+  `deleted_xid IS NULL`. `idx_scan` stayed 0 across a driven workload that deliberately
+  included an object-scoped precondition.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective
@@ -123,7 +309,66 @@ Summarize outcomes, gaps, and lessons learned at major milestones or at completi
 Compare the result against the original purpose. Record here: the EXPLAIN index-usage table,
 the created_xid keep/drop outcome, and the per-mode fetch counts before/after.
 
-(To be filled during and after implementation.)
+### Milestone 1–2: the EXPLAIN index-usage table
+
+Captured with `EXPLAIN (ANALYZE, BUFFERS)` against the dev database seeded to 250,019 rows
+(200,006 live, 50,013 soft-deleted, 4,006 objects) and `ANALYZE`d. Batch statements were
+EXPLAINed at **5,000 entries** — five times `EN_MAX_BATCH_SIZE`'s default of 1,000 — per the
+master plan's binding rule that a batched statement's cost is argued at production batch and
+table sizes. Every statement in `en-postgres/src/En/Postgres/TupleStore.hs` that touches
+`relation_tuple` is listed; the three that touch only `en_transaction`
+(`anchorTransactionStatement`, `currentSnapshotStatement`, `oldestRetainedXidStatement`) are
+out of scope for an index review of `relation_tuple`.
+
+| Statement | Index used (before drop) | Index used (after drop) | Regressed? |
+|---|---|---|---|
+| `readObjectRelationStatement` | `object_hist_idx` | `object_hist_idx` | no |
+| `readStartingWithUserStatement` (16 keys) | `subject_hist_idx` | `subject_hist_idx` | no |
+| `readStartingWithUserStatement` (1000 keys) | `subject_hist_idx` | `subject_hist_idx` | no |
+| `readAllTuplesStatement` | `pkey` | `pkey` | no |
+| `probeTuplesStatement` | `object_hist_idx` | `object_hist_idx` | no |
+| `lockMatchingLiveTupleStatement` (full identity) | `live_unique` | `live_unique` | no |
+| `matchingLiveTupleExistsStatement` (full identity) | `live_unique` | `live_unique` | no |
+| `matchingLiveTupleExistsStatement` (object prefix) | `live_unique` (Index Only) | `live_unique` (Index Only) | no |
+| `matchingLiveTupleExistsStatement` (subject-scoped) | **`subject_live_idx`** | `subject_hist_idx` (faster) | no |
+| `batchTouchReplaceStatement` (5000) | `live_unique` + `pkey` | `live_unique` + `pkey` | no |
+| `batchInsertTupleStatement` (5000) | `live_unique` (arbiter) | `live_unique` (arbiter) | no |
+| `batchUnconvergedStatement` (5000) | `live_unique` | `live_unique` | no |
+| `batchDeleteTupleStatement` (5000) | `live_unique` + `pkey` | `live_unique` + `pkey` | no |
+| `reapDeletedTuplesStatement` | `deleted_xid_idx` | `deleted_xid_idx` | no |
+| `reapDeletedTuplesBatchStatement` | `deleted_xid_idx` (+ pkey join) | `deleted_xid_idx` (+ seq-scan join) | no — see Surprises; planner flip caused by autovacuum, not by this drop |
+
+Two `Seq Scan`s survive in the post-drop sweep and are present identically before it: the
+`object_type`-only precondition filters, which are `LIMIT 1` / `EXISTS` early-exits touching
+2–4 buffers when a match exists. They are not regressions. (When they *miss*, the custom plan
+uses `live_unique`; see the generic-plan note in Surprises & Discoveries.)
+
+`pg_stat_user_indexes.idx_scan` deltas across a workload driven through `en-server`
+(`just start-and-test` plus a `mustExist` full-identity precondition, a `mustExist`
+object-scoped precondition, a `mustNotExist` subject-scoped precondition, and a check):
+
+| Index | idx_scan delta | Verdict |
+|---|---|---|
+| `relation_tuple_live_unique` | 5 | keep |
+| `relation_tuple_subject_hist_idx` | 4 | keep |
+| `relation_tuple_pkey` | 3 | keep |
+| `relation_tuple_object_hist_idx` | 1 | keep |
+| `relation_tuple_subject_live_idx` | **1** | **dropped anyway** — redundant, see Decision Log |
+| `relation_tuple_created_xid_idx` | 0 | **kept** — reserved for docs/plans/53 |
+| `relation_tuple_deleted_xid_idx` | 0 (26,504 lifetime) | keep — serves the reaper |
+| `relation_tuple_object_live_idx` | **0** | **dropped** — dead and subsumed |
+
+**`created_xid` outcome: KEEP.** docs/plans/53-add-a-watch-changelog-api.md is Not Started but
+affirmatively claims the index (its window query bounds each arm with
+`created_xid >= $start_xmin::xid8` expressly to keep it load-bearing). Mirror entries are
+recorded in both plans' Decision Logs, and a `COMMENT ON INDEX` records the reservation in the
+live schema.
+
+**Write amplification removed.** 20,000-row insert into the seeded table, median of three
+trials: 0.573 s with all indexes → 0.378 s with both `*_live_idx` dropped (−34%); ~36 MB of
+index storage reclaimed. Dropping `object_live_idx` alone measured within noise of baseline,
+so the win required dropping both — which is what made the `subject_live_idx` counterfactual
+worth running rather than deferring to the plan's keep-the-index gate.
 
 
 ## Context and Orientation
