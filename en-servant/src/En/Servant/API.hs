@@ -34,7 +34,6 @@ module En.Servant.API (
     WriteTuplesRequestWire (..),
     WriteTuplesResponseWire (..),
     DeleteTuplesRequestWire (..),
-    ErrorWire (..),
     objectRefToWire,
     objectRefFromWire,
     subjectToWire,
@@ -69,18 +68,19 @@ import Effectful.Error.Static (Error)
 import GHC.Clock (getMonotonicTimeNSec)
 import Servant (
     Application,
+    Context (..),
     Handler,
     JSON,
     Post,
     Proxy (..),
     ReqBody,
     Server,
-    err400,
-    serve,
+    serveWithContext,
     throwError,
     type (:<|>) (..),
     type (:>),
  )
+import Servant.Server (ErrorFormatter, ErrorFormatters (..), defaultErrorFormatters)
 
 import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..), checkMany)
 import En.Effect.ConsistencyStore (ConsistencyStore)
@@ -90,7 +90,16 @@ import En.Expand qualified as Expand
 import En.Lookup qualified as Lookup
 import En.Revision (Consistency (..), ConsistencyToken (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
-import En.Servant.Seam (EnServer, Env (..), ErrorWire (..), jsonError, runEngine)
+import En.Servant.Seam (
+    EnServer,
+    Env (..),
+    badRequest,
+    batchTooLarge,
+    faultToServerError,
+    invalidRequest,
+    runEngine,
+ )
+import En.Servant.Seam qualified as Seam
 import En.Tuple (
     CaveatContext (..),
     CaveatPayload (..),
@@ -130,8 +139,31 @@ server env =
         :<|> expandHandler env
 
 app :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> Application
-app =
-    serve apiProxy . server
+app env =
+    serveWithContext apiProxy (envelopeFormatters :. EmptyContext) (server env)
+
+{- | Make Servant's own errors speak the same envelope as en's.
+
+A request that fails to parse, or that matches no route, is rejected before any
+handler runs, so it cannot be a 'MultiVerb' response alternative. Without this the
+caller would get Servant's plain-text body and an inconsistent error content type.
+
+Not covered: @405 Method Not Allowed@ and @415 Unsupported Media Type@, which Servant
+raises outside 'ErrorFormatters'. Both currently return an empty body. A 405 is what
+@DELETE \/v1\/relationships@ now yields, and it notably does not consume the request
+body — which is the reason deletion moved to @POST@.
+-}
+envelopeFormatters :: ErrorFormatters
+envelopeFormatters =
+    defaultErrorFormatters
+        { bodyParserErrorFormatter = malformedBody
+        , urlParseErrorFormatter = malformedBody
+        , notFoundErrorFormatter = const Seam.notFound
+        }
+  where
+    malformedBody :: ErrorFormatter
+    malformedBody _typeRep _request detail =
+        faultToServerError (badRequest "malformed_request_body" (Text.pack detail))
 
 {- The JSON below is the public contract. Every instance in this section is written by
 hand so that the wire shape is a reviewed artifact rather than a side effect of
@@ -794,7 +826,11 @@ checkHandler env request = do
 batchCheckHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) => Env es -> BatchCheckRequestWire -> Handler BatchCheckResponseWire
 batchCheckHandler env request = do
     if length request.pairs > env.maxBatchSize
-        then throwError (jsonError err400 "batch exceeds maximum batch size")
+        then
+            throwError
+                ( faultToServerError
+                    (batchTooLarge ("batch exceeds the maximum of " <> Text.pack (show env.maxBatchSize) <> " pairs"))
+                )
         else pure ()
     consistency <- either400 (consistencyFromWire request.consistency)
     context <- either400 (contextFromWire request.context)
@@ -1045,4 +1081,4 @@ traverseOr400 convert values =
 
 either400 :: Either Text a -> Handler a
 either400 =
-    either (throwError . jsonError err400) pure
+    either (throwError . faultToServerError . invalidRequest) pure

@@ -6,6 +6,7 @@ import Data.Aeson (FromJSON, ToJSON, decode, encode)
 import Data.ByteString.Lazy (ByteString)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
+import Data.Text qualified as Text
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Effectful (IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
@@ -22,7 +23,7 @@ import En.Conformance.Kikan (
  )
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
-import En.Error (EnError)
+import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
 import En.Revision (DatastoreId (..))
 import En.Schema (ObjectType (..))
@@ -56,11 +57,18 @@ import En.Servant.API (
     WriteTuplesResponseWire (..),
     server,
  )
+import En.Servant.Seam (
+    EnFault (..),
+    ErrorEnvelopeWire (..),
+    enErrorToFault,
+    faultToServerError,
+ )
 import En.Tuple (ObjectRef (..))
 
 main :: IO ()
 main = do
     wireContractTests
+    errorModelTests
 
     let env =
             Env
@@ -134,6 +142,55 @@ main = do
     assertRight "cached lookup endpoint returns a page second" =<< runHandler (lookupEndpoint lookupRequest)
     lookupStatsAfterSecond <- cacheStats cachedLookupEnv.cacheDecisions
     assertBool "cached lookup endpoint uses decision cache for confirmations" (lookupStatsAfterSecond.hits > lookupStatsAfterFirst.hits)
+
+{- | Pin the engine-error mapping: status, stable code, and retryability.
+
+These three are the client's contract. A client decides whether to retry from
+@retryable@ alone, and branches on @code@ — never on the message text, which is prose
+and may change.
+-}
+errorModelTests :: IO ()
+errorModelTests = do
+    mapsTo "UnknownRelation" (UnknownRelation "audit") (400, "unknown_relation", False)
+    mapsTo "SchemaViolation" (SchemaViolation "subject type not permitted") (400, "schema_violation", False)
+    mapsTo "MissingCaveatContext" (MissingCaveatContext ["now"]) (400, "missing_caveat_context", False)
+    mapsTo "InvalidConsistencyToken" (InvalidConsistencyToken "bad token") (400, "invalid_consistency_token", False)
+    mapsTo "ResolutionLimitExceeded" ResolutionLimitExceeded (422, "resolution_limit_exceeded", False)
+    mapsTo "StoreError" (StoreError secretDetail) (503, "store_error", True)
+
+    -- The 503 message must never carry the SQL text and bound parameters that
+    -- Hasql.toDetailedText puts in StoreError; the operator gets those on stderr.
+    assertBool
+        "store_error envelope hides the store's detail"
+        (not (secretDetail `Text.isInfixOf` (envelopeOf (enErrorToFault (StoreError secretDetail))).message))
+
+    assertEqual
+        "unknown_relation names the offending relation"
+        "unknown relation or permission: audit"
+        (envelopeOf (enErrorToFault (UnknownRelation "audit"))).message
+
+    golden
+        "ErrorEnvelopeWire"
+        "{\"code\":\"store_error\",\"message\":\"the tuple store failed; retry later\",\"retryable\":true}"
+        (envelopeOf (enErrorToFault (StoreError secretDetail)))
+  where
+    secretDetail = "SELECT * FROM relation_tuple WHERE object_id = $1 -- 'alice'"
+
+    mapsTo :: String -> EnError -> (Int, Text, Bool) -> IO ()
+    mapsTo label err expected =
+        assertEqual ("error mapping: " <> label) expected (statusCodeRetryable (enErrorToFault err))
+
+    statusCodeRetryable :: EnFault -> (Int, Text, Bool)
+    statusCodeRetryable fault =
+        (errHTTPCode (faultToServerError fault), envelope.code, envelope.retryable)
+      where
+        envelope = envelopeOf fault
+
+envelopeOf :: EnFault -> ErrorEnvelopeWire
+envelopeOf = \case
+    BadRequestFault envelope -> envelope
+    UnprocessableFault envelope -> envelope
+    UnavailableFault envelope -> envelope
 
 {- | Freeze the JSON wire contract of every type in "En.Servant.API".
 

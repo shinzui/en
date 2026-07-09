@@ -5,26 +5,37 @@ module En.Servant.Seam (
     AppEffects,
     Env (..),
     EnServer,
-    ErrorWire (..),
+    ErrorEnvelopeWire (..),
+    EnFault (..),
+    enErrorToFault,
+    badRequest,
+    invalidRequest,
+    batchTooLarge,
+    permissionDenied,
+    notFound,
+    faultToServerError,
+    envelopeError,
     runEngine,
+    runEngineEither,
     enErrorToServerError,
-    jsonError,
 ) where
 
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (FromJSON, ToJSON, encode)
+import Data.Aeson (FromJSON (..), ToJSON (..), encode, pairs, withObject, (.:), (.=))
+import Data.Aeson qualified as Aeson
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
+import Data.Text.IO qualified as Text
 import Effectful (Eff, IOE)
 import Effectful.Error.Static (Error)
-import GHC.Generics (Generic)
-import Servant (Handler, ServerError (..), err500, throwError)
+import Servant (Handler, ServerError (..), err400, err403, err404, err422, err503, throwError)
+import System.IO (stderr)
 
 import En.Check (CheckDecision)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
-import En.Error (EnError)
+import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
 import En.Postgres.Database (Database)
 import En.Reachability (ReachabilityGraph)
@@ -44,24 +55,149 @@ data Env es = Env
 
 type EnServer = Env AppEffects
 
-newtype ErrorWire = ErrorWire
-    { error :: Text
+{- | The single error shape of the en API.
+
+@code@ is a stable machine-readable identifier; it is the contract, and never the
+@Show@ output of an internal type. @retryable@ lets a client implement retry policy
+without parsing prose: store outages are retryable, token and schema faults are not.
+-}
+data ErrorEnvelopeWire = ErrorEnvelopeWire
+    { code :: !Text
+    , message :: !Text
+    , retryable :: !Bool
     }
-    deriving stock (Eq, Show, Generic)
-    deriving anyclass (FromJSON, ToJSON)
+    deriving stock (Eq, Show)
 
-runEngine :: Env es -> Eff es a -> Handler a
-runEngine Env{runPorts} action = do
-    result <- liftIO (runPorts action)
-    either (throwError . enErrorToServerError) pure result
+instance ToJSON ErrorEnvelopeWire where
+    toJSON wire =
+        Aeson.object ["code" .= wire.code, "message" .= wire.message, "retryable" .= wire.retryable]
+    toEncoding wire =
+        pairs ("code" .= wire.code <> "message" .= wire.message <> "retryable" .= wire.retryable)
 
-enErrorToServerError :: EnError -> ServerError
-enErrorToServerError =
-    jsonError err500 . Text.pack . show
+instance FromJSON ErrorEnvelopeWire where
+    parseJSON = withObject "ErrorEnvelopeWire" \o ->
+        ErrorEnvelopeWire <$> o .: "code" <*> o .: "message" <*> o .: "retryable"
 
-jsonError :: ServerError -> Text -> ServerError
-jsonError err message =
+{- | A failure a handler can produce. The constructor selects the HTTP status, so the
+'MultiVerb' response alternatives in "En.Servant.API" and the thrown 'ServerError's
+used by embedded hosts are built from one source of truth.
+-}
+data EnFault
+    = -- | 400: the caller sent something en cannot act on.
+      BadRequestFault !ErrorEnvelopeWire
+    | -- | 422: the request was well-formed but exceeded an evaluation bound.
+      UnprocessableFault !ErrorEnvelopeWire
+    | -- | 503: a dependency of en failed. Retryable.
+      UnavailableFault !ErrorEnvelopeWire
+    deriving stock (Eq, Show)
+
+{- | Map an engine error onto its status, stable code, and retryability.
+
+'StoreError' deliberately drops its detail: it carries SQL text and bound parameters
+(via @Hasql.toDetailedText@), which must not cross the trust boundary. 'logEnError'
+prints it for the operator instead.
+-}
+enErrorToFault :: EnError -> EnFault
+enErrorToFault = \case
+    UnknownRelation relation ->
+        BadRequestFault (envelope "unknown_relation" ("unknown relation or permission: " <> relation))
+    SchemaViolation detail ->
+        BadRequestFault (envelope "schema_violation" detail)
+    MissingCaveatContext names ->
+        BadRequestFault
+            (envelope "missing_caveat_context" ("missing caveat context: " <> Text.intercalate ", " names))
+    InvalidConsistencyToken detail ->
+        BadRequestFault (envelope "invalid_consistency_token" detail)
+    ResolutionLimitExceeded ->
+        UnprocessableFault
+            (envelope "resolution_limit_exceeded" "the traversal exceeded its depth or breadth bound")
+    StoreError _detail ->
+        UnavailableFault
+            ErrorEnvelopeWire
+                { code = "store_error"
+                , message = "the tuple store failed; retry later"
+                , retryable = True
+                }
+  where
+    envelope code message = ErrorEnvelopeWire{code, message, retryable = False}
+
+-- | A 400 under an arbitrary stable code. No client fault is ever retryable.
+badRequest :: Text -> Text -> EnFault
+badRequest code message =
+    BadRequestFault ErrorEnvelopeWire{code, message, retryable = False}
+
+-- | A request en rejected before it reached the engine.
+invalidRequest :: Text -> EnFault
+invalidRequest = badRequest "invalid_request"
+
+-- | A batch larger than the configured maximum.
+batchTooLarge :: Text -> EnFault
+batchTooLarge = badRequest "batch_too_large"
+
+{- | A 404 for a path that matches no route. Not an 'EnFault': Servant raises it
+before any handler runs, so no operation can return it.
+-}
+notFound :: ServerError
+notFound =
+    envelopeError err404 ErrorEnvelopeWire{code = "not_found", message = "no such endpoint", retryable = False}
+
+{- | A 403 for embedded host routes gated by 'En.Servant.Authorize.requirePermission'.
+Not an 'EnFault': no @EnAPI@ operation can produce it, so it has no response
+alternative to return into.
+-}
+permissionDenied :: Text -> ServerError
+permissionDenied message =
+    envelopeError err403 ErrorEnvelopeWire{code = "permission_denied", message, retryable = False}
+
+-- | Render a fault as the 'ServerError' that carries it at the status it names.
+faultToServerError :: EnFault -> ServerError
+faultToServerError = \case
+    BadRequestFault envelope -> envelopeError err400 envelope
+    UnprocessableFault envelope -> envelopeError err422 envelope
+    UnavailableFault envelope -> envelopeError err503 envelope
+
+-- | Attach an envelope to a 'ServerError', at that error's status.
+envelopeError :: ServerError -> ErrorEnvelopeWire -> ServerError
+envelopeError err envelope =
     err
-        { errBody = encode ErrorWire{error = message}
+        { errBody = encode envelope
         , errHeaders = [("Content-Type", Text.encodeUtf8 "application/json")]
         }
+
+{- | The detail an operator needs and a caller must not see.
+
+Only 'StoreError' carries such detail today. EP-36's structured logging formalizes
+this; until then, stderr.
+-}
+logEnError :: EnError -> IO ()
+logEnError = \case
+    StoreError detail -> Text.hPutStrLn stderr ("en: store error: " <> detail)
+    _ -> pure ()
+
+{- | Run an engine action, throwing on failure.
+
+For embedded host routes, which have no response alternative to return a fault into.
+@EnAPI@'s own handlers use 'runEngineEither'.
+-}
+runEngine :: Env es -> Eff es a -> Handler a
+runEngine env action = do
+    result <- runEngineEither env action
+    either (throwError . faultToServerError) pure result
+
+-- | Run an engine action, returning its failure as a value.
+runEngineEither :: Env es -> Eff es a -> Handler (Either EnFault a)
+runEngineEither Env{runPorts} action = do
+    result <- liftIO (runPorts action)
+    case result of
+        Right value -> pure (Right value)
+        Left err -> do
+            liftIO (logEnError err)
+            pure (Left (enErrorToFault err))
+
+{- | The engine-error mapping as a 'ServerError', for embedded hosts that catch it.
+
+Note this does /not/ log: 'runEngine' has already done so on the path that matters.
+-}
+enErrorToServerError :: EnError -> ServerError
+enErrorToServerError =
+    faultToServerError . enErrorToFault

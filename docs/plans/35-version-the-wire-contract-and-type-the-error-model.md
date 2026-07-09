@@ -80,11 +80,13 @@ This section must always reflect the actual current state of the work.
   (`test-server`) updated; `docs/user/service-and-operations.md` and
   `docs/user/production-deployment-and-performance.md` swept for old shapes; an "API
   versioning" section added documenting the discriminators and the one-time break.
-- [ ] M3: typed error envelope (`ErrorEnvelopeWire`) in Seam.hs with the
+- [x] M3 (2026-07-08): typed error envelope (`ErrorEnvelopeWire`) in Seam.hs with the
   `EnError -> EnFault` mapping (`status`, `code`, `retryable`); `requirePermission` and
-  handler 400s migrated onto it.
-- [ ] M3: uniform JSON errors for body-decode/404 via Servant `ErrorFormatters` and
-  `serveWithContext`; 405/415 behavior observed and recorded.
+  handler 400s migrated onto it. Table test pins all six `EnError` constructors.
+- [x] M3 (2026-07-08): uniform JSON errors for body-decode/404 via Servant
+  `ErrorFormatters` and `serveWithContext`; 405 observed to return an empty body (see
+  Surprises). Verified with PostgreSQL stopped: `503`, `store_error`,
+  `"retryable":true`, generic message, SQL detail on stderr only.
 - [ ] M3b: the six operations become `MultiVerb` endpoints over the shared response list
   `EnResponses`; handlers return `EnResult` instead of throwing; `AsUnion` instance
   written by hand.
@@ -137,6 +139,43 @@ implementation. Provide concise evidence.
   prefix. Verified with a read-only key: `403` on both write routes, `200` on
   `/v1/check`. `methodDelete` is no longer imported in
   `en-server/app/Middleware.hs`.
+
+- **An unknown discriminator surfaces as `malformed_request_body`, not its own code.**
+  The `FromJSON` instances reject `{"mode":"freshest"}`, but that failure happens inside
+  Servant's `ReqBody` combinator, so it reaches the client through
+  `bodyParserErrorFormatter`. The message is still precise — `Error in $.consistency:
+  unknown consistency mode "freshest"; expected minimizeLatency, fullyConsistent,
+  atLeastAsFresh, atExactSnapshot` — because aeson prepends the JSON path. This is the
+  right outcome (a bad discriminator *is* a malformed body), and it is worth knowing
+  that no amount of instance work can give it a distinct code.
+
+- **`405` and `415` bodies stay empty; `ErrorFormatters` cannot reach them.** Confirmed
+  with curl: `DELETE /v1/relationships` returns `405` with a zero-length body and no
+  `Content-Type`. `ErrorFormatters` has hooks only for body-parse, URL-parse,
+  header-parse, and not-found. The plan offered an outermost WAI middleware in `app` to
+  rewrite bodyless 4xx responses into the envelope; **not done**, because en-server
+  already composes WAI middleware in `en-server/app/Main.hs` and EP-36 owns that stack.
+  A 405 reaching a client means the client used the wrong verb — a programming error,
+  not a runtime condition it must parse. Recorded here so EP-36 can add the rewrite if
+  it wants uniformity.
+
+- **`InvalidConsistencyToken` messages leak an internal constructor name.** A garbage
+  token yields `{"code":"invalid_consistency_token","message":"TokenBadPrefix",…}`. The
+  `code` is stable and correct, and `message` is explicitly prose that clients must not
+  branch on, so the contract holds — but `TokenBadPrefix` is the `Show` output of an
+  engine-internal type flowing through `En.Revision`'s `EnError` payload. Cosmetic, and
+  out of scope here (this plan changes representation, not engine text). Whichever plan
+  next touches `En.Revision`'s token parsing should give it human prose.
+
+- **This plan closes the loop on EP-34's database-restart finding.** The master plan
+  records that a PostgreSQL restart costs `2 × (established connections)` failed
+  requests, and that the first failure per stale connection is a *statement*-level error
+  whose text (`Unexpected number of rows …`) reads like a row-decoding bug. Both now
+  reach the client as `503 store_error` with `"retryable":true`, because
+  `enErrorToFault` classifies on the `EnError` constructor — `StoreError` — and never on
+  message text, exactly as EP-34 warned it must. Verified by stopping PostgreSQL under
+  load: four consecutive probes all returned the same retryable envelope, and the
+  underlying socket error appeared only on the server's stderr.
 
 - **`.:?` already handles explicit `null`.** `TupleWire.caveat` encodes as
   `"caveat":null` and decodes from either an explicit `null` or an absent key, because

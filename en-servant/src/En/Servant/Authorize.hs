@@ -3,12 +3,12 @@ module En.Servant.Authorize (
     requirePermission,
 ) where
 
-import Servant (Handler, err403, throwError)
+import Servant (Handler, throwError)
 
 import En.Check (CheckDecision (..))
 import En.Revision (Consistency)
 import En.Schema (RelationName)
-import En.Servant.Seam (Env (..), jsonError, runEngine)
+import En.Servant.Seam (Env (..), permissionDenied, runEngine)
 import En.Tuple (CaveatContext, ObjectRef, Subject)
 
 requirePermission ::
@@ -33,5 +33,7 @@ requirePermission env consistency context subject permission object = do
             )
     case decision of
         Allowed -> pure ()
-        Denied -> throwError (jsonError err403 "permission denied")
-        Conditional _ -> throwError (jsonError err403 "permission is conditional")
+        Denied -> throwError (permissionDenied "permission denied")
+        Conditional _ ->
+            throwError
+                (permissionDenied "permission is conditional; supply the missing caveat context")
