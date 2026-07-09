@@ -88,13 +88,39 @@ Size the pool to the concurrent database-touching work you expect, and keep
 `max_connections` (default `100`). `EN_POOL_MAX_LIFETIME_MS` defaults to one hour
 so connections cycle through server-side configuration changes.
 
-A PostgreSQL restart no longer requires restarting `en-server`. Sessions that land
-on a connection killed by the restart fail once with a `500`, the pool discards
-that connection, and the next request establishes a fresh one — so up to
-`EN_POOL_SIZE` requests may fail while stale connections are flushed. Failures
-carry the detail `pool connection failure` or `timed out acquiring a pooled
-database connection`; transient occurrences right after a restart are expected,
-sustained ones are not. Clients should retry `5xx` responses.
+A PostgreSQL restart no longer requires restarting `en-server`: the pool discards
+connections killed by the restart and establishes fresh ones on demand. Recovery
+is not instantaneous, and it costs more requests than one might expect.
+
+Each connection left stale by the restart fails **twice** before the pool drops
+it. The first session on a stale connection reports a misleading statement-level
+error, which `hasql-pool` does not treat as grounds for discarding the
+connection, so it returns to the pool:
+
+```text
+{"error":"StoreError \"Unexpected number of rows\n  sql: SELECT pg_current_snapshot()::text\n  expectedMin: 1\n  expectedMax: 1\n  actual: 1\"}
+```
+
+(`expectedMin: 1, expectedMax: 1, actual: 1` is self-contradictory — read it as
+"the connection died", not as a decoding bug.) The second session on that same
+connection reports the connection-level error, and the pool discards it:
+
+```text
+{"error":"StoreError \"Connection error\n  reason: no connection to the server\""}
+```
+
+So a restart costs roughly `2 × (established connections)` failed requests — with
+five established connections, ten `500`s, recovering on the eleventh. Note that a
+single API request runs several database sessions, and each borrows its own
+pooled connection, so one failing request may burn more than one stale
+connection. Established connections are usually fewer than `EN_POOL_SIZE`, since
+the pool grows lazily under load.
+
+Clients must retry `5xx` responses. A burst of the two errors above immediately
+after a database restart is expected; sustained occurrences are not. Also expect
+`timed out acquiring a pooled database connection` when the pool is exhausted for
+longer than `EN_POOL_ACQUISITION_TIMEOUT_MS` — that one means `EN_POOL_SIZE` is
+too small for the offered load, not that the database is down.
 
 With `EN_SCHEMA_PATH` set, startup logs the loaded path and the active schema
 hash:

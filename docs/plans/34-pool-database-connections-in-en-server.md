@@ -59,10 +59,15 @@ This section must always reflect the actual current state of the work.
   AllowedWire`), acceptance 2 (bogus `EN_DATABASE_URL` exits 1 with the migrations hint,
   port never bound), acceptance 5 (`EN_POOL_SIZE=0` exits 1; `EN_POOL_SIZE=25` logs the
   pool line) all verified.
-- [ ] M3: reconnect-after-restart validated: smoke test passes, PostgreSQL restarted via
-  `pg_ctl`, smoke test passes again against the same server process; transcript
-  recorded in Outcomes.
-- [ ] M3: concurrency sanity check (parallel curl loop) recorded.
+- [x] M3 (2026-07-08): reconnect-after-restart validated twice against the same server
+  process (pid 39010, never restarted). Recovery costs `2 × (established connections)`
+  failed requests, not the `EN_POOL_SIZE` the Decision Log assumed; transcript and
+  mechanism in Outcomes and Surprises & Discoveries.
+- [x] M3 (2026-07-08): concurrency sanity check recorded — 50/50 `200`, and 3 concurrent
+  PostgreSQL backends observed under a 400-request parallel load (the single-connection
+  design pinned this at 1). Required fixing the plan's own `xargs -I{}` command.
+- [x] M3 (2026-07-08): acceptance 6 (no consumer regressions) — `cabal build all`,
+  `cabal test en-servant`, `cabal test en-core` all pass.
 
 
 ## Surprises & Discoveries
@@ -101,6 +106,80 @@ implementation. Provide concise evidence.
   the new helper is `optionalPositiveIntEnv :: String -> Int -> IO Int` — default **and**
   a `>= 1` floor — rather than a defaulting variant of the non-negative parser. Both
   helpers now coexist in `Main.hs`.
+
+- **A stale connection fails *twice*, not once, so restart recovery costs
+  `2 × (established connections)` failed requests.** The Decision Log's
+  "converges within at most `EN_POOL_SIZE` failed requests" is wrong. Measured with
+  `EN_POOL_SIZE=5`: 3 established connections → 6 failed requests; 5 established
+  connections → 10 failed requests, recovering on the 11th, then 20/20 `200`s. Exactly
+  `2n`, twice, is not a coincidence. The mechanism is in
+  `hasql-pool`'s `Hasql.Pool.SessionErrorDestructors.requiresConnectionDiscard`, which
+  discards a connection only for `ConnectionSessionError`, `MissingTypesSessionError`,
+  or a `ScriptSessionError`/`StatementSessionError` carrying SQLSTATE `0A000`/`XX000`.
+  The *first* session on a stale connection returns neither — it returns a
+  `StatementSessionError` whose payload is self-contradictory:
+
+  ```text
+  {"error":"StoreError \"Unexpected number of rows
+    sql: SELECT pg_current_snapshot()::text
+    prepared: true
+    expectedMin: 1
+    expectedMax: 1
+    actual: 1\""}
+  ```
+
+  `expectedMin: 1, expectedMax: 1, actual: 1` should be a *success*. Because it is not a
+  discardable error, `hasql-pool` returns the dead connection to the pool. Only the
+  *second* session on it surfaces the connection-level truth and triggers the discard:
+
+  ```text
+  {"error":"StoreError \"Connection error
+    reason: no connection to the server\""}
+  ```
+
+  Consequences recorded rather than fixed here (the plan's purpose — surviving a restart
+  without a process restart — is met, proven twice with the original pid still serving):
+  - `docs/user/service-and-operations.md` now documents the real bound and both texts.
+  - **EP-35 must classify errors by `SessionError` constructor, never by message text.**
+    The first post-restart failure *reads* like a row-decoding bug but is a transient,
+    retryable connection failure. A `retryable` flag derived from the message would get
+    this exactly backwards. `Hasql.Errors.isTransient` already answers correctly
+    (`ConnectionSessionError _ -> True`), but it answers `False` for this first error —
+    so EP-35 should not lean on it alone either.
+  - **EP-36's readiness probe will observe this.** A probe that runs one session can draw
+    a stale connection and report unready while the server is fine, or (worse) consume
+    the "free" first failure and mask it from a real request. Readiness should tolerate a
+    single failure before flipping.
+
+- **Each `runSession` is a separate `Pool.use`, so one HTTP request spans several
+  connections.** `En.Postgres.TupleStore` and `En.Postgres.Revision` call `runSession`
+  once per logical step (head revision, then object/relation reads, then writes), and the
+  `Database` effect maps each call to one pool acquisition. Under the old
+  single-connection runner every session in a request shared a connection; now they do
+  not. This is *safe by design* — en pins reads to an explicit revision and evaluates
+  visibility with `pg_visible_in_snapshot`, so correctness never depended on a shared
+  session snapshot — but it is a real semantic change and it is why a single failing
+  request can burn more than one stale connection. **EP-37's maintenance loop must not
+  assume its `oldestRetainedXidSession` and `reapDeletedTuplesSession` share a snapshot
+  or a connection**; they never did share a transaction, and now they do not even share a
+  socket. Anything needing session-local state (advisory locks, `SET LOCAL`, temp tables)
+  cannot be expressed as two `runSession` calls.
+
+- **`just test-server` masks database failures and cannot prove restart recovery.** Its
+  first request is `curl -sS -X DELETE .../tuples >/dev/null` with no `--fail` and no
+  status check, so a `500` there is silently swallowed — absorbing one or two stale
+  connections before the assertions begin. That is why the smoke test passed on its first
+  post-restart attempt while direct `/check` probes were still returning `500`. The
+  restart proof in this plan therefore rests on the direct probe loop, not on
+  `just test-server`. Left as-is (fixing the Justfile is out of scope), but any later
+  plan that leans on `just test-server` as a health signal should know it under-reports.
+
+- **The plan's own concurrency command was broken.** `xargs -P 16 -I{}` substitutes the
+  `{}` placeholder into the JSON body — `"context":{"values":{}}` became
+  `"context":{"values":1}` — and all 50 requests returned `400`, which looks exactly like
+  a pooling failure. Corrected to `-I@@` in Concrete Steps. With that fixed, 50/50 return
+  `200`, and sampling `pg_stat_activity` during a 400-request run shows 3 concurrent
+  `en-server` backends where the single-connection design pinned it at 1.
 
 - **Warp's TLS/plaintext branch had to be lifted out of `main`.** Attaching
   `` `finally` Pool.release pool `` to a multi-line `case tlsConfig of` inside the
@@ -168,6 +247,12 @@ Record every decision made while working on the plan.
   errors as `retryable` in the typed error envelope so clients can retry safely at
   their layer. Validation below encodes this honestly.
   Date: 2026-07-07
+  **Amended 2026-07-08 (M3):** the decision stands, but its convergence bound was
+  wrong. Measured cost is `2 × (established connections)` failed requests, not
+  `EN_POOL_SIZE` — each stale connection fails twice before `hasql-pool` discards it.
+  See Surprises & Discoveries. The decision not to auto-retry is unchanged and is now
+  *more* consequential, so `docs/user/service-and-operations.md` documents the real
+  bound and both error texts an operator will see.
 - Decision: Add `optionalPositiveIntEnv :: String -> Int -> IO Int` (default plus a
   `>= 1` floor) rather than a defaulting variant of `optionalNonNegativeIntEnv`.
   Rationale: The plan called for "a variant taking a default value", but all four pool
@@ -193,7 +278,68 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+**Complete (2026-07-08).** Finding A2 is fixed. `en-server` interprets the `Database`
+effect against a `hasql-pool` `Pool`; concurrent requests are served from distinct
+PostgreSQL backends; a `pg_ctl restart` no longer bricks the process; the inert bracket
+is gone, replaced by a `finally` that will become load-bearing when EP-36 adds graceful
+shutdown.
+
+Against the Purpose section's two claims:
+
+*"Concurrent requests each borrow their own connection."* Verified. Sampling
+`pg_stat_activity` during 400 parallel `/check` requests (`-P 32`) showed 3 concurrent
+`en-server` backends; 50/50 parallel requests return `200`. The old runner held exactly
+one `Connection` — an `MVar` around one libpq socket — so this count was structurally
+pinned at 1. The pool grows lazily, so it stops at 3 rather than `EN_POOL_SIZE=5`;
+en's sessions are short enough that 5 are never needed at once at this load.
+
+*"A PostgreSQL restart no longer bricks the server."* Verified twice, same server pid
+throughout:
+
+```text
+=== backends before restart ===
+5
+=== pg_ctl restart ===
+waiting for server to shut down.... done
+server stopped
+waiting for server to start.... done
+server started
+=== server process still alive? ===
+39010 S+   .../en-server
+=== probes after restart ===
+probes 1-5:  500  StoreError "Unexpected number of rows … actual: 1"
+probes 6-10: 500  StoreError "Connection error / reason: no connection to the server"
+probe 11:    200
+=== 20 more probes ===
+200 200 200 200 200 200 200 200 200 200 200 200 200 200 200 200 200 200 200 200
+```
+
+The old single-connection design failed *every* request forever after this point. That
+contrast is the proof the finding is fixed.
+
+**The one substantive gap, honestly stated.** Recovery is twice as expensive as this
+plan predicted when it was written. Each stale connection fails two requests, not one,
+because `hasql-pool` only discards a connection on a connection-level error and the
+first session on a dead socket reports a statement-level one (with the actively
+misleading text `expectedMin: 1, expectedMax: 1, actual: 1`). The measured law is
+`2 × (established connections)` — confirmed at both 3 and 5 connections. The Decision Log
+entry that predicted `EN_POOL_SIZE` has been amended in place rather than quietly
+corrected, and `docs/user/service-and-operations.md` documents the real bound and both
+error strings so an operator reading a post-restart log is not misled into hunting a
+decoding bug. The decision *not* to auto-retry still stands — blind re-execution is
+unsafe for writes — but it now costs more, and EP-35's `retryable` classification must
+key off the `SessionError` constructor rather than the message.
+
+Two findings escape this plan's scope and are logged for siblings: each `runSession` is
+its own `Pool.use`, so a single request spans several connections (EP-37 must not assume
+a shared snapshot); and `just test-server` swallows the HTTP status of its opening
+`DELETE`, so it cannot be trusted as a restart-recovery signal.
+
+Lesson worth carrying: two of this plan's prewritten validation commands were wrong in
+ways that impersonate the bug under test. `xargs -I{}` rewrote the JSON body and produced
+50 × `400`, which reads exactly like a broken pool. Redirecting stdout hid every startup
+line, which reads exactly like a server that never configured its pool. Both cost real
+time. Validation commands deserve the same skepticism as the code they validate.
 
 
 ## Context and Orientation
@@ -478,11 +624,14 @@ Terminal 1 must show no crash and require no restart. If process-compose's super
 flags the postgres process after the out-of-band restart, `just process-down && just
 process-up` restores its view; the proof stands either way.)
 
-Concurrency sanity check (server still running):
+Concurrency sanity check (server still running). Note the `-I@@` placeholder: **do not
+use `xargs -I{}` here**, because `xargs` substitutes `{}` inside the JSON body
+(`"values":{}` becomes `"values":1`) and every request returns 400.
 
 ```bash
-seq 1 50 | xargs -P 16 -I{} curl -s -o /dev/null -w "%{http_code}\n" \
+seq 1 50 | xargs -P 16 -I@@ curl -s -o /dev/null -w "%{http_code}\n" \
   localhost:8080/check \
+  -H 'Authorization: Bearer dev-secret-0123456789' \
   -H 'content-type: application/json' \
   -d '{"consistency":{"tag":"MinimizeLatencyWire"},"context":{"values":{}},"subject":{"tag":"SubjectIdWire","contents":{"objectType":"user","objectId":"alice"}},"permission":"view","object":{"objectType":"space","objectId":"project-x"}}' \
   | sort | uniq -c
@@ -492,6 +641,15 @@ Expected:
 
 ```text
   50 200
+```
+
+To observe that requests really are served from distinct connections, sample
+PostgreSQL while the load runs (the count settles above 1, which the
+single-connection design could never do):
+
+```bash
+psql "$PG_CONNECTION_STRING" -tAc \
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='client backend' AND application_name=''"
 ```
 
 (If EP-33 has already landed, add its `Authorization: Bearer …` header to these curl

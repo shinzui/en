@@ -71,7 +71,7 @@ merely because they touch the same lines, not because of real artifact dependenc
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | EP-33 | Add caller authentication and rate limiting to en-server | docs/plans/33-add-caller-authentication-and-rate-limiting-to-en-server.md | None | None | Complete |
-| EP-34 | Pool database connections in en-server | docs/plans/34-pool-database-connections-in-en-server.md | None | None | In Progress |
+| EP-34 | Pool database connections in en-server | docs/plans/34-pool-database-connections-in-en-server.md | None | None | Complete |
 | EP-35 | Version the wire contract and type the error model | docs/plans/35-version-the-wire-contract-and-type-the-error-model.md | None | None | Not Started |
 | EP-36 | Add health endpoints, graceful shutdown, and observability | docs/plans/36-add-health-endpoints-graceful-shutdown-and-observability.md | None | EP-34, EP-35 | Not Started |
 | EP-37 | Schedule background maintenance for reaping and transaction pruning | docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md | None | EP-34 | Not Started |
@@ -136,7 +136,7 @@ recovery by the same horizon.
 
 - [x] EP-33: authentication required on every endpoint; unauthenticated requests get 401
 - [x] EP-33: write endpoints separately authorizable; rate limiting active
-- [ ] EP-34: en-server serves concurrent requests through hasql-pool and survives a PostgreSQL restart
+- [x] EP-34: en-server serves concurrent requests through hasql-pool and survives a PostgreSQL restart
 - [ ] EP-35: versioned path prefix and stable field names on all endpoints; constructor tags gone
 - [ ] EP-35: typed error envelope with machine-readable codes; 4xx/5xx split correct; OpenAPI document served
 - [ ] EP-36: /healthz and /readyz respond correctly; SIGTERM drains in-flight requests
@@ -200,6 +200,54 @@ From EP-33 (2026-07-08), affecting sibling plans:
   plan re-keys buckets by client IP, it must add eviction or it becomes an unbounded
   memory leak.
 
+From EP-34 (2026-07-08), affecting sibling plans:
+
+- **The `Database` runner is now `runDatabasePool :: Pool -> Eff (Database : es) a -> Eff es a`**
+  (`en-postgres/src/En/Postgres/Database.hs`), and `en-server/app/Main.hs` builds its
+  `runAppIO` from it. `runDatabaseConnection` still exists for the integration test. As
+  the Integration Points required, **EP-36's readiness probe and EP-37's maintenance
+  session must call through the `Database` effect** and never hold a raw `Connection`.
+
+- **Every `runSession` is a separate `Pool.use`, so a single HTTP request now spans
+  several PostgreSQL connections.** This was invisible under the single-connection
+  runner. It is safe — en pins reads to an explicit revision and evaluates visibility
+  with `pg_visible_in_snapshot`, so nothing depended on a shared session snapshot — but
+  **EP-37 must not assume its `oldestRetainedXidSession` and `reapDeletedTuplesSession`
+  share a connection or a snapshot**, and no plan may express session-local state
+  (advisory locks, `SET LOCAL`, temp tables) across two `runSession` calls.
+
+- **After a PostgreSQL restart, each stale pooled connection fails two requests, not
+  one.** `hasql-pool` discards a connection only on a connection-level error; the first
+  session on a dead socket returns a *statement*-level error whose text is actively
+  misleading (`Unexpected number of rows … expectedMin: 1, expectedMax: 1, actual: 1`),
+  so the dead connection goes back into the pool and fails once more before being
+  dropped. Measured `2 × (established connections)` at both 3 and 5 connections.
+  **EP-35 must therefore classify `retryable` by `SessionError` constructor, never by
+  message text** — that first error reads like a row-decoding bug and is in fact a
+  transient connection failure. Note `Hasql.Errors.isTransient` also returns `False` for
+  it, so it cannot be the sole signal either. **EP-36's readiness probe** should tolerate
+  one failure before flipping to unready, or it will flap after a database restart and
+  may consume the "free" first failure that a real request would otherwise absorb.
+
+- **`just test-server` cannot prove database-recovery behavior.** Its opening
+  `curl -sS -X DELETE .../tuples >/dev/null` has no `--fail` and no status check, so a
+  `500` there is silently swallowed. It passed on the first attempt after a restart while
+  direct `/check` probes were still returning `500`. Any plan using `just test-server` as
+  a health signal should know it under-reports; EP-36, which adds real health endpoints,
+  is the natural place to stop relying on it.
+
+- **`Warp.run`/`WarpTLS.runTLS` moved out of `main` into a top-level
+  `serve :: Maybe TlsConfig -> Int -> Wai.Application -> IO ()`**, and `main` now ends
+  with `serve tlsConfig port wrappedApp \`finally\` Pool.release pool`. **EP-36 adds
+  graceful shutdown inside `serve`**, not in `main`; the `finally` that releases the pool
+  becomes load-bearing at that moment (today `Warp.run` never returns normally).
+
+- **EP-34 confirmed EP-33's block-buffered-stdout finding.** With stdout redirected to a
+  file and the process ended by SIGTERM, *no* startup line appears — including the new
+  `Connection pool: size=…` line. The same run under a pty prints all of them. EP-36's
+  `hSetBuffering stdout LineBuffering` remains necessary and now hides operational
+  configuration, not just the auth warning.
+
 
 ## Decision Log
 
@@ -212,6 +260,14 @@ From EP-33 (2026-07-08), affecting sibling plans:
 - Decision: No hard dependencies between children; coordinate through Integration Points instead.
   Rationale: Every plan is independently compilable and verifiable; serializing them would delay the CRITICAL auth fix behind unrelated work.
   Date: 2026-07-07
+- Decision: Accept that a PostgreSQL restart costs `2 × (established connections)` failed
+  requests rather than adding automatic session retry in EP-34.
+  Rationale: Blind re-execution of a failed session is unsafe for writes — the transaction
+  may or may not have committed — and `hasql-pool` deliberately does not do it. The server
+  recovers with no process restart, which is the property finding A2 demanded. The cost is
+  now documented in `docs/user/service-and-operations.md` with both error strings, and
+  EP-35's typed envelope will mark these errors retryable so clients retry at their layer.
+  Date: 2026-07-08
 
 
 ## Outcomes & Retrospective
