@@ -3,8 +3,12 @@
 module Main (main) where
 
 import Data.Aeson (FromJSON, ToJSON, decode, encode)
+import Data.Aeson qualified as Aeson
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy (ByteString)
 import Data.Functor ((<&>))
+import Data.List qualified as List
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -59,6 +63,7 @@ import En.Servant.API (
     WriteTuplesResponseWire (..),
     server,
  )
+import En.Servant.OpenApi (enOpenApi)
 import En.Servant.Seam (
     EnFault (..),
     ErrorEnvelopeWire (..),
@@ -71,6 +76,7 @@ main :: IO ()
 main = do
     wireContractTests
     errorModelTests
+    openApiDocumentTests
 
     let env =
             Env
@@ -167,6 +173,54 @@ main = do
     assertOk "cached lookup endpoint returns a page second" =<< runHandler (lookupEndpoint lookupRequest)
     lookupStatsAfterSecond <- cacheStats cachedLookupEnv.cacheDecisions
     assertBool "cached lookup endpoint uses decision cache for confirmations" (lookupStatsAfterSecond.hits > lookupStatsAfterFirst.hits)
+
+{- | The generated document describes the API that is actually served.
+
+Checks the two properties that silently rot: the path set, and that every operation
+declares its error responses. The response statuses come from each operation's
+'MultiVerb' response list, so this fails the moment an endpoint is added without one.
+-}
+openApiDocumentTests :: IO ()
+openApiDocumentTests = do
+    document <- either fail pure (Aeson.eitherDecode (encode enOpenApi))
+
+    assertEqual
+        "openapi document lists exactly the served operations"
+        [ "/v1/batch-check"
+        , "/v1/check"
+        , "/v1/expand"
+        , "/v1/lookup"
+        , "/v1/relationships"
+        , "/v1/relationships/delete"
+        ]
+        (List.sort (objectKeys (document `at` "paths")))
+
+    mapM_
+        ( \path ->
+            assertEqual
+                ("operation " <> Text.unpack path <> " documents its error responses")
+                ["200", "400", "422", "503"]
+                (List.sort (objectKeys (document `at` "paths" `at` Key.fromText path `at` "post" `at` "responses")))
+        )
+        [ "/v1/batch-check"
+        , "/v1/check"
+        , "/v1/expand"
+        , "/v1/lookup"
+        , "/v1/relationships"
+        , "/v1/relationships/delete"
+        ]
+
+    assertBool
+        "openapi document defines the error envelope"
+        ("ErrorEnvelopeWire" `elem` objectKeys (document `at` "components" `at` "schemas"))
+  where
+    at :: Aeson.Value -> Key.Key -> Aeson.Value
+    at (Aeson.Object o) key = maybe Aeson.Null id (KeyMap.lookup key o)
+    at _ _ = Aeson.Null
+
+    objectKeys :: Aeson.Value -> [Text]
+    objectKeys (Aeson.Object o) = Key.toText <$> KeyMap.keys o
+    objectKeys _ = []
 
 {- | Pin the engine-error mapping: status, stable code, and retryability.
 

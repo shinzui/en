@@ -97,9 +97,12 @@ This section must always reflect the actual current state of the work.
 - [x] M3b (2026-07-08): **no-wire-change claim verified.** Captured the error transcript
   against the M3 commit (`059fbd4`) and against the M3b tree, and `diff` reported them
   identical — same statuses, same bodies, including the empty-bodied 405 and 415.
-- [ ] M4: OpenAPI document generated with servant-openapi-hs and served at
-  `GET /v1/openapi.json`; `ToSchema` instances hand-written to match the JSON grammar;
-  every operation documents its 400/422/503 responses.
+- [x] M4 (2026-07-08): OpenAPI 3.1 document generated with servant-openapi-hs and served
+  at `GET /v1/openapi.json` (via new `En.Servant.OpenApi`, which `en-server` now serves
+  through `appWithOpenApi`); `ToSchema` instances hand-written to match the M1 grammar;
+  each of the six operations documents `200`, `400`, `422`, `503`. Pins recorded in the
+  Decision Log. A test decodes `enOpenApi` and asserts the path set and per-operation
+  response statuses.
 - [ ] Final: full curl transcript reproduced; `cabal test en-servant` and
   `just start-and-test` green; breaking change called out in
   `docs/user/service-and-operations.md`.
@@ -200,6 +203,20 @@ implementation. Provide concise evidence.
   against the M3 commit `059fbd4` and again against the M3b tree; `diff` reported them
   identical. That is the property the whole decision rested on, so it is now a recorded
   measurement and not an argument.
+
+- **`declareSchemaRef` handles the recursive `ExpandNodeWire` for free.** The plan
+  worried about hand-building a self-reference. `openapi-hs`'s `Declare` monad is lazy in
+  its declarations, so `declareSchemaRef (Proxy @ExpandNodeWire)` called from inside
+  `ExpandNodeWire`'s own instance registers the name before recursing and terminates.
+  The emitted document has
+  `"children": {"type":"array","items":{"$ref":"#/components/schemas/ExpandNodeWire"}}`
+  rather than an infinitely inlined schema.
+
+- **The generated document does not describe its own endpoint.** `enOpenApi` is
+  `toOpenApi apiProxy`, and `apiProxy` is `EnAPI` — six operations. `/v1/openapi.json`
+  lives in `ServedAPI`, outside `EnAPI`, so it is served but not documented. This is the
+  intended consequence of keeping `en-client` free of it, and the plan's acceptance
+  criterion ("the `paths` set equals the served operations") reads on the six.
 
 - **`.:?` already handles explicit `null`.** `TupleWire.caveat` encodes as
   `"caveat":null` and decodes from either an explicit `null` or an absent key, because
@@ -315,6 +332,27 @@ Record every decision made while working on the plan.
   `ToSchema` instances are required so the document matches the hand-written JSON —
   and the golden tests in M1 are what keep both honest.
   Date: 2026-07-07
+  Pins resolved at implementation time (2026-07-08): `shinzui/openapi-hs` at
+  `965340a30fad0782f2c964ab97b4ab0f12fa044d` (v4.1.0), `shinzui/servant-openapi-hs` at
+  `7cbbc234cb7c0e900495b2f676e2912a7f456ff0` (v4.1.0). Both are top-level packages, so
+  neither pin needs a `subdir:`.
+- Decision: Put the OpenAPI route in a new `En.Servant.OpenApi` module serving
+  `ServedAPI = EnAPI :<|> "v1" :> "openapi.json" :> Get '[JSON] OpenApi`, accept the
+  `ToSchema` orphan instances there, and have `en-server` call its `appWithOpenApi`.
+  `En.Servant.API.app` still serves the bare `EnAPI` for embedded hosts.
+  Rationale: Keeping the description route out of `EnAPI` is what keeps `en-client` —
+  which is derived from `EnAPI` — free of an operation no client wants. The orphans are
+  contained: both the wire types and their instances ship in `en-servant`, so no other
+  package can define a competing instance without depending on this one first. The
+  alternative, moving 20-odd `ToSchema` instances into `En.Servant.API`, would make the
+  module that defines the wire contract also depend on the OpenAPI machinery.
+  Date: 2026-07-08
+- Decision: Do not exempt `GET /v1/openapi.json` from authentication.
+  Rationale: EP-33 exempts only `/healthz` and `/readyz`, on the grounds that
+  orchestrator probes cannot conveniently carry credentials. A schema scraper can. The
+  document reveals the full shape of the authorization API, which is not secret but is
+  reconnaissance; requiring a bearer key costs a legitimate consumer one header.
+  Date: 2026-07-08
 - Decision: Define `toEncoding` explicitly alongside `toJSON` for every wire type,
   rather than letting it default to `Data.Aeson.Encoding.value . toJSON`.
   Rationale: It is what makes the exact-bytes golden tests this plan calls for both

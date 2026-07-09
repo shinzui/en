@@ -299,9 +299,75 @@ curl -sS -X POST localhost:8080/v1/check \
 # {"decision":{"result":"allowed"}}
 ```
 
+### Machine-readable description
+
+`GET /v1/openapi.json` serves an OpenAPI 3.1 document describing every operation, its
+request and response schemas, and its error responses. It requires a bearer key like
+any other endpoint (only `/healthz` and `/readyz` are exempt), and it does not describe
+itself — `paths` contains exactly the six authorization operations.
+
+```shell
+curl -sS -H "Authorization: Bearer $EN_API_KEY" localhost:8080/v1/openapi.json \
+  | jq -r '.paths | keys[]'
+```
+
+Each operation documents `200`, `400`, `422`, and `503`. Those statuses are not
+hand-written prose: they are response alternatives of the operation's type in
+`En.Servant.API`, so the document cannot drift from what the server returns.
+
+### Error responses
+
+Every error — engine, validation, body-decode, or authentication — is one JSON object:
+
+```json
+{"code": "invalid_consistency_token", "message": "…", "retryable": false}
+```
+
+Branch on `code`, which is stable. Never branch on `message`, which is prose and may
+change. `retryable` is the whole retry policy: it is `true` only for `store_error`.
+
+| Status | `code` | Meaning |
+| --- | --- | --- |
+| `400` | `unknown_relation` | The permission or relation is not in the active schema |
+| `400` | `schema_violation` | A tuple referenced a subject or object the schema forbids |
+| `400` | `missing_caveat_context` | A caveat needed context the request did not supply |
+| `400` | `invalid_consistency_token` | The token is malformed or outside the GC window |
+| `400` | `invalid_request` | A field failed validation (e.g. an empty `relation`) |
+| `400` | `batch_too_large` | The batch exceeded the configured maximum |
+| `400` | `malformed_request_body` | The body was not valid JSON, or a discriminator was unrecognized |
+| `401` | `unauthenticated` | Missing, malformed, or unknown bearer key |
+| `403` | `permission_denied` | A read-only key attempted a write |
+| `404` | `not_found` | No such endpoint |
+| `422` | `resolution_limit_exceeded` | The traversal exceeded its depth or breadth bound |
+| `429` | `rate_limited` | The caller exhausted its token bucket |
+| `503` | `store_error` | The tuple store failed. **Retryable** |
+
+A `503 store_error` never carries the underlying SQL or bound parameters; those go to
+the server's stderr for the operator. A PostgreSQL restart surfaces as a short burst of
+retryable `503`s (see "Connection pooling" above) rather than as a server that must be
+restarted.
+
+Two responses fall outside the envelope, because Servant raises them before any handler
+runs and before the error formatter is reached: `405 Method Not Allowed` (wrong verb for
+a real path) and `415 Unsupported Media Type` (a `Content-Type` other than
+`application/json`). Both have empty bodies. Each means the client is calling the API
+incorrectly, not that a runtime condition occurred.
+
 The typed Haskell client in `en-client` is derived from the same Servant API type,
 so it tracks this surface automatically. Point its `BaseUrl` at the host root; the
-`/v1` prefix lives in the API type, not the base URL.
+`/v1` prefix lives in the API type, not the base URL. Every operation returns an
+`EnResult`, so engine faults arrive as values to pattern-match rather than as an opaque
+`ClientError`:
+
+```haskell
+result <- runClientM (enClient.check request) clientEnv
+case result of
+    Right (EnOk response) -> useDecision response.decision
+    Right (EnUnavailable envelope) | envelope.retryable -> retryLater
+    Right (EnClientError envelope) -> reportBug envelope.code
+    Right other -> reportBug (Text.pack (show other))
+    Left transportError -> reportTransport transportError
+```
 
 ```haskell
 import En.Client
@@ -326,8 +392,10 @@ requirePermission
     object
 ```
 
-It returns `()` on `Allowed`, throws `403` on `Denied` or `Conditional`, and
-throws `500` on engine errors.
+It returns `()` on `Allowed` and throws a `403` with code `permission_denied` on
+`Denied` or `Conditional`. Engine errors are thrown as the same envelope and status
+that the en endpoints return them with — `400`, `422`, or `503` — not as a blanket
+`500`.
 
 ## Operational guidance
 

@@ -38,17 +38,22 @@ library
   exposed-modules:
     En.Servant.API
     En.Servant.Authorize
+    En.Servant.OpenApi
     En.Servant.Seam
 
   build-depends:
     , aeson
-    , base            >=4.19 && <5
+    , base                       >=4.19 && <5
     , containers
     , effectful
     , effectful-core
     , en-core
     , en-postgres
+    , insert-ordered-containers
+    , lens
+    , openapi-hs
     , servant
+    , servant-openapi-hs
     , servant-server
     , sop-core
     , text

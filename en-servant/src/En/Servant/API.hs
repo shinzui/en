@@ -8,6 +8,7 @@ module En.Servant.API (
     Env (..),
     server,
     app,
+    envelopeFormatters,
     EnResponses,
     EnResult (..),
     ObjectRefWire (..),

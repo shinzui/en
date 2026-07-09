@@ -27,7 +27,7 @@ import En.Revision (DatastoreId (..), SchemaHash (..))
 import En.Schema (Schema, schemaHash, validateSchema)
 import En.Schema.Builder qualified as Schema
 import En.Schema.Parse (parseSchema)
-import En.Servant.API (app)
+import En.Servant.OpenApi (appWithOpenApi)
 import En.Servant.Seam (AppEffects, Env (..))
 import Hasql.Connection.Settings qualified as Settings
 import Hasql.Pool qualified as Pool
@@ -168,7 +168,7 @@ main = do
     Text.putStrLn ("Decision cache: " <> describeEntryCache decisionMaxEntries)
     Text.putStrLn ("Rate limit: " <> describeRateLimit rateLimitConfig)
     rateLimit <- rateLimitMiddleware rateLimitConfig
-    let wrappedApp = authMiddleware authConfig (rateLimit (app serverEnv))
+    let wrappedApp = authMiddleware authConfig (rateLimit (appWithOpenApi serverEnv))
     serve tlsConfig port wrappedApp `finally` Pool.release pool
 
 serve :: Maybe TlsConfig -> Int -> Wai.Application -> IO ()

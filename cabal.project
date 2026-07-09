@@ -35,3 +35,23 @@ source-repository-package
     location: https://github.com/shinzui/biscuit-haskell-project.git
     tag:      aef4272f0d44eec75c79aa6c2dd00c4200401829
     subdir:   biscuit-haskell/biscuit
+
+-- ------------------------------------------------------------
+-- openapi-hs / servant-openapi-hs for en-servant's OpenAPI document.
+--
+-- Hackage openapi3/servant-openapi3 do not build against this project's GHC
+-- 9.12.4 / servant 0.20.3 without patches. These forks target exactly that
+-- toolchain (their cabal files require base >=4.21) and emit OpenAPI 3.1.
+-- servant-openapi-hs additionally carries a HasOpenApi port for servant's
+-- MultiVerb, which is what lets en's per-operation error responses (400/422/503)
+-- appear in the generated document. Neither is on Hackage; pin the sources.
+-- ------------------------------------------------------------
+source-repository-package
+    type:     git
+    location: https://github.com/shinzui/openapi-hs.git
+    tag:      965340a30fad0782f2c964ab97b4ab0f12fa044d
+
+source-repository-package
+    type:     git
+    location: https://github.com/shinzui/servant-openapi-hs.git
+    tag:      7cbbc234cb7c0e900495b2f676e2912a7f456ff0
