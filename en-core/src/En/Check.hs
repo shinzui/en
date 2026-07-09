@@ -65,7 +65,8 @@ check ::
     Eff es CheckDecision
 check graph consistency context subject permission object = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
-    either throwError pure =<< runCheck graph context revision subject permission object
+    (result, _memo) <- runCheckMemo graph context revision subject permission object Map.empty
+    either throwError pure result
 
 {- | Cached variant of 'check'. Cache hits are keyed by datastore id, schema
 hash, resolved revision, subject, relation, object, and caveat context.
@@ -124,18 +125,6 @@ dedupePairs =
         | Map.member pair seen = (ordered, seen)
         | otherwise = (pair : ordered, Map.insert pair () seen)
 
-runCheck ::
-    (TupleStore :> es) =>
-    ReachabilityGraph ->
-    CaveatContext ->
-    Revision ->
-    Subject ->
-    RelationName ->
-    ObjectRef ->
-    Eff es (Either EnError CheckDecision)
-runCheck graph context revision subject permission object =
-    evalRelation graph context revision subject object permission initialState
-
 data EvalState = EvalState
     { depth :: !Int
     , visited :: ![Subproblem]
@@ -165,39 +154,6 @@ maxDepth = 25
 
 pageLimit :: Int
 pageLimit = 1000
-
-evalRelation ::
-    (TupleStore :> es) =>
-    ReachabilityGraph ->
-    CaveatContext ->
-    Revision ->
-    Subject ->
-    ObjectRef ->
-    RelationName ->
-    EvalState ->
-    Eff es (Either EnError CheckDecision)
-evalRelation graph context revision subject object relation state
-    | state.depth >= maxDepth =
-        pure (Left ResolutionLimitExceeded)
-    | subproblem `elem` state.visited =
-        pure (Left ResolutionLimitExceeded)
-    | otherwise =
-        case Map.lookup ref graph.relations of
-            Nothing ->
-                pure (Left (UnknownRelation (renderRef ref)))
-            Just schemaRelation ->
-                evalRewrite
-                    graph
-                    context
-                    revision
-                    subject
-                    object
-                    relation
-                    schemaRelation.rewrite
-                    EvalState{depth = state.depth + 1, visited = subproblem : state.visited}
-  where
-    ref = RelationRef{objectType = object.objectType, relation}
-    subproblem = Subproblem{subject, object, relation}
 
 runCheckMemo ::
     (TupleStore :> es) =>
@@ -448,112 +404,6 @@ evalTupleToUsersetMemo cacheOps graph context revision subject object tuplesetRe
             SubjectWildcard _ ->
                 pure (decisions <> [Right Denied], memo')
 
-    applyRowGate tuple =
-        (>>= applyTupleCaveat graph context tuple.caveat)
-
-evalRewrite ::
-    (TupleStore :> es) =>
-    ReachabilityGraph ->
-    CaveatContext ->
-    Revision ->
-    Subject ->
-    ObjectRef ->
-    RelationName ->
-    Rewrite ->
-    EvalState ->
-    Eff es (Either EnError CheckDecision)
-evalRewrite graph context revision subject object currentRelation rewrite state =
-    case rewrite of
-        This ->
-            evalThis graph context revision subject object currentRelation state
-        ComputedUserset relation ->
-            evalRelation graph context revision subject object relation state
-        TupleToUserset tuplesetRelation computedRelation ->
-            evalTupleToUserset graph context revision subject object tuplesetRelation computedRelation state
-        Union rewrites -> do
-            decisions <- traverse (\current -> evalRewrite graph context revision subject object currentRelation current state) rewrites
-            pure (Decision.union <$> sequence decisions)
-        Intersection rewrites -> do
-            decisions <- traverse (\current -> evalRewrite graph context revision subject object currentRelation current state) rewrites
-            pure (Decision.intersection <$> sequence decisions)
-        Exclusion base subtractRewrite -> do
-            baseDecision <- evalRewrite graph context revision subject object currentRelation base state
-            case baseDecision of
-                Left err -> pure (Left err)
-                Right Denied -> pure (Right Denied)
-                Right (Conditional obligations) -> pure (Right (Conditional obligations))
-                Right Allowed -> do
-                    subtractDecision <- evalRewrite graph context revision subject object currentRelation subtractRewrite state
-                    pure (Decision.exclusion <$> subtractDecision)
-        Caveated caveat rewriteInner -> do
-            inner <- evalRewrite graph context revision subject object currentRelation rewriteInner state
-            pure (applyRewriteCaveat graph context caveat =<< inner)
-
-evalThis ::
-    (TupleStore :> es) =>
-    ReachabilityGraph ->
-    CaveatContext ->
-    Revision ->
-    Subject ->
-    ObjectRef ->
-    RelationName ->
-    EvalState ->
-    Eff es (Either EnError CheckDecision)
-evalThis graph context revision subject object relation state
-    | state.depth >= maxDepth =
-        pure (Left ResolutionLimitExceeded)
-    | otherwise = do
-        page <- readObjectRelation revision object relation pageLimit Nothing
-        case ensureExhausted page of
-            Left err -> pure (Left err)
-            Right rows -> do
-                decisions <- traverse rowDecision rows
-                pure (Decision.union <$> sequence decisions)
-  where
-    rowDecision TupleRow{tuple}
-        | tuple.subject == subject || wildcardMatches tuple.subject subject =
-            pure (applyTupleCaveat graph context tuple.caveat Allowed)
-        | otherwise =
-            case tuple.subject of
-                SubjectId _ ->
-                    pure (Right Denied)
-                SubjectSet subjectObject subjectRelation ->
-                    fmap
-                        (>>= applyTupleCaveat graph context tuple.caveat)
-                        (evalRelation graph context revision subject subjectObject subjectRelation state)
-                SubjectWildcard _ ->
-                    pure (Right Denied)
-
-evalTupleToUserset ::
-    (TupleStore :> es) =>
-    ReachabilityGraph ->
-    CaveatContext ->
-    Revision ->
-    Subject ->
-    ObjectRef ->
-    RelationName ->
-    RelationName ->
-    EvalState ->
-    Eff es (Either EnError CheckDecision)
-evalTupleToUserset graph context revision subject object tuplesetRelation computedRelation state = do
-    page <- readObjectRelation revision object tuplesetRelation pageLimit Nothing
-    case ensureExhausted page of
-        Left err -> pure (Left err)
-        Right rows -> do
-            decisions <-
-                traverse
-                    ( \TupleRow{tuple} ->
-                        case tuple.subject of
-                            SubjectId subjectObject ->
-                                applyRowGate tuple <$> evalRelation graph context revision subject subjectObject computedRelation state
-                            SubjectSet subjectObject subjectRelation ->
-                                applyRowGate tuple <$> evalRelation graph context revision subject subjectObject subjectRelation state
-                            SubjectWildcard _ ->
-                                pure (Right Denied)
-                    )
-                    rows
-            pure (Decision.union <$> sequence decisions)
-  where
     applyRowGate tuple =
         (>>= applyTupleCaveat graph context tuple.caveat)
 

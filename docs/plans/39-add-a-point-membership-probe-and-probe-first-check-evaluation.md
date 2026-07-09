@@ -59,17 +59,22 @@ number of store reads.
   `en-core/test/Main.hs` (commit `a6b7482`); captured the `Left ResolutionLimitExceeded`
   failure. The fixture shape this plan originally proposed did not reproduce B1; see
   Surprises & Discoveries for the corrected fixture.
-- [ ] M4a (new, discovered in M1): repair `erroringTupleStore` in `en-core/test/Main.hs`
-  before deleting `ensureExhausted` — it injects errors by returning `HasMore`
-  unconditionally, which turns M4's drain loop into an infinite loop. See Surprises &
-  Discoveries.
-- [ ] M2: add the `ProbeTuples` operation to the `TupleStore` effect
-  (`en-core/src/En/Effect/TupleStore.hs`) and implement it in the in-memory conformance
-  store (`en-core/src/En/Conformance/Kikan.hs`); leave the cached interposer as an explicit
-  passthrough with a comment pointing at docs/plans/41.
-- [ ] M3: implement the probe in the PostgreSQL store
-  (`en-postgres/src/En/Postgres/TupleStore.hs`) as a prepared statement; verify index use
-  with EXPLAIN; add an integration test in `en-postgres/integration-test/Main.hs`.
+- [x] M4a (new, discovered in M1; done 2026-07-08 as part of M2): repaired
+  `erroringTupleStore` in `en-core/test/Main.hs` before deleting `ensureExhausted` — it
+  injected errors by returning `HasMore` unconditionally, which would have turned M4's
+  drain loop into an infinite loop. See Surprises & Discoveries.
+- [x] M2 (2026-07-08): added the `ProbeTuples` operation to the `TupleStore` effect
+  (`en-core/src/En/Effect/TupleStore.hs`) and implemented it in the in-memory conformance
+  store (`en-core/src/En/Conformance/Kikan.hs`); cached interposer left an explicit
+  passthrough with a comment pointing at docs/plans/41. Unit assertions in
+  `en-core/test/Main.hs` cover a present subject, an absent subject, and caveat carriage.
+- [x] M2a (2026-07-08): repaired `erroringTupleStore` (the M4a item, pulled forward because
+  M2 had to add a `ProbeTuples` case to the same interpreter anyway).
+- [x] M3 (2026-07-08): implemented the probe in the PostgreSQL store
+  (`en-postgres/src/En/Postgres/TupleStore.hs`) as a prepared statement; verified index use
+  with EXPLAIN; added the `runProbeScenario` integration test in
+  `en-postgres/integration-test/Main.hs`. M2+M3 landed as one commit (`b0323d3`) because
+  the GADT constructor breaks the exhaustive PostgreSQL interpreter until handled.
 - [ ] M4: unify `check` onto the memoized evaluator; make `evalThisMemo` probe-first;
   replace `ensureExhausted` with a page-draining reader in `En.Check`.
 - [ ] M5: batch direct-membership discovery for the subject-set recursion frontier with
@@ -106,6 +111,32 @@ child plan of another master plan left a sibling package red. Neither master pla
 acceptance ran `cabal test all` across the whole workspace after landing. Later plans in
 this master plan should run the *full* workspace suite at their Final milestone, not only
 the focused suites they touch.
+
+**M3 — the planner picks the subject-side index, exactly as the Decision Log predicted.**
+The plan's "no new index" decision rested on a claim that had never been measured: that
+`relation_tuple_subject_hist_idx` can serve the probe with equality on the subject triple
+plus `(object_type, relation)`, leaving `object_id` as a cheap filter. It does. Against
+1,504 rows on `folder:probe-wide#viewer` (after `ANALYZE relation_tuple`), the plan is:
+
+```text
+Nested Loop
+  ->  HashAggregate
+        Group Key: unnest.unnest, unnest.unnest_1, unnest.unnest_2
+        ->  Function Scan on unnest
+  ->  Index Scan using relation_tuple_subject_hist_idx on relation_tuple
+        Index Cond: ((subject_type = unnest.unnest) AND (subject_id = unnest.unnest_1) AND (COALESCE(subject_relation, ''::text) = unnest.unnest_2) AND (object_type = 'folder'::text) AND (relation = 'viewer'::text))
+        Filter: (object_id = 'probe-wide'::text)
+```
+
+No sequential scan, so the deferred-index follow-up in the Decision Log stays deferred and
+no migration is needed. The integration test asserts this property rather than merely
+printing it: `runProbeScenario` fails if the plan contains neither `Index Scan` nor
+`Bitmap Index Scan`. That guards against a future schema or statistics change silently
+turning the probe back into the full-relation scan it exists to eliminate.
+
+One implementation detail worth recording: `probeTuplesSession` short-circuits on an empty
+candidate list rather than sending an empty `unnest`, since a probe with no candidates
+cannot match anything and the round trip would be wasted.
 
 **M1 — this plan's proposed wide fixture would not have reproduced B1.** The M1 milestone
 text suggests a fixture "of at least 1,500 tuples `folder:fN#viewer@user:memberN`", and
