@@ -61,8 +61,11 @@ context still gets `Conditional` from that same cached entry.
   hand a `ResidualDecision` back into the traversal. `CheckCacheEnv.cacheDecisions ::
   Cache SubproblemKey ResidualDecision`; construction sites updated in
   `en-core/test/Main.hs`, `en-servant/test/Main.hs`, `en-server/app/Main.hs`.
-- [ ] M3: re-key the external cache — `SubproblemKey` loses `context`; `checkCached`
-  re-applies context on hit; failing-then-green cross-context tests.
+- [x] M3 (2026-07-08): `SubproblemKey` loses `context`; `decisionCacheOps` no longer takes
+  one. Cross-context tests observed red (4 reads vs 2) on the M2 tree, green after. The
+  never-stale assertions were observed failing against a cache that stores the
+  context-applied answer — the one bug this milestone could plausibly have introduced.
+  `laterRequestContext` added to `En.Conformance.Kikan`.
 - [ ] M4: cached tuple-page interposer handles `ProbeTuples` (integration point owned
   here per the master plan): `TupleReadKey` gains a probe variant; probe results cached
   by revision.
@@ -184,6 +187,42 @@ EP-39's blessed case is untouched, and both are now pinned by tests
 `an unconditional grant still short-circuits past an unknown caveat`): an *unconditional*
 grant beside a malformed row still returns `Right Allowed`, because `RAllowed` is present in
 the probe residuals and settles the union before the `Left` is inspected.
+
+**B6, measured (2026-07-08).** The red run on the M2 tree, before `context` left the key.
+Two checks of the same caveated grant differing only in `current_time`; the second one
+re-traversed the graph from scratch:
+
+```text
+user error (different caveat context hits the decision cache
+expected: 2
+actual:   4)
+```
+
+After the key change the second, third, and fourth contexts each perform *zero* store reads
+and the cache reports hits — while `expiredContext` still gets `Denied` and
+`missingAutonomyContext` still gets its `Conditional` obligation, from that one entry.
+
+**The never-stale test earns its place; nothing else in the suite does (2026-07-08).** Per
+the master plan's rule, the M3 assertions were run against a deliberately broken cache. The
+first sabotage — `residualGate` dropping its caveat entirely — was caught, but by the
+*pre-existing* `cached conditional check returns Conditional first`, because it corrupts
+even the single-context answer. That proves nothing about cross-context safety.
+
+The second sabotage is the one that matters, and it is the exact bug a careless fix for B6
+would ship: keep the context-free *key*, but store the decision **as computed under the
+inserting request's context** (collapse `RAllowed`/`RDenied` through `applyResidual` before
+`insertCache`). Every pre-existing assertion still passed. So did
+`a different caveat context reuses the cached entry`. Only the new assertion fired:
+
+```text
+user error (an expired context gets Denied from the shared entry
+expected: Right Denied
+actual:   Right Allowed)
+```
+
+An expired time-bounded grant, served as `Allowed` to a later request. Asserting the *hit*
+is not enough; a cross-context cache test must also assert that the answer still tracks the
+context, or it certifies the very bug it was written to prevent.
 
 
 ## Decision Log

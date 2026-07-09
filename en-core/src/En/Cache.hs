@@ -89,6 +89,21 @@ instance Ord DecisionKey where
             (left.datastoreId, left.schemaHash, revisionEncoding left.revision, left.subject, left.permission, left.object, left.context)
             (right.datastoreId, right.schemaHash, revisionEncoding right.revision, right.subject, right.permission, right.object, right.context)
 
+{- | Identifies one check subproblem: "is @subject@ a member of @object#relation@,
+at this revision, under this schema, in this datastore?"
+
+The request's caveat context is deliberately /not/ part of the key. The value
+stored under it is an @En.Decision.ResidualDecision@ -- the answer with its
+caveats left symbolic — which is correct for every request that asks this
+question, whatever context each one carries. Each request folds its own context
+in on the way out.
+
+Putting the context in the key is what made this cache useless: the canonical
+caveat is a time-bounded grant, virtually every request carries a fresh
+@current_time@, so every key was unique and the cross-request hit rate was
+approximately zero. Excluding it cannot serve a stale answer, because no
+context-dependent value is stored.
+-}
 data SubproblemKey = SubproblemKey
     { datastoreId :: !DatastoreId
     , schemaHash :: !SchemaHash
@@ -96,15 +111,14 @@ data SubproblemKey = SubproblemKey
     , subject :: !Subject
     , relation :: !RelationName
     , object :: !ObjectRef
-    , context :: !CaveatContext
     }
     deriving stock (Eq, Show)
 
 instance Ord SubproblemKey where
     compare left right =
         compare
-            (left.datastoreId, left.schemaHash, revisionEncoding left.revision, left.subject, left.relation, left.object, left.context)
-            (right.datastoreId, right.schemaHash, revisionEncoding right.revision, right.subject, right.relation, right.object, right.context)
+            (left.datastoreId, left.schemaHash, revisionEncoding left.revision, left.subject, left.relation, left.object)
+            (right.datastoreId, right.schemaHash, revisionEncoding right.revision, right.subject, right.relation, right.object)
 
 newCache :: CacheConfig -> IO (Cache key value)
 newCache config = do

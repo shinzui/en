@@ -98,7 +98,7 @@ checkCached ::
     Eff es CheckDecision
 checkCached cacheEnv graph consistency context subject permission object = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
-    (residual, _memo) <- runCheckMemoWithCache (Just (decisionCacheOps cacheEnv graph context)) graph revision subject permission object Map.empty
+    (residual, _memo) <- runCheckMemoWithCache (Just (decisionCacheOps cacheEnv graph)) graph revision subject permission object Map.empty
     either throwError pure (residual >>= applyResidual graph.caveats context)
 
 {- | Evaluate many checks against one resolved consistency snapshot.
@@ -240,13 +240,18 @@ data DecisionCacheOps es = DecisionCacheOps
     , insertDecision :: !(Revision -> Subject -> RelationName -> ObjectRef -> ResidualDecision -> Eff es ())
     }
 
+{- | The cross-request decision cache, as the evaluator sees it.
+
+Note the absence of a 'CaveatContext' parameter. Keys and values are both
+context-free, which is the whole point: a residual computed for one request
+answers every other request that asks the same question.
+-}
 decisionCacheOps ::
     (IOE :> es) =>
     CheckCacheEnv ->
     ReachabilityGraph ->
-    CaveatContext ->
     DecisionCacheOps es
-decisionCacheOps CheckCacheEnv{cacheDatastoreId, cacheDecisions} graph context =
+decisionCacheOps CheckCacheEnv{cacheDatastoreId, cacheDecisions} graph =
     DecisionCacheOps
         { lookupDecision = \revision subject relation object ->
             liftIO (lookupCache cacheDecisions (cacheKey revision subject relation object))
@@ -262,7 +267,6 @@ decisionCacheOps CheckCacheEnv{cacheDatastoreId, cacheDecisions} graph context =
             , subject
             , relation
             , object
-            , context
             }
 
 {- | Evaluate @subject@'s membership in @object#relation@, as a residual.

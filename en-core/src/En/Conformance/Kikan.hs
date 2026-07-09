@@ -9,6 +9,7 @@ module En.Conformance.Kikan (
     agencyTuples,
     autonomyCaveat,
     requestContext,
+    laterRequestContext,
     adminContext,
     missingAutonomyContext,
     expiredContext,
@@ -274,6 +275,19 @@ requestContext =
         ( Map.fromList
             [ ("requested_autonomy", ValueEnum "act")
             , ("current_time", ValueTimestamp currentTime)
+            ]
+        )
+
+{- | 'requestContext' one minute later, still well before the fixture's @until@
+expiry. Two requests that differ only here ask the same question and must share
+one decision-cache entry -- while each still gets its own answer.
+-}
+laterRequestContext :: CaveatContext
+laterRequestContext =
+    CaveatContext
+        ( Map.fromList
+            [ ("requested_autonomy", ValueEnum "act")
+            , ("current_time", ValueTimestamp (parseUtc "2026-06-23T00:01:00Z"))
             ]
         )
 

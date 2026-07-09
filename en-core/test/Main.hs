@@ -1036,9 +1036,34 @@ testDecisionCache graph = do
     conditionalReadsAfterFirst <- readIORef conditionalReadCount
     assertEqual "cached conditional check returns Conditional second" (Right conditionalDecision) =<< checkCachedEngine consistencyStore (countingTupleStore conditionalReadCount tupleStore) conditionalEnv graph MinimizeLatency missingAutonomyContext (SubjectId user) (RelationName "view") intention
     assertEqual "cached conditional check suppresses second read" conditionalReadsAfterFirst =<< readIORef conditionalReadCount
-    assertEqual "decision key separates caveat context through checkCached" (Right Allowed) =<< checkCachedEngine consistencyStore (countingTupleStore conditionalReadCount tupleStore) conditionalEnv graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") intention
-    readsAfterContextMiss <- readIORef conditionalReadCount
-    assertBool "different caveat context misses decision cache" (readsAfterContextMiss > conditionalReadsAfterFirst)
+    -- Inverted deliberately: this assertion used to demand that a different caveat
+    -- context *miss* the decision cache, which is finding B6 written down as a test.
+    -- The entry is context-free now, so a different context hits it -- and still gets
+    -- its own answer, which is the strictly stronger claim asserted just below.
+    assertEqual "a different caveat context reuses the cached entry" (Right Allowed) =<< checkCachedEngine consistencyStore (countingTupleStore conditionalReadCount tupleStore) conditionalEnv graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") intention
+    assertEqual "different caveat context hits the decision cache" conditionalReadsAfterFirst =<< readIORef conditionalReadCount
+
+    {- The headline of docs/plans/41: one entry, many contexts, no staleness.
+
+    The first check populates the cache by traversing the graph. Every later check
+    asks the same question under a different caveat context, so it must read the
+    store zero more times, report a cache hit, and still answer that context
+    correctly -- allowed while the grant is live, denied once it has expired, and
+    conditional when the request omits the context the caveat needs. -}
+    crossContextEnv <- newCheckCacheEnv
+    crossReads <- newIORef 0
+    let crossCheck context = checkCachedEngine consistencyStore (countingTupleStore crossReads tupleStore) crossContextEnv graph MinimizeLatency context (SubjectId user) (RelationName "view") intention
+    assertEqual "caveated check under context A evaluates" (Right Allowed) =<< crossCheck requestContext
+    readsAfterFirst <- readIORef crossReads
+    assertBool "the first context reads the store" (readsAfterFirst > 0)
+    crossStatsAfterFirst <- cacheStats crossContextEnv.cacheDecisions
+    assertEqual "caveated check under a later context still allows" (Right Allowed) =<< crossCheck laterRequestContext
+    assertEqual "a context differing only in current_time performs no store reads" readsAfterFirst =<< readIORef crossReads
+    crossStatsAfterSecond <- cacheStats crossContextEnv.cacheDecisions
+    assertBool "cache stats show hits across caveat contexts" (crossStatsAfterSecond.hits > crossStatsAfterFirst.hits)
+    assertEqual "an expired context gets Denied from the shared entry" (Right Denied) =<< crossCheck expiredContext
+    assertEqual "a context missing the caveat's parameter gets Conditional from the shared entry" (Right conditionalDecision) =<< crossCheck missingAutonomyContext
+    assertEqual "no context ever re-read the store" readsAfterFirst =<< readIORef crossReads
 
     separationReadCount <- newIORef 0
     separationEnv <- newCheckCacheEnv
