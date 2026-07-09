@@ -5,6 +5,7 @@ title: "Fail loudly on storage decode errors and tighten write snapshots"
 kind: exec-plan
 created_at: 2026-07-07T15:24:59Z
 master_plan: "docs/masterplans/8-correct-write-path-and-storage-semantics.md"
+intention: intention_01kx48hvkeemk9j4r828132s2h
 ---
 
 # Fail loudly on storage decode errors and tighten write snapshots
@@ -45,14 +46,18 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] Add `InvalidCursor Text` to `en-core/src/En/Error.hs`.
-- [ ] Make `decodeCursor` in `en-postgres/src/En/Postgres/TupleStore.hs` total-with-error and validate cursors in the interpreter before running read sessions.
-- [ ] Move caveat-payload decoding into the hasql column decoder so an undecodable payload fails the session (surfacing as `StoreError`); delete the `Map.empty` fallback in `decodeTupleCaveat`.
-- [ ] Fix the `limit <= 0` cursor off-by-one in `pageFromRows` (return the caller's own cursor instead of consuming the next row's id).
-- [ ] Tighten `writeVisibleSnapshot`: mark the xid gap `[snapshot.xmax .. xid-1]` in-progress; return `Either` and mint the token in the interpreter so a parse failure throws `StoreError`.
-- [ ] Add integration scenarios: token repeatability under a concurrent writer (fails pre-fix), malformed-cursor error, malformed-payload error, limit-0 page behavior.
-- [ ] Document the GC-window ≫ request-duration invariant in `docs/user/production-deployment-and-performance.md` and `docs/spec/0001-en-overview.md` §7.
-- [ ] Run `cabal build all` and `cabal test all`; record the failing-then-passing repeatability transcript.
+- [x] Add `InvalidCursor Text` to `en-core/src/En/Error.hs`.
+- [x] Make `decodeCursor` in `en-postgres/src/En/Postgres/TupleStore.hs` total-with-error and validate cursors in the interpreter before running read sessions.
+- [x] Move caveat-payload decoding into the hasql column decoder so an undecodable payload fails the session (surfacing as `StoreError`); delete the `Map.empty` fallback in `decodeTupleCaveat`.
+- [x] Fix the `limit <= 0` cursor off-by-one in `pageFromRows` (return the caller's own cursor instead of consuming the next row's id).
+- [x] Tighten `writeVisibleSnapshot`: mark the xid gap `[snapshot.xmax .. xid-1]` in-progress; return `Either` and mint the token in the interpreter so a parse failure throws `StoreError`.
+- [x] Add integration scenarios: token repeatability under a concurrent writer (fails pre-fix), malformed-cursor error, malformed-payload error, limit-0 page behavior.
+- [x] Document the GC-window ≫ request-duration invariant in `docs/user/production-deployment-and-performance.md` and `docs/spec/0001-en-overview.md` §7.
+- [x] Run `cabal build all` and `cabal test all`; record the failing-then-passing repeatability transcript.
+
+Not in the original checklist, discovered during implementation:
+
+- [x] Map `InvalidCursor` in `en-servant/src/En/Servant/Seam.hs`'s `enErrorToFault` (a total case over `EnError`; the new constructor made it incomplete). It becomes a 400 under the stable code `invalid_cursor`.
 
 
 ## Surprises & Discoveries
@@ -60,7 +65,54 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+**The repeatability scenario reproduces C5 exactly as predicted.** Written first and run
+against the pre-fix snapshot construction (the gap list stubbed to `[]`, everything else
+in place), the suite fails with precisely the diff the plan forecast:
+
+```text
+Test suite en-postgres-integration-tests: RUNNING...
+en-postgres-integration-tests: Uncaught exception ghc-internal:GHC.Internal.IO.Exception.IOException:
+
+user error (reads at one write token are repeatable across a concurrent commit
+expected: 1
+actual:   2)
+Test suite en-postgres-integration-tests: FAIL
+```
+
+The concurrent writer's xid sat in the raised gap without being listed in `xip`, so its
+commit — between the two reads — changed what a fixed token could see. With the gap marked
+in-progress:
+
+```text
+Test suite en-postgres-integration-tests: RUNNING...
+Test suite en-postgres-integration-tests: PASS
+1 of 1 test suites (1 of 1 test cases) passed.
+```
+
+**A planted corrupt row is invisible to any token minted before it.** The malformed-payload
+scenario first read `Right []` rather than a `StoreError`, because the raw `INSERT` takes its
+own xid — necessarily newer than the revision of the token the scenario had been holding — so
+`pg_visible_in_snapshot(created_xid, …)` excluded it. The scenario now reads at a fresh
+`headRevision`. The failure was the visibility predicate working correctly, not the decoder
+failing to fire; a corrupt row planted by a *migration* or an out-of-band writer is likewise
+only reachable at revisions after it lands. Any future scenario that plants a row with raw SQL
+and then reads it must take a fresh revision afterwards.
+
+**Two failure channels now stack on the write session.** EP-46 had already made
+`applyTupleWritesSession` return `Either Text ConsistencyToken` to report a precondition
+failure. This plan changes the success arm to `Anchor` rather than adding a second `Either`:
+the session yields `Either Text Anchor`, the interpreter turns a `Left` into
+`WritePreconditionFailed` and then mints, turning a mint failure into `StoreError`. The two
+faults stay distinguishable by constructor — an arbitration loss (412, not retryable) versus a
+storage fault (503, retryable) — which is the distinction the master plan's Surprises section
+asked EP-46 to preserve.
+
+**Adding an `EnError` constructor is not a local change.** `enErrorToFault` in
+`en-servant/src/En/Servant/Seam.hs` is a total case over `EnError`, so `InvalidCursor` had to
+be given an HTTP mapping in the same commit or nothing would build. The plan assigned that
+mapping to docs/plans/35, which has already landed; the constructor simply joins the existing
+`BadRequestFault` family under the code `invalid_cursor`. EP-49 and EP-48 should expect the
+same coupling if they add error constructors.
 
 
 ## Decision Log
@@ -122,6 +174,26 @@ Record every decision made while working on the plan.
   migration-sequencing coordination between docs/plans/45 and docs/plans/49 noted in the
   master plan.
   Date: 2026-07-07
+- Decision: `InvalidCursor` is mapped to a 400 under the stable code `invalid_cursor` in this
+  plan rather than deferred to docs/plans/35.
+  Rationale: `enErrorToFault` is a total case over `EnError`, so the mapping is not optional —
+  omitting it breaks the build. docs/plans/35 has landed, and its `EnFault` family already
+  holds the right home for a client fault: a non-retryable `BadRequestFault`.
+  Date: 2026-07-09
+- Decision: `applyTupleWritesSession` returns `Either Text Anchor` rather than growing a second
+  failure channel; the interpreter mints the token from the anchor.
+  Rationale: The `Left` was already spoken for by EP-46's precondition failure. Making the
+  success arm carry the anchor keeps one `Either` in the session, and the interpreter maps the
+  two failures to the two constructors that already distinguish them for callers —
+  `WritePreconditionFailed` (412, an arbitration loss) and `StoreError` (503, retryable).
+  Date: 2026-07-09
+- Decision: The two code milestones landed in one commit rather than two.
+  Rationale: Both move a fallible step out of a hasql `Session` and into the interpreter, and
+  they share that seam in `interpretTupleStorePostgres` — splitting them would have produced a
+  first commit whose interpreter already carried half of the second. The pre-fix repeatability
+  transcript was captured independently (by stubbing only the snapshot gap list), which is the
+  evidence the two-commit split existed to preserve.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective
@@ -129,7 +201,43 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+**Complete, 2026-07-09.** All four places the store used to lie now either error or behave:
+
+- A cursor the store never issued returns `Left (InvalidCursor "not-a-number")` instead of
+  silently restarting the scan. Validated in the interpreter, before any session opens, so the
+  read sessions stay infallible.
+- An undecodable `caveat_payload` fails its statement inside the hasql column decoder and
+  surfaces as `StoreError`. A SQL `NULL` payload still decodes to an empty payload — a caveat
+  with no write-time arguments is a legitimate fact, and the plan's warning to preserve that
+  distinction was the one subtlety in the change.
+- A write token names a snapshot whose meaning does not change: the xids in the gap the token
+  raises over are listed in-progress, so a concurrent transaction's later commit is invisible at
+  that token forever. The scenario that proves it fails 1-vs-2 against the old construction and
+  passes against the new one; both transcripts are in Surprises & Discoveries. A snapshot that
+  cannot be parsed at mint time is now a `StoreError`, not a token unable to see its own write.
+- A `limit = 0` page returns no rows, hands back the caller's own cursor, and loses nothing on
+  resumption.
+- The GC-window ≫ request-duration invariant (C7) is stated in the deployment guide (with the
+  `AtExactSnapshot` pagination rule and the silently-incomplete-read failure mode), normatively
+  in the spec's §7, and pointed at from the `EN_GC_WINDOW` table entry in the operations guide.
+
+`cabal build all` and `cabal test all` pass; all 8 suites, exit 0. No consumer regressed — the
+token text format is unchanged, so en-servant and en-biscuit noticed nothing.
+
+Gaps and things left for siblings. The GC TOCTOU (C7) is documented, not closed: token
+validation still reads the horizon before the read runs, and the race remains reachable in
+principle. Closing it would mean holding the horizon against the reaper for the duration of the
+read — a lock or a snapshot on `en_transaction` — which is a design decision no finding asked
+for. `decodeTestCursor` in `en-core/src/En/Conformance/Kikan.hs` still swallows a bad cursor,
+deliberately: its cursors are engine-internal test artifacts, and client-supplied *lookup*
+cursors belong to docs/plans/42.
+
+The lesson worth carrying: the two bugs that took real work were the ones the tests found, not
+the ones the plan described. The corrupt-payload scenario silently passed against a read that
+returned zero rows, because a raw `INSERT`'s xid is newer than any token already in hand — a
+green assertion that was testing nothing. Write the scenario, then break the code and watch it
+fail, is the only way to know an assertion has teeth. EP-46 learned this about concurrency; it
+generalizes.
 
 
 ## Context and Orientation

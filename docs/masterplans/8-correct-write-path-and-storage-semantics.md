@@ -71,7 +71,7 @@ that en-core consumers embed against).
 |---|-------|------|-----------|-----------|--------|
 | EP-45 | Adopt touch semantics for tuple writes | docs/plans/45-adopt-touch-semantics-for-tuple-writes.md | None | None | Complete |
 | EP-46 | Add write preconditions and atomic mixed writes | docs/plans/46-add-write-preconditions-and-atomic-mixed-writes.md | EP-45 | None | Complete |
-| EP-47 | Fail loudly on storage decode errors and tighten write snapshots | docs/plans/47-fail-loudly-on-storage-decode-errors-and-tighten-write-snapshots.md | None | None | Not Started |
+| EP-47 | Fail loudly on storage decode errors and tighten write snapshots | docs/plans/47-fail-loudly-on-storage-decode-errors-and-tighten-write-snapshots.md | None | None | Complete |
 | EP-48 | Batch tuple writes and add bulk import and export | docs/plans/48-batch-tuple-writes-and-add-bulk-import-and-export.md | EP-45 | EP-46 | Not Started |
 | EP-49 | Trim dead indexes and resolve consistency lazily | docs/plans/49-trim-dead-indexes-and-resolve-consistency-lazily.md | None | None | Not Started |
 
@@ -138,8 +138,8 @@ in the generated OpenAPI document. Any later plan adding a status must do the sa
 - [x] EP-45: integration tests prove payload updates and caveat additions take effect (no silent no-op, no duplicate live rows)
 - [x] EP-46: preconditions enforced transactionally; precondition failure is a typed error
 - [x] EP-46: atomic mixed write-and-delete in one request/token
-- [ ] EP-47: undecodable caveat payloads and malformed cursors are errors, not defaults
-- [ ] EP-47: write tokens denote exact snapshots (gap marked in-progress); GC TOCTOU invariant documented
+- [x] EP-47: undecodable caveat payloads and malformed cursors are errors, not defaults
+- [x] EP-47: write tokens denote exact snapshots (gap marked in-progress); GC TOCTOU invariant documented
 - [ ] EP-48: N-tuple writes are O(1) round trips; bulk import/export commands exist
 - [ ] EP-49: dead indexes removed (after watch-plan coordination); EXPLAIN confirms remaining index coverage
 - [ ] EP-49: consistency resolution fetches only what the requested mode needs
@@ -216,6 +216,37 @@ different grant than the one it names. EP-48 extends this effect (bulk export) w
 the constructor. Discovered while implementing EP-46, 2026-07-09.
 
 
+**The write session now returns an `Anchor`, not a token (binds EP-48).** EP-47 moved token
+minting out of `applyTupleWritesSession` and into `interpretTupleStorePostgres`, so the session's
+type is `Either Text Anchor`: `Left` is EP-46's precondition failure, and the interpreter mints
+from the `Right`, turning a snapshot that will not parse into a `StoreError` rather than a token
+that cannot see its own write. **EP-48's batched `applyTupleWritesSession` must keep this shape** —
+it owns the write statements, not the token. Per Integration Points, EP-48 calls
+`writeVisibleSnapshot`/`tokenFromAnchor` unmodified. Discovered while implementing EP-47, 2026-07-09.
+
+**Adding an `EnError` constructor forces an `en-servant` edit (affects EP-48, EP-49).**
+`enErrorToFault` in `en-servant/src/En/Servant/Seam.hs` is a total case over `EnError`, so a new
+constructor breaks the build until it has an HTTP mapping. EP-47's `InvalidCursor` joins the
+`BadRequestFault` family as a non-retryable 400 under the stable code `invalid_cursor`. Any later
+plan adding a constructor must budget for the same edit, and must pick a status that already has a
+`Respond` alternative in `EnResponses` or add one (see the resolved note in Integration Points).
+Discovered while implementing EP-47, 2026-07-09.
+
+**A row planted by raw SQL is invisible at every token already in hand (affects EP-48).** EP-47's
+malformed-payload scenario passed green while asserting nothing: it planted a corrupt row with a
+raw `INSERT`, then read at a revision minted *before* that insert, so the visibility predicate
+excluded the row and no decode ever ran. Any scenario that seeds state outside the effect — which
+EP-48's bulk-import tests will do constantly — must take a fresh `headRevision` after seeding.
+Discovered while implementing EP-47, 2026-07-09.
+
+**C7 is documented, not closed.** The GC TOCTOU remains reachable in principle: token validation
+reads the horizon, then the tuple read runs, and the reaper can delete in between. EP-47 states the
+`EN_GC_WINDOW` ≫ request-duration invariant in the deployment guide, the spec §7, and the operations
+guide's variable table. Closing the race would require holding the horizon against the reaper for
+the read's duration — a design decision no finding in the review asked for, and out of scope for
+every plan in this master plan. Discovered while implementing EP-47, 2026-07-09.
+
+
 ## Decision Log
 
 - Decision: Order touch semantics (EP-45) before preconditions (EP-46) as a hard dependency.
@@ -238,6 +269,12 @@ the constructor. Discovered while implementing EP-46, 2026-07-09.
   Date: 2026-07-09
 - Decision: The wire-coordination conditional with docs/plans/35 is resolved in the affirmative; new statuses ship as MultiVerb response alternatives.
   Rationale: EP-35 landed on 2026-07-08, before EP-46 began. Its typed error model routes every handler failure through EnFault into a declared response alternative, so a status reachable only via a thrown ServerError would be absent from the API type and the OpenAPI document.
+  Date: 2026-07-09
+- Decision: Token minting lives in the interpreter, not the write session; EP-48's batched session returns an Anchor.
+  Rationale: A snapshot that will not parse is not a database error, and hasql's Session has no ergonomic channel for a pure post-processing failure. Lifting the fallible step makes it a first-class StoreError instead of the silent fallback that minted a token unable to see its own write.
+  Date: 2026-07-09
+- Decision: EP-47 maps InvalidCursor to a 400 itself rather than deferring the HTTP mapping to docs/plans/35.
+  Rationale: enErrorToFault is a total case; the mapping is a build requirement, not a scheduling choice. docs/plans/35 has landed and already provides the non-retryable BadRequestFault this belongs in.
   Date: 2026-07-09
 
 
