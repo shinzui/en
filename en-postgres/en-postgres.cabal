@@ -35,6 +35,7 @@ library
     En.Postgres.Datastore
     En.Postgres.Revision
     En.Postgres.TupleStore
+    En.Postgres.Watch
 
   build-depends:
     , aeson

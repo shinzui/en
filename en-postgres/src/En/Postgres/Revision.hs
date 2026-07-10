@@ -33,6 +33,8 @@ module En.Postgres.Revision (
     validateTokenMetadata,
     resolveConsistencyRequest,
     runConsistencyStorePostgres,
+    escapeText,
+    unescapeText,
 ) where
 
 import Data.Char (digitToInt, isDigit, ord)
@@ -471,6 +473,12 @@ parseWord fieldName textValue
             [(value, "")] -> Right value
             _ -> Left (fieldName <> " is not a Word64")
 
+{- | Percent-escape everything that is not @[A-Za-z0-9_-]@.
+
+Exported for "En.Postgres.Watch", whose cursor codec must escape its fields the same way
+this module's token codec does: both split on @.@, so a field holding one would otherwise
+be read as two.
+-}
 escapeText :: Text -> Text
 escapeText =
     Text.concatMap

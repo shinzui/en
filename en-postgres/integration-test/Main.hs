@@ -50,11 +50,13 @@ import En.Lookup qualified as Lookup
 import En.Postgres.Database (Database, runDatabaseConnection)
 import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgSnapshot, parsePgSnapshot, renderPgSnapshot, runConsistencyStorePostgres, tokenMetadataFromPayload, transactionVisible)
 import En.Postgres.TupleStore (pruneTransactionsBatchSession, reapDeletedTuplesBatchSession, runTupleStorePostgres)
+import En.Postgres.Watch qualified as Watch
 import En.Reachability (ReachabilityGraph, compile)
-import En.Revision (Consistency (..), DatastoreId (..), Revision (..), RevisionOrder (..))
+import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), RevisionOrder (..))
 import En.Schema (AllowedSubject (..), CaveatName (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..), Schema (..))
 import En.Schema qualified as Schema
 import En.Tuple (CaveatContext (..), CaveatPayload (..), CaveatValue (..), ObjectRef (..), Subject (..), Tuple (..), TupleCaveat (..))
+import En.Watch (WatchBatch (..), WatchStart (..))
 import EphemeralPg qualified as Pg
 import Hasql.Connection qualified as Connection
 import Hasql.Decoders qualified as Decoders
@@ -85,6 +87,8 @@ main = do
         runRelationshipFilterScenario connection
         resetSchema connection
         runWatchWindowScenario connection
+        resetSchema connection
+        runWatchFeedScenario connection
         resetSchema connection
         runMigrationDedupeScenario connection
         Connection.release connection
@@ -1224,6 +1228,126 @@ runWatchWindowScenario connection = do
     assertBool
         ("the deleted_xid arm must be index-served; plan was:\n" <> Text.unpack plan)
         (Text.isInfixOf "relation_tuple_deleted_xid_idx" plan)
+
+{- | The feed as a consumer sees it: subscribe, write, poll, delete, poll, catch up.
+
+This is the story `POST /v1/watch` tells, one layer below HTTP. What it proves that
+'runWatchWindowScenario' cannot is that the cursor closes the loop — each poll's cursor is
+the next poll's start, and the two together neither skip a change nor repeat one.
+
+The expiry path is forced rather than waited for. A cursor whose window opens at @1:1:@
+names history a real garbage-collection horizon has long since destroyed, so it exercises
+the same rejection an offline consumer would meet, in a test that takes no time.
+-}
+runWatchFeedScenario :: Connection.Connection -> IO ()
+runWatchFeedScenario connection = do
+    config <- testConfig
+    let space name = ObjectRef (ObjectType "space") name
+        grant name = Tuple (space name) (RelationName "viewer") (SubjectId (ObjectRef (ObjectType "user") "alice")) Nothing
+        watched = grant "watched"
+        other = grant "other"
+
+        poll cursorText = runPgOrFail connection config (Watch.watch config (StartFromCursor cursorText) Nothing 100)
+        eventsOf batch = [(change.kind, change.tuple) | change <- batch.changes]
+
+    subscribed <- runPgOrFail connection config (Watch.watch config StartFromNow Nothing 100)
+    assertEqual "subscribing from now reports no changes" [] (eventsOf subscribed)
+
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [watched, other])
+    afterWrite <- poll subscribed.cursor
+    assertEqual
+        "the first poll after a write reports both grants as touches"
+        (sort [(ChangeTouch, watched), (ChangeTouch, other)])
+        (sort (eventsOf afterWrite))
+
+    caughtUp <- poll afterWrite.cursor
+    assertEqual "polling a caught-up feed reports nothing" [] (eventsOf caughtUp)
+
+    _ <- runPgOrFail connection config (TupleStore.deleteTuples [watched])
+    afterDelete <- poll caughtUp.cursor
+    assertEqual
+        "the poll after a delete reports exactly that revocation"
+        [(ChangeDelete, watched)]
+        (eventsOf afterDelete)
+
+    {- Idempotence: re-presenting a cursor re-reads the same window. A consumer that
+    crashed after processing a batch and before persisting its cursor replays it, which is
+    the at-least-once delivery this feed promises. -}
+    replayed <- poll caughtUp.cursor
+    assertEqual "re-presenting a cursor replays the same batch" (eventsOf afterDelete) (eventsOf replayed)
+
+    {- The window's end is minted as @checkedAt@, so a consumer can read a store that has
+    already applied everything the batch just told it about. -}
+    assertEqual
+        "a batch's checkedAt token is accepted as a later read's freshness bound"
+        (Right 1)
+        . fmap (length . (.rows))
+        =<< runPg
+            connection
+            config
+            ( do
+                ResolvedConsistency{revision} <- ConsistencyStore.resolveConsistency (AtLeastAsFresh afterDelete.checkedAt)
+                TupleStore.readAllTuples revision 100 Nothing
+            )
+
+    -- A drain across a window wider than one page visits every change exactly once.
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [grant "drain-a", grant "drain-b", grant "drain-c"])
+    drained <- drainWatch connection config afterDelete.cursor
+    assertEqual
+        "draining a multi-page window at limit 1 reports every change exactly once"
+        (sort [(ChangeTouch, grant "drain-a"), (ChangeTouch, grant "drain-b"), (ChangeTouch, grant "drain-c")])
+        (sort drained)
+
+    -- An ordinary consistency token is a start position: "everything since my write".
+    writeToken <- runPgOrFail connection config (TupleStore.writeTuples [grant "since-my-write"])
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [grant "after-my-write"])
+    let ConsistencyToken writeTokenText = writeToken
+    sinceWrite <- runPgOrFail connection config (Watch.watch config (StartFromToken writeTokenText) Nothing 100)
+    assertEqual
+        "a consistency token starts the feed at the revision it pins"
+        [(ChangeTouch, grant "after-my-write")]
+        (eventsOf sinceWrite)
+
+    -- A subscription filter narrows the feed without changing what the cursor means.
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [grant "filtered-in", grant "filtered-out"])
+    let onlyFilteredIn = relationshipFilter (Just "space") (Just "filtered-in") Nothing Nothing Nothing AnySubjectRelation Nothing
+    scoped <- runPgOrFail connection config (Watch.watch config (StartFromCursor sinceWrite.cursor) (Just onlyFilteredIn) 100)
+    assertEqual
+        "a filtered subscription reports only the grants its filter names"
+        [(ChangeTouch, grant "filtered-in")]
+        (eventsOf scoped)
+
+    -- The two fail-closed guards, against the real store's real horizon.
+    let expired = Watch.encodeWatchCursor config.datastoreId (Watch.WatchAt (Revision "1:1:"))
+    assertEqual
+        "a cursor whose window predates the garbage-collection horizon is refused"
+        (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
+        =<< runPg connection config (Watch.watch config (StartFromCursor expired) Nothing 100)
+
+    let foreign' = Watch.encodeWatchCursor (DatastoreId "not-this-datastore") (Watch.WatchAt (Revision "1:1:"))
+    assertEqual
+        "a cursor minted by another datastore is refused before its horizon is even read"
+        (Left (InvalidConsistencyToken "watch cursor datastore does not match this en datastore"))
+        =<< runPg connection config (Watch.watch config (StartFromCursor foreign') Nothing 100)
+
+    assertEqual
+        "a cursor this store never issued is refused as a malformed cursor"
+        (Left (InvalidCursor "not-a-cursor"))
+        =<< runPg connection config (Watch.watch config (StartFromCursor "not-a-cursor") Nothing 100)
+
+{- | Drain a watch feed at one change per page until it reports nothing new.
+
+Termination is the point of the assertion this feeds: a drain ends when a poll returns no
+changes, and a cursor that failed to advance would loop here forever rather than fail.
+-}
+drainWatch :: Connection.Connection -> ConsistencyConfig -> Text -> IO [(ChangeKind, Tuple)]
+drainWatch connection config = step []
+  where
+    step seen cursorText = do
+        batch <- runPgOrFail connection config (Watch.watch config (StartFromCursor cursorText) Nothing 1)
+        case batch.changes of
+            [] -> pure seen
+            changes -> step (seen <> [(change.kind, change.tuple) | change <- changes]) batch.cursor
 
 {- | Fill @relation_tuple@ with history, so the planner has a reason to prefer an index.
 

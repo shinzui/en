@@ -8,6 +8,7 @@ import Data.Text qualified as Text
 import Data.Time (UTCTime, addUTCTime, defaultTimeLocale, parseTimeOrError)
 
 import En.Effect.ConsistencyStore (ResolvedConsistency (..), TokenMetadata (..))
+import En.Effect.TupleStore (StoreCursor (..))
 import En.Error (EnError (..))
 import En.Postgres.Revision (
     ConsistencyConfig (..),
@@ -26,6 +27,12 @@ import En.Postgres.Revision (
     transactionVisible,
     validateTokenMetadata,
  )
+import En.Postgres.Watch (
+    WatchCursorState (..),
+    decodeWatchCursor,
+    encodeWatchCursor,
+    validateWatchCursor,
+ )
 import En.Revision (
     Consistency (..),
     ConsistencyToken (..),
@@ -38,6 +45,7 @@ import En.Revision (
 main :: IO ()
 main = do
     testOptimizedRevisionReader
+    testWatchCursorCodec
     assertEqual
         "pg_snapshot parses and renders canonically"
         (Right PgSnapshot{xmin = 10, xmax = 20, xip = [12, 15]})
@@ -233,6 +241,113 @@ main = do
 
     gettersRun optimized request =
         snd <$> runResolve optimized request
+
+{- | The watch cursor's codec and its two fail-closed guards.
+
+The codec is pure, so everything a cursor can be wrong about — the wrong store, a window
+whose history is gone, a shape the store never minted — is checkable without a database.
+That matters because the expiry path is otherwise reachable only by outwaiting a real
+garbage-collection window.
+-}
+testWatchCursorCodec :: IO ()
+testWatchCursorCodec = do
+    let datastore = DatastoreId "watch-datastore"
+        other = DatastoreId "someone-elses-datastore"
+        config =
+            ConsistencyConfig
+                { datastoreId = datastore
+                , schemaHash = SchemaHash "schema"
+                , gcWindow = "24 hours"
+                }
+        start = Revision "100:120:110"
+        end = Revision "120:140:"
+        atStart = WatchAt start
+        draining = WatchDraining start end (StoreCursor "4242")
+        roundTrip cursorState = decodeWatchCursor (encodeWatchCursor datastore cursorState)
+
+    assertEqual
+        "a between-windows cursor round-trips"
+        (Right (datastore, atStart))
+        (roundTrip atStart)
+    assertEqual
+        "a mid-drain cursor round-trips both window edges and the row"
+        (Right (datastore, draining))
+        (roundTrip draining)
+
+    -- A datastore id holding the codec's own separator survives it, which is what the
+    -- percent-escaping is for. Unescaped, this would decode as a seven-field cursor.
+    let dotted = DatastoreId "en.prod.1"
+    assertEqual
+        "a datastore id containing the field separator round-trips"
+        (Right (dotted, atStart))
+        (decodeWatchCursor (encodeWatchCursor dotted atStart))
+
+    assertEqual
+        "a consistency token is not a watch cursor"
+        (Left (InvalidCursor "en1.store.schema.100:120:.") :: Either EnError (DatastoreId, WatchCursorState))
+        (decodeWatchCursor "en1.store.schema.100:120:.")
+    assertEqual
+        "a cursor with the wrong prefix is refused"
+        (Left (InvalidCursor "enwatch2.store.at.100:120:..") :: Either EnError (DatastoreId, WatchCursorState))
+        (decodeWatchCursor "enwatch2.store.at.100:120:..")
+    assertEqual
+        "a cursor whose revision is not a snapshot is refused"
+        (Left (InvalidCursor "enwatch1.store.at.not-a-snapshot..") :: Either EnError (DatastoreId, WatchCursorState))
+        (decodeWatchCursor "enwatch1.store.at.not-a-snapshot..")
+    {- A drain cursor with no row id would resume the window from its start on every poll,
+    redelivering the first page forever. A between-windows cursor carrying one describes a
+    position in a window it does not name. Both are shapes this codec never emits. -}
+    assertEqual
+        "a drain cursor with no row id is refused"
+        (Left (InvalidCursor "enwatch1.store.drain.100:120:.120:140:.") :: Either EnError (DatastoreId, WatchCursorState))
+        (decodeWatchCursor "enwatch1.store.drain.100:120:.120:140:.")
+    assertEqual
+        "a between-windows cursor carrying a row id is refused"
+        (Left (InvalidCursor "enwatch1.store.at.100:120:..7") :: Either EnError (DatastoreId, WatchCursorState))
+        (decodeWatchCursor "enwatch1.store.at.100:120:..7")
+
+    -- Horizon 0: nothing has been reaped, so every window is still replayable.
+    assertEqual
+        "a cursor from this datastore validates while its history survives"
+        (Right atStart)
+        (validateWatchCursor config 0 datastore atStart)
+    assertEqual
+        "a cursor minted by another datastore is refused"
+        (Left (InvalidConsistencyToken "watch cursor datastore does not match this en datastore"))
+        (validateWatchCursor config 0 other atStart)
+    {- The horizon is compared against the window /start/, not its end: the deletions a
+    drain still owes happened at revisions between the two, and it is the start that says
+    how far back the feed must be able to see. -}
+    assertEqual
+        "a cursor whose window opens behind the garbage-collection horizon is refused"
+        (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
+        (validateWatchCursor config 120 datastore atStart)
+    assertEqual
+        "a mid-drain cursor is judged on its window start, not its end"
+        (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
+        (validateWatchCursor config 120 datastore draining)
+
+    {- The boundary is @horizon <= start.xmin@, not the @horizon < revision.xmax@ a token
+    demands. At @horizon == xmin@ every reapable row (@deleted_xid < horizon@) is below
+    @xmin@ and therefore visible in the window's start snapshot, so it is not live there and
+    the window owes no event about it. One xid higher and a reaped row could still be live
+    at the start, and the window would silently lose its deletion.
+
+    The @xmax@ rule would also expire a one-poll-old subscription: its cursor is minted from
+    the head revision, whose @xmax@ is the next unassigned xid, and the very first write
+    afterwards raises the horizon to meet it. 'start' below has @xmin = 100@, @xmax = 120@. -}
+    assertEqual
+        "the horizon check is inclusive at the window start's xmin"
+        (Right atStart)
+        (validateWatchCursor config 100 datastore atStart)
+    assertEqual
+        "one xid past the window start's xmin is refused"
+        (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
+        (validateWatchCursor config 101 datastore atStart)
+    assertEqual
+        "a horizon between the window start's xmin and xmax is refused, though a token would pass"
+        (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
+        (validateWatchCursor config 119 datastore atStart)
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
 assertEqual label expected actual

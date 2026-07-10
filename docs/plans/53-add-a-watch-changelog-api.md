@@ -48,8 +48,8 @@ This section must always reflect the actual current state of the work.
 - [x] M1 (2026-07-09): Define `ChangeKind`, `TupleChange`, `ChangePage` and the `ReadChanges` operation in `en-core/src/En/Effect/TupleStore.hs`; stub it in the in-memory interpreter (`en-core/src/En/Conformance/Kikan.hs`). Also added `En.Watch` (`WatchStart`, `WatchBatch`, `watchUnsupported`) to en-core — see Decision Log.
 - [x] M1 (2026-07-09): Implement the window query in `en-postgres/src/En/Postgres/TupleStore.hs`. One statement with an `OR` of two xmin-bounded arms, not `UNION ALL`: the planner produces a `BitmapOr` over both xid indexes, so the fallback the plan reserved was not needed.
 - [x] M1 (2026-07-09): Integration tests in `en-postgres/integration-test/Main.hs` (`runWatchWindowScenario`): write→window shows touch; delete→window shows delete; create+delete inside one window is skipped; within-window pagination at `limit = 1` is complete and duplicate-free across rows that emit no event; a filtered window narrows to the grants it names; `EXPLAIN` confirms both xid indexes serve the arms under a `BitmapOr`.
-- [ ] M2: Watch cursor codec and validation in `en-postgres/src/En/Postgres/Watch.hs` (new module), including accepting an `en1.` consistency token as a start position and the GC-horizon expiry check; unit tests in `en-postgres/test/Main.hs`.
-- [ ] M2: The `watch` orchestration function (window selection, draining state machine, resumption cursor, `checkedAt` token) in `En.Postgres.Watch`, integration-tested.
+- [x] M2 (2026-07-09): Watch cursor codec and validation in `en-postgres/src/En/Postgres/Watch.hs` (new module), including accepting an `en1.` consistency token as a start position and the GC-horizon expiry check; unit tests in `en-postgres/test/Main.hs` (`testWatchCursorCodec`). The horizon check is **not** `validateTokenMetadata`'s — see Surprises & Discoveries.
+- [x] M2 (2026-07-09): The `watch` orchestration function (window selection, draining state machine, resumption cursor, `checkedAt` token) in `En.Postgres.Watch`, integration-tested by `runWatchFeedScenario` in `en-postgres/integration-test/Main.hs`. `mintToken` is used, not `encodeToken`: `docs/plans/42` had already added the `MintToken` operation, and it is a pure encode in every interpreter.
 - [ ] M3: `POST /watch` route, wire DTOs, `Env.watchOperation`, server wiring, `EnClient.watch`; servant tests including the cursor-expired error path.
 - [ ] M3: If `docs/plans/50`'s `RelationshipFilter` has landed, add the optional `filter` field to the watch request and apply it as residual predicates; otherwise record the deferral.
 - [ ] M4: Run the end-to-end transcript (start from now → write → poll shows touch → delete → poll shows delete) against a live server and paste the output into Validation and Acceptance.
@@ -95,6 +95,41 @@ implementation. Provide concise evidence.
   two different leading columns with a shared `id` ordering, so the real fix is the `UNION`
   rewrite with per-arm keyset seeks. Recorded so a future plan can price it rather than
   rediscover it.
+
+- 2026-07-09 (M2, **a bug this plan's design would have shipped**): the GC-horizon check this
+  plan told `decodeWatchCursor` to copy from `validateTokenMetadata` — reject when
+  `snapshot.xmax <= oldestRetainedXid` — expires a subscription one poll after it is created.
+  A `StartFromNow` cursor is minted from `headRevision`, whose snapshot `xmax` is the next
+  *unassigned* xid; the very next write is assigned exactly that xid, inserts its
+  `en_transaction` anchor, and `oldestRetainedXid` (which is `min(xid)` over the retention
+  window) rises to meet it. The integration test caught it on its first run:
+
+  ```text
+  user error (InvalidConsistencyToken "watch cursor is older than the garbage-collection window")
+  ```
+
+  Write tokens dodge this only because `writeVisibleSnapshot` raises their `xmax` past the
+  write's own xid. Nothing raises a head revision's.
+
+  The fix is not to loosen the comparison but to ask the question the window actually asks.
+  The reaper removes rows whose `deleted_xid < horizon`. A window starting at snapshot `S`
+  owes an event about a reaped row only if that row's deletion is *not* visible in `S`. If
+  `horizon <= S.xmin` then every reaped row has `deleted_xid < S.xmin` and is therefore
+  visible in `S` by the definition of `xmin`, so it is not live at `S` and no event is owed;
+  its creation is older still, so no touch is owed either. The window is exact. So
+  `validateWatchCursor` rejects on `snapshot.xmin < oldestRetainedXid`.
+
+  This is not merely looser than the token rule — it is different, and stricter where it
+  matters. A snapshot `849:851:849` passes `xmax > horizon` for a horizon of `850` while
+  listing `849` in progress, so a row deleted at `849` is live at `S`, is below the horizon,
+  and is reapable: the token rule would admit a window that silently loses that deletion. The
+  `xmin` rule rejects it. That the two rules disagree in *both* directions is the argument
+  for deriving this one rather than copying.
+
+  The same sharp edge exists, unexercised, for `checkedAt` tokens minted from a head
+  revision (`docs/plans/51`): mint at `FullyConsistent`, let one write land, and the token no
+  longer validates. It predates this plan and belongs to no plan currently open. Recorded
+  here because this is where it was found.
 
 - 2026-07-09 (M1, paging): the resumption cursor must name the last row **fetched**, not the
   last event **emitted**. A row created and retired inside one window is fetched by the
@@ -144,6 +179,9 @@ Record every decision made while working on the plan.
   Date: 2026-07-09
 - Decision: `ReadChanges` takes `Maybe RelationshipFilter` from the start rather than deferring the subscription filter to a later plan, and `WatchDraining` carries a `StoreCursor` rather than the `TupleRowId` this plan's sketch named.
   Rationale: `docs/plans/50` has landed, so `RelationshipFilter`, `validateRelationshipFilter`, `relationshipFilterFromWire`, and the `compileFilter` predicate composition all exist; threading the filter through the window query costs one `compileFilter` call and one wire field, and adding it later would mean revisiting the storage operation, the effect, the stub, and the endpoint. `StoreCursor` is what `PageState`'s `HasMore` carries and what `readChanges` accepts, so carrying `TupleRowId` would mean converting at both ends of a value the store round-trips unchanged.
+  Date: 2026-07-09
+- Decision: The watch cursor's garbage-collection check is `horizon <= start.xmin`, not `validateTokenMetadata`'s `horizon < revision.xmax`. This plan's Decision Log entry saying validation "checks the GC horizon exactly as `validateTokenMetadata` does" is superseded.
+  Rationale: The token rule is both unsound and unusable here, in opposite directions, and the window's own rule is derivable. See Surprises & Discoveries for the derivation, the counterexample snapshot `849:851:849`, and the integration-test failure that forced it. The schema-hash exemption the original entry records is unchanged and still deliberate.
   Date: 2026-07-09
 - Decision: A malformed watch cursor is `InvalidCursor`; an expired one is `InvalidConsistencyToken "watch cursor is older than the garbage-collection window"`.
   Rationale: The plan's Decision Log only fixed the expired case. The two failures are different artifacts obtained different ways, which is precisely the distinction `En.Error.InvalidCursor`'s own Haddock draws — a cursor this store never issued is a client fault about a pagination token, and it maps to the stable wire code `invalid_cursor`, while an expired window is the token-staleness class and maps to `invalid_consistency_token`.
