@@ -98,6 +98,13 @@ data ServerConfig = ServerConfig
     , rateLimit :: !RateLimitConfig
     , maintenance :: !MaintenanceConfig
     , tls :: !(Maybe TlsConfig)
+    , schemaReloadForce :: !Bool
+    {- ^ Activate a schema on @SIGHUP@ even when it strands live grants.
+
+    Off by default: a reload that orphans grants is refused, with the report in the log.
+    An operator removing a feature legitimately wants its grants dead, and this is how
+    they say so — explicitly, in the process environment, before the signal arrives.
+    -}
     }
 
 {- | Every variable the server reads. Kept exhaustive so the documented configuration
@@ -128,6 +135,7 @@ knownVariables =
     , "EN_RATE_LIMIT_RPS"
     , "EN_RESULT_CAP"
     , "EN_SCHEMA_PATH"
+    , "EN_SCHEMA_RELOAD_FORCE"
     , "EN_TLS_CERT_FILE"
     , "EN_TLS_KEY_FILE"
     , "EN_TUPLE_READ_CACHE_MAX_ENTRIES"
@@ -208,6 +216,7 @@ parseServerConfig environment = do
     tls <- parseTls environment
     rateLimit <- parseRateLimit environment
     maintenance <- parseMaintenance environment
+    schemaReloadForce <- withDefault "EN_SCHEMA_RELOAD_FORCE" False boolean
     (auth, authWarnings) <- parseAuth environment
     pure
         ( ServerConfig
@@ -224,6 +233,7 @@ parseServerConfig environment = do
             , rateLimit
             , maintenance
             , tls
+            , schemaReloadForce
             }
         , authWarnings <> storeWarnings
         )

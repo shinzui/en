@@ -339,6 +339,58 @@ like a migration: clients must be prepared to fall back from `atLeastAsFresh` ch
 `fullyConsistent` and re-acquire their tokens. See
 [Datastore identity](#datastore-identity) for the other reason a token can be refused.
 
+### Reloading the schema without a restart
+
+Send the server `SIGHUP` and it re-reads `EN_SCHEMA_PATH`, runs the same stored-tuple scan
+`check-schema` runs, and — if nothing would be stranded — swaps the model atomically.
+
+```shell
+kill -HUP "$(pgrep -f en-server | head -1)"
+```
+
+```text
+Schema reloaded from /etc/en/blog.en
+Schema hash: fnv1a64:723e92640d5dbd67 (was fnv1a64:1061a4beb2d5506c)
+WARNING: all consistency tokens minted under the previous schema hash are now invalid.
+```
+
+Requests in flight when the signal arrives finish under the schema they started with. Each
+request takes one snapshot of the model at its start and evaluates, mints, and validates
+against that one snapshot for its whole life, so no request can ever evaluate one model and
+stamp its answer with another's hash.
+
+There is no HTTP endpoint for reload, by design. `SIGHUP` requires process-level access,
+which is the right bar for swapping an authorization model.
+
+**A reload that would strand grants is refused, and the old model keeps serving:**
+
+```text
+Schema reload refused: 1 orphan(s) across 1 live tuple(s) under candidate fnv1a64:673195894cece659
+ORPHAN post:1#author@user:alice — relation post#author not in candidate schema
+reload refused; set EN_SCHEMA_RELOAD_FORCE=true to activate anyway.
+```
+
+Set `EN_SCHEMA_RELOAD_FORCE=true` in the server's environment to activate an orphaning
+schema anyway — the intentional case of removing a feature and wanting its grants dead. The
+orphan report is still printed, prefixed `Schema reload FORCED over …`. Because it is read
+from the environment, arming the override means restarting the server; there is no way to
+force a reload of a process that was not started ready to force one.
+
+Forcing has one sharp edge worth stating plainly. The stranded relationships are *not*
+deleted — the rows stay in the table until they are deleted or reaped — but nothing can
+evaluate them any more, so every decision that depended on them flips. Reloading the
+previous schema text brings them back: the model changed, never the data.
+
+Every other reload failure is a log line and nothing else. An unreadable file, a parse
+error, a validation error, and an orphan refusal all leave the previous schema serving
+untouched, so the worst outcome of a bad reload is a message; the recovery is to fix the
+file and signal again. A `SIGHUP` whose file is byte-identical to the running model logs
+`Schema unchanged (…); not reloading.` and skips both the swap and the token-invalidation
+warning — signalling twice does not invalidate anything twice.
+
+A server started without `EN_SCHEMA_PATH` serves the built-in demo model and has nothing to
+re-read; `SIGHUP` says so and returns.
+
 ### Connection pooling
 
 `en-server` serves every request from a pool of PostgreSQL connections, so

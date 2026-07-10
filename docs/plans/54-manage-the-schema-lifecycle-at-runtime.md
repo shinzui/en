@@ -56,9 +56,10 @@ This section must always reflect the actual current state of the work.
 - [x] M2 (2026-07-10): Implement `En.SchemaCheck.validateTuplesAgainstSchema` (pure per-tuple checks, orphan report types) with en-core unit tests covering every orphan class, both directions of the caveat-payload rule, and the "one reason per tuple" ordering.
 - [x] M2 (2026-07-10): Add the `check-schema` subcommand to `en-server/app/Main.hs` with its report output and exit codes (0/1/2, all four exercised live); integration-test the pass against an ephemeral database over a fixture larger than one drain page, plus a retired grant that is owed no orphan.
 - [x] M2 (2026-07-10): Write the compatible-change taxonomy into `docs/user/service-and-operations.md`, cross-checked line by line against the six `OrphanReason` constructors and their rendered messages.
-- [ ] M3: Implement SIGHUP reload: re-read `EN_SCHEMA_PATH`, parse/validate/compile, run the stored-tuple pass, atomically swap the `IORef`, log old/new hash and the token-invalidation warning; `EN_SCHEMA_RELOAD_FORCE=1` override; failure leaves the old schema serving.
-- [ ] M3: Live acceptance: reload transcript (schema edit → SIGHUP → `GET /schema` shows new hash; old token rejected; orphaning edit refused) pasted into Validation and Acceptance.
-- [ ] Deferred (recorded, not in this plan): authenticated `POST /admin/schema/reload` once `docs/plans/33-add-caller-authentication-and-rate-limiting-to-en-server.md` lands.
+- [x] M3 (2026-07-10): Implement SIGHUP reload: re-read `EN_SCHEMA_PATH`, parse/validate/compile, run the stored-tuple pass, atomically swap the `IORef`, log old/new hash and the token-invalidation warning; `EN_SCHEMA_RELOAD_FORCE=true` override (not `=1`, see Decision Log); every failure leaves the old schema serving. Unchanged file skips the swap and the warning.
+- [x] M3 (2026-07-10): Live acceptance: full reload transcript in Validation and Acceptance — unchanged file, compatible edit, orphaning edit refused, unparseable file, forced activation.
+- [x] M3 (2026-07-10): Reload workflow written into `docs/user/service-and-operations.md`, extending the taxonomy section M2 added.
+- [ ] Deferred (recorded, not in this plan): authenticated `POST /admin/schema/reload` once `docs/plans/33-add-caller-authentication-and-rate-limiting-to-en-server.md` lands. **Note: EP-33 has since landed** (`en-server` has API keys, `EN_AUTH_DISABLED`, and role-scoped middleware), so the blocker named here is discharged; the endpoint remains unbuilt and unscoped, and `SIGHUP` remains the only reload trigger.
 
 
 ## Surprises & Discoveries
@@ -112,6 +113,32 @@ implementation. Provide concise evidence.
   an unused-import warning. Under `NoFieldSelectors` the error is worse: it points at the *other*
   record with a `hash` field (`SchemaInfoWire`) and suggests using that one.
 
+- 2026-07-10 (M3; the reload's own log line is a place to lie, and the plan nearly did): the
+  swap logs "all consistency tokens minted under the previous schema hash are now invalid". A
+  `SIGHUP` on a file that has not changed produces a candidate whose hash equals the active
+  one, so swapping would print that sentence about tokens that are, in fact, still valid.
+  Supervisors send `SIGHUP` for reasons that have nothing to do with the schema. The
+  hash-equality skip the plan's Idempotence section offered as optional is therefore not an
+  optimization; it is what keeps the log honest. Recorded in the Decision Log.
+
+- 2026-07-10 (M3; the acceptance run cannot use the dev database, and this will bite the next
+  plan too): the dev store holds 200,024 live grants from earlier plans' benchmarks, nearly all
+  of them `space:*`. Any candidate schema that does not model `space` — including the `blog.en`
+  this plan's own Concrete Steps prescribe — is refused with 200,023 orphan lines. The reload
+  scenarios were run against a fresh `en_ep54` database with the migrations applied. The
+  pollution is not a defect; it is what a validation pass is *for*, and running `check-schema`
+  against it produced this plan's only performance datapoint: a full unanchored scan of
+  200,024 live rows takes 1.8 seconds. It also found a grant the author's own `GROUP BY` had
+  hidden — `space:public#member@user:*`, a wildcard — which is the orphan class (`OrphanDisallowedSubject`)
+  that is hardest to predict by reading a schema.
+
+- 2026-07-10 (M3; `cabal run` and `timeout` do not compose): `timeout 30 cabal run -v0 en-server`
+  spent ~25 seconds rebuilding and was killed seconds after the port bound, so every `curl` in
+  the same script failed to connect against a server whose log showed a clean startup. Use
+  `cabal list-bin en-server` and run the binary. This compounds the master plan's existing
+  warning about port 8080 (held here by an `ssh` tunnel, not an `en-server`): between the two,
+  an acceptance run can talk to the wrong process, or to no process, and read plausibly either way.
+
 - 2026-07-10 (orientation; **corrects M2's description of `en-server`'s argument handling**):
   `en-server/app/Main.hs` does not "currently ignore `getArgs`". It has a `Command` sum
   (`Serve`/`Import`/`Export`), a `parseCommand`, and a `usage` that exits 2 — the exit code this
@@ -147,6 +174,18 @@ Record every decision made while working on the plan.
 - Decision: Caches survive reload untouched: the decision cache self-invalidates because `SubproblemKey` includes the schema hash (see `decisionCacheOps` in `en-core/src/En/Check.hs`), so post-reload lookups miss; the tuple-read cache is schema-independent (keyed by revision and query, not by model) and stays valid.
   Rationale: Verified in source; flushing them on reload would be harmless but unnecessary. If implementation finds a `TupleReadKey` component that does depend on the schema, flush it and amend this entry.
   Date: 2026-07-07
+- Decision: the force override is `EN_SCHEMA_RELOAD_FORCE=true`, parsed in `en-server/app/Config.hs`, not `EN_SCHEMA_RELOAD_FORCE=1` read ad hoc at reload time.
+  Rationale: Every other boolean this server reads is `true`/`false` through `Config.boolean` (`EN_AUTH_DISABLED` is the precedent), every variable is listed in `knownVariables`, and the "Configuration is validated at startup" contract says an invalid value fails startup rather than being silently ignored. A variable read with `lookupEnv` inside a signal handler would honour none of that: `EN_SCHEMA_RELOAD_FORCE=yes` would silently mean "do not force", discovered only when a reload the operator expected to succeed was refused. The value cannot change in a running process either way, so parsing it at startup loses nothing and buys validation.
+  Date: 2026-07-10
+- Decision: a `SIGHUP` whose candidate hashes equal to the active schema skips the swap, and says so.
+  Rationale: The plan's Idempotence section offered this as an implementer's choice and asked that it be recorded. Taken, for one reason beyond cost: the swap's log line ends with "all consistency tokens minted under the previous schema hash are now invalid", and that sentence would be a lie. An operator who signals a process twice, or whose supervisor sends `SIGHUP` on a config reload that did not touch the schema, must not be told their clients' tokens just died. Skipping the swap also skips a needless full-table scan.
+  Date: 2026-07-10
+- Decision: the reload's validation pass runs through `runAppNow` — the *active* schema's interpreter stack — rather than one built from the candidate.
+  Rationale: The pass calls `headRevision` and drains `readAllTuples`. It mints no consistency token and presents none, so the schema hash embedded in the store interpreters never enters into it. Building a candidate stack to run it would imply the hash mattered, and would invite a later reader to wonder what happens to a token minted under a schema that was never activated. Nothing does, because none is.
+  Date: 2026-07-10
+- Decision: `loadCandidateSchema` returns a `LoadedSchema` (source, origin, validated model) rather than a bare `ValidSchema`, and is shared by `check-schema` and the reload handler.
+  Rationale: The reload must put the candidate's *source text* into the new `ActiveSchema`, or `GET /v1/schema` would keep serving the text of the model that was replaced — the exact defect the endpoint exists to prevent, arriving through the exact feature that makes it possible. Sharing one loader means the schema `check-schema` vets and the schema `SIGHUP` activates cannot be read, parsed, or validated differently.
+  Date: 2026-07-10
 - Decision: `validateTuplesAgainstSchema` returns an `OrphanReport { scanned, orphans }`, not the bare `[TupleOrphan]` this plan's Interfaces section specifies.
   Rationale: The report line the plan itself specifies — "N orphan(s) across M live tuple(s)" — needs the scanned count, and recovering it with a second full scan would double the cost of an already-sequential pass. "0 orphans" over an empty store and over 200,000 grants are different reports, and an operator about to force a destructive schema through needs to know which one they are reading. The scan visits every row either way, so the count is free.
   Date: 2026-07-10
@@ -175,7 +214,50 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+**Complete, 2026-07-10.** Every promise in Purpose is met and demonstrated live: `GET /v1/schema`
+returns the source text, hash, origin, and load time; `SIGHUP` reloads with an atomic swap that
+in-flight requests cannot straddle; the swap is gated by a stored-tuple scan that names exactly
+which grants would be orphaned and why; the same scan is available offline as
+`en-server check-schema <path>` with distinct exit codes for "strands grants" and "bad file"; and
+the compatible-change taxonomy is in `docs/user/service-and-operations.md`, cross-checked against
+the six `OrphanReason` constructors rather than written from the plan's prose.
+
+Three things came in smaller than planned, all for the same reason — the tree had already grown
+what this plan proposed to add:
+
+- The `EnumerateTuples` store operation was **not written**. `ReadAllTuples` already had its exact
+  signature, its row-id ordering, and both interpreters, added for `en-server export`.
+- `ActiveSchema` carries **no `hash` field**. `ReachabilityGraph.hash` is the hash, and it is what
+  `En.Check` already keys the decision cache on — which is *why* the plan's claim that the decision
+  cache self-invalidates on reload is true.
+- M3's worry about "a single shared connection" was stale: `docs/plans/34` landed, so the reload's
+  scan takes a pooled connection like any request.
+
+The design that mattered most was M1's, and it is worth restating because it is the whole safety
+argument: `runPorts` takes an `ActiveSchema` rather than reading one. A handler that chose its graph
+and let its interpreters choose their hash independently could, on a reload landing between the two,
+evaluate the old model and mint a token under the new one. Making the snapshot an *argument* means
+there is nothing to synchronize — the tearing state cannot be spelled. The live evidence is Scenario
+3: a `fullyConsistent` check after a reload mints its `checkedAt` under the new hash, which only
+happens because the interpreter stack was rebuilt from the request's snapshot.
+
+Two gaps, both recorded rather than closed:
+
+- **The authenticated `POST /admin/schema/reload` is still unbuilt.** Its stated blocker
+  (`docs/plans/33`) has since landed, so the reason it was deferred no longer holds. `SIGHUP`
+  remains the only trigger, which is defensible — process-level access is the right bar — but the
+  decision should now be made on its merits rather than inherited.
+- **`demoSchema` was a latent lie.** It was built with `En.Schema.Builder` while `GET /v1/schema`
+  promised to return its source text. It happened to be correct, and is now derived from the text by
+  the parser so it cannot stop being. Adding a read endpoint turned a harmless duplication into a
+  correctness obligation; that is worth remembering the next time a value is described in two places.
+
+One thing the plan asked for and did not get: the compatible-change taxonomy claims that editing a
+permission's rewrite "strands nothing", and the validator agrees by saying nothing at all. That is
+correct and also the most dangerous edit an operator can make, because every decision involving the
+permission can change and no tooling here will warn them. The documentation says so in as many words.
+Detecting *behavioral* schema drift — diffing decisions across two models over the stored graph — is a
+real capability this plan does not provide and did not scope.
 
 
 ## Context and Orientation
@@ -515,74 +597,143 @@ just process-down
 
 ## Validation and Acceptance
 
-Scenario 1 — read the live schema (after M1):
+All scenarios below were run on 2026-07-10 against a **clean** database
+(`createdb en_ep54`, then every file in `en-migrations/db/migrations/*.sql`). The dev
+database is not usable for these: earlier plans left 200,024 live `space:*` grants in it, so
+any candidate schema that does not model `space` refuses with 200,023 orphan lines. Not port
+8080 either — it was held by an unrelated `ssh` tunnel. Check with
+`lsof -nP -iTCP:8080 -sTCP:LISTEN`, and run the built binary (`cabal list-bin en-server`)
+rather than `cabal run`, whose rebuild eats a `timeout`.
+
+Test-level validation: `cabal test all` is green — `en-core` (the checker's unit tests, every
+`OrphanReason` plus both directions of the caveat-payload rule), `en-postgres-integration-tests`
+(the pass end to end, over a fixture larger than one drain page, with a retired grant owed no
+orphan), and `en-servant` (`GET /v1/schema`, its OpenAPI shape, and every pre-existing handler
+test as the regression gate for M1's `Env` rework).
+
+### Scenario 1 — read the live schema (M1)
 
 ```bash
-curl -sS localhost:8080/schema
+curl -sS localhost:8094/v1/schema
 ```
 
 ```json
 {
-  "source": "object user {}\n\nobject post {\n  relation author: user\n  …",
-  "hash": "fnv1a64:…",
-  "origin": "/tmp/blog.en",
-  "loadedAt": "2026-07-07T…Z"
+  "source": "object user {}\n\nobject post {\n  relation author: user\n  relation reader: user, user:*\n  permission view = author | reader\n  permission edit = author\n}\n",
+  "hash": "fnv1a64:1061a4beb2d5506c",
+  "origin": "/tmp/reload.en",
+  "loadedAt": "2026-07-10T14:45:36.14586Z"
 }
 ```
 
-The `hash` must equal the startup log's `Schema hash:` line.
+The `hash` equals the startup log's `Schema hash:` line. Serving the built-in demo model
+instead reports `"origin": "builtin-demo"` and `fnv1a64:88633b46c783909e`.
 
-Scenario 2 — compatible reload (after M3). Write a tuple and capture its token, then
-append a new relation to `/tmp/blog.en` (compatible: additive):
-
-```bash
-TOKEN=$(curl -sS -X POST localhost:8080/tuples -H 'content-type: application/json' -d '{
-  "tuples": [{"object": {"objectType": "post", "objectId": "1"}, "relation": "author",
-              "subject": {"tag": "SubjectIdWire", "contents": {"objectType": "user", "objectId": "alice"}},
-              "caveat": null}]}' | jq -r '.token')
-printf '\nobject tag {}\n' >> /tmp/blog.en
-kill -HUP "$(pgrep -f en-server | head -1)"
-```
-
-Expected server log:
+### Scenario 2 — an unchanged file is not a reload (M3)
 
 ```text
-Schema reloaded from /tmp/blog.en
-Schema hash: fnv1a64:<new> (was fnv1a64:<old>)
+Schema reload: SIGHUP re-reads /tmp/reload.en; orphaning schemas are refused
+...
+Schema unchanged (fnv1a64:1061a4beb2d5506c); not reloading.
+```
+
+No swap, no scan, and — the point — no token-invalidation warning.
+
+### Scenario 3 — compatible reload (M3)
+
+Write a tuple and keep its token, append `object tag {}` to the schema file, then `SIGHUP`:
+
+```text
+Schema reloaded from /tmp/reload.en
+Schema hash: fnv1a64:723e92640d5dbd67 (was fnv1a64:1061a4beb2d5506c)
 WARNING: all consistency tokens minted under the previous schema hash are now invalid.
 ```
 
-`curl -sS localhost:8080/schema` now shows the new source and new hash — without a
-restart. And the old token is dead, as documented: a check with
-`{"tag": "AtLeastAsFreshWire", "contents": "$TOKEN"}` fails with the
-schema-hash-mismatch token error (an HTTP 500 with that message under today's
-collapsed error model — review A3 — or the typed error once `docs/plans/35` lands),
-while the same check with `{"tag": "FullyConsistentWire"}` returns
-`{"decision": {"tag": "AllowedWire"}, …}`.
-
-Scenario 3 — orphaning reload refused. Edit `/tmp/blog.en` removing
-`relation author…` (which the tuple from scenario 2 uses), `kill -HUP` again.
-Expected server log:
+`GET /v1/schema` reports the new hash and a fresh `loadedAt` — without a restart. The warning
+is not decoration: the token minted moments earlier is now refused, and a `fullyConsistent`
+check answers normally and mints its `checkedAt` under the *new* hash, which is what proves
+the interpreter stack was rebuilt from the request's snapshot rather than from startup state.
 
 ```text
-Schema reload refused: 1 orphan(s) found against candidate fnv1a64:…
-ORPHAN post:1#author@user:alice — relation post#author not in candidate schema
-reload refused; set EN_SCHEMA_RELOAD_FORCE=1 to activate anyway
+$ curl … -d '{"consistency":{"mode":"atLeastAsFresh","token":"en1.…fnv1a64%3a1061a4beb2d5506c.27827%3a27828%3a."}, …}'
+{"code":"invalid_consistency_token","message":"token schema hash does not match the active schema","retryable":false}
+
+$ curl … -d '{"consistency":{"mode":"fullyConsistent"}, …}'
+{"decision":{"result":"allowed"},"checkedAt":"en1.…fnv1a64%3a723e92640d5dbd67.27828%3a27828%3a."}
 ```
 
-`GET /schema` still shows scenario 2's schema (old model keeps serving); checks
-still work. Restarting the server with `EN_SCHEMA_RELOAD_FORCE=1` in the environment
-and repeating the SIGHUP activates the destructive schema (forced path).
+### Scenario 4 — an orphaning reload is refused (M3)
 
-Scenario 4 — `check-schema` offline (after M2): as shown in Concrete Steps, the
-subcommand prints the same orphan line for the scenario-3 candidate and exits 1;
-against the scenario-2 schema it prints `0 orphan(s)` and exits 0.
+Remove `relation author` (and the two permissions naming it, or the schema fails validation
+rather than stranding anything), then `SIGHUP`:
 
-Test-level validation: the M2 unit tests cover every `OrphanReason`; the integration
-suite covers the pass end to end; the servant suite covers `GET /schema` and the
-snapshot-passing `Env` rework (all pre-existing handler tests still green is itself
-the regression gate for M1).
+```text
+Schema reload refused: 1 orphan(s) across 1 live tuple(s) under candidate fnv1a64:673195894cece659
+ORPHAN post:1#author@user:alice — relation post#author not in candidate schema
+reload refused; set EN_SCHEMA_RELOAD_FORCE=true to activate anyway.
+```
 
+`GET /v1/schema` still reports `fnv1a64:723e92640d5dbd67`, and the check still returns
+`allowed`. The old model kept serving.
+
+### Scenario 5 — a bad file leaves the old schema serving (M3)
+
+```text
+en-server: schema reload failed: could not parse /tmp/reload.en: SchemaViolation "object post is missing closing }"
+the previous schema is still serving.
+```
+
+`GET /v1/schema` is unchanged. This is the one place the reload path deliberately diverges
+from plan 26's fail-closed startup: a running authorization server must survive a bad reload
+rather than exit.
+
+### Scenario 6 — forced activation, and its sharp edge (M3)
+
+Restart with `EN_SCHEMA_RELOAD_FORCE=true` (the startup line says so:
+`… EN_SCHEMA_RELOAD_FORCE=true, orphaning schemas will be ACTIVATED`) and repeat scenario 4:
+
+```text
+Schema reload FORCED over 1 orphan(s) across 1 live tuple(s) under candidate fnv1a64:673195894cece659
+ORPHAN post:1#author@user:alice — relation post#author not in candidate schema
+Schema reloaded from /tmp/reload.en
+Schema hash: fnv1a64:673195894cece659 (was fnv1a64:723e92640d5dbd67)
+WARNING: all consistency tokens minted under the previous schema hash are now invalid.
+```
+
+The destructive model is now active. `alice`'s `view` on `post:1` flips from `allowed` to
+`denied` — and the row is still in the table:
+
+```text
+$ psql "$EN_DATABASE_URL" -tAc "select object_type||':'||object_id||'#'||relation from relation_tuple where deleted_xid is null;"
+post:1#author
+```
+
+Reloading the previous schema text brings the grant back. The model changed; the data never did.
+
+### Scenario 7 — `check-schema` offline (M2)
+
+Against the dev database's 200,024 live grants, a full unanchored scan takes **1.8 seconds**:
+
+```text
+$ en-server check-schema /tmp/full.en
+0 orphan(s) across 200024 live tuple(s); candidate schema fnv1a64:89c2665aa2315f44 fits them all.
+$ echo $?
+0
+
+$ en-server check-schema /tmp/blog.en | tail -1
+200023 orphan(s) across 200024 live tuple(s); candidate schema fnv1a64:1061a4beb2d5506c would strand them.
+$ echo $?
+1
+
+$ en-server check-schema /tmp/nope.en
+en-server: could not read /tmp/nope.en: /tmp/nope.en: openFile: does not exist (No such file or directory)
+$ echo $?
+2
+```
+
+A candidate that parses but fails `validateSchema` also exits 2
+(`invalid schema in …: UnknownRelation "unknown allowed subject object type: ghost"`), and
+none of the three exit-2 paths touches the database.
 
 ## Idempotence and Recovery
 

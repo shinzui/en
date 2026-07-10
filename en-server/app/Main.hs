@@ -1,6 +1,7 @@
 module Main (main) where
 
 import Control.Concurrent.Async (withAsync)
+import Control.Concurrent.MVar (newMVar, withMVar)
 import Control.Exception (IOException, finally, try)
 import Control.Monad (foldM, guard)
 import Data.Aeson qualified as Aeson
@@ -8,7 +9,7 @@ import Data.ByteString.Lazy qualified as LazyByteString
 import Data.ByteString.Lazy.Char8 qualified as LazyChar8
 import Data.Char (isSpace)
 import Data.Foldable (traverse_)
-import Data.IORef (newIORef, readIORef)
+import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Data.Time (DiffTime, getCurrentTime)
@@ -22,7 +23,7 @@ import Network.Wai.Handler.WarpTLS qualified as WarpTLS
 import System.Environment (getArgs)
 import System.Exit (ExitCode (ExitFailure), exitFailure, exitSuccess, exitWith)
 import System.IO (BufferMode (BlockBuffering, LineBuffering), hSetBuffering, stderr, stdout)
-import System.Posix.Signals (Handler (Catch), installHandler, sigINT, sigTERM)
+import System.Posix.Signals (Handler (Catch), installHandler, sigHUP, sigINT, sigTERM)
 import Text.Read (readMaybe)
 
 import Config (PoolConfig (..), ServerConfig (..), StoreConfig (..), TlsConfig (..), loadServerConfig, loadStoreConfig, validateGcWindow)
@@ -388,6 +389,17 @@ runServe serverConfig loadedSchema pool config = do
             <> "; max batch size: "
             <> Text.pack (show serverConfig.maxBatchSize)
         )
+    Text.putStrLn ("Schema reload: SIGHUP" <> describeReloadSource serverConfig.store.schemaPath serverConfig.schemaReloadForce)
+    -- One writer, serialized. Two SIGHUPs in flight would otherwise race to
+    -- `atomicWriteIORef`, and the loser's orphan report would describe a schema that is
+    -- not the one now serving.
+    reloadGuard <- newMVar ()
+    _ <-
+        installHandler
+            sigHUP
+            (Catch (withMVar reloadGuard \() -> reloadSchema serverConfig activeSchemaRef runAppNow))
+            Nothing
+
     rateLimit <- rateLimitMiddleware serverConfig.rateLimit
     requestLogger <- newRequestLogger
     metrics <- newMetrics
@@ -418,6 +430,99 @@ runServe serverConfig loadedSchema pool config = do
     -- loses only the batch in flight; the next start resumes from what was committed.
     withAsync (runMaintenanceLoop serverConfig.maintenance runAppNow) \_maintenance ->
         serve serverConfig.tls serverConfig.port wrappedApp
+
+describeReloadSource :: Maybe FilePath -> Bool -> Text.Text
+describeReloadSource schemaPath force =
+    case schemaPath of
+        Nothing -> " (no EN_SCHEMA_PATH; nothing to reload)"
+        Just path ->
+            " re-reads " <> Text.pack path <> forceSuffix
+  where
+    forceSuffix
+        | force = "; EN_SCHEMA_RELOAD_FORCE=true, orphaning schemas will be ACTIVATED"
+        | otherwise = "; orphaning schemas are refused"
+
+{- | Re-read @EN_SCHEMA_PATH@ and swap the active schema, or refuse and keep serving.
+
+Every failure mode leaves the previous 'ActiveSchema' untouched: an unreadable file, a parse
+error, a validation error, and an orphan refusal all log and return. A running authorization
+server must survive a bad reload rather than exit — which is the one place this diverges from
+the fail-closed startup path, where exiting is the safe thing to do because nothing is being
+served yet.
+
+Nothing is needed here for in-flight requests. A request took its snapshot at its start and
+holds it; 'atomicWriteIORef' is seen only by snapshots taken after it returns.
+
+An unchanged file is not a reload. The swap is skipped when the candidate's hash equals the
+active one's, which also skips the token-invalidation warning — an operator who signals twice
+should not be told, falsely, that they have just invalidated every token in flight.
+-}
+reloadSchema ::
+    ServerConfig ->
+    IORef ActiveSchema ->
+    (forall a. Eff AppEffects a -> IO (Either EnError a)) ->
+    IO ()
+reloadSchema serverConfig activeSchemaRef runAppNow =
+    case serverConfig.store.schemaPath of
+        Nothing -> toStdout "SIGHUP received but no EN_SCHEMA_PATH is set; nothing to reload."
+        Just path -> reloadFrom path
+  where
+    reloadFrom path =
+        loadCandidateSchema path >>= \case
+            Left err -> refuse ("schema reload failed: " <> err)
+            Right candidate -> do
+                active <- readIORef activeSchemaRef
+                let graph = compile candidate.validSchema
+                    oldHash = renderSchemaHash active.graph.hash
+                    newHash = renderSchemaHash graph.hash
+                if graph.hash == active.graph.hash
+                    then toStdout ("Schema unchanged (" <> newHash <> "); not reloading.")
+                    else
+                        runAppNow (validateCandidate candidate.validSchema) >>= \case
+                            Left err -> refuse ("schema reload failed: could not scan the store: " <> showText err)
+                            Right report -> activate candidate graph oldHash newHash report
+
+    -- Scanned under whatever schema is active: the pass mints no token and presents none,
+    -- so the interpreters' schema hash never enters into it. It reads the head revision and
+    -- drains it, and that is all.
+    validateCandidate candidate = do
+        revision <- TupleStore.headRevision
+        validateTuplesAgainstSchema candidate revision
+
+    activate candidate graph oldHash newHash report
+        | not (null report.orphans) && not serverConfig.schemaReloadForce = do
+            toStdout ("Schema reload refused: " <> orphanSummary newHash report)
+            traverse_ (toStdout . renderTupleOrphan) report.orphans
+            toStdout "reload refused; set EN_SCHEMA_RELOAD_FORCE=true to activate anyway."
+        | otherwise = do
+            loadedAt <- getCurrentTime
+            atomicWriteIORef
+                activeSchemaRef
+                ActiveSchema
+                    { graph
+                    , source = candidate.source
+                    , origin = candidate.origin
+                    , loadedAt
+                    }
+            if null report.orphans
+                then pure ()
+                else do
+                    toStdout ("Schema reload FORCED over " <> orphanSummary newHash report)
+                    traverse_ (toStdout . renderTupleOrphan) report.orphans
+            toStdout ("Schema reloaded from " <> candidate.origin)
+            toStdout ("Schema hash: " <> newHash <> " (was " <> oldHash <> ")")
+            toStdout "WARNING: all consistency tokens minted under the previous schema hash are now invalid."
+
+    orphanSummary newHash report =
+        showText (length report.orphans)
+            <> " orphan(s) across "
+            <> showText report.scanned
+            <> " live tuple(s) under candidate "
+            <> newHash
+
+    refuse message = do
+        toStderr ("en-server: " <> message)
+        toStderr "the previous schema is still serving."
 
 {- | Run a store action against the pool: the effect stack a subcommand needs.
 
@@ -529,13 +634,13 @@ deliberately ignored. The question is what the /candidate/ makes of the stored d
 pipeline vetting a schema change should not have to arrange for the outgoing one to be
 present.
 -}
-runCheckSchema :: ValidSchema -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
+runCheckSchema :: LoadedSchema -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
 runCheckSchema candidate _activeSchema pool config = do
-    let candidateHash = renderSchemaHash (schemaHash candidate)
+    let candidateHash = renderSchemaHash (schemaHash candidate.validSchema)
     outcome <- runStoreIO pool config do
         revision <- TupleStore.headRevision
         liftIO (toStderr ("checking at revision " <> revision.revisionEncoding))
-        validateTuplesAgainstSchema candidate revision
+        validateTuplesAgainstSchema candidate.validSchema revision
     report <- either (storeFailure "check-schema") pure outcome
     traverse_ (Text.putStrLn . renderTupleOrphan) report.orphans
     let orphanCount = length report.orphans
@@ -553,27 +658,28 @@ runCheckSchema candidate _activeSchema pool config = do
             Text.putStrLn (summary <> " would strand them.")
             exitWith (ExitFailure 1)
 
-{- | Read, parse, and validate a candidate schema without exiting.
+{- | Read, parse, and validate a candidate schema without exiting, keeping its source text.
 
-'loadSchema' cannot be reused: every one of its failure paths calls 'configFailure', which
-exits 1 -- the code 'runCheckSchema' reserves for "the candidate strands live grants". A
-pipeline that cannot tell a typo in a schema file from a schema that would destroy data is
-worse than no pipeline.
+'loadSchema' cannot be reused for either caller. Every one of its failure paths calls
+'configFailure', which exits 1 -- the code 'runCheckSchema' reserves for "the candidate
+strands live grants" (a pipeline that cannot tell a typo in a schema file from a schema that
+would destroy data is worse than no pipeline), and which a running server must never do
+because an operator mistyped a file it was asked to reload.
 -}
-loadCandidateSchema :: FilePath -> IO (Either Text.Text ValidSchema)
+loadCandidateSchema :: FilePath -> IO (Either Text.Text LoadedSchema)
 loadCandidateSchema path = do
     readResult <- try (Text.readFile path) :: IO (Either IOException Text.Text)
     pure do
-        contents <-
+        source <-
             case readResult of
                 Right value -> Right value
                 Left err -> Left ("could not read " <> Text.pack path <> ": " <> Text.pack (show err))
         parsed <-
-            case parseSchema contents of
+            case parseSchema source of
                 Right value -> Right value
                 Left err -> Left ("could not parse " <> Text.pack path <> ": " <> Text.pack (show err))
         case validateSchema parsed of
-            Right valid -> Right valid
+            Right validSchema -> Right LoadedSchema{source, origin = Text.pack path, validSchema}
             Left err -> Left ("invalid schema in " <> Text.pack path <> ": " <> Text.pack (show err))
 
 -- | The candidate is unusable. Distinct from 'configFailure', which exits 1.
