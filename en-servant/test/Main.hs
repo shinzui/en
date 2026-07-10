@@ -6,11 +6,13 @@ import Data.Aeson (FromJSON, ToJSON, decode, encode)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.ByteString qualified as BS
 import Data.ByteString.Lazy (ByteString)
 import Data.Foldable qualified as Foldable
 import Data.Functor ((<&>))
 import Data.List qualified as List
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -18,6 +20,9 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Time (UTCTime (..), fromGregorian, getCurrentTime, secondsToDiffTime)
 import Effectful (Eff, IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
+import Network.HTTP.Types (methodPost, statusCode)
+import Network.Wai (Application, Request (..), defaultRequest)
+import Network.Wai.Test (SRequest (..), SResponse (..), runSession, setPath, srequest)
 import Servant (Handler, ServerError (..), runHandler)
 
 import Auth.Biscuit (toPublic)
@@ -96,6 +101,7 @@ import En.Servant.API (
     WatchResponseWire (..),
     WriteTuplesRequestWire (..),
     WriteTuplesResponseWire (..),
+    app,
     server,
  )
 import En.Servant.OpenApi (enOpenApi)
@@ -346,6 +352,7 @@ main = do
     lookupSubjectsTests env
     writePreconditionTests env
     mintGrantTests env
+    routingTests env
 
 {- | @\/v1\/lookup-subjects@ over the wire, against the in-memory store.
 
@@ -553,6 +560,137 @@ writePreconditionTests env = do
             , subjectId = Just subjectId
             , subjectRelation = Just NoSubjectRelationWire
             }
+
+{- | End-to-end routing and the error-envelope hook, driven through the real WAI
+'Application' rather than by calling handlers directly.
+
+The handler-level tests above call each handler as a function, so they never exercise
+Servant's routing or the 'envelopeFormatters' installed by 'app'. This drives 'app env'
+over the socket-facing surface: it proves each path reaches its own handler (a misroute
+would 404), that a well-formed request returns its typed 200 body, and — the point of the
+milestone — that the two pre-handler error hooks still speak 'ErrorEnvelopeWire'. A
+malformed body is rejected by servant's body parser before any handler runs, so only
+'bodyParserErrorFormatter' can turn it into the envelope; an unmatched path is rejected by
+routing, so only 'notFoundErrorFormatter' can. Neither is reachable from a handler test.
+
+en has no live misordering hazard to guard here — every route carries a distinct request
+body type (and the two bodyless verbs distinct shapes), so a transposition is already a
+compile error. What this pins is the observable HTTP behavior, so the Milestone 3 module
+move cannot silently change it.
+-}
+routingTests :: Env TestEffects -> IO ()
+routingTests env = do
+    let application = app env
+
+        aliceViewProjectX =
+            CheckRequestWire
+                { consistency = MinimizeLatencyWire
+                , context = CaveatContextWire Map.empty
+                , subject = SubjectIdWire ObjectRefWire{objectType = "user", objectId = "alice"}
+                , permission = "view"
+                , object = ObjectRefWire{objectType = "space", objectId = "project-x"}
+                }
+
+    -- POST /v1/check routes to the check handler and answers the typed decision.
+    checkResponse <- postJson application "/v1/check" (encode aliceViewProjectX)
+    assertEqual "POST /v1/check returns 200" 200 (statusCode checkResponse.simpleStatus)
+    assertEqual
+        "POST /v1/check decodes to CheckResponseWire and alice may view project-x"
+        (Just AllowedWire)
+        (fmap (.decision) (decode checkResponse.simpleBody :: Maybe CheckResponseWire))
+
+    -- POST /v1/lookup routes and returns a page.
+    let aliceViewSpaces =
+            LookupRequestWire
+                { consistency = MinimizeLatencyWire
+                , subject = SubjectIdWire ObjectRefWire{objectType = "user", objectId = "alice"}
+                , permission = "view"
+                , objectType = "space"
+                , context = CaveatContextWire Map.empty
+                , limit = 10
+                , cursor = Nothing
+                , deadlineMillis = Nothing
+                }
+    lookupResponse <- postJson application "/v1/lookup" (encode aliceViewSpaces)
+    assertEqual "POST /v1/lookup returns 200" 200 (statusCode lookupResponse.simpleStatus)
+    assertBool
+        "POST /v1/lookup decodes to LookupPageWire"
+        (isJust (decode lookupResponse.simpleBody :: Maybe LookupPageWire))
+
+    -- POST /v1/relationships routes to the write handler (the in-memory store accepts writes).
+    let writeBody =
+            WriteTuplesRequestWire
+                { tuples =
+                    [ TupleWire
+                        { object = ObjectRefWire{objectType = "space", objectId = "project-x"}
+                        , relation = "viewer"
+                        , subject = SubjectIdWire ObjectRefWire{objectType = "user", objectId = "bob"}
+                        , caveat = Nothing
+                        }
+                    ]
+                , deletes = Nothing
+                , preconditions = Nothing
+                }
+    writeResponse <- postJson application "/v1/relationships" (encode writeBody)
+    assertEqual "POST /v1/relationships routes to the write handler (200, not 404)" 200 (statusCode writeResponse.simpleStatus)
+
+    -- POST /v1/expand routes.
+    let expandBody =
+            ExpandRequestWire
+                { consistency = MinimizeLatencyWire
+                , object = ObjectRefWire{objectType = "space", objectId = "project-x"}
+                , permission = "view"
+                , context = CaveatContextWire Map.empty
+                , limit = 10
+                , cursor = Nothing
+                }
+    expandResponse <- postJson application "/v1/expand" (encode expandBody)
+    assertEqual "POST /v1/expand returns 200" 200 (statusCode expandResponse.simpleStatus)
+
+    -- POST /v1/batch-check routes.
+    let batchBody =
+            BatchCheckRequestWire
+                { consistency = MinimizeLatencyWire
+                , context = CaveatContextWire Map.empty
+                , pairs = [pair "alice" "view" "project-x"]
+                }
+    batchResponse <- postJson application "/v1/batch-check" (encode batchBody)
+    assertEqual "POST /v1/batch-check returns 200" 200 (statusCode batchResponse.simpleStatus)
+
+    {- The point of the milestone: a malformed body comes back as the machine-readable
+    envelope, proving envelopeFormatters' bodyParserErrorFormatter survived the refactor. -}
+    malformed <- postJson application "/v1/check" "not json at all"
+    assertEqual "a malformed body is a 400" 400 (statusCode malformed.simpleStatus)
+    assertEqual
+        "a malformed body returns the ErrorEnvelopeWire with code malformed_request_body"
+        (Just "malformed_request_body")
+        (fmap (.code) (decode malformed.simpleBody :: Maybe ErrorEnvelopeWire))
+
+    -- An unmatched path comes back as the 404 envelope, proving notFoundErrorFormatter.
+    notThere <- postJson application "/v1/no-such-path" "{}"
+    assertEqual "an unknown path is a 404" 404 (statusCode notThere.simpleStatus)
+    assertEqual
+        "an unknown path returns the ErrorEnvelopeWire with code not_found"
+        (Just "not_found")
+        (fmap (.code) (decode notThere.simpleBody :: Maybe ErrorEnvelopeWire))
+
+-- | @POST <path>@ with a JSON body, driven through the WAI 'Application'.
+postJson :: Application -> BS.ByteString -> ByteString -> IO SResponse
+postJson application path body =
+    runSession
+        ( srequest
+            SRequest
+                { simpleRequest =
+                    setPath
+                        defaultRequest
+                            { requestMethod = methodPost
+                            , requestHeaders = [("Content-Type", "application/json")]
+                            }
+                        path
+                , simpleRequestBody = body
+                }
+        )
+        application
 
 {- | The generated document describes the API that is actually served.
 

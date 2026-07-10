@@ -104,10 +104,17 @@ trailing it.
       `biscuit-haskell` config) cannot build against local `en`, so the preserved-interface
       argument stands in for a local build. Added `servant-client-core` to `en-client`'s
       `build-depends` (needed for `Servant.Client.Generic`).
-- [ ] Milestone 2: add a `Network.Wai.Test` end-to-end routing guard that drives `app env`
-      over all six paths, asserts a malformed body returns `ErrorEnvelopeWire` (proving
-      `envelopeFormatters` survived), and asserts an unknown path returns the 404 envelope.
-      This pins behavior before the Milestone 3 file moves.
+- [x] Milestone 2 (done 2026-07-10): added `routingTests :: Env TestEffects -> IO ()` that
+      drives `app env` via `Network.Wai.Test` over `/v1/check`, `/v1/lookup`,
+      `/v1/relationships`, `/v1/expand`, and `/v1/batch-check` (each a distinct routing field,
+      each returning its typed 200 body), asserts a malformed body on `/v1/check` returns the
+      `ErrorEnvelopeWire` with `code == "malformed_request_body"` (proving
+      `bodyParserErrorFormatter` survived), and asserts `/v1/no-such-path` returns the 404
+      envelope with `code == "not_found"` (proving `notFoundErrorFormatter`). Added `wai`,
+      `wai-extra`, and `http-types` to the `en-servant-tests` `build-depends`. `cabal test all`
+      passes. Deliberate-break check: renaming the `check` field path to `checkx` fails the
+      suite (the `openApiDocumentTests` path-set assertion fires first, before `routingTests`,
+      which would independently 404 on `/v1/check`); reverted.
 - [ ] Milestone 3: split `En.Servant.API` into vertical slices — `En.Servant.Wire` (shared
       wire vocabulary), `En.Servant.Response` (the `MultiVerb` machinery), and
       `En.Tuple.Api` / `En.Check.Api` / `En.Lookup.Api` / `En.Expand.Api` (routes + DTOs +

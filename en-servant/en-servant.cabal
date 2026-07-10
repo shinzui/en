@@ -80,7 +80,10 @@ test-suite en-servant-tests
     , en-biscuit
     , en-core
     , en-servant
+    , http-types
     , servant
     , servant-server
     , text
     , time
+    , wai
+    , wai-extra
