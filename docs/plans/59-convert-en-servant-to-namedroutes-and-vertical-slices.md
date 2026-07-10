@@ -132,9 +132,13 @@ trailing it.
       the `Handlers`/`server env` extraction. `cabal build all` and `cabal test all` pass with no
       warnings; `grep ':<|>' API.hs` is empty; slices are concept-as-directory. Downstream by
       import review (both blocked from local build, as recorded).
-- [ ] Milestone 4: amend the document of record,
-      `docs/plans/35-version-the-wire-contract-and-type-the-error-model.md`, whose code
-      blocks specify the `:<|>` chain and positional server this plan replaces.
+- [x] Milestone 4 (done 2026-07-10): amended
+      `docs/plans/35-version-the-wire-contract-and-type-the-error-model.md`. Its Milestone 2 and
+      Milestone 3b `EnAPI` code blocks now show the `NamedRoutes` record form (not the `:<|>`
+      chain), the two positional-server/test comments were updated to record-field extraction,
+      and a dated Revision Note naming plan 59 was appended. The `ServedAPI` OpenAPI-mount `:<|>`
+      is intentionally kept (correct mounting use); the `MultiVerb` response content plan 35
+      specifies is untouched.
 - [ ] Milestone 5: bring en's OpenAPI derivation up to the full canonical recipe — add stable
       `operationId`s to `enOpenApi`, add an `en-openapi` executable that writes a checked-in
       `docs/api/openapi.json` (sorted keys, trailing newline), commit the artifact, add a drift

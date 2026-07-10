@@ -614,18 +614,25 @@ server answers only on the new paths and every in-repo consumer uses them.
 In `en-servant/src/En/Servant/API.hs`, redefine:
 
 ```haskell
-type EnAPI =
-    "v1" :> ( "relationships" :> ReqBody '[JSON] WriteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
-        :<|> "relationships" :> "delete" :> ReqBody '[JSON] DeleteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
-        :<|> "check" :> ReqBody '[JSON] CheckRequestWire :> Post '[JSON] CheckResponseWire
-        :<|> "batch-check" :> ReqBody '[JSON] BatchCheckRequestWire :> Post '[JSON] BatchCheckResponseWire
-        :<|> "lookup" :> ReqBody '[JSON] LookupRequestWire :> Post '[JSON] LookupPageWire
-        :<|> "expand" :> ReqBody '[JSON] ExpandRequestWire :> Post '[JSON] ExpandTreeWire )
+-- Updated by docs/plans/59 to a NamedRoutes record; see the revision note at the
+-- foot of this plan. The original form of this block was a positional ":<|>" chain.
+data EnApi mode = EnApi
+    { writeTuples :: mode :- "v1" :> "relationships" :> ReqBody '[JSON] WriteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
+    , deleteTuples :: mode :- "v1" :> "relationships" :> "delete" :> ReqBody '[JSON] DeleteTuplesRequestWire :> Post '[JSON] WriteTuplesResponseWire
+    , check :: mode :- "v1" :> "check" :> ReqBody '[JSON] CheckRequestWire :> Post '[JSON] CheckResponseWire
+    , batchCheck :: mode :- "v1" :> "batch-check" :> ReqBody '[JSON] BatchCheckRequestWire :> Post '[JSON] BatchCheckResponseWire
+    , lookup :: mode :- "v1" :> "lookup" :> ReqBody '[JSON] LookupRequestWire :> Post '[JSON] LookupPageWire
+    , expand :: mode :- "v1" :> "expand" :> ReqBody '[JSON] ExpandRequestWire :> Post '[JSON] ExpandTreeWire
+    }
+    deriving stock (Generic)
+
+type EnAPI = NamedRoutes EnApi
 ```
 
-The `Delete` import from Servant goes away; handler order in `server` is unchanged
-(write, delete, check, batch, lookup, expand), so `en-servant/test/Main.hs`'s positional
-pattern matches (`_write :<|> _delete :<|> …`) still line up — verify, don't assume.
+The `Delete` import from Servant goes away; `server` supplies its handlers by record field
+(`EnApi { writeTuples = …, deleteTuples = …, … }`), and `en-servant/test/Main.hs` extracts
+a handler by binding the field it wants (`EnApi{check} = server env`) rather than by a
+positional `_write :<|> _delete :<|> …` pattern — verify, don't assume.
 `en-client/src/En/Client.hs` needs no code change beyond recompilation (the record is
 derived from `apiProxy`), but update its module comment to note the `/v1` base and that
 `ClientEnv`'s `BaseUrl` should point at the host root (the `/v1` prefix is in the API
@@ -797,18 +804,23 @@ instance
 `Union` is `Data.SOP.NS I`, so the instance body uses `Z`, `S`, and `I` from
 `Data.SOP` — add `sop-core` to `en-servant`'s library `build-depends`.
 
-Each route becomes a `MultiVerb`, replacing `Post '[JSON] X`:
+Each route becomes a `MultiVerb`, replacing `Post '[JSON] X` (shown here in the NamedRoutes
+record form docs/plans/59 later adopted — see the revision note at the foot of this plan;
+originally each `MultiVerb` was an alternative of a positional `:<|>` chain):
 
 ```haskell
-type EnAPI =
-    "v1"
-        :> ( "relationships"
-                :> ReqBody '[JSON] WriteTuplesRequestWire
-                :> MultiVerb 'POST '[JSON]
-                    (EnResponses "Consistency token for the write" WriteTuplesResponseWire)
-                    (EnResult WriteTuplesResponseWire)
-             :<|> …
-           )
+data EnApi mode = EnApi
+    { writeTuples ::
+        mode :- "v1" :> "relationships"
+             :> ReqBody '[JSON] WriteTuplesRequestWire
+             :> MultiVerb 'POST '[JSON]
+                  (EnResponses "Consistency token for the write" WriteTuplesResponseWire)
+                  (EnResult WriteTuplesResponseWire)
+    , … -- one field per operation, each ending in its own MultiVerb
+    }
+    deriving stock (Generic)
+
+type EnAPI = NamedRoutes EnApi
 ```
 
 Handlers change from `Handler X` to `Handler (EnResult X)`. The validation helpers that
@@ -833,8 +845,8 @@ fields accordingly and note in the module comment that callers pattern-match `En
 rather than catching a `ClientError` for engine faults (transport and framework errors
 still surface as `ClientError`).
 
-`en-servant/test/Main.hs`: the positional `server env` destructuring is unchanged, but
-assertions move onto `EnResult`. The oversized-batch test asserts
+`en-servant/test/Main.hs`: the test extracts each handler from `server env` by record field
+(rather than by a positional pattern), and assertions move onto `EnResult`. The oversized-batch test asserts
 `EnClientError` with code `batch_too_large` instead of inspecting `errHTTPCode`, which
 is a strictly stronger check. Add a test that a check for an unknown permission returns
 `EnClientError` with code `unknown_relation`.
@@ -1078,3 +1090,33 @@ Decision Log entries dated 2026-07-08.
 Sections revised: Purpose / Big Picture, Progress, Decision Log, Plan of Work
 (overview, Milestone 3, new Milestone 3b, Milestone 4), Validation and Acceptance,
 Interfaces and Dependencies.
+
+
+## Revision Note — 2026-07-10 (external: docs/plans/59)
+
+**What changed.** The route type moved from a positional `:<|>` chain to a servant
+`NamedRoutes` record, and the DTOs and handlers moved out of the monolithic
+`En/Servant/API.hs` into vertical slices — `En.Tuple.Api`, `En.Check.Api`, `En.Lookup.Api`,
+`En.Expand.Api`, and `En.Schema.Api` — with shared wire vocabulary in `En.Servant.Wire` and
+the `MultiVerb` machinery in `En.Servant.Response`. `En.Servant.API` is now a thin re-export
+umbrella that mounts each slice's route sub-record under `/v1`, so its public interface is a
+superset of what it exported before and no consumer's import breaks. This was done by
+`docs/plans/59-convert-en-servant-to-namedroutes-and-vertical-slices.md`; the two `EnAPI`
+type blocks and the two positional-server comments in this plan's Milestone 2 and Milestone
+3b were updated in place to the record form so a reader of this plan alone is not led into
+rebuilding the chain.
+
+**What did not change.** The `MultiVerb` response model this plan established is untouched:
+`EnResponses`, `EnResult`, the hand-written `AsUnion` instance and its exhaustiveness witness,
+`faultToResult`, `EnFault`, `enErrorToFault`, and `envelopeFormatters` were carried through
+verbatim (only relocated to `En.Servant.Response`), and no JSON byte, status, or error code
+changed. The `ServedAPI = EnAPI :<|> "v1" :> "openapi.json" :> …` mount keeps its `:<|>` —
+that is the correct use of the operator, mounting the whole API beside the OpenAPI route.
+
+**Note on scope.** This plan's narrative describes six operations; by the time plan 59 ran,
+the live `/v1` surface had grown to twelve (adding relationship query, filtered delete, watch,
+lookup-subjects, grant minting, and the schema `GET`). Plan 59 carried all twelve through the
+conversion unchanged.
+
+Sections revised: Milestone 2 (`EnAPI` block and positional-pattern comment), Milestone 3b
+(`EnAPI` block and positional-server comment), this Revision Note.
