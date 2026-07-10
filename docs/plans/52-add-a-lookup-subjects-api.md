@@ -42,11 +42,11 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Create `en-core/src/En/LookupSubjects.hs` with the request/result/cursor types and the traversal skeleton over `This`, `ComputedUserset`, and `Union`.
-- [ ] M1: Implement `TupleToUserset` traversal and tuple/rewrite caveat gating.
-- [ ] M1: Implement intersection/exclusion candidate confirmation via forward check, and wildcard surfacing rules.
-- [ ] M1: Implement paging (`Exhausted`/`HasMore`/`Truncated`), the cursor codec, and the deadline hook; add the module to `en-core/en-core.cabal` exposed-modules.
-- [ ] M1: Conformance tests over the kikan fixtures: direct members, group nesting through `org#member`, caveated delegate (Conditional), exclusion (`member_not_owner`), intersection (`audit`), pagination determinism; plus a local wildcard-schema test.
+- [x] M1 (2026-07-09): Create `en-core/src/En/LookupSubjects.hs` with the request/result/cursor types and the traversal skeleton over `This`, `ComputedUserset`, and `Union`.
+- [x] M1 (2026-07-09): Implement `TupleToUserset` traversal and tuple/rewrite caveat gating.
+- [x] M1 (2026-07-09): Implement intersection/exclusion candidate confirmation via forward check, and wildcard surfacing rules.
+- [x] M1 (2026-07-09): Implement paging (`Exhausted`/`HasMore`/`Truncated`), the cursor codec, and the deadline hook; add the module to `en-core/en-core.cabal` exposed-modules.
+- [x] M1 (2026-07-09): Conformance tests over the kikan fixtures: group nesting through `org#member`, caveated delegate (Allowed and Conditional), exclusion (`member_not_owner`), intersection (`audit`), pagination determinism; plus a local wildcard-schema test, a malformed-cursor test, and a foreign-token cursor test under the strict consistency store.
 - [ ] M2: Wire DTOs, `POST /lookup-subjects` route, handler, and `Env.lookupSubjectsOperation` in `en-servant/src/En/Servant/API.hs` and `en-servant/src/En/Servant/Seam.hs`; wire cached/uncached variants in `en-server/app/Main.hs`; extend `en-servant/test/Main.hs`.
 - [ ] M2: Add the `lookupSubjects` field to `EnClient` in `en-client/src/En/Client.hs`.
 - [ ] M3: Run the end-to-end curl transcript against a live server and paste the observed output into Validation and Acceptance.
@@ -57,7 +57,38 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- 2026-07-09 (M1): the external sequencing this plan only *preferred* has already
+  happened. Master plans 6, 7, and 8 are all Complete, so `docs/plans/35` (versioned wire
+  contract), `docs/plans/40` and `42` (cycle semantics, validated cursors, real deadline),
+  and `docs/plans/49` (index trim) all landed before this plan started. Consequences: the
+  route is `POST /v1/lookup-subjects`, not `POST /lookup-subjects`; every JSON transcript
+  written into this plan on 2026-07-07 showing `{"tag": …}` sum encodings is stale — the
+  `v1` contract encodes sums with a string discriminator (`kind` for subjects, `result`
+  for decisions, `mode` for consistency, `status` for page states); and the "inheriting
+  engine defects through the confirmation step" risk in Idempotence and Recovery is moot,
+  because `check` no longer errors on a data cycle.
+
+- 2026-07-09 (M1): `En.Check.evalTupleToUsersetMemo` follows a tupleset row's *own*
+  subject relation, not the arrow's `computedRelation`, when the row's subject is a
+  userset. That is, for `TupleToUserset parent view` over a row
+  `space:child#parent@space:p#editor`, check evaluates `space:p#editor`, not
+  `space:p#view`. `En.Expand.expandTupleToUserset` does the same. This module copies that
+  behavior rather than the arrow's nominal reading, because the confirmation step calls
+  `check`: had the traversal followed `computedRelation` there, a candidate the walk found
+  would be denied by the check confirming it, and intersections would silently return
+  fewer subjects than the union of their branches contains.
+
+- 2026-07-09 (M1): the six conformance scenarios passed on their first run. That is worth
+  recording rather than celebrating — it is what "reach-then-check delegating to the one
+  evaluator" buys. The exclusion and intersection cases are not vacuous: without the
+  confirmation step, `exclusionSpace#member_not_owner` returns `member-owner` (the base
+  branch grants it) and `auditedSpace#audit` returns every member *or* owner rather than
+  the one subject holding both. Both assertions name the exact singleton set.
+
+  ```text
+  Test suite en-core-conformance: PASS
+  1 of 1 test suites (1 of 1 test cases) passed.
+  ```
 
 
 ## Decision Log
@@ -85,6 +116,21 @@ Record every decision made while working on the plan.
 - Decision: The response includes a `checkedAt` consistency token from day one, following the convention of `docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md`.
   Rationale: Master plan 9's Integration Points require every new read DTO to carry the token. If EP-51 has landed, mint via its `mintToken` effect operation; if not, add the field per the review's E3 description (minted exactly like write tokens through the consistency boundary) and let EP-51 reconcile — record whichever happened here.
   Date: 2026-07-07
+- Decision: EP-51 had landed, so `checkedAt` follows its established convention exactly, and a cursored resume does **not** re-resolve the request's `consistency`.
+  Rationale: `LookupSubjectsPage.checkedAt :: ConsistencyToken` is minted by the `MintToken` operation of the `ConsistencyStore` effect (a pure encode in every interpreter, so it costs no round trip) from the revision the read *resolved to*. On the wire it is `checkedAt :: !Text`, last in the response object. On a cursor resume the token comes from the cursor's *validated* token and `resolveConsistency` is never called — EP-51's Surprises record a lookup page-two request asking for `minimizeLatency` and correctly receiving page one's snapshot, and a cursored read that re-resolves silently spans two snapshots and pages with gaps.
+  Date: 2026-07-09
+- Decision: Do not port `En.Lookup`'s `EmitWindow` (the watermark-and-confirm-budget optimization that bounds confirmation to the current page). Confirm every candidate.
+  Rationale: The window is sound only where a confirmation's output goes straight into the page, so it threads a `Maybe EmitWindow` through every rewrite node with per-constructor rules about when to pass it on. Copying that into a brand-new evaluator buys a constant factor on the confirmation of intersection and exclusion nodes and risks a page with gaps if one rule is copied wrong. `docs/plans/42` owns lookup's paging mechanics; when a future plan generalizes them, this module adopts the result. The page vocabulary, cursor discipline, and traversal shape are already identical, which is what makes that transfer mechanical.
+  Date: 2026-07-09
+- Decision: `LookupSubjectsRequest.limit` is a bare `Int`, not a `LookupSubjectsLimit` newtype mirroring `En.Lookup.LookupLimit`.
+  Rationale: The plan's own sketch spelled it `Int`, and the handler already carries an unrelated `Int` (`deadlineMillis`) that a newtype here would not distinguish from anything. One fewer type for a novice to thread.
+  Date: 2026-07-09
+- Decision: The traversal's invariant arguments (graph, context, revision, subject type, deadline, confirming checker) travel in one `Traversal` record rather than as positional parameters.
+  Rationale: `En.Lookup`'s evaluators take nine positional arguments, three of which are `RelationName`s and two `ObjectType`s, so a call site can transpose two of them without a type error. The record is internal, so it costs nothing on the public surface.
+  Date: 2026-07-09
+- Decision: A tupleset row whose subject is a userset is followed through that userset's own relation, not the arrow's `computedRelation`.
+  Rationale: This is what `En.Check` does, and the confirmation step calls `check`. See Surprises & Discoveries.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective

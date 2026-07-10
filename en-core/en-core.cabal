@@ -52,6 +52,7 @@ library
     En.Error
     En.Expand
     En.Lookup
+    En.LookupSubjects
     En.Prelude
     En.Reachability
     En.Revision
