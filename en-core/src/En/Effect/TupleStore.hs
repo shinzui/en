@@ -20,6 +20,7 @@ module En.Effect.TupleStore (
     headRevision,
     optimizedRevision,
     oldestRetainedXid,
+    advanceGcHorizon,
     reapDeletedTuples,
     TupleFilter (..),
     SubjectRelationFilter (..),
@@ -449,6 +450,14 @@ data TupleStore :: Effect where
     HeadRevision :: TupleStore m Revision
     OptimizedRevision :: TupleStore m Revision
     OldestRetainedXid :: TupleStore m Word64
+    {- | Advance the durable garbage-collection horizon to
+    @GREATEST(mark, freshly computed)@ and return the new value. Distinct from
+    'OldestRetainedXid', which only /reads/ the clamped horizon: this is the
+    write the reaper issues to publish its horizon before it destroys anything,
+    so validation can never fall below a horizon reaping already acted on. See
+    @docs/plans/60@ Milestone 4.
+    -}
+    AdvanceGcHorizon :: TupleStore m Word64
     ReapDeletedTuples :: Word64 -> TupleStore m Int64
 
 type instance DispatchOf TupleStore = Dynamic
@@ -523,6 +532,15 @@ optimizedRevision =
 oldestRetainedXid :: (TupleStore :> es) => Eff es Word64
 oldestRetainedXid =
     send OldestRetainedXid
+
+{- | Advance the durable garbage-collection horizon and return the new high-water
+mark. The reaper calls this to fix the horizon it will reap and prune at; token
+validation calls 'oldestRetainedXid', which reads the same durable mark. See
+'AdvanceGcHorizon'.
+-}
+advanceGcHorizon :: (TupleStore :> es) => Eff es Word64
+advanceGcHorizon =
+    send AdvanceGcHorizon
 
 reapDeletedTuples :: (TupleStore :> es) => Word64 -> Eff es Int64
 reapDeletedTuples =

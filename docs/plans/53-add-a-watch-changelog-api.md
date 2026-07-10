@@ -153,8 +153,11 @@ implementation. Provide concise evidence.
   the head-revision `checkedAt` bug now has a regression test. EP-60 additionally discovered, while
   investigating the horizon's soundness, that `oldestRetainedXid` is **not monotonic**: a
   long-running xid-bearing transaction can walk it backwards as anchor rows age out of the window,
-  which both the old and new rules depend on not happening — tracked as EP-60's Milestone 4 (a
-  monotone high-water-mark horizon), a blocking prerequisite for the full soundness claim.
+  which both the old and new rules depend on not happening — and then fixed it (EP-60 Milestone 4,
+  complete 2026-07-10): the served horizon is now a durable high-water mark (`en_gc_horizon`),
+  advanced by the reaper before it reaps and read by validation, so it can never regress. The watch
+  cursor rides the same shared predicate and the same durable horizon, so this soundness fix covers
+  `validateWatchCursor` too.
 
 - 2026-07-09 (M1, paging): the resumption cursor must name the last row **fetched**, not the
   last event **emitted**. A row created and retired inside one window is fetched by the

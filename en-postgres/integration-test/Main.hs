@@ -1674,6 +1674,23 @@ currentXactIdStatement =
         Encoders.noParams
         (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
 
+{- | The /raw/ horizon 'oldestRetainedXidStatement' computed before Milestone 4: the
+@coalesce(min(xid), pg_snapshot_xmin(...))@ over the retention window, with no
+high-water clamp. 'runHorizonMonotonicityScenario' uses it to show the raw term still
+regresses under a held xid, while the served horizon (clamped to @en_gc_horizon@) does
+not.
+-}
+rawHorizonStatement :: Statement Text Int64
+rawHorizonStatement =
+    Statement.preparable
+        """
+        SELECT coalesce(min(xid), pg_snapshot_xmin(pg_current_snapshot()))::text::bigint
+        FROM en_transaction
+        WHERE created_at >= now() - $1::interval
+        """
+        (Encoders.param (Encoders.nonNullable Encoders.text))
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
+
 {- | Storage refuses to answer rather than answering wrongly.
 
 Three ways the store used to lie, each now a typed error or a harmless no-op: a
@@ -2170,18 +2187,23 @@ runSnapshotOracleScenario connection =
         oracle <- oracleCompare connection left right
         assertEqual ("snapshot comparator agrees with PostgreSQL oracle for " <> Text.unpack (renderPgSnapshot left) <> " vs " <> Text.unpack (renderPgSnapshot right)) oracle (comparePgSnapshot left right)
 
-{- | Is 'oldestRetainedXid' non-decreasing? Every horizon rule -- the old @xmax <= horizon@
-rule and M1's 'retainedHistoryVisible' alike -- is sound only if the horizon never moves
-backwards: reaping at @T1@ physically destroys rows below @H(T1)@, and validation at @T2 > T1@
-reasons about @H(T2)@; the safety argument needs @H(T1) <= H(T2)@, or a token validated under a
-lower later horizon can be told a reaped row is still live.
+{- | The served garbage-collection horizon is a monotone high-water mark: it never moves
+backwards. Every horizon rule -- the old @xmax <= horizon@ rule and M1's
+'retainedHistoryVisible' alike -- is sound only if the horizon never regresses: reaping at
+@T1@ physically destroys rows below @H(T1)@, and validation at @T2 > T1@ reasons about
+@H(T2)@; the safety argument needs @H(T1) <= H(T2)@, or a token validated under a lower later
+horizon can be told a reaped row is still live.
 
-The suspect is 'oldestRetainedXidStatement''s @coalesce(min(xid), pg_snapshot_xmin(...))@
-fallback. This scenario constructs the adversarial case the plan names: a long-running
-transaction that has been assigned an xid (via @pg_current_xact_id()@) and holds it open,
-pinning @pg_snapshot_xmin@ low, while every @en_transaction@ anchor row ages out of a fixed
-retention window. The window is a real @"1 seconds"@ throughout; only wall-clock time passes
-between the two observations, exactly as it would in production.
+M1 found the raw @coalesce(min(xid), pg_snapshot_xmin(...))@ query does __not__ hold that on
+its own; Milestone 4 makes the served horizon monotone with a durable high-water mark
+(@en_gc_horizon@). The reaper publishes its horizon with 'TupleStore.advanceGcHorizon' and
+token validation reads it back with 'TupleStore.oldestRetainedXid', clamped up to the mark.
+
+This scenario constructs the adversarial case the plan names and asserts /both/ halves at once:
+the raw term (@rawHorizonStatement@) still regresses, while the served horizon holds its mark.
+A long-running transaction assigned an xid (via @pg_current_xact_id()@) is held open, pinning
+@pg_snapshot_xmin@ low, while every @en_transaction@ anchor ages out of a fixed @"1 seconds"@
+window. Only wall-clock time passes between the observations, exactly as in production.
 -}
 runHorizonMonotonicityScenario :: Pg.Database -> Connection.Connection -> IO ()
 runHorizonMonotonicityScenario database connection = do
@@ -2198,40 +2220,56 @@ runHorizonMonotonicityScenario database connection = do
     runSessionOrFail holder (Session.script "BEGIN")
     heldXid <- runSessionOrFail holder (Session.statement () currentXactIdStatement)
     _ <- runPgOrFail connection config (TupleStore.writeTuples [anchorTuple])
-    -- The anchor row is inside the window: min(xid) governs.
-    horizonBefore <- runPgOrFail connection shortWindow TupleStore.oldestRetainedXid
+    -- The anchor row is inside the window: min(xid) governs. Publish it as the reaper's pass
+    -- would, advancing the durable high-water mark.
+    servedBefore <- runPgOrFail connection shortWindow TupleStore.advanceGcHorizon
+    rawBefore <- runSessionOrFail connection (Session.statement shortWindow.gcWindow rawHorizonStatement)
     -- Age the anchor row out of the one-second window, holder still open.
     threadDelay 1_200_000
-    horizonAfter <- runPgOrFail connection shortWindow TupleStore.oldestRetainedXid
+    rawAfter <- runSessionOrFail connection (Session.statement shortWindow.gcWindow rawHorizonStatement)
+    servedAfter <- runPgOrFail connection shortWindow TupleStore.oldestRetainedXid
     runSessionOrFail holder (Session.script "ROLLBACK")
     Connection.release holder
-    {- The finding (docs/plans/60, M1): the horizon is __not__ monotonic. With the anchor row
-    inside the window the horizon is @min(xid)@, which is above the held xid; once the row ages
-    out the horizon falls to @pg_snapshot_xmin@, which the held transaction pins at or below
-    that xid. A held transaction older than the window is enough to walk the horizon backwards.
-    Both the old rule and M1's rule share this dependency (see the plan's Decision Log and its
-    prospective Milestone 4, the monotone high-water mark). -}
+    {- The hazard is real: with the anchor inside the window the raw horizon is @min(xid)@, above
+    the held xid; once the row ages out it falls to @pg_snapshot_xmin@, which the held transaction
+    pins at or below that xid. -}
     assertBool
         ( "the held xid sits below the in-window horizon; got heldXid="
             <> show heldXid
-            <> " horizonBefore="
-            <> show horizonBefore
+            <> " servedBefore="
+            <> show servedBefore
         )
-        (fromIntegral heldXid < horizonBefore)
+        (fromIntegral heldXid < servedBefore)
     assertBool
-        ( "the horizon moves backwards once the anchor ages out under a held transaction; got before="
-            <> show horizonBefore
+        ( "the raw horizon still moves backwards once the anchor ages out under a held transaction; got before="
+            <> show rawBefore
             <> " after="
-            <> show horizonAfter
+            <> show rawAfter
         )
-        (horizonAfter < horizonBefore)
+        (rawAfter < rawBefore)
     assertBool
-        ( "the horizon falls to the held transaction's xid; got heldXid="
+        ( "the raw horizon falls to the held transaction's xid; got heldXid="
             <> show heldXid
-            <> " horizonAfter="
-            <> show horizonAfter
+            <> " rawAfter="
+            <> show rawAfter
         )
-        (horizonAfter <= fromIntegral heldXid)
+        (rawAfter <= heldXid)
+    {- Milestone 4: the served horizon holds its high-water mark rather than regressing with the
+    raw term, so reaping and validation cannot disagree across time. -}
+    assertBool
+        ( "the served horizon holds its high-water mark rather than regressing; got servedBefore="
+            <> show servedBefore
+            <> " servedAfter="
+            <> show servedAfter
+        )
+        (servedAfter >= servedBefore)
+    assertBool
+        ( "the served horizon stays above the held xid, so reaped history is still protected; got heldXid="
+            <> show heldXid
+            <> " servedAfter="
+            <> show servedAfter
+        )
+        (fromIntegral heldXid < servedAfter)
 
 {- | 'retainedHistoryVisible' against the same PostgreSQL oracle 'runSnapshotOracleScenario'
 uses. The predicate is a statement /about/ visibility -- "every transaction below the horizon
@@ -2408,6 +2446,18 @@ schemaSql =
     """
     DROP TABLE IF EXISTS relation_tuple;
     DROP TABLE IF EXISTS en_transaction;
+    DROP TABLE IF EXISTS en_gc_horizon;
+
+    -- The garbage-collection horizon's durable high-water mark; see
+    -- en-migrations/db/migrations/20260710150000_gc-horizon-high-water-mark.sql
+    -- and docs/plans/60 Milestone 4. Seeded to 0 so validation and the reaper
+    -- always find the singleton row.
+    CREATE TABLE en_gc_horizon
+      ( singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton)
+      , horizon bigint NOT NULL DEFAULT 0
+      );
+
+    INSERT INTO en_gc_horizon (singleton, horizon) VALUES (true, 0);
 
     CREATE TABLE en_transaction
       ( xid xid8 PRIMARY KEY

@@ -158,6 +158,8 @@ interpretTupleStorePostgres config readOptimizedRevision =
             readOptimizedRevision
         OldestRetainedXid ->
             orThrow =<< runSession (oldestRetainedXidSession config.gcWindow)
+        AdvanceGcHorizon ->
+            orThrow =<< runSession (advanceGcHorizonSession config.gcWindow)
         ReapDeletedTuples horizon ->
             orThrow =<< runSession (reapDeletedTuplesSession horizon)
   where
@@ -398,6 +400,18 @@ oldestRetainedXidSession :: Text -> Session Word64
 oldestRetainedXidSession window =
     fromIntegral <$> Session.statement window oldestRetainedXidStatement
 
+{- | Advance the durable garbage-collection horizon to @GREATEST(mark, fresh)@ and
+return the new high-water mark.
+
+The reaper runs this once per pass to fix the horizon it will reap and prune at,
+before it destroys anything. Its @UPDATE@ is committed in its own session, so any
+later 'oldestRetainedXidSession' — on this or any other replica — reads a mark at
+least as high as every reap already performed. See @docs/plans/60@ Milestone 4.
+-}
+advanceGcHorizonSession :: Text -> Session Word64
+advanceGcHorizonSession window =
+    fromIntegral <$> Session.statement window advanceGcHorizonStatement
+
 {- | Physically delete every soft-deleted tuple behind @horizon@ in one statement.
 
 Retained for embedded consumers and the integration test. Background maintenance
@@ -430,9 +444,13 @@ were removed.
 
 Rows are selected by @xid < horizon@ rather than by re-deriving a cutoff from
 @created_at@, so the pruner, the reaper, and token validation share one horizon and
-cannot disagree. Because @horizon@ is @min(xid)@ over the rows inside the retention
-window, no row inside the window is ever selected: every such row has
-@xid >= horizon@ by construction.
+cannot disagree. @horizon@ is @GREATEST(high-water mark, min(xid) over the retention
+window)@ ('advanceGcHorizonStatement'): normally the @min(xid)@ term governs and no
+in-window anchor is selected, but when the mark sits above a fresh in-window
+@min(xid)@ — the non-monotone case Milestone 4 clamps away — an in-window anchor
+below the mark may be pruned. That is safe: the mark already treats every xid below
+it as behind the horizon, so token validation would already reject any snapshot that
+needs such an anchor to be in flight, and the anchor no longer protects anything.
 -}
 pruneTransactionsBatchSession :: Word64 -> Int -> Session Int64
 pruneTransactionsBatchSession horizon batch =
@@ -912,13 +930,59 @@ currentSnapshotStatement =
         Encoders.noParams
         (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.text)))
 
+{- | The garbage-collection horizon token validation reads: the greater of the
+durable high-water mark ('en_gc_horizon') and the freshly computed horizon.
+
+The fresh term is @coalesce(min(xid), pg_snapshot_xmin(pg_current_snapshot()))@
+over @en_transaction@ rows inside @EN_GC_WINDOW@ — the @min(xid)@ branch rises as
+rows age out, and the @coalesce@ fallback answers on an empty window. That fallback
+can /fall/, because a long-running open transaction pins @pg_snapshot_xmin@ low
+(see @docs/plans/60@ Milestone 4, and @runHorizonMonotonicityScenario@). Clamping
+up to the high-water mark is what makes the served horizon monotone: the mark holds
+the greatest horizon ever published, so this query never returns a value below one
+the reaper already reaped at.
+
+This statement only /reads/ the mark; the reaper advances it
+('advanceGcHorizonStatement'). Keeping validation write-free keeps the read path —
+every @atExactSnapshot@ and @atLeastAsFresh@ request — off the single-row lock the
+@UPDATE@ takes.
+-}
 oldestRetainedXidStatement :: Statement Text Int64
 oldestRetainedXidStatement =
     Statement.preparable
         """
-        SELECT coalesce(min(xid), pg_snapshot_xmin(pg_current_snapshot()))::text::bigint
+        SELECT GREATEST(
+                 (SELECT horizon FROM en_gc_horizon),
+                 coalesce(min(xid), pg_snapshot_xmin(pg_current_snapshot()))::text::bigint
+               )
         FROM en_transaction
         WHERE created_at >= now() - $1::interval
+        """
+        (Encoders.param (Encoders.nonNullable Encoders.text))
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
+
+{- | Advance the durable high-water mark to @GREATEST(mark, fresh)@ and return the
+new value, in one statement.
+
+@fresh@ is the same term 'oldestRetainedXidStatement' computes; @GREATEST@ makes the
+advance monotone regardless of how two racing reapers interleave — each takes the
+single row's lock, and neither can lower it. The reaper reaps and prunes at exactly
+the returned value, and because this @UPDATE@ commits before the reap runs, token
+validation's read of the mark is always bounded below by every reap already done.
+-}
+advanceGcHorizonStatement :: Statement Text Int64
+advanceGcHorizonStatement =
+    Statement.preparable
+        """
+        WITH fresh AS (
+          SELECT coalesce(min(xid), pg_snapshot_xmin(pg_current_snapshot()))::text::bigint AS horizon
+          FROM en_transaction
+          WHERE created_at >= now() - $1::interval
+        )
+        UPDATE en_gc_horizon g
+        SET horizon = GREATEST(g.horizon, fresh.horizon)
+        FROM fresh
+        RETURNING g.horizon
         """
         (Encoders.param (Encoders.nonNullable Encoders.text))
         (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))

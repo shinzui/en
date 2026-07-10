@@ -89,6 +89,11 @@ run-migrations: create-database
     else \
       echo "dead live indexes already dropped"; \
     fi
+  @if [ "$(psql "$PG_CONNECTION_STRING" -tAc "SELECT to_regclass('public.en_gc_horizon') IS NOT NULL")" = "f" ]; then \
+      psql "$PG_CONNECTION_STRING" -v ON_ERROR_STOP=1 -f en-migrations/db/migrations/20260710150000_gc-horizon-high-water-mark.sql; \
+    else \
+      echo "gc-horizon high-water mark already applied"; \
+    fi
 
 # Run a write-token-check HTTP smoke test against a running en-server
 [group("testing")]

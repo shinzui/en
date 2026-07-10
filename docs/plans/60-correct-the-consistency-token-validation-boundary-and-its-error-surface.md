@@ -67,14 +67,14 @@ This section must always reflect the actual current state of the work.
 - [x] M1: Rewrite `validateWatchCursor` in `en-postgres/src/En/Postgres/Watch.hs` to use the same predicate, replacing the conservative `snapshot.xmin < oldestRetainedXid` special case `docs/plans/53` derived. (2026-07-10 — watch cursor tests that pinned the conservative rule updated to the exact-predicate boundaries.)
 - [x] M1: Investigate whether `oldestRetainedXid` is genuinely non-decreasing. **Finding: it is NOT.** (2026-07-10 — `runHorizonMonotonicityScenario` constructs a held xid-bearing transaction that pins `pg_snapshot_xmin` below the aged-out anchor's `min(xid)`; the horizon falls backwards. See Surprises & Discoveries. This makes Milestone 4 a blocking prerequisite for the full soundness claim; M1's local fix is still a strict improvement and lands, because the old rule shared the dependency.)
 - [x] M1: Regression test the reported bug end to end: a token minted from a head revision, on a store with no writes inside the garbage-collection window, is accepted. (2026-07-10 — integration `runTupleStoreScenario`; and unit coverage in `en-postgres/test/Main.hs`.)
-- [ ] M4 (new, blocking): make `oldestRetainedXid` a monotone high-water mark, so no horizon rule can be walked backwards. See Milestone 4 and the 2026-07-10 monotonicity Decision Log entry.
+- [x] M4 (new, blocking): make the served horizon a monotone high-water mark, so no horizon rule can be walked backwards. (2026-07-10 — durable singleton `en_gc_horizon`; `oldestRetainedXid` reads `GREATEST(mark, fresh)` write-free, the reaper advances the mark with the new `advanceGcHorizon` before it reaps. Migration `20260710150000_gc-horizon-high-water-mark.sql` + justfile guard + integration `schemaSql`. `runHorizonMonotonicityScenario` inverted: it now asserts the raw query still regresses while the served horizon holds its mark. Live-confirmed on a real server: a head token accepted at mark 0 is refused as `consistency_token_expired` once the mark is raised above its snapshot.)
 - [x] M2: Decide the token-decode failure taxonomy and its wire codes. (2026-07-10 — the opening three-code proposal confirmed; watch cursors fold into the same taxonomy. See the confirmed-taxonomy Decision Log entry.)
 - [x] M2: Replace `Text.pack (show err)` in `tokenMetadataFromPayload` with a rendering written for a client. Fix `parseExpiry`'s misuse of `TokenBadEscape` while there. (2026-07-10 — new `renderTokenDecodeError`; new `TokenBadExpiry` constructor.)
 - [x] M2: Reconcile malformed-cursor errors. `En.Lookup`/`En.LookupSubjects` now raise `InvalidCursor` for a structurally malformed cursor, matching `En.Postgres.Watch` and the `InvalidCursor` Haddock; the lookup sites were the deviation. (2026-07-10 — client-visible: a malformed lookup/lookup-subjects cursor's code changes from `invalid_consistency_token` to `invalid_cursor`.)
 - [x] M2: Update `en-servant/test/Main.hs`'s error-model table and the assertion in `en-postgres/integration-test/Main.hs` that currently pins the leak (`InvalidConsistencyToken "TokenBadPrefix"`). (2026-07-10 — error-model table gains `malformed_consistency_token`, `consistency_token_expired`, `invalid_cursor`; added a no-constructor-names regression guard driving the real `tokenMetadataFromPayload`.)
 - [x] M3: Benchmark the watch drain against a populated table: cost per page as a function of window width and page size. (2026-07-10 — `EXPLAIN (ANALYZE, BUFFERS)` on dev PostgreSQL; table in Validation and Acceptance, M3.)
 - [x] M3: Decide from the numbers — rewrite the window query, or record the cost and close the item. (2026-07-10 — measured, documented, **not changed**; the drain is linear, and the one real cost is a bounded once-per-drain first-page scan of the pre-window live set that no simple index removes. See the M3-resolved Decision Log entry.)
-- [x] Update `docs/plans/53`'s Surprises entry and `docs/masterplans/9-complete-the-en-api-surface.md`'s Decision Log to point at this plan's outcome. (2026-07-10 — both the `checkedAt`/horizon Surprises entries in plan 53 and the "belongs to no plan currently open" leak note plus the EP-60 Decision entry in masterplan 9 now record M1–M3 landed and M4 outstanding.)
+- [x] Update `docs/plans/53`'s Surprises entry and `docs/masterplans/9-complete-the-en-api-surface.md`'s Decision Log to point at this plan's outcome. (2026-07-10 — both the `checkedAt`/horizon Surprises entries in plan 53 and the "belongs to no plan currently open" leak note plus the EP-60 Decision entry in masterplan 9 now record all four milestones complete, including M4's durable high-water mark.)
 
 
 ## Surprises & Discoveries
@@ -253,6 +253,55 @@ Record every decision made while working on the plan.
   plan, and it would help only the wide-window, small-page first page. Not justified. `docs/plans/53`'s
   `EXPLAIN` is superseded by this plan's measurement; the query is unchanged.
   Date: 2026-07-10
+- Decision (M4, resolved — where the mark lives): the high-water mark is **durable**, a singleton
+  `en_gc_horizon(singleton bool pk, horizon bigint)` row (migration
+  `20260710150000_gc-horizon-high-water-mark.sql`, mirroring `en_datastore_metadata`), not a
+  per-process `IORef`.
+  Rationale: en is a designed-for multi-replica deployment (`en_datastore_metadata`'s own migration
+  discusses "servers racing on first startup"), and each `en-server` replica runs its own maintenance
+  reaper (`en-server/app/Maintenance.hs`). Soundness requires validation on *any* replica to be bounded
+  below by reaping on *any* replica, which a per-process value cannot provide — replica B's validation
+  never sees replica A's reap. A durable row is the only mechanism that makes reaping and validation
+  agree across both time and replicas, which is the whole point of M4. The row is seeded to 0 by the
+  migration so validation and the reaper always find it; `GREATEST` lifts it to the first real horizon.
+  Date: 2026-07-10
+- Decision (M4, resolved — who reads vs. who advances): **validation reads the mark; the reaper
+  advances it, and publishes before it reaps.** `oldestRetainedXid` (the hot validation path, every
+  `atExactSnapshot`/`atLeastAsFresh`) becomes a write-free `SELECT GREATEST((SELECT horizon FROM
+  en_gc_horizon), coalesce(min(xid), pg_snapshot_xmin(...)))`. A new `advanceGcHorizon`
+  (`AdvanceGcHorizon` in `En.Effect.TupleStore`) runs an `UPDATE en_gc_horizon SET horizon =
+  GREATEST(horizon, fresh) RETURNING horizon`; `Maintenance.runPass` calls it in place of
+  `oldestRetainedXid`, so the mark is committed before any row is reaped.
+  Rationale: soundness needs only that *reaping* never uses a horizon below one *validation* could
+  later fall beneath. Since the reaper commits the advanced mark before reaping and reaps at exactly
+  that value, and every validation reads `>= mark`, validation is always bounded below by every
+  executed reap — even if the raw `coalesce` term has fallen back. Keeping validation write-free keeps
+  the read path off the single-row lock the `UPDATE` takes; the reaper (600 s interval) pays it. Two
+  racing reapers are safe: `GREATEST` under the row lock is monotone regardless of interleaving.
+  Date: 2026-07-10
+- Decision (M4, resolved — the mark preserves M1, and its one conservative edge): clamping the horizon
+  *up* only ever rejects more, and it never reintroduces M1's false-reject.
+  Rationale: every value the mark can hold is a past freshly-computed horizon, each bounded above by
+  its own snapshot's `xmax` and therefore by the current one, so `mark <= current xmax` always and a
+  token minted from a current head revision (`xmax:xmax:` with empty `xip`) still validates
+  (`retainedHistoryVisible mark {_,xmax,[]}` is `mark <= xmax && True`). The M1 regression test has no
+  held transaction, so its head snapshot's `xip` is empty and the clamp changes nothing — confirmed
+  live (a head token accepted at mark 0; still accepted). The one conservative edge: a fresh head token
+  whose snapshot lists an *in-flight* xid below the mark is rejected even though no committed reaped row
+  is actually live at it. This is sound (never accepts unsafe) and only bites under the exact
+  held-xid-below-the-mark pathology M4 exists to address; distinguishing committed from in-flight in the
+  predicate is not worth the complexity. `pruneTransactionsBatchSession`'s "no in-window row is ever
+  selected" Haddock is corrected accordingly — an in-window anchor below the mark may now be pruned,
+  which is safe because the mark already treats it as behind the horizon.
+  Date: 2026-07-10
+- Decision (M4, resolved — the now-false monotonicity Haddock): the `TtlCache` Haddock in
+  `En.Postgres.Revision` (and `Maintenance`'s module comment) that *asserted* natural monotonicity is
+  corrected to state monotonicity is *enforced* by `en_gc_horizon`, and to reference the current
+  `retainedHistoryVisible` rule rather than the pre-M1 `xmax <= horizon` comparison it still named.
+  Rationale: the plan required correcting the assertion M1 disproved; the passage's actual argument
+  (don't cache the horizon, because a stale smaller horizon accepts tokens whose history is gone) is
+  unchanged and still correct — only the false premise and the stale rule name needed fixing.
+  Date: 2026-07-10
 
 
 ## Outcomes & Retrospective
@@ -260,7 +309,8 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-**M1–M3 complete; M4 discovered and outstanding (2026-07-10).** `cabal test all` is green.
+**M1–M4 complete (2026-07-10).** `cabal test all` is green, and the whole stack is live-verified
+against a real migrated database.
 
 - **M1 — one correct horizon rule.** `retainedHistoryVisible :: Word64 -> PgSnapshot -> Bool` is the
   single predicate governing both `validateTokenMetadata` and `validateWatchCursor`. It is the exact
@@ -284,19 +334,20 @@ Compare the result against the original purpose.
   page proportional to the pre-window live set, which no simple index removes cleanly. Left unchanged
   with the numbers on record — the plan's own "measured, documented, not changed" passing grade.
 
-- **M4 — discovered, blocking, outstanding.** The one gap against Purpose ("not one transaction
-  longer than the history it names survives"): M1's monotonicity investigation *disproved* the
-  monotonicity every horizon rule silently assumes. `oldestRetainedXid` walks backwards when a
-  long-running xid-bearing transaction pins `pg_snapshot_xmin` below the aged-out `min(xid)`
-  (confirmed live in `runHorizonMonotonicityScenario`). This is a pre-existing, shared unsoundness —
-  M1's rule is strictly better than the old one and no worse on this axis — but the full soundness
-  claim needs a monotone high-water-mark horizon (Milestone 4). Per the plan's Idempotence guidance,
-  this is a blocking prerequisite, recorded loudly rather than papered over. The `TtlCache` Haddock
-  that *asserts* monotonicity is now known false and is M4's to correct.
+- **M4 — a horizon that cannot regress.** The gap M1 uncovered against Purpose ("not one transaction
+  longer than the history it names survives") is closed. The served horizon is now a durable high-water
+  mark: a singleton `en_gc_horizon` row that token validation reads (`GREATEST(mark, fresh)`, write-free)
+  and the reaper advances (`advanceGcHorizon`) *before* it reaps, so validation on any replica is bounded
+  below by every reap any replica has performed — sound across both time and replicas, which a per-process
+  value could not be. `runHorizonMonotonicityScenario` is inverted to assert the raw `coalesce` query
+  still regresses under a held xid while the served horizon holds its mark, and it passes. M1's fix is
+  preserved (`mark <= current xmax` always, confirmed live: a head token accepted at mark 0), with one
+  sound, well-scoped conservative edge documented in the Decision Log. The `TtlCache`/`Maintenance`/prune
+  Haddock that asserted natural monotonicity is corrected to say monotonicity is now *enforced*.
 
 Lesson: the deepest finding came not from the reported bug but from the discipline of asking whether
-the assumption under the fix actually holds. The bug was a symptom; the horizon's non-monotonicity is
-the disease the reported bug happened to make visible.
+the assumption under the fix actually holds. The bug was a symptom; the horizon's non-monotonicity was
+the disease the reported bug happened to make visible — and M4 cured it rather than the symptom.
 
 
 ## Context and Orientation
@@ -810,7 +861,15 @@ End-state interfaces, by full module path:
 - `En.Servant.Seam` (`en-servant/src/En/Servant/Seam.hs`): `enErrorToFault` gains the new codes. It is
   the only place a wire code is chosen.
 - `En.Postgres.TupleStore` (`en-postgres/src/En/Postgres/TupleStore.hs`): `readChangesStatement`
-  changes only if M3's numbers justify it.
+  unchanged (M3). `oldestRetainedXidStatement` now reads `GREATEST(en_gc_horizon.horizon, fresh)`
+  (M4); a new `advanceGcHorizonStatement` / `advanceGcHorizonSession` persists the mark.
+- `En.Effect.TupleStore` (`en-core/src/En/Effect/TupleStore.hs`): new op `AdvanceGcHorizon :: TupleStore
+  m Word64` and smart constructor `advanceGcHorizon` (M4), for the reaper to publish its horizon.
+- `en-migrations` / `en_gc_horizon` (M4): new singleton table
+  (`db/migrations/20260710150000_gc-horizon-high-water-mark.sql`, seeded to 0) holding the durable
+  high-water-mark horizon; the integration suite's `schemaSql` seeds the same table.
+- `en-server/app/Maintenance.hs` (M4): `runPass` calls `advanceGcHorizon` in place of
+  `oldestRetainedXid`, so the reaper advances and publishes the mark before it reaps.
 
 Dependencies, restated so this plan stands alone. No hard dependency on any open plan. It corrects
 code introduced by `docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md` (which
@@ -819,10 +878,10 @@ found the bug and worked around it locally), and code that predates both (`valid
 `tokenMetadataFromPayload`). It touches the error taxonomy that
 `docs/plans/35-version-the-wire-contract-and-type-the-error-model.md` established; that plan is
 Complete, and its envelope is unchanged here — only the set of `code` values grows.
-`docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md` is not yet
-landed and owns the reaping cadence; M1's monotonicity finding is input to it, and if that plan lands
-first it must not be assumed to have fixed anything recorded here. No new package dependencies are
-required.
+`docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md` is in fact
+**Complete** (landed 2026-07-08; `en-server/app/Maintenance.hs` is its reaper) — the note here that it
+was "not yet landed" was mistaken. M4 modifies that reaper to advance the durable horizon mark rather
+than recompute the horizon each pass. No new package dependencies are required.
 
 On completion, update the Surprises entry in `docs/plans/53-add-a-watch-changelog-api.md` that records
 the latent `checkedAt` defect, and the Decision Log entry in

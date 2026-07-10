@@ -110,12 +110,14 @@ exactly what 'MinimizeLatency' asks for.
 It does /not/ hold for the garbage-collection horizon
 ('En.Effect.TupleStore.oldestRetainedXid'), which is why the horizon is not cached
 here. See the 2026-07-09 Decision Log entry in
-@docs/plans/49-trim-dead-indexes-and-resolve-consistency-lazily.md@: the horizon
-rises monotonically as transactions age out of the window, 'validateTokenMetadata'
-rejects a token when @snapshot.xmax <= horizon@, and so a stale (smaller) horizon
-rejects /fewer/ tokens — it honours tokens whose history the reaper has already
-destroyed. A TTL on the horizon is a TTL on how long an expired token keeps
-working.
+@docs/plans/49-trim-dead-indexes-and-resolve-consistency-lazily.md@: the horizon is
+monotone non-decreasing — a durable high-water mark, @en_gc_horizon@, holds it there
+(@docs/plans/60@ Milestone 4, which found the raw @coalesce@ query is /not/ monotone
+on its own and clamps it up to the mark). 'validateTokenMetadata' rejects a token
+unless 'retainedHistoryVisible' holds of the horizon, and that predicate is /easier/
+to satisfy for a smaller horizon, so a stale (smaller) horizon accepts /more/ tokens
+— it honours tokens whose history the reaper has already destroyed. A TTL on the
+horizon is a TTL on how long an expired token keeps working.
 -}
 data TtlCache a = TtlCache
     { config :: !OptimizedRevisionConfig

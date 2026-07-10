@@ -2724,6 +2724,8 @@ interpretFixtureTupleStore countRef errorObject tuples =
             pure testRevision
         OldestRetainedXid ->
             pure 0
+        AdvanceGcHorizon ->
+            pure 0
         ReapDeletedTuples _ ->
             pure 0
   where

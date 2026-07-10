@@ -577,9 +577,11 @@ transaction id still protected by `EN_GC_WINDOW` — and then deletes, in batche
 - soft-deleted `relation_tuple` rows whose `deleted_xid` is behind the horizon, and
 - `en_transaction` rows whose `xid` is behind the horizon.
 
-Nothing inside the retention window is ever removed, so a consistency token that still
-validates can always be resolved. The horizon comes from the same query token
-validation uses, so the reaper, the pruner, and token validation cannot disagree.
+A consistency token that still validates can always be resolved. The horizon is a
+durable high-water mark (`en_gc_horizon`): each pass advances it and reaps at the
+advanced value, while token validation reads that same mark, so the reaper, the pruner,
+and token validation cannot disagree — not even across time or across replicas, because
+the mark never moves backwards.
 
 Each pass logs one line:
 
@@ -608,9 +610,11 @@ only for one-shot environments and debugging.
 Two consequences of `EN_GC_WINDOW` worth stating plainly. It is simultaneously the
 retention window for garbage and the validity window for consistency tokens — shrinking
 it to make maintenance more aggressive also invalidates tokens sooner. And if no write
-occurs for a full window, `en_transaction` legitimately drains to zero; the horizon then
-falls back to `pg_snapshot_xmin(pg_current_snapshot())`, which is the same value the
-query would have returned with the old rows still present.
+occurs for a full window, `en_transaction` legitimately drains to zero; the freshly
+computed horizon then falls back to `pg_snapshot_xmin(pg_current_snapshot())`, which a
+long-running open transaction can pin below an earlier value. The durable high-water mark
+absorbs that: the served horizon is `GREATEST(mark, fresh)`, so it never regresses even
+when the fresh term does.
 
 ## Authentication, rate limiting, and TLS
 

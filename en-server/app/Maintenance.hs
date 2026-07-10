@@ -5,12 +5,14 @@ en never physically deletes on the write path: deleting a relationship tuple set
 and every write inserts one bookkeeping row into @en_transaction@. Both accumulate
 forever unless something removes them. Nothing did.
 
-This module is that something. On an interval it computes the garbage-collection
+This module is that something. On an interval it advances the garbage-collection
 horizon -- the oldest transaction id still protected by @EN_GC_WINDOW@ -- and then
 deletes, in bounded batches, every soft-deleted tuple and every transaction row behind
-it. The horizon comes from the same @TupleStore@ operation that token validation uses,
-so the reaper, the pruner, and token validation can never disagree about what is safe
-to remove.
+it. The horizon is a durable high-water mark (@en_gc_horizon@): this pass advances it
+and reaps at the advanced value, while token validation reads that same mark, so the
+reaper, the pruner, and token validation can never disagree about what is safe to
+remove -- not even across time or across replicas, which a horizon recomputed from
+scratch each pass could not guarantee (@docs/plans/60@ Milestone 4).
 
 Pruning @en_transaction@ is not merely housekeeping. The horizon query is a @min(xid)@
 over the retention window, and PostgreSQL answers it by walking the @xid@ primary key
@@ -89,14 +91,22 @@ runMaintenanceLoop config runApp
             Just _ -> True
             Nothing -> False
 
-{- | One pass: read the horizon, drain the reap backlog, drain the prune backlog, and
-report. A database error at any step abandons the pass; the next one starts over, and
-whatever the failed pass committed stays committed.
+{- | One pass: advance the horizon, drain the reap backlog, drain the prune backlog,
+and report. A database error at any step abandons the pass; the next one starts over,
+and whatever the failed pass committed stays committed.
+
+The horizon is fixed by 'TupleStore.advanceGcHorizon', which advances the durable
+high-water mark ('en_gc_horizon') and returns it before any row is destroyed. Token
+validation reads that same mark ('TupleStore.oldestRetainedXid'), so once a pass has
+published its horizon, no later validation — on this replica or another — can fall
+below it and bless a snapshot needing a row this pass reaps. Publishing before
+reaping is what makes reaping and validation agree across time; see @docs/plans/60@
+Milestone 4.
 -}
 runPass :: MaintenanceConfig -> RunApp -> IO ()
 runPass config runApp =
-    runApp TupleStore.oldestRetainedXid >>= \case
-        Left err -> logLine ("could not read the garbage-collection horizon: " <> renderEnError err)
+    runApp TupleStore.advanceGcHorizon >>= \case
+        Left err -> logLine ("could not advance the garbage-collection horizon: " <> renderEnError err)
         Right horizon ->
             drain (reapDeletedTuplesBatchSession horizon) >>= \case
                 Left err -> logLine ("reap failed at horizon " <> render horizon <> ": " <> err)
