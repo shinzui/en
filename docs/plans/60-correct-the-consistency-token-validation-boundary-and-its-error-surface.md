@@ -68,10 +68,10 @@ This section must always reflect the actual current state of the work.
 - [x] M1: Investigate whether `oldestRetainedXid` is genuinely non-decreasing. **Finding: it is NOT.** (2026-07-10 — `runHorizonMonotonicityScenario` constructs a held xid-bearing transaction that pins `pg_snapshot_xmin` below the aged-out anchor's `min(xid)`; the horizon falls backwards. See Surprises & Discoveries. This makes Milestone 4 a blocking prerequisite for the full soundness claim; M1's local fix is still a strict improvement and lands, because the old rule shared the dependency.)
 - [x] M1: Regression test the reported bug end to end: a token minted from a head revision, on a store with no writes inside the garbage-collection window, is accepted. (2026-07-10 — integration `runTupleStoreScenario`; and unit coverage in `en-postgres/test/Main.hs`.)
 - [ ] M4 (new, blocking): make `oldestRetainedXid` a monotone high-water mark, so no horizon rule can be walked backwards. See Milestone 4 and the 2026-07-10 monotonicity Decision Log entry.
-- [ ] M2: Decide the token-decode failure taxonomy and its wire codes (see Decision Log for the opening proposal).
-- [ ] M2: Replace `Text.pack (show err)` in `tokenMetadataFromPayload` with a rendering written for a client. Fix `parseExpiry`'s misuse of `TokenBadEscape` while there.
-- [ ] M2: Reconcile malformed-cursor errors. `En.Lookup` and `En.LookupSubjects` raise `InvalidConsistencyToken "lookup cursor"`; `En.Postgres.Watch` raises `InvalidCursor`. One of them is wrong.
-- [ ] M2: Update `en-servant/test/Main.hs`'s error-model table and the assertion in `en-postgres/integration-test/Main.hs` that currently pins the leak (`InvalidConsistencyToken "TokenBadPrefix"`).
+- [x] M2: Decide the token-decode failure taxonomy and its wire codes. (2026-07-10 — the opening three-code proposal confirmed; watch cursors fold into the same taxonomy. See the confirmed-taxonomy Decision Log entry.)
+- [x] M2: Replace `Text.pack (show err)` in `tokenMetadataFromPayload` with a rendering written for a client. Fix `parseExpiry`'s misuse of `TokenBadEscape` while there. (2026-07-10 — new `renderTokenDecodeError`; new `TokenBadExpiry` constructor.)
+- [x] M2: Reconcile malformed-cursor errors. `En.Lookup`/`En.LookupSubjects` now raise `InvalidCursor` for a structurally malformed cursor, matching `En.Postgres.Watch` and the `InvalidCursor` Haddock; the lookup sites were the deviation. (2026-07-10 — client-visible: a malformed lookup/lookup-subjects cursor's code changes from `invalid_consistency_token` to `invalid_cursor`.)
+- [x] M2: Update `en-servant/test/Main.hs`'s error-model table and the assertion in `en-postgres/integration-test/Main.hs` that currently pins the leak (`InvalidConsistencyToken "TokenBadPrefix"`). (2026-07-10 — error-model table gains `malformed_consistency_token`, `consistency_token_expired`, `invalid_cursor`; added a no-constructor-names regression guard driving the real `tokenMetadataFromPayload`.)
 - [ ] M3: Benchmark the watch drain against a populated table: cost per page as a function of window width and page size.
 - [ ] M3: Decide from the numbers — rewrite the window query, or record the cost and close the item. Both are acceptable outcomes; shipping an unmeasured rewrite is not.
 - [ ] Update `docs/plans/53`'s Surprises entry and `docs/masterplans/9-complete-the-en-api-surface.md`'s Decision Log to point at this plan's outcome.
@@ -192,6 +192,31 @@ Record every decision made while working on the plan.
   the codes it knows. `docs/plans/53` already draws exactly this line for watch cursors
   (`invalid_cursor` for malformed, `invalid_consistency_token` for expired), so the taxonomy is
   half-built already and merely inconsistent.
+  Date: 2026-07-10
+- Decision (M2 taxonomy, confirmed): the opening three-code proposal stands, and watch cursors are
+  folded into the same taxonomy rather than kept separate. The `EnError` sum gains
+  `MalformedConsistencyToken Text` (code `malformed_consistency_token`) and `ConsistencyTokenExpired
+  Text` (code `consistency_token_expired`); `InvalidConsistencyToken` narrows to "wrong datastore or
+  schema hash". A token that does not decode is `MalformedConsistencyToken` (rendered by the new
+  `renderTokenDecodeError`, never `show`); a well-formed token whose history is gone or whose
+  `expiresAt` has passed is `ConsistencyTokenExpired`; a well-formed current token for the wrong
+  datastore/schema is `InvalidConsistencyToken`. `En.Postgres.Watch.validateWatchCursor` uses the
+  same three: foreign → `InvalidConsistencyToken`, window-behind-horizon → `ConsistencyTokenExpired`.
+  Rationale: these are three different recoveries — fix the bug, re-read and retry, reconfigure — and
+  a client that switches on the codes it knows is unaffected by the additions (`docs/plans/35` froze
+  the envelope, not the code set). Retryability stays `false` for all three: an expired token retried
+  verbatim fails identically; the recovery is a fresh read, a different request.
+  Date: 2026-07-10
+- Decision (M2, client-visible behaviour change): a structurally malformed lookup or lookup-subjects
+  cursor now returns `invalid_cursor`, not `invalid_consistency_token`.
+  Rationale: `En.Error.InvalidCursor`'s own Haddock argues a malformed cursor is a different artifact
+  from a token fault, and `En.Postgres.Watch` already followed it; the two lookup sites
+  (`InvalidConsistencyToken "lookup cursor"` / `"lookup-subjects cursor"`) predated the argument and
+  were the deviation. This changes no field on the envelope, only the `code` a client sees for a
+  malformed lookup cursor — called out here because it is a behaviour change to a frozen contract's
+  observable output. A malformed lookup cursor and a malformed watch cursor now carry the same code.
+  A well-formed cursor whose embedded token is bad still surfaces that token's own fault
+  (`malformed`/`expired`/`invalid`), unchanged.
   Date: 2026-07-10
 - Decision: M3's acceptable outcomes include "measured, documented, not changed".
   Rationale: `docs/plans/53` recorded the drain's re-scan as a bounded cost and declined to price
