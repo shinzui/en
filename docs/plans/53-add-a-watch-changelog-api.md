@@ -94,7 +94,12 @@ implementation. Provide concise evidence.
   an index on `(created_xid, id)` plus one on `(deleted_xid, id)`, cannot serve an `OR` across
   two different leading columns with a shared `id` ordering, so the real fix is the `UNION`
   rewrite with per-arm keyset seeks. Recorded so a future plan can price it rather than
-  rediscover it.
+  rediscover it. **That plan is
+  `docs/plans/60-correct-the-consistency-token-validation-boundary-and-its-error-surface.md`,
+  whose M3 measures the drain first and is explicitly permitted to conclude that the cost is
+  acceptable and change nothing. It also notes the `UNION` rewrite is less obviously available
+  than this entry assumes: a row created and retired inside one window matches both arms, so the
+  union needs a `DISTINCT ON (id)` that reintroduces a sort.**
 
 - 2026-07-09 (M2, **a bug this plan's design would have shipped**): the GC-horizon check this
   plan told `decodeWatchCursor` to copy from `validateTokenMetadata` — reject when
@@ -128,8 +133,18 @@ implementation. Provide concise evidence.
 
   The same sharp edge exists, unexercised, for `checkedAt` tokens minted from a head
   revision (`docs/plans/51`): mint at `FullyConsistent`, let one write land, and the token no
-  longer validates. It predates this plan and belongs to no plan currently open. Recorded
-  here because this is where it was found.
+  longer validates. Recorded here because this is where it was found.
+
+  **Followed up 2026-07-10 by `docs/plans/60-correct-the-consistency-token-validation-boundary-and-its-error-surface.md`,
+  which reproduced it live and found it worse than described.** No write is needed: on a store
+  with no writes inside `EN_GC_WINDOW`, `oldestRetainedXidStatement` falls back to
+  `pg_snapshot_xmin(pg_current_snapshot())`, and a `checkedAt` token minted from the head
+  revision milliseconds earlier is refused. EP-60 also found that the token rule is unsound in
+  the *other* direction — it accepts `849:851:849` against a horizon of `850`, under which a
+  reaped row is still live — and that the exact condition, "every transaction below the horizon
+  is visible in this snapshot", subsumes both the token rule and this plan's `horizon <=
+  start.xmin`. EP-60 unifies them into one predicate, so `validateWatchCursor`'s divergence on
+  the *horizon* is temporary. Its divergence on the *schema hash* is not, and EP-60 preserves it.
 
 - 2026-07-09 (M1, paging): the resumption cursor must name the last row **fetched**, not the
   last event **emitted**. A row created and retired inside one window is fetched by the

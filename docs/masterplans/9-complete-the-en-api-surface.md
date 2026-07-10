@@ -413,8 +413,18 @@ depends on that package.
   it against a horizon of `850` while a row deleted at `849` is both live at the start and
   reapable. **The same sharp edge exists for `checkedAt` tokens minted from a head revision
   (EP-51's convention): mint at `fullyConsistent`, let one write land, and the token no longer
-  validates.** Nothing in the tree exercises it, and no open plan owns it. EP-54 must not
-  assume a head-derived token or revision keeps validating across a write.
+  validates.** EP-54 must not assume a head-derived token or revision keeps validating across a
+  write.
+
+  **Owned as of 2026-07-10 by
+  docs/plans/60-correct-the-consistency-token-validation-boundary-and-its-error-surface.md**, a
+  standalone plan outside this initiative. It reproduced the defect live — no write is even
+  needed, because on a store idle for longer than `EN_GC_WINDOW` the horizon falls back to
+  `pg_snapshot_xmin(pg_current_snapshot())` and a `checkedAt` token minted milliseconds earlier
+  is refused — and established that the token rule is *also* unsound in the opposite direction,
+  accepting `849:851:849` against a horizon of `850` where a reaped row is still live. The exact
+  condition is "every transaction below the horizon is visible in this snapshot", and it
+  subsumes both the token rule and EP-53's `horizon <= start.xmin`. EP-60 unifies them.
 
 - 2026-07-09 (EP-53 complete; **binds EP-54**): the shared filter EP-50 defined is now
   consumed by a second caller, unchanged, and the composition rule held. `ReadChanges` takes
@@ -498,6 +508,9 @@ depends on that package.
 - Decision: EP-53 confirmed the leak still exists and still did not fix it. A tampered `startToken` on `POST /v1/watch` surfaces a `TokenDecodeError` constructor name; the watch cursor's own failures do not.
   Rationale: Unchanged from the entry above. The fix is a wire-contract design task, and EP-53 is scoped to one new read. EP-54 inherits it in turn.
   Date: 2026-07-09
+- Decision: The `TokenDecodeError` leak and the garbage-collection rule are fixed by `docs/plans/60-correct-the-consistency-token-validation-boundary-and-its-error-surface.md`, a standalone ExecPlan outside this initiative, not by EP-54 and not by a sixth child here.
+  Rationale: Neither is new API surface, which is what this initiative's Vision scopes it to, and four of five children were Complete when they were found. Both are defects in the consistency-token boundary — one in its validation rule, one in its error rendering — and they share a file, a test suite, and a taxonomy question. EP-60 also inherits EP-53's unpriced watch-drain re-scan, since measuring it needs the same storage-benchmark setup. EP-54 remains this initiative's last child and is unaffected.
+  Date: 2026-07-10
 - Decision: The watch cursor's garbage-collection check is `horizon <= start.xmin`, diverging from `validateTokenMetadata`'s `horizon < revision.xmax`, and EP-53's own Decision Log entry saying it "checks the GC horizon exactly as `validateTokenMetadata` does" is superseded.
   Rationale: See Surprises. The token rule is unusable for a head-derived cursor and unsound for a revision window, in opposite directions. The window's condition is derivable from what the reaper removes, so it was derived rather than copied. Recorded at master-plan level because it also identifies a latent defect in EP-51's `checkedAt` convention that no open plan owns.
   Date: 2026-07-09
