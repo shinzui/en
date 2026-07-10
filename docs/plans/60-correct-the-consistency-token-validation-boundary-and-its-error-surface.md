@@ -74,7 +74,7 @@ This section must always reflect the actual current state of the work.
 - [x] M2: Update `en-servant/test/Main.hs`'s error-model table and the assertion in `en-postgres/integration-test/Main.hs` that currently pins the leak (`InvalidConsistencyToken "TokenBadPrefix"`). (2026-07-10 — error-model table gains `malformed_consistency_token`, `consistency_token_expired`, `invalid_cursor`; added a no-constructor-names regression guard driving the real `tokenMetadataFromPayload`.)
 - [x] M3: Benchmark the watch drain against a populated table: cost per page as a function of window width and page size. (2026-07-10 — `EXPLAIN (ANALYZE, BUFFERS)` on dev PostgreSQL; table in Validation and Acceptance, M3.)
 - [x] M3: Decide from the numbers — rewrite the window query, or record the cost and close the item. (2026-07-10 — measured, documented, **not changed**; the drain is linear, and the one real cost is a bounded once-per-drain first-page scan of the pre-window live set that no simple index removes. See the M3-resolved Decision Log entry.)
-- [ ] Update `docs/plans/53`'s Surprises entry and `docs/masterplans/9-complete-the-en-api-surface.md`'s Decision Log to point at this plan's outcome.
+- [x] Update `docs/plans/53`'s Surprises entry and `docs/masterplans/9-complete-the-en-api-surface.md`'s Decision Log to point at this plan's outcome. (2026-07-10 — both the `checkedAt`/horizon Surprises entries in plan 53 and the "belongs to no plan currently open" leak note plus the EP-60 Decision entry in masterplan 9 now record M1–M3 landed and M4 outstanding.)
 
 
 ## Surprises & Discoveries
@@ -260,7 +260,43 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+**M1–M3 complete; M4 discovered and outstanding (2026-07-10).** `cabal test all` is green.
+
+- **M1 — one correct horizon rule.** `retainedHistoryVisible :: Word64 -> PgSnapshot -> Bool` is the
+  single predicate governing both `validateTokenMetadata` and `validateWatchCursor`. It is the exact
+  condition — "every transaction below the horizon is visible in this snapshot" — proved against
+  PostgreSQL's own `pg_visible_in_snapshot` over 120 generated snapshots × their horizon ranges. The
+  reported bug is fixed and regression-tested: a head-revision token on an idle store now validates
+  (it was refused); the `849:851:849` false-accept is refused; a genuinely pruned snapshot is still
+  refused. Against Purpose: "a token minted from any revision, at any time, validates for as long as
+  the history it names survives" — achieved *within a single horizon*, but see M4.
+
+- **M2 — a failure a client can act on.** Three stable wire codes replace the one that leaked
+  constructor names: `malformed_consistency_token`, `consistency_token_expired`,
+  `invalid_consistency_token`. Decode failures render as client prose, never `show`. `parseExpiry`'s
+  `TokenBadEscape` misuse is fixed (`TokenBadExpiry`). Malformed lookup/lookup-subjects cursors now
+  match watch cursors as `invalid_cursor`. A servant regression guard drives the real
+  `tokenMetadataFromPayload` and asserts no response body carries an internal constructor name.
+
+- **M3 — priced the watch drain, changed nothing.** Measurement (dev PostgreSQL, `EXPLAIN (ANALYZE,
+  BUFFERS)`) showed the drain is *linear*, not the feared quadratic re-scan: continuation pages
+  keyset-seek on the primary key (sub-millisecond), and the only real cost is a once-per-drain first
+  page proportional to the pre-window live set, which no simple index removes cleanly. Left unchanged
+  with the numbers on record — the plan's own "measured, documented, not changed" passing grade.
+
+- **M4 — discovered, blocking, outstanding.** The one gap against Purpose ("not one transaction
+  longer than the history it names survives"): M1's monotonicity investigation *disproved* the
+  monotonicity every horizon rule silently assumes. `oldestRetainedXid` walks backwards when a
+  long-running xid-bearing transaction pins `pg_snapshot_xmin` below the aged-out `min(xid)`
+  (confirmed live in `runHorizonMonotonicityScenario`). This is a pre-existing, shared unsoundness —
+  M1's rule is strictly better than the old one and no worse on this axis — but the full soundness
+  claim needs a monotone high-water-mark horizon (Milestone 4). Per the plan's Idempotence guidance,
+  this is a blocking prerequisite, recorded loudly rather than papered over. The `TtlCache` Haddock
+  that *asserts* monotonicity is now known false and is M4's to correct.
+
+Lesson: the deepest finding came not from the reported bug but from the discipline of asking whether
+the assumption under the fix actually holds. The bug was a symptom; the horizon's non-monotonicity is
+the disease the reported bug happened to make visible.
 
 
 ## Context and Orientation

@@ -408,6 +408,15 @@ depends on that package.
   same function and inherits it. Whoever fixes it should note that the `v1` contract
   (docs/plans/35) exists precisely to keep internal constructor names off the wire.
 
+  **Fixed 2026-07-10 by docs/plans/60 (M2).** It belonged to that plan. `tokenMetadataFromPayload`
+  now renders decode failures as `MalformedConsistencyToken` via `renderTokenDecodeError` (client
+  prose, never `show`), and the taxonomy grew three stable codes —
+  `malformed_consistency_token` / `consistency_token_expired` / `invalid_consistency_token` — with
+  a servant regression guard that no malformed-token body carries a constructor name. The same plan
+  replaced the `xmax <= horizon` garbage-collection rule with the exact `retainedHistoryVisible`
+  predicate (shared by tokens and watch cursors) and found, en route, that `oldestRetainedXid` is
+  not monotonic (docs/plans/60 Milestone 4).
+
 - 2026-07-09 (EP-52 complete; **corrects the third Surprises entry above, in EP-52's
   favour**): the "inherit the engine's current defects in a brand-new API" risk this master
   plan's Dependency Graph raised for EP-52 never materialized, because docs/plans/40 and 42
@@ -579,6 +588,7 @@ depends on that package.
 - Decision: The `TokenDecodeError` leak and the garbage-collection rule are fixed by `docs/plans/60-correct-the-consistency-token-validation-boundary-and-its-error-surface.md`, a standalone ExecPlan outside this initiative, not by EP-54 and not by a sixth child here.
   Rationale: Neither is new API surface, which is what this initiative's Vision scopes it to, and four of five children were Complete when they were found. Both are defects in the consistency-token boundary — one in its validation rule, one in its error rendering — and they share a file, a test suite, and a taxonomy question. EP-60 also inherits EP-53's unpriced watch-drain re-scan, since measuring it needs the same storage-benchmark setup. EP-54 remains this initiative's last child and is unaffected.
   Date: 2026-07-10
+  **Update 2026-07-10 (EP-60 M1–M3 landed):** the `retainedHistoryVisible` rule (one predicate for tokens and watch cursors, proved against the `pg_visible_in_snapshot` oracle), the three-code failure taxonomy, and the watch-drain measurement (linear, left unchanged) are done and green under `cabal test all`. EP-60 grew a **Milestone 4**: while proving the horizon's soundness it found `oldestRetainedXid` is not monotonic — a long-running xid-bearing transaction walks it backwards as anchor rows age out — which every horizon rule depends on. M4 (a monotone high-water-mark horizon) is a blocking prerequisite for the full soundness claim and is tracked in EP-60; it is input to `docs/plans/37`'s reaping cadence.
 - Decision: The watch cursor's garbage-collection check is `horizon <= start.xmin`, diverging from `validateTokenMetadata`'s `horizon < revision.xmax`, and EP-53's own Decision Log entry saying it "checks the GC horizon exactly as `validateTokenMetadata` does" is superseded.
   Rationale: See Surprises. The token rule is unusable for a head-derived cursor and unsound for a revision window, in opposite directions. The window's condition is derivable from what the reaper removes, so it was derived rather than copied. Recorded at master-plan level because it also identifies a latent defect in EP-51's `checkedAt` convention that no open plan owns.
   Date: 2026-07-09

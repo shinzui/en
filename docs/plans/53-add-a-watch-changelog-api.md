@@ -146,6 +146,16 @@ implementation. Provide concise evidence.
   start.xmin`. EP-60 unifies them into one predicate, so `validateWatchCursor`'s divergence on
   the *horizon* is temporary. Its divergence on the *schema hash* is not, and EP-60 preserves it.
 
+  **Resolved 2026-07-10 (EP-60 landed).** `retainedHistoryVisible horizon snapshot` — "every
+  transaction below the horizon is visible in this snapshot" — is now the single predicate for both
+  `validateTokenMetadata` and `validateWatchCursor`; this plan's `horizon <= start.xmin` rule is
+  retired. EP-60 proved the predicate against PostgreSQL's own `pg_visible_in_snapshot` oracle, and
+  the head-revision `checkedAt` bug now has a regression test. EP-60 additionally discovered, while
+  investigating the horizon's soundness, that `oldestRetainedXid` is **not monotonic**: a
+  long-running xid-bearing transaction can walk it backwards as anchor rows age out of the window,
+  which both the old and new rules depend on not happening — tracked as EP-60's Milestone 4 (a
+  monotone high-water-mark horizon), a blocking prerequisite for the full soundness claim.
+
 - 2026-07-09 (M1, paging): the resumption cursor must name the last row **fetched**, not the
   last event **emitted**. A row created and retired inside one window is fetched by the
   statement and then classified away, so a page can hold fewer events than its limit while
@@ -183,6 +193,13 @@ implementation. Provide concise evidence.
   did not fix it; neither does this plan, for the same reason — the fix is designing stable
   codes for the token-decode failure modes, which is a wire-contract question beside
   `docs/plans/35`'s error model.
+
+  **Fixed 2026-07-10 by EP-60 (M2).** `tokenMetadataFromPayload` now renders decode failures with
+  `renderTokenDecodeError` (client prose) as `MalformedConsistencyToken`, and the taxonomy grew
+  three stable codes — `malformed_consistency_token`, `consistency_token_expired`,
+  `invalid_consistency_token`. The watch cursor's own expired-history failure moved from
+  `invalid_consistency_token` to `consistency_token_expired`. A servant regression guard now
+  asserts no malformed-token response body carries an internal constructor name.
 
 
 ## Decision Log
