@@ -58,7 +58,7 @@ This section must always reflect the actual current state of the work.
 - [x] M3 (2026-07-09): added `readRelationships` and `deleteRelationships` to `EnClient` in `en-client/src/En/Client.hs`.
 - [x] M3 (2026-07-09): extended `en-servant/test/Main.hs` with golden encodings for the six wire types, `relationshipEndpointTests` (query, pagination, caveat residual, five grammar rejections, dry run, real delete), and OpenAPI assertions for the two new paths, the six new schemas, and `dryRun` being required. `cabal test all` passes across all seven suites.
 - [x] M3 (2026-07-09): replaced six positional `server env` destructurings in `en-servant/test/Main.hs` with one `Handlers` record — see Surprises & Discoveries.
-- [ ] M4: Run the end-to-end curl transcripts ("list grants for alice", "offboard alice") against a locally running `en-server` and paste the observed output into Validation and Acceptance.
+- [x] M4 (2026-07-09): ran both operator stories against a locally running `en-server` and pasted the observed output into Validation and Acceptance, along with the grammar rejections, pagination resumption, and a seven-call latency series that confirms the composed predicate survives PostgreSQL's switch to a generic plan. Rewrote the Concrete Steps transcripts, which still described the pre-EP-35 wire contract.
 
 
 ## Surprises & Discoveries
@@ -178,6 +178,24 @@ implementation. Provide concise evidence.
   behind the API. Worth recording because it is the opposite of what a hand-written
   description usually gives you.
 
+- 2026-07-09, M4 (`just start-server` cannot be trusted for acceptance): the recipe binds
+  port 8080, and `just process-up` may already have started an `en-server` there from an
+  older build. The second bind fails with
+  `Network.Socket.bind: resource busy (Address already in use)`, but `GET /healthz` still
+  answers `200` — from the *old* process. A curl acceptance run against 8080 would have
+  reported the new endpoints as `404` (or, worse, silently exercised stale handlers on the
+  paths that did exist) with no indication that the wrong binary was serving. The M4
+  transcripts were taken from `EN_PORT=8099 cabal run en-server`, and Concrete Steps now
+  says why.
+
+- 2026-07-09, M4 (the generic-plan claim, confirmed on the live server): seven consecutive
+  subject-anchored queries against 200,009 live rows took
+  `0.001888s 0.001496s 0.001370s 0.001119s 0.001631s 0.001181s 0.001061s`. PostgreSQL
+  builds custom plans for a prepared statement's first five executions and only then
+  considers a generic one, so calls six and seven are precisely where the null-guard form
+  would have fallen off its index. They are the two fastest of the seven. The `EXPLAIN`
+  argument recorded above is not merely theoretical.
+
 - 2026-07-09, M0 (index premise falsified): the Context and Orientation section below says
   the partial live indexes "are, however, exactly right for the delete-by-filter `UPDATE`,
   whose predicate *is* `deleted_xid IS NULL`". They were dropped by docs/plans/49 in
@@ -228,10 +246,51 @@ Record every decision made while working on the plan.
 
 ## Outcomes & Retrospective
 
-Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
-Compare the result against the original purpose.
+Complete, 2026-07-09. The purpose stated at the top of this plan is met: `POST
+/v1/relationships/query` lists stored tuples matching a declarative filter at a requested
+consistency with keyset pagination, and `POST /v1/relationships/delete-by-filter`
+soft-deletes every live match behind a mandatory `dryRun` flag, returning a count and a
+token that sees the revocation. Both acceptance transcripts run green against a real
+server. Gap E2 of `docs/reviews/2026-07-07-architecture-performance-review.md` is closed:
+offboarding a user is one call, and auditing "what does alice hold?" no longer requires
+bespoke SQL.
 
-(To be filled during and after implementation.)
+Four things differ from the plan as written, all because it was drafted against a tree
+that moved under it — master plans 6, 7, and 8 all landed in the interim. The delete path
+is `/delete-by-filter`, not `/delete`, which was taken. `RelationshipFilter` is a widening
+of the `TupleFilter` that write preconditions already had, and keeps its three-valued
+`SubjectRelationFilter` rather than the `Maybe RelationName` sketched here. The wire types
+are hand-written, not `Generic`-derived. And the delete session mirrors
+`applyTupleWritesSession`, because `deleteTuplesSession` no longer exists. Each is
+recorded in the Decision Log with its reasoning.
+
+The plan's most valuable instruction was the one it framed as a contingency: "run
+`EXPLAIN` … if the planner refuses the hist indexes for the null-guard form, switch to
+building the statement text dynamically." The planner does refuse — but only under a
+generic plan, which PostgreSQL adopts no earlier than a prepared statement's sixth
+execution. A test suite, a development server, and a curl transcript all execute a
+statement once. The failure was therefore invisible to every check this plan would
+otherwise have run: a 1200× regression, appearing in production, on a hot read endpoint,
+with no error and no log line. Correctness-first would have shipped it. Measuring the plan
+before choosing the shape is what caught it, and the seven-call latency series in
+Validation and Acceptance is what proves the chosen shape survives the boundary.
+
+Two latent hazards were closed in passing. `en-servant/test/Main.hs` destructured
+`server`'s positional handler chain six separate times; inserting routes mid-chain rebinds
+every later name, and `writeTuples`/`deleteTuples` share a response type, so the shift
+would have been silent. It is now one `Handlers` record. And the storage/in-memory filter
+agreement is asserted directly — the integration scenario compares the compiled SQL's
+results against `matchesRelationshipFilter` over the same fixture, on eleven shapes, with
+a non-vacuity guard on each. That guard immediately caught a bad test case (a caveat
+constraint on an object type holding no caveated grant), which a hand-written expected set
+would have enshrined as correct.
+
+What this plan does not do: the query response carries no `checkedAt` token. That
+convention belongs to `docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md`,
+which will add the field to `ReadRelationshipsResponseWire`. There is also no server-side
+ceiling on `limit`; the handler rejects a non-positive one but accepts an arbitrarily
+large one, exactly as `/v1/lookup` and `/v1/expand` do today. Capping all three together
+is a coherent change and belongs in one plan, not smuggled into this one.
 
 
 ## Context and Orientation
@@ -583,21 +642,33 @@ Integration tests (ephemeral PostgreSQL, needs only the dev shell):
 cabal test en-postgres-integration-tests
 ```
 
-Start the local development PostgreSQL and the server (the Justfile owns this:
+Start the local development PostgreSQL and apply the migrations (the Justfile owns this:
 `process-up` starts PostgreSQL via process-compose and waits for `pg_ctl status`;
-`run-migrations` applies the SQL files under `en-migrations/db/migrations/` with
-`psql`; `start-server` runs migrations then `cabal run en-server`):
+`run-migrations` applies the SQL files under `en-migrations/db/migrations/` with `psql`):
 
 ```bash
 just process-up
-just start-server
+just run-migrations
 ```
 
-Expected server startup log includes:
+Do not use `just start-server` for the acceptance run. It binds port 8080, which
+`process-compose` may already be serving from an older `en-server` binary; the second
+bind fails with `Address already in use` and a curl against 8080 then exercises the wrong
+build, reporting success for code that is not the code under test. Run the server
+directly on a free port instead. Authentication is required unless it is explicitly
+disabled (see `en-server/app/Config.hs`):
+
+```bash
+EN_PORT=8099 EN_AUTH_DISABLED=true EN_DATABASE_URL="$PG_CONNECTION_STRING" cabal run en-server
+```
+
+Expected server startup log ends with:
 
 ```text
-en-server listening on :8080
+Serving plaintext HTTP; terminate TLS at a reverse proxy or set EN_TLS_CERT_FILE/EN_TLS_KEY_FILE.
 ```
+
+Confirm it is up, and that it is yours, with `curl -sS localhost:8099/healthz`.
 
 When finished:
 
@@ -605,16 +676,18 @@ When finished:
 just process-down
 ```
 
-The demo schema (served when `EN_SCHEMA_PATH` is unset — see
-`en-server/app/Main.hs`) has object types `user` and `space` with relation `viewer`
-and permission `view`; the transcripts below use it. Seed one grant first:
+The demo schema (served when `EN_SCHEMA_PATH` is unset — see `en-server/app/Main.hs`) has
+object types `user` and `space` with relation `viewer` and permission `view`; the
+transcripts below use it. Seed one grant first. The path is `/v1/relationships` and the
+subject carries a `kind` discriminator — both established by docs/plans/35, after this
+plan was written:
 
 ```bash
-curl -sS -X POST localhost:8080/tuples -H 'content-type: application/json' -d '{
+curl -sS -X POST localhost:8099/v1/relationships -H 'content-type: application/json' -d '{
   "tuples": [{
     "object": {"objectType": "space", "objectId": "project-x"},
     "relation": "viewer",
-    "subject": {"tag": "SubjectIdWire", "contents": {"objectType": "user", "objectId": "alice"}},
+    "subject": {"kind": "id", "objectType": "user", "objectId": "alice"},
     "caveat": null
   }]
 }'
@@ -623,88 +696,180 @@ curl -sS -X POST localhost:8080/tuples -H 'content-type: application/json' -d '{
 
 ## Validation and Acceptance
 
-Acceptance scenario 1 — "list all grants for user alice". After seeding as above:
+Test-level validation, all passing as of 2026-07-09:
 
 ```bash
-curl -sS -X POST localhost:8080/relationships/query -H 'content-type: application/json' -d '{
-  "consistency": {"tag": "FullyConsistentWire"},
-  "filter": {"objectType": null, "objectId": null, "relation": null,
-             "subjectType": "user", "subjectId": "alice",
-             "subjectRelation": null, "caveatName": null},
+cabal build all
+cabal test all      # seven suites: en-core-interface-tests, en-core-conformance,
+                    # en-postgres-revision-tests, en-postgres-integration-tests,
+                    # en-servant-tests, en-biscuit-tests, en-client-tests
+```
+
+`en-postgres-integration-tests` includes `runRelationshipFilterScenario`, which asserts
+the compiled SQL and the in-memory `matchesRelationshipFilter` agree on eleven filter
+shapes and are both empty on four more; that keyset pagination resumes rather than
+restarts; that a delete-by-filter's count equals the number of grants a read at its token
+no longer sees, while a read at the *pre-delete* snapshot still sees them; and that
+re-running the delete retires nothing.
+
+The end-to-end transcripts below were captured on 2026-07-09 against `cabal run en-server`
+on port 8099 (`EN_AUTH_DISABLED=true`, `EN_PORT=8099`), backed by the local development
+PostgreSQL. That database happened to hold 250,018 rows (200,009 of them live) left by an
+earlier benchmark, so these numbers are a filtered read against a populated table rather
+than an empty one. The server serves the built-in demo schema — object types `user` and
+`space`, relation `viewer`, permission `view` — because `EN_SCHEMA_PATH` was unset.
+
+Seed the grant. Writes have touch semantics, so re-writing an identical grant is a no-op:
+
+```bash
+curl -sS -X POST localhost:8099/v1/relationships -H 'content-type: application/json' -d '{
+  "tuples": [{
+    "object": {"objectType": "space", "objectId": "project-x"},
+    "relation": "viewer",
+    "subject": {"kind": "id", "objectType": "user", "objectId": "alice"},
+    "caveat": null
+  }]
+}'
+```
+
+```json
+{"token":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a88633b46c783909e.27793%3a27794%3a."}
+```
+
+Acceptance scenario 1 — "list all grants for user alice". The filter is anchored on the
+subject alone; no object type is named, which is exactly the query no prior endpoint could
+express:
+
+```bash
+curl -sS -X POST localhost:8099/v1/relationships/query -H 'content-type: application/json' -d '{
+  "consistency": {"mode": "fullyConsistent"},
+  "filter": {"subjectType": "user", "subjectId": "alice"},
   "limit": 100,
   "cursor": null
 }'
 ```
 
-Expected response (one tuple, exhausted page):
-
 ```json
-{
-  "relationships": [
-    {
-      "object": {"objectType": "space", "objectId": "project-x"},
-      "relation": "viewer",
-      "subject": {"tag": "SubjectIdWire", "contents": {"objectType": "user", "objectId": "alice"}},
-      "caveat": null
-    }
-  ],
-  "state": {"tag": "RelationshipsExhaustedWire"}
-}
+{"relationships":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}],"state":{"status":"exhausted"}}
 ```
 
-Acceptance scenario 2 — "offboard user alice". First the mandatory dry run:
+Acceptance scenario 2 — "offboard user alice". First, that she can in fact view the space:
 
 ```bash
-curl -sS -X POST localhost:8080/relationships/delete -H 'content-type: application/json' -d '{
-  "filter": {"objectType": null, "objectId": null, "relation": null,
-             "subjectType": "user", "subjectId": "alice",
-             "subjectRelation": null, "caveatName": null},
-  "dryRun": true
-}'
-```
-
-```json
-{"dryRun": true, "count": 1, "token": null}
-```
-
-Then the actual deletion, which returns a token:
-
-```bash
-curl -sS -X POST localhost:8080/relationships/delete -H 'content-type: application/json' -d '{
-  "filter": {"objectType": null, "objectId": null, "relation": null,
-             "subjectType": "user", "subjectId": "alice",
-             "subjectRelation": null, "caveatName": null},
-  "dryRun": false
-}'
-```
-
-```json
-{"dryRun": false, "count": 1, "token": "en1.…"}
-```
-
-Finally, a check at the returned token proves the revocation is visible:
-
-```bash
-curl -sS -X POST localhost:8080/check -H 'content-type: application/json' -d '{
-  "consistency": {"tag": "AtLeastAsFreshWire", "contents": "<token from previous response>"},
+curl -sS -X POST localhost:8099/v1/check -H 'content-type: application/json' -d '{
+  "consistency": {"mode": "fullyConsistent"},
   "context": {"values": {}},
-  "subject": {"tag": "SubjectIdWire", "contents": {"objectType": "user", "objectId": "alice"}},
+  "subject": {"kind": "id", "objectType": "user", "objectId": "alice"},
   "permission": "view",
   "object": {"objectType": "space", "objectId": "project-x"}
 }'
 ```
 
 ```json
-{"decision": {"tag": "DeniedWire"}}
+{"decision":{"result":"allowed"}}
 ```
 
-A rejected filter (nothing anchored) must return HTTP 400 with the JSON error envelope
-(`{"error": "..."}` under the current contract). Test-level validation: the new cases
-in `cabal test en-core`, `cabal test en-servant`, and
-`cabal test en-postgres-integration-tests` all pass; the integration suite includes the
-snapshot-visibility assertion (pre-delete reads still see the tuples; reads at the
-returned token do not). If `docs/plans/35`'s versioned contract has landed, adjust
-paths and JSON shapes to it and note the adjustment in the Decision Log.
+The dry run, which reports what a deletion would retire and retires nothing:
+
+```bash
+curl -sS -X POST localhost:8099/v1/relationships/delete-by-filter -H 'content-type: application/json' -d '{
+  "filter": {"subjectType": "user", "subjectId": "alice"},
+  "dryRun": true
+}'
+```
+
+```json
+{"dryRun":true,"count":1,"token":null}
+```
+
+The deletion, which returns a token:
+
+```bash
+curl -sS -X POST localhost:8099/v1/relationships/delete-by-filter -H 'content-type: application/json' -d '{
+  "filter": {"subjectType": "user", "subjectId": "alice"},
+  "dryRun": false
+}'
+```
+
+```json
+{"dryRun":false,"count":1,"token":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a88633b46c783909e.27794%3a27795%3a."}
+```
+
+And a check at that token proves the revocation is visible — the point of returning it:
+
+```bash
+curl -sS -X POST localhost:8099/v1/check -H 'content-type: application/json' -d '{
+  "consistency": {"mode": "atLeastAsFresh", "token": "en1.0c9c482f-…27794%3a27795%3a."},
+  "context": {"values": {}},
+  "subject": {"kind": "id", "objectType": "user", "objectId": "alice"},
+  "permission": "view",
+  "object": {"objectType": "space", "objectId": "project-x"}
+}'
+```
+
+```json
+{"decision":{"result":"denied"}}
+```
+
+Offboarding a user is one call. Re-running it is safe — the filter finds nothing live to
+retire, so the count is zero and the fresh token names a transaction that changed nothing:
+
+```json
+{"dryRun":false,"count":0,"token":"en1.0c9c482f-…27795%3a27796%3a."}
+```
+
+The grammar, on the wire. Each rejection is a `400` carrying the typed error envelope, and
+each says which rule was broken:
+
+```text
+POST /v1/relationships/query        {"filter": {}}
+  → HTTP 400 {"code":"invalid_request","message":"filter must constrain objectType or subjectType","retryable":false}
+
+POST /v1/relationships/delete-by-filter  {"filter": {"relation":"viewer"}, "dryRun": false}
+  → HTTP 400 {"code":"invalid_request","message":"filter must constrain objectType or subjectType","retryable":false}
+
+POST /v1/relationships/query        {"filter": {"objectType":"space","subjectId":"alice"}}
+  → HTTP 400 {"code":"invalid_request","message":"filter subjectId requires subjectType","retryable":false}
+```
+
+Note the second: a delete-by-filter whose filter is unanchored is refused before anything
+is deleted. And omitting `dryRun` entirely does not decode, so it cannot delete:
+
+```text
+POST /v1/relationships/delete-by-filter  {"filter": {"subjectType":"user","subjectId":"alice"}}
+  → HTTP 400 {"code":"malformed_request_body","message":"Error in $: key \"dryRun\" not found","retryable":false}
+```
+
+Keyset pagination resumes from the cursor rather than restarting:
+
+```bash
+curl -sS -X POST localhost:8099/v1/relationships/query -H 'content-type: application/json' -d '{
+  "consistency": {"mode": "fullyConsistent"},
+  "filter": {"subjectType": "user", "subjectId": "importer"},
+  "limit": 2, "cursor": null
+}'
+```
+
+```json
+{"relationships":[{"object":{"objectType":"space","objectId":"smoke-1"},…},{"object":{"objectType":"space","objectId":"smoke-2"},…}],"state":{"status":"hasMore","cursor":"65042"}}
+```
+
+Passing `"cursor": "65042"` back returns `smoke-3` and `smoke-4` — the next two rows, not
+the first two again.
+
+Finally, the claim the Decision Log makes about prepared statements, checked against the
+running server. Seven consecutive subject-anchored queries against the 200,009 live rows,
+`minimizeLatency`:
+
+```text
+0.001888s 0.001496s 0.001370s 0.001119s 0.001631s 0.001181s 0.001061s
+```
+
+PostgreSQL builds custom plans for a prepared statement's first five executions and only
+then considers a generic one. Calls six and seven are the fastest of the seven, so the
+composed predicate keeps its index scan across that boundary. Had the statement used
+`($n::text IS NULL OR column = $n)` guards, the sixth call is where the 40 ms primary-key
+scan recorded in Surprises & Discoveries would have begun.
 
 
 ## Idempotence and Recovery

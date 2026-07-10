@@ -68,7 +68,7 @@ verifiable without the others.
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-50 | Expose relationship read and delete-by-filter endpoints | docs/plans/50-expose-relationship-read-and-delete-by-filter-endpoints.md | None | None | In Progress |
+| EP-50 | Expose relationship read and delete-by-filter endpoints | docs/plans/50-expose-relationship-read-and-delete-by-filter-endpoints.md | None | None | Complete |
 | EP-51 | Return checked-at consistency tokens from read responses | docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md | None | None | Not Started |
 | EP-52 | Add a lookup-subjects API | docs/plans/52-add-a-lookup-subjects-api.md | None | None | Not Started |
 | EP-53 | Add a watch changelog API | docs/plans/53-add-a-watch-changelog-api.md | None | None | Not Started |
@@ -96,10 +96,20 @@ docs/plans/57-mint-biscuit-grants-over-http.md (master plan 10) hard-depends on 
 ## Integration Points
 
 The relationship filter type — which fields of (object type, object id, relation,
-subject type, subject id, caveat name) may be constrained — is defined by EP-50 as both
-a wire DTO in `en-servant/src/En/Servant/API.hs` and a core query type consumed by the
-store. EP-53 reuses the same filter for scoping watch subscriptions, and EP-54 uses it
-for per-type tuple enumeration during schema validation. EP-50 owns the definition.
+subject type, subject id, subject relation, caveat name) may be constrained — is defined
+by EP-50 as both a wire DTO in `en-servant/src/En/Servant/API.hs` and a core query type
+consumed by the store. EP-53 reuses the same filter for scoping watch subscriptions, and
+EP-54 uses it for per-type tuple enumeration during schema validation. EP-50 owns the
+definition.
+
+**Landed 2026-07-09.** The type is `RelationshipFilter` in
+`en-core/src/En/Effect/TupleStore.hs`, its wire form is `RelationshipFilterWire`, and its
+final field set differs from the parenthetical above: `subjectRelation` is a three-valued
+`SubjectRelationFilter`, not a nullable relation name. Consumers must construct through
+`validateRelationshipFilter` (core) or `relationshipFilterFromWire` (wire), which enforce
+the anchoring grammar: at least one of `objectType`/`subjectType`; `objectId` requires
+`objectType`; `subjectId` and a non-`Any` `subjectRelation` require `subjectType`. See
+Surprises & Discoveries for why, and for the SQL-composition rule that comes with it.
 
 Checked-at token plumbing is defined by EP-51: `check`/`lookup`/`expand` results in
 `en-core` gain the resolved revision, and every read response DTO gains a token field.
@@ -112,7 +122,15 @@ The watch changelog storage query (EP-53) reads `relation_tuple.created_xid`/
 `relation_tuple_created_xid_idx` — the index that
 docs/plans/49-trim-dead-indexes-and-resolve-consistency-lazily.md (master plan 8)
 proposes to drop as dead. EP-53 and EP-49 must reconcile before either lands the index
-change; whichever goes first records the outcome in both Decision Logs. EP-53's cursor
+change; whichever goes first records the outcome in both Decision Logs.
+
+**Resolved 2026-07-09, nothing left to reconcile.** EP-49 is Complete. It dropped only the
+two partial live indexes (`relation_tuple_object_live_idx`,
+`relation_tuple_subject_live_idx`) in
+`en-migrations/db/migrations/20260709232320_drop-dead-live-indexes.sql`.
+`relation_tuple_created_xid_idx` survives, so EP-53 inherits the index its changelog query
+wants. EP-50 separately confirmed by `EXPLAIN` that the delete-by-filter `UPDATE` is still
+index-served without the dropped live indexes, so there is no case for reinstating them. EP-53's cursor
 recovery is bounded by the GC horizon maintained by
 docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md
 (master plan 6): once `en_transaction` rows and reaped tuples are pruned, a watch cursor
@@ -128,8 +146,8 @@ immutable argument and EP-54 rewires them.
 
 ## Progress
 
-- [ ] EP-50: GET/query endpoint lists relationships by filter with keyset pagination
-- [ ] EP-50: delete-by-filter endpoint with dry-run count; offboarding a user is one call
+- [x] EP-50 (2026-07-09): `POST /v1/relationships/query` lists relationships by filter with keyset pagination
+- [x] EP-50 (2026-07-09): `POST /v1/relationships/delete-by-filter` with a mandatory dry-run flag; offboarding a user is one call
 - [ ] EP-51: every read response carries the token it was evaluated at; write-then-read-at-token round-trips
 - [ ] EP-52: lookup-subjects returns a flat, cursored subject set with correct caveat and operator handling
 - [ ] EP-53: watch feed streams tuple changes since a revision; expired cursors rejected with a typed error
@@ -190,6 +208,49 @@ immutable argument and EP-54 rewires them.
   follows that session's transaction shape (`BEGIN`, anchor insert, mutate, `COMMIT`,
   `tokenFromAnchor`) rather than the `deleteTuplesSession` its plan names, which no
   longer exists.
+
+- 2026-07-09 (EP-50 complete; binds EP-53 and EP-54): the shared filter now exists and is
+  **not** the shape the Integration Points section below describes. `RelationshipFilter`
+  in `en-core/src/En/Effect/TupleStore.hs` has fields `objectType :: Maybe ObjectType`,
+  `objectId :: Maybe Text`, `relation :: Maybe RelationName`,
+  `subjectType :: Maybe ObjectType`, `subjectId :: Maybe Text`,
+  `subjectRelation :: SubjectRelationFilter` (three-valued, *not* `Maybe RelationName`),
+  and `caveatName :: Maybe CaveatName`. Construct it through
+  `validateRelationshipFilter`, which enforces the anchoring grammar; `widenTupleFilter`
+  converts a precondition's `TupleFilter` into one. The wire form is
+  `RelationshipFilterWire` in `en-servant/src/En/Servant/API.hs`, with
+  `relationshipFilterFromWire` doing conversion and validation as one step. EP-53 scopes
+  watch subscriptions with this type and EP-54 enumerates tuples per type with it; neither
+  should redefine it, and neither should widen its field set without updating the other.
+
+- 2026-07-09 (EP-50 complete; binds every plan that adds an endpoint): a prepared statement
+  whose optional predicates are sent as `($n::text IS NULL OR column = $n)` guards is
+  index-served only under PostgreSQL's *custom* plan, which it stops building after a
+  statement's fifth execution. Measured on 250,000 rows, the generic plan abandons the
+  anchor index for a primary-key scan: 3527 buffers and 40.6 ms against 4 buffers and
+  0.033 ms. The regression is invisible to tests, to a development server, and to a curl
+  transcript, all of which execute a statement once or twice. EP-53's changelog query and
+  EP-54's per-type enumeration both take optional predicates and must compose their
+  `WHERE` clause from the fields actually present, as `compileFilter` in
+  `en-postgres/src/En/Postgres/TupleStore.hs` does. Evidence is in EP-50's Surprises &
+  Discoveries.
+
+- 2026-07-09 (EP-50 complete; binds EP-51, EP-52, EP-53): the new-endpoint pattern is
+  established and should be copied rather than reinvented. A route is a `MultiVerb` over
+  `EnResponses`, its handler returns `EnResult` and reports faults as values through
+  `enHandler`/`orInvalid` rather than throwing, its wire types get hand-written aeson
+  instances with a string discriminator (`status` for page states — reuse
+  `exhausted`/`hasMore`/`truncated`), and it gets a hand-written `ToSchema` instance in
+  `en-servant/src/En/Servant/OpenApi.hs`. That last is compile-enforced: adding a route to
+  `EnAPI` without a schema fails to build. `en-servant/test/Main.hs` now destructures
+  `server`'s handler chain exactly once, into a `Handlers` record — add a field there, not
+  a seventh positional pattern.
+
+- 2026-07-09 (EP-50 complete; affects any plan running the server by hand): `just
+  start-server` binds port 8080, which `just process-up` may already be serving from an
+  older `en-server` binary. The second bind fails, but `GET /healthz` still answers `200`
+  from the stale process, so an acceptance run against 8080 silently exercises the wrong
+  build. Use `EN_PORT=<free> EN_AUTH_DISABLED=true cabal run en-server` instead.
 
 
 ## Decision Log
