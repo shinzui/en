@@ -61,12 +61,13 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Add `retainedHistoryVisible :: Word64 -> PgSnapshot -> Bool` to `en-postgres/src/En/Postgres/Revision.hs`, with the derivation in its Haddock.
-- [ ] M1: Prove it against the PostgreSQL oracle in `en-postgres/integration-test/Main.hs`: for generated (snapshot, horizon) pairs, the predicate agrees with "every transaction below the horizon is visible", asked of the database itself.
-- [ ] M1: Rewrite `validateTokenMetadata`'s garbage-collection clause to use it. Update the unit expectations in `en-postgres/test/Main.hs`.
-- [ ] M1: Rewrite `validateWatchCursor` in `en-postgres/src/En/Postgres/Watch.hs` to use the same predicate, replacing the conservative `snapshot.xmin < oldestRetainedXid` special case `docs/plans/53` derived.
-- [ ] M1: Investigate whether `oldestRetainedXid` is genuinely non-decreasing. Every horizon rule's soundness rests on it, including today's. Record the finding whichever way it falls; if it is not, say so loudly and scope the fix.
-- [ ] M1: Regression test the reported bug end to end: a token minted from a head revision, on a store with no writes inside the garbage-collection window, is accepted.
+- [x] M1: Add `retainedHistoryVisible :: Word64 -> PgSnapshot -> Bool` to `en-postgres/src/En/Postgres/Revision.hs`, with the derivation in its Haddock. (2026-07-10)
+- [x] M1: Prove it against the PostgreSQL oracle in `en-postgres/integration-test/Main.hs`: for generated (snapshot, horizon) pairs, the predicate agrees with "every transaction below the horizon is visible", asked of the database itself. (2026-07-10 — `runRetainedHistoryOracleScenario`, 120 snapshots × their horizon ranges; passes.)
+- [x] M1: Rewrite `validateTokenMetadata`'s garbage-collection clause to use it. Update the unit expectations in `en-postgres/test/Main.hs`. (2026-07-10)
+- [x] M1: Rewrite `validateWatchCursor` in `en-postgres/src/En/Postgres/Watch.hs` to use the same predicate, replacing the conservative `snapshot.xmin < oldestRetainedXid` special case `docs/plans/53` derived. (2026-07-10 — watch cursor tests that pinned the conservative rule updated to the exact-predicate boundaries.)
+- [x] M1: Investigate whether `oldestRetainedXid` is genuinely non-decreasing. **Finding: it is NOT.** (2026-07-10 — `runHorizonMonotonicityScenario` constructs a held xid-bearing transaction that pins `pg_snapshot_xmin` below the aged-out anchor's `min(xid)`; the horizon falls backwards. See Surprises & Discoveries. This makes Milestone 4 a blocking prerequisite for the full soundness claim; M1's local fix is still a strict improvement and lands, because the old rule shared the dependency.)
+- [x] M1: Regression test the reported bug end to end: a token minted from a head revision, on a store with no writes inside the garbage-collection window, is accepted. (2026-07-10 — integration `runTupleStoreScenario`; and unit coverage in `en-postgres/test/Main.hs`.)
+- [ ] M4 (new, blocking): make `oldestRetainedXid` a monotone high-water mark, so no horizon rule can be walked backwards. See Milestone 4 and the 2026-07-10 monotonicity Decision Log entry.
 - [ ] M2: Decide the token-decode failure taxonomy and its wire codes (see Decision Log for the opening proposal).
 - [ ] M2: Replace `Text.pack (show err)` in `tokenMetadataFromPayload` with a rendering written for a client. Fix `parseExpiry`'s misuse of `TokenBadEscape` while there.
 - [ ] M2: Reconcile malformed-cursor errors. `En.Lookup` and `En.LookupSubjects` raise `InvalidConsistencyToken "lookup cursor"`; `En.Postgres.Watch` raises `InvalidCursor`. One of them is wrong.
@@ -94,6 +95,26 @@ implementation. Provide concise evidence.
   `xmax` above the horizon too. Nothing raises a head revision's `xmax`, so `checkedAt` — added by
   `docs/plans/51` to *every* read response — has no such protection. The bug was introduced by a
   plan that added a token where none had been, not by the check itself.
+
+- 2026-07-10 (M1, confirmed live against ephemeral PostgreSQL): **the garbage-collection horizon
+  is not monotonic.** `runHorizonMonotonicityScenario` in `en-postgres/integration-test/Main.hs`
+  opens a second connection, runs `BEGIN; SELECT pg_current_xact_id()` to force it an xid, and
+  holds the transaction open. A single write then lands an `en_transaction` anchor with a *higher*
+  xid, created now. Read under a fixed `"1 seconds"` window while the anchor is fresh, the horizon
+  is `min(xid)` = the anchor's xid, which is above the held xid (`heldXid < horizonBefore`, asserted
+  and true). After `threadDelay 1.2s` the anchor ages out of the same window, the `min(xid)` branch
+  finds nothing, and `oldestRetainedXidStatement`'s `coalesce` fallback returns
+  `pg_snapshot_xmin(pg_current_snapshot())` — which the still-open held transaction pins at or below
+  its xid. So `horizonAfter <= heldXid < horizonBefore`: the horizon walked backwards, by exactly the
+  gap the held transaction created. Only wall-clock time passed between the two reads; the window was
+  the same value throughout, so this is the production scenario, not an artefact of varying the
+  window. The plan's Decision Log had flagged this as a suspected hazard; it is now a measured fact.
+  Its consequence: rows reaped under the higher earlier horizon can be judged "still needed" by a
+  token validated under the lower later horizon, and both the old rule and M1's exact rule are
+  unsound against it. M1's rule is still strictly better than the old one (it fixes the two
+  in-window bugs this plan opened on), and it is no worse on this shared dependency — but the full
+  "not one transaction longer than the history it names survives" claim in Purpose needs the horizon
+  to stop regressing, which is Milestone 4.
 
 
 ## Decision Log
@@ -145,6 +166,20 @@ Record every decision made while working on the plan.
   that pinned value. The Haddock in `En.Postgres.Revision` already *asserts* monotonicity ("the
   horizon rises monotonically as transactions age out of the window") without proving it. If the
   assertion is false, the fix belongs here, because this plan is the one that leans on it.
+  Date: 2026-07-10
+- Decision (resolved): the horizon is **not** monotonic, confirmed live, so Milestone 4 (a monotone
+  high-water mark) is a blocking prerequisite for the plan's full soundness claim — and the
+  `En.Postgres.Revision`/`TtlCache` Haddock that *asserts* monotonicity is now known to be false and
+  must be corrected by M4.
+  Rationale: `runHorizonMonotonicityScenario` demonstrates the `coalesce`-fallback drop the previous
+  entry only suspected: a held xid-bearing transaction drives `horizonAfter <= heldXid < horizonBefore`
+  under a fixed window as the anchor ages out (see Surprises & Discoveries). M1's local fix still
+  lands — it strictly improves on the old rule and shares, rather than worsens, this dependency — but
+  the plan cannot claim a token validates "not one transaction longer than the history it names
+  survives" until the horizon stops regressing. M4's shape: make the persisted/served horizon
+  `max(previously_served_horizon, freshly_computed_horizon)` (a durable or per-process high-water
+  mark), so reaping and validation can never disagree across time. The exact mechanism (where the
+  mark lives, and whether `docs/plans/37`'s background maintenance owns it) is M4's to settle.
   Date: 2026-07-10
 - Decision (opening proposal, to be confirmed in M2): token failures split into three stable wire
   codes rather than the one they share today — `malformed_consistency_token` (the token is not a
@@ -433,6 +468,48 @@ estimated window width, say), and there may not.
 Acceptance: the numbers are in this plan's Validation and Acceptance section, and the Decision Log
 records what was done about them and why. "Nothing, and here is why" is a passing grade. A rewrite
 without a before-and-after table is not.
+
+
+### Milestone 4 (new, blocking): a horizon that cannot regress
+
+Scope: M1's monotonicity investigation found the garbage-collection horizon is not monotonic
+(Surprises & Discoveries, 2026-07-10). A held xid-bearing transaction that outlives the retention
+window drives `oldestRetainedXid` backwards from `min(xid)` to the pinned
+`pg_snapshot_xmin(pg_current_snapshot())`. Reaping under the higher earlier horizon then destroys
+rows that a token validated under the lower later horizon is told are still live — the exact
+answer the check exists to prevent, now reachable through time rather than through the snapshot.
+Both the old rule and M1's exact rule share this dependency, so M1 is not a regression; but the
+plan's Purpose ("a token validates for as long as the history it names survives, and not one
+transaction longer") is not fully true until the horizon stops regressing. This milestone is a
+blocking prerequisite for that claim.
+
+The shape, to be settled in this milestone rather than assumed now: the horizon that reaping and
+validation share must be a **high-water mark** — `max(previously_committed_horizon, freshly_computed)`
+— so a later read can never see a smaller value than an earlier reap already acted on. Open
+questions M4 must answer:
+
+* Where the mark lives. A per-process `IORef` is enough only if exactly one process reaps; a
+  multi-replica deployment needs it durable (a single-row table, or a column on a maintenance-state
+  row) so every replica's validation is bounded below by every replica's reaping. `docs/plans/37`
+  owns the reaping cadence and may be the natural home; if it lands first it must not be assumed to
+  have fixed this.
+* Whether the mark advances at reap time, at validation time, or both. Soundness needs only that
+  *reaping* never uses a horizon below the highest one *validation* could later fall beneath — i.e.
+  the reaper must clamp its horizon up to the mark and publish it, and validation must clamp up to
+  the same mark.
+* What the mark does to the bug M1 fixed. Clamping *up* only ever rejects more, so it must not
+  reintroduce the false-reject: the mark is bounded above by any genuine `min(xid)`, and on an idle
+  store with no reaping it should never exceed a head revision's `xmax`. The regression test from M1
+  must still pass under M4.
+
+Correct the now-false monotonicity assertion in `En.Postgres.Revision`'s `TtlCache` Haddock (and
+anywhere else that asserts it) as part of this milestone, and invert
+`runHorizonMonotonicityScenario` to assert the horizon holds its high-water mark rather than
+regresses.
+
+Acceptance: a scenario in which a held transaction ages the anchor out shows the served horizon
+holding steady (or rising) rather than dropping; the M1 regression and oracle tests still pass;
+`cabal test all` is green.
 
 
 ## Concrete Steps
