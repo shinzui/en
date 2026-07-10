@@ -30,6 +30,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding (decodeUtf8)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import System.Exit (exitFailure)
 
@@ -54,6 +55,7 @@ import Auth.Biscuit (
     query,
     queryRawBiscuitFacts,
     serializeB64,
+    serializePublicKeyHex,
     toPublic,
  )
 import Auth.Biscuit.Datalog.AST (Query)
@@ -72,7 +74,14 @@ import En.Biscuit.Grant (
     grantBlock,
     grantFactsText,
  )
-import En.Biscuit.Keys (IssuerKeyId (..), IssuerKeySet (..), singleKey)
+import En.Biscuit.Keys (
+    IssuerKeyId (..),
+    IssuerKeySet (..),
+    parseIssuerKeySetText,
+    parseSigningKeyText,
+    renderIssuerKeySetText,
+    singleKey,
+ )
 import En.Biscuit.Mint (
     EnBiscuitMintError (..),
     MintConfig (..),
@@ -122,6 +131,7 @@ main = do
     keySelectionAttackTest
     legacyTokenTest
     blockRevocationTest
+    keyCodecTest
     attenuationTests
     shomeiFlowTest
     attenuationForgedRightTest
@@ -684,6 +694,60 @@ blockRevocationTest = do
         =<< verifyGrant (keySetFor public) childToken roadmapRequest{revokedBlockIds = revokeAdded}
     assertVerified "block revocation: revoking only the child's added block leaves the parent valid"
         =<< verifyGrant (keySetFor public) parentToken roadmapRequest{revokedBlockIds = revokeAdded}
+
+{- | The key-material text codec the server config (EP-57) consumes. A keyset
+round-trips through render/parse, a signing-key entry parses to its id and
+material, and every malformed input (bad id, non-hex, wrong length, duplicate
+id, empty, legacy-only) is rejected with a message naming the offending entry.
+-}
+keyCodecTest :: IO ()
+keyCodecTest = do
+    secretA <- loadSecret
+    secretB <- loadSecretB
+    let pubA = toPublic secretA
+        pubB = toPublic secretB
+        pubHexA = decodeUtf8 (serializePublicKeyHex pubA)
+        secretHexA = "a2c4ead323536b925f3488ee83e0888b79c2761405ca7c0c9a018c7c1905eecc"
+
+    -- Round-trip: a keyset with two keys and a legacy key.
+    let keySet =
+            IssuerKeySet
+                { keysById = Map.fromList [(IssuerKeyId 1, pubA), (IssuerKeyId 2, pubB)]
+                , legacyKey = Just pubA
+                }
+    case parseIssuerKeySetText (renderIssuerKeySetText keySet) of
+        Right parsed -> assertEqual "key codec: keyset round-trips through render/parse" keySet parsed
+        Left err -> die ("key codec: round-trip should parse, got " <> T.unpack err)
+
+    -- A signing-key entry parses to its id and the right secret.
+    case parseSigningKeyText ("2:" <> secretHexA) of
+        Right (kid, sk) -> do
+            assertEqual "key codec: signing key id" (IssuerKeyId 2) kid
+            assertBool "key codec: signing key material" (toPublic sk == pubA)
+        Left err -> die ("key codec: signing key should parse, got " <> T.unpack err)
+
+    -- Whitespace around entries is trimmed.
+    case parseIssuerKeySetText (" 1: " <> pubHexA <> " ") of
+        Right _ -> pure ()
+        Left err -> die ("key codec: whitespace should be trimmed, got " <> T.unpack err)
+
+    -- Rejections, each naming the fault.
+    assertParseError "empty input" "empty" (parseIssuerKeySetText "")
+    assertParseError "non-integer id" "key id" (parseIssuerKeySetText ("x:" <> pubHexA))
+    assertParseError "negative id" "key id" (parseIssuerKeySetText ("-1:" <> pubHexA))
+    assertParseError "non-hex key" "hex" (parseIssuerKeySetText "1:not-hex-material")
+    assertParseError "wrong-length key" "hex" (parseIssuerKeySetText "1:abcd")
+    assertParseError "duplicate id" "duplicate" (parseIssuerKeySetText ("1:" <> pubHexA <> ",1:" <> pubHexA))
+    assertParseError "legacy-only" "legacy" (parseIssuerKeySetText ("legacy:" <> pubHexA))
+    assertParseError "signing key wrong length" "hex" (parseSigningKeyText "1:abcd")
+
+-- | Assert a codec parse failed with a message mentioning @needle@.
+assertParseError :: String -> Text -> Either Text a -> IO ()
+assertParseError label needle result =
+    case result of
+        Left msg | needle `T.isInfixOf` msg -> pure ()
+        Left msg -> die (label <> ": message " <> show msg <> " should mention " <> show needle)
+        Right _ -> die (label <> ": expected a parse error, got a value")
 
 {- | Attenuate a scoped token to one resource and one service; the narrowed
 request still verifies, but the original broader requests do not.

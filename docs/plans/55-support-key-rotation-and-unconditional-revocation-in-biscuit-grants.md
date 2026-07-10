@@ -58,9 +58,9 @@ This section must always reflect the actual current state of the work.
 - [x] M3 (2026-07-10): Add `revokedBlockIds :: Set ByteString -> m Bool` to `VerifyRequest` and wire it into `ParserConfig.isRevoked` so every verify consults built-in block revocation ids before blocks are decoded.
 - [x] M3 (2026-07-10): Map the `RevokedBiscuit` parse error to the existing `Revoked` verify error (all other parse errors stay `SignatureInvalid`); the application-level `revoked` check remains an optional extra layer, unchanged.
 - [x] M3 (2026-07-10): Add `blockRevocationTest`: a token with no application `revocationId` verifies with an empty set and is `Revoked` once a `MintedGrant.revocationIds` id is in the set; revoking only an attenuation block's id kills the child while the parent stays valid. Application-level revocation (`verifyObjectTests`) still passes.
-- [ ] M4: Add the key-material text format (`parseSigningKeyText`, `parseIssuerKeySetText`, renderers) to `En.Biscuit.Keys` with tests, including rejection of malformed input.
-- [ ] M4: Update `docs/user/biscuit-decision-tokens.md`: key ids, keyset config format, rotation procedure, unconditional revocation ids.
-- [ ] Final: `cabal build all` and `cabal test en-biscuit` pass; Outcomes & Retrospective written.
+- [x] M4 (2026-07-10): Add the key-material text format (`parseSigningKeyText`, `parseIssuerKeySetText`, `renderIssuerKeySetText`) to `En.Biscuit.Keys` with `keyCodecTest` — round-trip plus each rejection (bad id, non-hex, wrong length, duplicate id, empty, legacy-only), each error naming the entry. (The codec landed in the Keys module with M1's commit; M4 adds its tests and docs.)
+- [x] M4 (2026-07-10): Update `docs/user/biscuit-decision-tokens.md`: `issuerKeyId` in the mint example, `MintedGrant` result, `IssuerKeySet`/`revokedBlockIds` in the verify example, a "Key rotation and revocation" section (config-only rollout + built-in block ids), security-checklist and API-summary updates. The `en_*` fact vocabulary note (key id lives in the envelope) is included.
+- [x] Final (2026-07-10): `cabal build all` clean and `cabal test en-biscuit` passes (all pre-existing and new tests); no consumers outside en-biscuit reference the changed signatures. Outcomes & Retrospective written.
 
 
 ## Surprises & Discoveries
@@ -184,7 +184,49 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+Delivered in full against the original purpose. All four milestones landed and
+`cabal test en-biscuit` is green, including the three behavioral acceptance
+stories the plan set out:
+
+- **Rotation without verifier redeploy** (`keyRotationTest`): tokens minted under
+  key A/id 1 and key B/id 2 both verify against one overlap keyset built once and
+  never reconfigured between calls; retiring key A rejects only the key-A token.
+  `legacyTokenTest` covers pre-key-id tokens against a `legacyKey`.
+- **A holder cannot steer key selection** (`keySelectionAttackTest`): an A-signed
+  token claiming key id 2 fails `SignatureInvalid` against a keyset mapping id 2
+  to key B. This closes the surface EP-56 flagged as arriving with the keyset.
+- **Unconditional revocation** (`blockRevocationTest`): a token minted with no
+  application `revocationId` is `Revoked` once one of its `MintedGrant.revocationIds`
+  is in `revokedBlockIds`; revoking an attenuation block's id kills the child
+  while the parent stays valid.
+
+Design notes and small deviations:
+
+- The whole `En.Biscuit.Keys` module — `IssuerKeyId`, `IssuerKeySet`, and the
+  text codecs — was created up front in the M1 commit rather than accreted across
+  M1/M2/M4, exactly as the plan permitted ("place it in the new `En.Biscuit.Keys`
+  module of M4 from the start if you prefer one home"). Each milestone's *tests*
+  still gate that milestone, so the milestone boundaries stayed observable.
+- `selectIssuerKey` is total, as `ParserConfig.getPublicKey` requires. Unknown
+  ids and an absent legacy key fall back to the highest trusted key id — a
+  deterministic, attacker-independent choice — and the signature check then fails
+  closed. The Decision Log's note that unknown ids surface as `SignatureInvalid`
+  (not a distinct `UnknownIssuerKey`) held: the library exposes no
+  `Maybe`-returning selector and does not export the `rootKeyId` accessor from
+  `Auth.Biscuit`, so precise pre-inspection was knowingly sacrificed.
+- `signGrant` now takes the whole `MintConfig` (for both the secret and the id)
+  plus the stamped expiry, rather than the plan's sketch of passing
+  `config.issuerSecretKey` and `config.issuerKeyId` separately — same effect,
+  fewer arguments.
+- Gap, as scoped out: no revocation *distribution* mechanism ships here. A
+  verifier still needs a way to learn the revoked set; the watch API
+  (`docs/plans/53-add-a-watch-changelog-api.md`) remains the natural carrier.
+
+Handoff to EP-57 (`docs/plans/57-mint-biscuit-grants-over-http.md`): the HTTP
+minting endpoint consumes `parseSigningKeyText`/`parseIssuerKeySetText` from
+server config and returns `MintedGrant`'s fields (`token`, `expiresAt`,
+`revocationIds`) over HTTP. `verifyGrant` now requires an `IssuerKeySet`, and
+`VerifyRequest` requires `revokedBlockIds`.
 
 
 ## Context and Orientation

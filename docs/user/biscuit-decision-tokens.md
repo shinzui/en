@@ -99,6 +99,7 @@ Minting lives in `En.Biscuit.Mint`. Only an `Allowed` decision produces a token;
 
 ```haskell
 import En.Biscuit.Grant
+import En.Biscuit.Keys (IssuerKeyId (..))
 import En.Biscuit.Mint
 import En.Revision (ConsistencyToken (..), SchemaHash (..))
 import En.Schema (ObjectType (..), RelationName (..))
@@ -109,12 +110,14 @@ config :: MintConfig IO
 config =
     MintConfig
         { issuerSecretKey = issuerKey        -- Auth.Biscuit.SecretKey
+        , issuerKeyId = IssuerKeyId 1         -- stamped into the token envelope;
+                                              -- bump it when you rotate the key
         , defaultTtl = 300                    -- seconds; keep it short
         , now = getCurrentTime
         }
 
 -- Build the grant that describes the decision, then mint it.
-mintForDecision :: CheckDecision -> Subject -> IO (Either EnBiscuitMintError ByteString)
+mintForDecision :: CheckDecision -> Subject -> IO (Either EnBiscuitMintError MintedGrant)
 mintForDecision decision subject =
     mintObjectGrant config decision $
         EnGrant
@@ -130,6 +133,12 @@ mintForDecision decision subject =
             }
 ```
 
+Every mint returns a `MintedGrant` on success: `token` (the URL-safe base64
+Biscuit you forward), `expiresAt` (the expiry actually stamped in), and
+`revocationIds` (the token's built-in per-block revocation ids). Record
+`revocationIds` if you might need to revoke the token before it expires — see
+[Key rotation and revocation](#key-rotation-and-revocation).
+
 Notes:
 
 - **The issuer controls the lifetime.** `mintObjectGrant`/`mintScopedGrant` stamp
@@ -137,6 +146,10 @@ Notes:
   grant builder cannot forge a long-lived token. Use
   `mintObjectGrantWithExpiry` / `mintScopedGrantWithExpiry` for an explicit
   absolute expiry.
+- **The key id travels in the token envelope, not in a fact.** `issuerKeyId` is
+  written to the Biscuit protobuf wrapper (`rootKeyId`), not to the `en_*`
+  Datalog vocabulary, so the wire fact vocabulary is unchanged. A verifier in any
+  language reads it from the envelope before checking the signature.
 - **Non-concrete subjects fail closed.** A userset (`SubjectSet`) or wildcard
   (`SubjectWildcard`) subject is rejected with `GrantEncodingError`; only a
   concrete `SubjectId` is mintable.
@@ -161,11 +174,12 @@ never falls back to calling `en`; each failure is a distinct, explicit
 
 ```haskell
 import qualified Data.Set as Set
+import En.Biscuit.Keys (IssuerKeySet)
 import En.Biscuit.Verify
 
-verifyDownstream :: PublicKey -> ByteString -> Subject -> IO (Either EnBiscuitVerifyError VerifiedGrant)
-verifyDownstream issuerPublicKey token authenticatedSubject =
-    verifyGrant issuerPublicKey token $
+verifyDownstream :: IssuerKeySet -> ByteString -> Subject -> IO (Either EnBiscuitVerifyError VerifiedGrant)
+verifyDownstream issuerKeys token authenticatedSubject =
+    verifyGrant issuerKeys token $
         VerifyRequest
             { expectedSubject = authenticatedSubject   -- from the downstream's own Shomei check
             , expectedAudience = Audience "document-service"
@@ -174,9 +188,22 @@ verifyDownstream issuerPublicKey token authenticatedSubject =
             , serviceName = Audience "document-service" -- this service's identity
             , acceptedSchemaHashes = Set.singleton (SchemaHash "<accepted hash>")
             , now = requestTime
-            , revoked = \_ -> pure False                -- check your revocation list
+            , revoked = \_ -> pure False                -- optional en_revocation_id check
+            , revokedBlockIds = \_ -> pure False        -- built-in block-id revocation set
             }
 ```
+
+`verifyGrant` takes an **`IssuerKeySet`**, not a single public key: the token's
+envelope key id selects which trusted key checks the signature. A downstream that
+trusts one issuer key uses `singleKey (IssuerKeyId 1) issuerPublicKey`; during a
+key rotation it trusts a keyset holding both the old and the new key. Building a
+keyset from configuration is covered in [Key rotation and
+revocation](#key-rotation-and-revocation).
+
+`revokedBlockIds` is consulted on **every** token — build it with
+`Auth.Biscuit.fromRevocationList` from your revocation set, or `\_ -> pure False`
+if you keep none. `revoked` is the older, optional layer that fires only for
+tokens carrying an application-level `en_revocation_id`.
 
 `expectedSubject` must be the subject the downstream **independently**
 authenticated (via its own local Shomei verification), not a value taken from the
@@ -213,6 +240,69 @@ narrow token =
 The narrowed token verifies for the narrowed request (resource `folder:f1`,
 service `thumbnail-service`) but not for the broader original — a request for a
 different resource or a different service fails with `RestrictionFailed`.
+
+## Key rotation and revocation
+
+Two operational levers live in `En.Biscuit.Keys`: rotating the issuer signing key
+without a synchronized fleet redeploy, and revoking any token before it expires.
+
+### Key ids and keyset configuration
+
+Every minted token carries an integer **key id** in its Biscuit envelope
+(`MintConfig.issuerKeyId`). A verifier holds an **`IssuerKeySet`** — a map from
+key id to trusted public key — and selects the checking key by the token's id.
+`En.Biscuit.Keys` provides a single-line text format so key material can come from
+environment-variable configuration:
+
+```text
+# One signing key for the minter: "<key-id>:<64 hex chars>"
+EN_BISCUIT_SIGNING_KEY=2:8f3c…d1
+
+# The verifier's trusted keyset: comma-separated "<key-id>:<hex>" public keys,
+# with an optional "legacy:<hex>" entry for tokens minted before key ids existed.
+EN_BISCUIT_ISSUER_KEYS=1:a91b…7e,2:5c04…9d,legacy:d3aa…20
+```
+
+Parse them with `parseSigningKeyText` (minter) and `parseIssuerKeySetText`
+(verifier); `renderIssuerKeySetText` is the inverse. Malformed entries — a
+non-integer id, non-hex or wrong-length key material, a duplicate id, or empty
+input — are rejected with an error naming the offending entry. In code,
+`singleKey (IssuerKeyId 1) pub` builds a one-key set directly.
+
+### Rotating the issuer key — a config-only rollout
+
+Rotation is a configuration change; no verifier binary is rebuilt or redeployed
+mid-flight.
+
+1. **Generate** a new signing key and assign it the next key id (e.g. id `2`).
+2. **Add** its public key to every verifier's `EN_BISCUIT_ISSUER_KEYS` alongside
+   the current one and roll that config out. Verifiers now trust `{1, 2}`; nothing
+   else changes. This is the *overlap window*.
+3. **Switch** the minter's `EN_BISCUIT_SIGNING_KEY` to `2:<new secret>`. New
+   tokens are signed by key 2; in-flight tokens signed by key 1 keep verifying
+   against the same keyset — no coordinated cutover.
+4. **Drop** key `1` from the verifiers' keysets once the longest possible token
+   TTL has elapsed since the switch, so no key-1 token can still be in flight.
+
+Tokens minted before key ids existed carry no id; configure them a `legacy:` key
+so verifiers keep honoring them through the transition, then remove it once they
+have all expired.
+
+### Revoking a token before it expires
+
+Every token is revocable, whether or not the minter supplied an application-level
+`revocationId`. Each Biscuit block (the authority block plus any attenuation
+blocks) has a **built-in revocation id** — its signature bytes — reported at mint
+time in `MintedGrant.revocationIds`. To revoke a token, add any of its ids to the
+set your verifiers consult and pass that set as `VerifyRequest.revokedBlockIds`
+(via `Auth.Biscuit.fromRevocationList`). A matching id makes `verifyGrant` return
+`Left Revoked` on every verifier, before the token's blocks are even decoded.
+
+Record `MintedGrant.revocationIds` at mint time for any token you might need to
+kill early. Revoking an attenuation block's id kills that narrowed token while the
+parent stays valid. Distributing the revocation set to verifiers (a shared store
+or feed) is out of scope for `en-biscuit`; this layer only guarantees every token
+is revocable in principle.
 
 ## When a downstream service must still call `en`
 
@@ -252,9 +342,17 @@ Do not overload a single `Authorization` header with two token types.
 ## Security checklist
 
 - The **issuer signing key** (`MintConfig.issuerSecretKey`) is separate from
-  Shomei's JWT signing keys. Distribute only the **public** key to downstream
-  verifiers.
+  Shomei's JWT signing keys. Distribute only the **public** keyset to downstream
+  verifiers, addressed by key id.
 - Keep `defaultTtl` short (seconds to a few minutes). Expiry is issuer-controlled.
+- **Rotate the issuer key by config, not redeploy.** Assign each signing key a
+  key id and give verifiers a keyset holding both the outgoing and incoming key
+  during the overlap window. See [Key rotation and
+  revocation](#key-rotation-and-revocation).
+- **Record `MintedGrant.revocationIds` at mint time** for any token you might need
+  to revoke before expiry — every token has them, and passing them to
+  `revokedBlockIds` revokes the token regardless of whether it carries an
+  application-level `revocationId`.
 - Scope tokens narrowly (specific audience, operation, resource/containers) so a
   stale grant cannot be replayed broadly.
 - Downstream services must authenticate the caller independently and pass the
@@ -266,8 +364,9 @@ Do not overload a single `Authorization` header with two token types.
 | Package module | What it gives you |
 | --- | --- |
 | `En.Biscuit.Grant` | `EnGrant`, `EnScopedGrant`, `EnBiscuitGrant`, `Audience`/`RequestId`/`RevocationId`, and the stable `en_*` Biscuit fact vocabulary |
-| `En.Biscuit.Mint` | `MintConfig`, `mintObjectGrant`/`mintScopedGrant` (+ `…WithExpiry`), `mintCheckedObjectGrant`, `EnBiscuitMintError` |
-| `En.Biscuit.Verify` | `VerifyRequest`, `verifyGrant`, `VerifiedGrant`, `EnBiscuitVerifyError`, `attenuateGrant`, `Attenuation`/`noAttenuation` |
+| `En.Biscuit.Keys` | `IssuerKeyId`, `IssuerKeySet`, `singleKey`/`selectIssuerKey`, and the `parseSigningKeyText`/`parseIssuerKeySetText`/`renderIssuerKeySetText` config codecs |
+| `En.Biscuit.Mint` | `MintConfig` (with `issuerKeyId`), `MintedGrant`, `mintObjectGrant`/`mintScopedGrant` (+ `…WithExpiry`), `mintCheckedObjectGrant`, `EnBiscuitMintError` |
+| `En.Biscuit.Verify` | `VerifyRequest` (with `revokedBlockIds`), `verifyGrant` (takes an `IssuerKeySet`), `VerifiedGrant`, `EnBiscuitVerifyError`, `attenuateGrant`, `Attenuation`/`noAttenuation` |
 | `En.Biscuit` | Re-exports all of the above |
 
 See `docs/ideas/biscuit-integration.md` for the original design rationale.
