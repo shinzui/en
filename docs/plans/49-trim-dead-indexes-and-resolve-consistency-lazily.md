@@ -169,42 +169,64 @@ horizon fetch from the token-less modes entirely — which are the hot check pat
 is still generalized as the plan asked, so a horizon cache can be added later behind its own
 knob and its own honest safety argument. Discovered 2026-07-09.
 
-**`reapDeletedTuplesBatchStatement` hash-joins a full table scan to delete 1,000 rows
-(out of scope here; for docs/plans/37).** The post-drop sweep showed the reaper's batch
-statement planning as a `Hash Join` whose outer side is a `Seq Scan on relation_tuple`
-(250,023 rows, 3,035 buffers) to reap a `LIMIT 1000` victim set — 23.7 ms. It looked at
-first like a regression this plan had caused. It is not: recreating both dropped indexes
-inside a transaction and re-EXPLAINing yields a *byte-identical* plan, same cost
-(`202.11..6684.93`), same `Seq Scan`. The flip happened between the pre- and post-drop
-sweeps because autovacuum ran over the driven workload and moved the `deleted_xid`
-statistics, not because an index disappeared.
+**The maintenance batch statements hash-joined a full table scan to delete 1,000 rows.
+Fixed here with a `ctid` join.** The post-drop sweep showed `reapDeletedTuplesBatchStatement`
+planning as a `Hash Join` whose outer side is a `Seq Scan on relation_tuple` (250,023 rows,
+3,035 buffers) to reap a `LIMIT 1000` victim set — 27 ms.
 
-The underlying defect is real. `SET LOCAL enable_seqscan = off` gets the obvious plan —
-a nested loop probing `relation_tuple_pkey` once per victim — at **1.233 ms, a 19×
-improvement**:
+It looked at first like a regression this plan had caused. It is not: recreating both dropped
+indexes inside a rolled-back transaction and re-EXPLAINing yields a *byte-identical* plan,
+same cost (`202.11..6684.93`), same `Seq Scan`. The flip between the pre- and post-drop sweeps
+was autovacuum moving the `deleted_xid` statistics, not an index disappearing. **A before/after
+EXPLAIN across a schema change is not a controlled experiment unless statistics are held still
+or the counterfactual is run in the same session.**
+
+The defect itself is real and predates this plan. PostgreSQL's estimates are nearly tied
+(`6684.93` hash join versus `6903.11` nested loop) and it picks the slower one, because it
+prices 1,000 cached primary-key probes as random I/O. The scan side grows linearly with the
+table while the nested loop does not, and — the part that makes it serious —
+`reapDeletedTuplesBatchSession` is *drained in a loop* by `en-server/app/Maintenance.hs`, so a
+backlog of `B` rows costs `B / batchSize` full table scans. The cost is
+`table_pages × batches`: quadratic, and the reaper is precisely the thing that runs when the
+table is large.
+
+The fix joins back on `ctid`, the physical tuple address, instead of on the primary key:
 
 ```text
--- planner's choice
+-- id join (planner's choice)
 ->  Hash Join  (cost=202.11..6684.93 rows=1000)
-      ->  Seq Scan on relation_tuple t  (cost=0.00..5535.23 rows=250023)
-    Execution Time: 23.706 ms
+      ->  Seq Scan on relation_tuple t  (actual rows=250024)
+    Buffers: shared hit=5096      Execution Time: 27.025 ms
 
--- enable_seqscan = off
-->  Nested Loop  (cost=0.71..6903.11 rows=1000)
-      ->  Index Scan using relation_tuple_pkey on relation_tuple t (loops=1000)
-    Execution Time: 1.233 ms
+-- ctid join (shipped)
+->  Nested Loop  (actual rows=1000)
+      ->  Index Scan using relation_tuple_deleted_xid_idx  (actual rows=1000)
+      ->  Tid Scan on relation_tuple t  (actual rows=1 loops=1000)
+    Buffers: shared hit=3061      Execution Time: 2.216 ms
 ```
 
-The estimates are nearly tied (6684.93 vs 6903.11) and PostgreSQL picks the slower one,
-because it costs 1,000 cached primary-key probes as if they were random I/O. The seq-scan
-side grows linearly with the table while the nested loop does not, so this gets *worse*
-with scale, and it is precisely the master plan's standing rule — a batched statement's
-cost is argued from its EXPLAIN plan, not from its round-trip count. The reaper is owned
-by docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md
-(master plan 6), and `en_transaction` pruning and reaper scheduling are explicitly out of
-this master plan's scope, so it is recorded here rather than fixed. A `LATERAL` probe
-driven from the victims CTE — the same shape EP-48's Decision Log mandates for every
-batched statement over `relation_tuple` — is the natural remedy. Discovered 2026-07-09.
+Draining the full 50,015-row backlog on the 250,024-row table: **1.330 s → 0.194 s** (51
+batches either way). `MATERIALIZED` on the victims CTE and `id IN (subquery)` were both tried
+and both still seq-scan — the estimate was never wrong, only the costing of the probes.
+
+`pruneTransactionsBatchStatement` carries the identical shape over `en_transaction`, which
+accrues one row per write transaction. Seeded to 250,038 rows it plans the same `Hash Join`
+over a full `Seq Scan` (21.4 ms) and takes the same `ctid` fix (1.9 ms). Both were fixed.
+
+Safety of `ctid`: a tuple address is only stable if the tuple cannot move. Both writers that
+set `deleted_xid` (`batchTouchReplaceStatement`, `batchDeleteTupleStatement`) restrict their
+`UPDATE` to `deleted_xid IS NULL`, so a soft-deleted row is never updated again; `en_transaction`
+rows are never updated at all. `VACUUM` cannot recycle a line pointer for a tuple the current
+statement's snapshot can still see, and the victim CTE and the `DELETE` run inside one statement
+under one snapshot. A racing second reaper deletes the row first and this statement's `Tid Scan`
+finds nothing, exactly as the `id` join behaved.
+
+The `ctid` form is self-correcting, not immune: on a small table the planner still hash-joins on
+`ctid` (verified on a 6-row table), which is harmless because the scan is cheap, but it does mean
+the integration fixture cannot assert the plan shape — the guard is the `EXPLAIN` above against a
+populated database, plus the existing correctness assertions in `runMaintenanceBatchScenario`,
+which were run once against an injected bug (dropping the horizon predicate) and failed with
+`expected: 25 / actual: 26`. Discovered and fixed 2026-07-09.
 
 **`readStartingWithUserStatement` at large fan-in does not sort all matches (the review's
 side-note, resolved).** Milestone 1 asked whether the global `ORDER BY id LIMIT` sorts every
@@ -334,6 +356,20 @@ Record every decision made while working on the plan.
   horizon fetch vanishes from the token-less modes that dominate the check path. Escalated to
   the user before acting.
   Date: 2026-07-09
+- Decision: The maintenance batch statements (`reapDeletedTuplesBatchStatement`,
+  `pruneTransactionsBatchStatement`) are fixed here rather than deferred to docs/plans/37, by
+  joining the victim CTE back on `ctid` instead of on the primary key.
+  Rationale: The master plan's Decision Log binds every batched statement over `relation_tuple`
+  to an index-probe plan, and these are batched statements over `relation_tuple`. docs/plans/37
+  owns *when* maintenance runs, not the plan shape of statements that already exist. The defect
+  is severe rather than cosmetic: the reap session is drained in a loop, so the full-table
+  `Seq Scan` in the join-back costs `table_pages × batches` — quadratic, on the code path that
+  by definition runs against large tables. Measured on a 250,024-row table with a 50,015-row
+  backlog: full drain 1.330 s → 0.194 s; per batch 27.0 ms → 2.2 ms. `ctid` is safe because
+  soft-deleted rows are never updated again (both writers restrict to `deleted_xid IS NULL`),
+  `en_transaction` rows are never updated, and vacuum cannot recycle a line pointer visible to
+  the statement's own snapshot. A mirror entry is recorded in docs/plans/37's Decision Log.
+  Date: 2026-07-09
 - Decision: `relation_tuple_object_live_idx` is dropped as strictly subsumed, not merely
   unused.
   Rationale: Its key `(object_type, object_id, relation, id)` under `WHERE deleted_xid IS
@@ -462,11 +498,24 @@ that a suite which fails to compile never prints one.
 
 - The horizon cache the plan specified was not built; the reasoning is in Surprises &
   Discoveries and the Decision Log. `TtlCache a` is generalized and ready for it.
-- `reapDeletedTuplesBatchStatement` plans a full-table hash join (19× slower than the
-  nested-loop alternative). Out of scope here; recorded for
-  docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md.
 - The precondition statements' sargability depends on PostgreSQL preferring a custom plan to
   a generic one. True today by a ~500× cost margin, but nothing in the SQL enforces it.
+- The maintenance statements' plan shape cannot be asserted by the integration fixture, whose
+  table is too small for the planner to prefer the tid path. It is pinned by the recorded
+  `EXPLAIN` against the populated dev database, and by the master plan's standing rule.
+
+### Scope taken beyond the plan
+
+`reapDeletedTuplesBatchStatement` and `pruneTransactionsBatchStatement` were rewritten to join
+on `ctid`. This plan's text does not mention them, and the master plan's Vision & Scope puts
+"`en_transaction` pruning and reaper scheduling" under
+docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md. The fix
+was taken here anyway, on three grounds: the master plan's own Decision Log binds *every*
+batched statement over `relation_tuple` to an index-probe plan and these are batched statements
+over `relation_tuple`; what EP-37 owns is the *scheduling* of maintenance, not the plan shape of
+statements that already exist; and the EXPLAIN harness that found the defect was already built
+and warm, so verifying the fix cost one command while deferring it would have shipped a known
+quadratic drain. The mirror note is recorded in EP-37's Decision Log.
 
 
 ## Context and Orientation

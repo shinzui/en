@@ -600,25 +600,52 @@ reapDeletedTuplesStatement =
         (Encoders.param (Encoders.nonNullable Encoders.text))
         (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
 
-{- | Victims are chosen by primary key in a CTE, then deleted by joining back on it.
-@LIMIT@ cannot appear directly on a @DELETE@.
+{- | Victims are chosen in a CTE, then deleted by joining back on their @ctid@.
+@LIMIT@ cannot appear directly on a @DELETE@, so the join back is unavoidable.
 
 @relation_tuple_deleted_xid_idx@ (a partial index on @deleted_xid@ where it is not
 null) serves the victim scan.
+
+The join back is on @ctid@, the physical tuple address, and not on the primary key.
+Keyed on @id@, PostgreSQL hash-joins the thousand victims against a sequential scan
+of the whole table: it prices a thousand cached primary-key probes above one scan
+(estimated 6903 against 6684) and picks the scan. That is 27 ms per batch on a
+250,000-row table, and 'reapDeletedTuplesBatchSession' is drained in a loop, so a
+backlog of @B@ rows costs @B/batch@ sequential scans — quadratic in table size, and
+the reaper is exactly the thing that runs when the table is large. Keyed on @ctid@
+the plan is a nested loop over a @Tid Scan@, 1.1 ms for the same batch.
+
+The @ctid@ form is self-correcting rather than immune. A tid lookup fetches one page,
+so the nested loop's cost barely grows with the table while the sequential scan's
+grows linearly; the planner therefore takes the tid path exactly when the table is
+big enough for the scan to hurt. On a small table it still hash-joins — which is why
+the integration fixture cannot assert the plan shape, and why this statement's cost
+is argued from an @EXPLAIN@ against a populated database (see
+@docs/plans/49-trim-dead-indexes-and-resolve-consistency-lazily.md@).
+
+A @ctid@ is only safe to carry across a statement boundary if the tuple cannot move,
+and here it cannot. Both writers that set @deleted_xid@
+('batchTouchReplaceStatement', 'batchDeleteTupleStatement') restrict their @UPDATE@
+to rows where @deleted_xid IS NULL@, so a soft-deleted row is never updated again and
+never migrates to a new tuple address. Nor can @VACUUM@ recycle the line pointer
+underneath us: the victim CTE and the @DELETE@ execute inside one statement under one
+snapshot, and vacuum cannot reclaim a tuple that snapshot can still see. A racing
+second reaper is likewise harmless — it deletes the row first, and this statement's
+@Tid Scan@ simply finds nothing there, exactly as the @id@ join would have.
 -}
 reapDeletedTuplesBatchStatement :: Statement (Text, Int64) Int64
 reapDeletedTuplesBatchStatement =
     Statement.preparable
         """
         WITH victims AS (
-          SELECT id FROM relation_tuple
+          SELECT ctid FROM relation_tuple
           WHERE deleted_xid IS NOT NULL
             AND deleted_xid < $1::xid8
           LIMIT $2
         ), reaped AS (
           DELETE FROM relation_tuple t
           USING victims v
-          WHERE t.id = v.id
+          WHERE t.ctid = v.ctid
           RETURNING t.id
         )
         SELECT count(*) FROM reaped
@@ -626,19 +653,28 @@ reapDeletedTuplesBatchStatement =
         (horizonAndBatchEncoder)
         (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
 
--- | Victims are chosen by @en_transaction@'s primary key, @xid@.
+{- | Victims are chosen by @en_transaction@'s primary key, @xid@, and deleted by
+joining back on their @ctid@.
+
+The same planner trap 'reapDeletedTuplesBatchStatement' documents, and the same fix:
+joined on @xid@ this hash-joins a thousand victims against a sequential scan of the
+whole table (21 ms per batch once @en_transaction@ holds 250,000 rows, which it
+reaches at one row per write transaction), and joined on @ctid@ it is a @Tid Scan@ at
+1.9 ms. @en_transaction@ rows are inserted once and never updated, so their tuple
+addresses are stable for the same reason.
+-}
 pruneTransactionsBatchStatement :: Statement (Text, Int64) Int64
 pruneTransactionsBatchStatement =
     Statement.preparable
         """
         WITH victims AS (
-          SELECT xid FROM en_transaction
+          SELECT ctid FROM en_transaction
           WHERE xid < $1::xid8
           LIMIT $2
         ), pruned AS (
           DELETE FROM en_transaction t
           USING victims v
-          WHERE t.xid = v.xid
+          WHERE t.ctid = v.ctid
           RETURNING t.xid
         )
         SELECT count(*) FROM pruned

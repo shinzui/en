@@ -358,22 +358,41 @@ alone met the full acceptance table (1/1/1/2), because the horizon fetch vanishe
 the token-less modes that dominate the check path. Discovered while implementing EP-49,
 2026-07-09.
 
-**The reaper's batch statement hash-joins a full table scan (binds
-docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md, master
-plan 6).** EP-49's EXPLAIN sweep found `reapDeletedTuplesBatchStatement` planning as a `Hash Join`
-whose outer side is a `Seq Scan` of all 250,023 rows, to reap a `LIMIT 1000` victim set: 23.7 ms.
-`SET enable_seqscan = off` yields the obvious nested loop over `relation_tuple_pkey` at 1.233 ms —
-**19× faster**. PostgreSQL's estimates are nearly tied (6684.93 vs 6903.11) and it picks the
-slower plan, costing 1,000 cached primary-key probes as random I/O. The seq-scan side grows with
-the table while the nested loop does not, so this worsens with scale. This is EP-48's `LATERAL`
-lesson in a statement EP-48 never touched, and the remedy is the same shape: drive the join from
-the victims CTE through a `LATERAL` probe. Out of scope for this master plan (reaper scheduling is
-EP-37's), recorded so EP-37 inherits it. Note also that the sweep initially *appeared* to show
-EP-49 causing this — the plan changed between the pre- and post-drop runs because autovacuum moved
-the `deleted_xid` statistics. Recreating the dropped indexes in a rolled-back transaction produced
-a byte-identical plan, proving the drop innocent. **A before/after EXPLAIN across a schema change
-is not a controlled experiment unless statistics are held still or the counterfactual is run in
-the same session.** Discovered while implementing EP-49, 2026-07-09.
+**The maintenance batch statements hash-joined a full table scan; fixed in EP-49 with a `ctid`
+join (binds docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md,
+master plan 6).** EP-49's EXPLAIN sweep found `reapDeletedTuplesBatchStatement` planning as a
+`Hash Join` whose outer side is a `Seq Scan` of all 250,024 rows, to reap a `LIMIT 1000` victim
+set: 27 ms. PostgreSQL's estimates are nearly tied (6684.93 hash join vs 6903.11 nested loop) and
+it picks the slower plan, pricing 1,000 cached primary-key probes as random I/O.
+
+What makes it severe rather than untidy is the loop: `drain` in `en-server/app/Maintenance.hs`
+re-runs the batch session until it returns a short batch, so a backlog of `B` rows costs
+`B / batchSize` full table scans. The cost is `table_pages × batches` — quadratic in table size,
+on the one code path guaranteed to meet large tables. `pruneTransactionsBatchStatement` carries
+the identical shape over `en_transaction`, which accrues a row per write transaction.
+
+Joining the victim CTE back on `ctid` rather than the primary key turns both into a nested loop
+over a `Tid Scan`: 27.0 ms → 2.2 ms per reap batch, and a full 50,015-row drain 1.330 s → 0.194 s.
+`MATERIALIZED` and `id IN (subquery)` were both tried and still seq-scan — the row estimate was
+never wrong, only the costing of the probes. `ctid` is safe because soft-deleted rows are never
+updated again (both writers restrict their `UPDATE` to `deleted_xid IS NULL`), `en_transaction`
+rows are never updated, and vacuum cannot recycle a line pointer for a tuple the statement's own
+snapshot can still see. It is self-correcting rather than immune: on a small table the planner
+still hash-joins on `ctid`, harmlessly, which is why the plan shape cannot be asserted from the
+ephemeral integration fixture.
+
+This was taken *inside* this master plan despite Vision & Scope assigning reaper work to EP-37,
+because EP-37 owns *when* maintenance runs, not the plan shape of statements that already exist,
+and because this master plan's own Decision Log binds every batched statement over
+`relation_tuple` to an index-probe plan. Scope is a reason to route a fix, not a reason to ship a
+known quadratic drain. The mirror note is in EP-37's Decision Log.
+
+Note also that the sweep initially *appeared* to show EP-49 causing this — the plan changed
+between the pre- and post-drop runs because autovacuum moved the `deleted_xid` statistics.
+Recreating the dropped indexes in a rolled-back transaction produced a byte-identical plan,
+proving the drop innocent. **A before/after EXPLAIN across a schema change is not a controlled
+experiment unless statistics are held still or the counterfactual is run in the same session.**
+Discovered and fixed while implementing EP-49, 2026-07-09.
 
 **The precondition statements are sargable only because PostgreSQL re-plans them per execution
 (affects any plan touching `TupleFilter` SQL).** `lockMatchingLiveTupleStatement` and
@@ -463,6 +482,8 @@ statement 55,792 ms → 14.4 ms once pinned to a `LATERAL` index probe; a 100,00
 re-import 272 s → 3.57 s; a 20,000-row insert 0.573 s → 0.378 s after the dead indexes went,
 with ~36 MB of index storage reclaimed. Read path: consistency resolution 3 → 1 round trips
 for `MinimizeLatency`, `FullyConsistent` and `AtExactSnapshot`, 3 → 2 for `AtLeastAsFresh`.
+Maintenance: a full reap of a 50,015-row backlog on a 250,024-row table 1.330 s → 0.194 s, and
+the drain is no longer quadratic in table size.
 
 **The decomposition held.** EP-45 before EP-46 was the right hard dependency and paid for
 itself immediately: EP-45's discovery that zero-row statement counts cannot stand in for a
@@ -504,9 +525,17 @@ and a seed script whose row count was an artifact of its own `ON CONFLICT` claus
 standing rule EP-46 introduced — run every new scenario once against the bug it claims to catch
 — caught the last three and was applied to both of EP-49's new assertions.
 
-**Left open, with owners.** `reapDeletedTuplesBatchStatement` plans a full-table hash join, 19×
-slower than the nested loop `enable_seqscan = off` reveals; it belongs to
-docs/plans/37 (master plan 6) and is recorded in Surprises & Discoveries. The precondition
+**A fourth lesson, learned late.** Scope routes a fix; it does not license shipping a known
+defect. The reaper's quadratic drain was filed as "EP-37's problem" and recorded, because this
+master plan's Vision & Scope names reaper work as out of scope — but EP-37 owns *when*
+maintenance runs, not the plan shape of statements that already existed, and this master plan's
+own Decision Log binds every batched statement over `relation_tuple` to an index-probe plan. The
+severity argument (the batch session is drained in a loop, so the cost is
+`table_pages × batches`) was never made until it was challenged. The fix took one statement
+rewrite each and the EXPLAIN harness was already warm. When a boundary and a measured defect
+disagree, make the severity argument out loud before invoking the boundary.
+
+**Left open, with owners.** The precondition
 statements are sargable only because PostgreSQL prefers a custom plan to a generic one, a
 margin that lives in the cost model rather than the SQL. C7's GC TOCTOU remains reachable in
 principle, bounded by the `EN_GC_WINDOW` ≫ request-duration invariant EP-47 documented in the
