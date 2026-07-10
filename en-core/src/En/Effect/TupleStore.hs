@@ -23,6 +23,13 @@ module En.Effect.TupleStore (
     reapDeletedTuples,
     TupleFilter (..),
     SubjectRelationFilter (..),
+    RelationshipFilter (..),
+    anyRelationshipFilter,
+    widenTupleFilter,
+    validateRelationshipFilter,
+    readRelationships,
+    countRelationships,
+    deleteRelationships,
     Precondition (..),
     TupleWriteRequest (..),
     exactTupleFilter,
@@ -36,14 +43,14 @@ module En.Effect.TupleStore (
 ) where
 
 import Data.Int (Int64)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Word (Word64)
 import Effectful (Dispatch (..), DispatchOf, Eff, Effect, (:>))
 import Effectful.Dispatch.Dynamic (send)
 
 import En.Revision (ConsistencyToken, Revision)
-import En.Schema (ObjectType (..), RelationName (..))
+import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
 import En.Tuple (ObjectRef (..), Subject (..), Tuple (..))
 
 newtype StoreCursor = StoreCursor
@@ -124,6 +131,119 @@ data TupleFilter = TupleFilter
     , subjectRelation :: !SubjectRelationFilter
     }
     deriving stock (Eq, Show)
+
+{- | A filter over stored tuples, for the operator-facing read and delete-by-filter
+operations.
+
+'TupleFilter' widened in exactly two directions, and no others (see 'widenTupleFilter').
+'objectType' is optional, because "every grant naming @user:alice@, whatever it is on" is
+the offboarding query this filter exists to answer. 'caveatName' is added, because
+"every grant held under caveat @within_autonomy@" is an audit an operator asks and no
+other filter can express.
+
+Not every inhabitant is legal: 'validateRelationshipFilter' enforces the anchoring
+grammar, and every consumer must construct through it. The rules are not taste. Reads
+here are snapshot-visible, so they are served by @relation_tuple_object_hist_idx@
+(leading @object_type@) or @relation_tuple_subject_hist_idx@ (leading @subject_type@),
+and a filter constraining neither column is a sequential scan of the whole table with no
+bound but its size. Offering that shape over HTTP is offering a denial of service.
+
+'subjectRelation' is a 'SubjectRelationFilter' rather than a @Maybe RelationName@ for the
+reason that type's own Haddock gives: @Nothing@-means-any cannot say "the subject carries
+no relation", so it conflates @user:alice@ with @user:alice#admin@ — two grants that can
+be live at once.
+-}
+data RelationshipFilter = RelationshipFilter
+    { objectType :: !(Maybe ObjectType)
+    , objectId :: !(Maybe Text)
+    , relation :: !(Maybe RelationName)
+    , subjectType :: !(Maybe ObjectType)
+    , subjectId :: !(Maybe Text)
+    , subjectRelation :: !SubjectRelationFilter
+    , caveatName :: !(Maybe CaveatName)
+    }
+    deriving stock (Eq, Show)
+
+{- | The filter constraining nothing. Illegal on its own — 'validateRelationshipFilter'
+rejects it — and useful only as the base a caller overrides fields on.
+-}
+anyRelationshipFilter :: RelationshipFilter
+anyRelationshipFilter =
+    RelationshipFilter
+        { objectType = Nothing
+        , objectId = Nothing
+        , relation = Nothing
+        , subjectType = Nothing
+        , subjectId = Nothing
+        , subjectRelation = AnySubjectRelation
+        , caveatName = Nothing
+        }
+
+{- | Every 'TupleFilter' is a legal 'RelationshipFilter': it constrains @objectType@, so
+it is anchored by construction, and it constrains no caveat.
+
+This is what keeps the two types' matching semantics from drifting. Filter matching is
+written once against 'RelationshipFilter'; 'TupleFilter' matching is that function
+after this widening. A field added to one type and forgotten in the other stops
+compiling here.
+-}
+widenTupleFilter :: TupleFilter -> RelationshipFilter
+widenTupleFilter tupleFilter =
+    RelationshipFilter
+        { objectType = Just tupleFilter.objectType
+        , objectId = tupleFilter.objectId
+        , relation = tupleFilter.relation
+        , subjectType = tupleFilter.subjectType
+        , subjectId = tupleFilter.subjectId
+        , subjectRelation = tupleFilter.subjectRelation
+        , -- A precondition names a grant's identity, and a caveat is an attribute of the
+          -- grant rather than part of that identity, so 'TupleFilter' constrains none.
+          caveatName = Nothing
+        }
+
+{- | Enforce the anchoring grammar, returning the reason on rejection.
+
+Three rules, each of which corresponds to an index this store actually has:
+
+* At least one of @objectType@ or @subjectType@ is present. Neither means no index
+  prefix, which means a sequential scan.
+
+* @objectId@ requires @objectType@. @relation_tuple_object_hist_idx@ leads with
+  @object_type@; an @objectId@ without it is a residual predicate over the whole table.
+
+* @subjectId@ and a non-'AnySubjectRelation' @subjectRelation@ require @subjectType@,
+  for the same reason against @relation_tuple_subject_hist_idx@. (This is also SpiceDB's
+  rule: its @SubjectFilter.optionalSubjectId@ is only meaningful under a @subjectType@.)
+
+@relation@ and @caveatName@ are deliberately unrestricted. Neither leads any index, so
+both are always residual predicates evaluated after an index scan the other fields
+anchored — a documented cost, paid on a row set the grammar has already bounded, not an
+unbounded one. Auditing "every grant on @user:alice@ under caveat @within_autonomy@" is a
+real question, and it is subject-anchored.
+-}
+validateRelationshipFilter :: RelationshipFilter -> Either Text RelationshipFilter
+validateRelationshipFilter relationshipFilter
+    | unanchored =
+        Left "filter must constrain objectType or subjectType"
+    | danglingObjectId =
+        Left "filter objectId requires objectType"
+    | danglingSubjectId =
+        Left "filter subjectId requires subjectType"
+    | danglingSubjectRelation =
+        Left "filter subjectRelation requires subjectType"
+    | otherwise =
+        Right relationshipFilter
+  where
+    hasObjectType = isJust relationshipFilter.objectType
+    hasSubjectType = isJust relationshipFilter.subjectType
+
+    unanchored = not hasObjectType && not hasSubjectType
+    danglingObjectId = isJust relationshipFilter.objectId && not hasObjectType
+    danglingSubjectId = isJust relationshipFilter.subjectId && not hasSubjectType
+    danglingSubjectRelation =
+        case relationshipFilter.subjectRelation of
+            AnySubjectRelation -> False
+            _ -> not hasSubjectType
 
 {- | A fact the write transaction re-verifies before applying any change.
 
@@ -243,6 +363,33 @@ data TupleStore :: Effect where
     'En.Error.WritePreconditionFailed' and mints no token.
     -}
     ApplyTupleWrites :: TupleWriteRequest -> TupleStore m ConsistencyToken
+    {- | The tuples live at @revision@ matching a validated 'RelationshipFilter',
+    ordered by internal row id and keyset-paginated.
+
+    The engine never issues this either. It answers the operator's question — "what
+    grants exist for @user:alice@?" — that neither 'ReadObjectRelation' (wrong
+    direction) nor 'ReadStartingWithUser' (needs an object type /and/ relation) can
+    put. Anchoring every page to one caller-held 'Revision' makes a paged listing a
+    consistent snapshot, exactly as it does for 'ReadAllTuples'.
+    -}
+    ReadRelationships :: Revision -> RelationshipFilter -> Int -> Maybe StoreCursor -> TupleStore m TuplePage
+    {- | How many tuples live at @revision@ match the filter.
+
+    The dry-run primitive of 'DeleteRelationships'. It is a separate operation rather
+    than a paged read the caller counts, because "how many grants would this revoke?"
+    must not itself be bounded by a page.
+    -}
+    CountRelationships :: Revision -> RelationshipFilter -> TupleStore m Int64
+    {- | Soft-delete every /currently live/ tuple matching the filter, atomically,
+    returning how many were retired and the token that sees the retirement.
+
+    Takes no 'Revision': like 'ApplyTupleWrites', it acts on the live state inside its
+    own transaction. Matching and deleting are one operation, and not a read the caller
+    follows with a delete, because two transactions cannot agree on what they saw: a
+    grant written between them would be counted and not deleted, or deleted and not
+    counted. The returned count and token therefore describe the same set of rows.
+    -}
+    DeleteRelationships :: RelationshipFilter -> TupleStore m (Int64, ConsistencyToken)
     HeadRevision :: TupleStore m Revision
     OptimizedRevision :: TupleStore m Revision
     OldestRetainedXid :: TupleStore m Word64
@@ -269,6 +416,26 @@ probeTuples revision object relation subjects =
 applyTupleWrites :: (TupleStore :> es) => TupleWriteRequest -> Eff es ConsistencyToken
 applyTupleWrites =
     send . ApplyTupleWrites
+
+{- | A page of tuples matching the filter, live at the revision.
+
+The filter must have come from 'validateRelationshipFilter'. Nothing in the type
+enforces that, and no interpreter re-checks it: the grammar is a bound on cost, so it
+belongs at the edge where a caller's filter arrives, not on every internal read.
+-}
+readRelationships :: (TupleStore :> es) => Revision -> RelationshipFilter -> Int -> Maybe StoreCursor -> Eff es TuplePage
+readRelationships revision relationshipFilter limit cursor =
+    send (ReadRelationships revision relationshipFilter limit cursor)
+
+-- | How many tuples live at the revision match the filter. See 'readRelationships'.
+countRelationships :: (TupleStore :> es) => Revision -> RelationshipFilter -> Eff es Int64
+countRelationships revision relationshipFilter =
+    send (CountRelationships revision relationshipFilter)
+
+-- | Retire every live tuple matching the filter. See 'readRelationships'.
+deleteRelationships :: (TupleStore :> es) => RelationshipFilter -> Eff es (Int64, ConsistencyToken)
+deleteRelationships =
+    send . DeleteRelationships
 
 -- | An unguarded write: 'applyTupleWrites' with no preconditions and no deletes.
 writeTuples :: (TupleStore :> es) => [Tuple] -> Eff es ConsistencyToken

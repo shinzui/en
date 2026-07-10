@@ -44,17 +44,27 @@ import En.Effect.CachedTupleStore (cachedTupleStore)
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
 import En.Effect.TupleStore (
     PageState (..),
+    RelationshipFilter (..),
     StoreCursor (..),
+    SubjectRelationFilter (..),
+    TupleFilter (..),
     TuplePage (..),
     TupleRow (..),
     TupleRowId (..),
     TupleStore (..),
     UsersetQuery (..),
+    anyRelationshipFilter,
+    countRelationships,
+    deleteRelationships,
     headRevision,
     optimizedRevision,
     probeTuples,
+    readAllTuples,
     readObjectRelation,
+    readRelationships,
     readStartingWithUser,
+    validateRelationshipFilter,
+    widenTupleFilter,
     writeTuples,
  )
 import En.Error (EnError (..))
@@ -319,6 +329,10 @@ main = do
     testCacheOperations
     testCachedTupleStore
     testStorePaging
+    testRelationshipFilterValidation
+    testRelationshipFilterMatching
+    testWidenTupleFilterAgrees
+    testRelationshipStoreOperations
     testDedupeObligations
     testResidualDecision
     validKikan <- either (fail . show) pure (validateSchema kikanSchema)
@@ -1094,6 +1108,222 @@ testStorePaging = do
         "the in-memory store drains every row of a relation spanning four pages"
         [SubjectId (pagedUser index) | index <- [1 .. pagedRowCount]]
         (fmap ((.subject) . (.tuple)) drained)
+
+{- | The filter fixture, chosen so every subject shape and the caveat constraint are
+each distinguished by at least one filter below: a concrete subject, a type wildcard
+(stored flattened as object id @*@), a userset, and a caveated grant.
+-}
+filterTuples :: [Tuple]
+filterTuples =
+    [ Tuple space (RelationName "owner") (SubjectId user) Nothing
+    , Tuple space (RelationName "viewer") (SubjectWildcard (ObjectType "user")) Nothing
+    , Tuple space (RelationName "member") (SubjectSet guestOrg (RelationName "member")) Nothing
+    , Tuple intention (RelationName "delegate") (SubjectId user) (Just autonomyCaveat)
+    , Tuple guestSpace (RelationName "owner") (SubjectId bob) Nothing
+    ]
+
+{- | A 'RelationshipFilter' built positionally, in field order: object type, object id,
+relation, subject type, subject id, subject relation, caveat name.
+
+Spelled as a constructor application rather than a record update over
+'anyRelationshipFilter' because @objectType@ and friends are field names of several
+types in scope here, and type-directed disambiguation of an ambiguous record update is
+a mechanism GHC has scheduled for removal. Naming the constructor resolves the fields
+outright.
+-}
+mkFilter ::
+    Maybe Text ->
+    Maybe Text ->
+    Maybe Text ->
+    Maybe Text ->
+    Maybe Text ->
+    SubjectRelationFilter ->
+    Maybe Text ->
+    RelationshipFilter
+mkFilter objectType objectId relation subjectType subjectId subjectRelation caveatName =
+    RelationshipFilter
+        { objectType = ObjectType <$> objectType
+        , objectId
+        , relation = RelationName <$> relation
+        , subjectType = ObjectType <$> subjectType
+        , subjectId
+        , subjectRelation
+        , caveatName = CaveatName <$> caveatName
+        }
+
+objectTypeFilter :: Text -> RelationshipFilter
+objectTypeFilter objectType =
+    mkFilter (Just objectType) Nothing Nothing Nothing Nothing AnySubjectRelation Nothing
+
+subjectFilter :: Text -> Text -> RelationshipFilter
+subjectFilter subjectType subjectId =
+    mkFilter Nothing Nothing Nothing (Just subjectType) (Just subjectId) AnySubjectRelation Nothing
+
+testRelationshipFilterValidation :: IO ()
+testRelationshipFilterValidation = do
+    let accepts label relationshipFilter =
+            assertBool
+                ("validateRelationshipFilter accepts " <> label)
+                (isRight (validateRelationshipFilter relationshipFilter))
+        -- Compared against the exact message, not merely 'isLeft': the reason reaches the
+        -- caller as an HTTP 400 body, so it is part of the contract.
+        rejects reason relationshipFilter =
+            assertEqual
+                ("validateRelationshipFilter rejects with: " <> Text.unpack reason)
+                (Left reason)
+                (() <$ validateRelationshipFilter relationshipFilter)
+
+    accepts "an object-anchored filter" (objectTypeFilter "space")
+    accepts "a subject-anchored filter" (subjectFilter "user" "alice")
+    accepts
+        "a filter anchored on both ends"
+        (mkFilter (Just "space") Nothing Nothing (Just "user") Nothing AnySubjectRelation Nothing)
+    accepts
+        "a caveat constraint under an anchor"
+        (mkFilter (Just "space") Nothing Nothing Nothing Nothing AnySubjectRelation (Just "within_autonomy"))
+    accepts
+        "an exact subject relation under a subjectType"
+        (mkFilter Nothing Nothing Nothing (Just "org") (Just "acme") (ExactSubjectRelation (RelationName "member")) Nothing)
+    accepts
+        "an unanchored relation constraint alongside an anchor"
+        (mkFilter Nothing Nothing (Just "viewer") (Just "user") Nothing AnySubjectRelation Nothing)
+
+    rejects "filter must constrain objectType or subjectType" anyRelationshipFilter
+    -- The residual-only shapes: legal fields, but nothing for an index to anchor on, so
+    -- each of these would be a sequential scan of relation_tuple.
+    rejects
+        "filter must constrain objectType or subjectType"
+        (mkFilter Nothing Nothing (Just "viewer") Nothing Nothing AnySubjectRelation Nothing)
+    rejects
+        "filter must constrain objectType or subjectType"
+        (mkFilter Nothing Nothing Nothing Nothing Nothing AnySubjectRelation (Just "within_autonomy"))
+    rejects
+        "filter objectId requires objectType"
+        (mkFilter Nothing (Just "project-x") Nothing (Just "user") Nothing AnySubjectRelation Nothing)
+    rejects
+        "filter subjectId requires subjectType"
+        (mkFilter (Just "space") Nothing Nothing Nothing (Just "alice") AnySubjectRelation Nothing)
+    rejects
+        "filter subjectRelation requires subjectType"
+        (mkFilter (Just "space") Nothing Nothing Nothing Nothing (ExactSubjectRelation (RelationName "member")) Nothing)
+    rejects
+        "filter subjectRelation requires subjectType"
+        (mkFilter (Just "space") Nothing Nothing Nothing Nothing NoSubjectRelation Nothing)
+
+testRelationshipFilterMatching :: IO ()
+testRelationshipFilterMatching = do
+    let matching relationshipFilter =
+            [tuple.relation | tuple <- filterTuples, matchesRelationshipFilter relationshipFilter tuple]
+
+    assertEqual
+        "a subject-anchored filter finds every grant naming the subject"
+        [RelationName "owner", RelationName "delegate"]
+        (matching (subjectFilter "user" "alice"))
+    assertEqual
+        "subjectId \"*\" matches the flattened wildcard grant and nothing else"
+        [RelationName "viewer"]
+        (matching (subjectFilter "user" "*"))
+    assertEqual
+        "an object-type filter finds every grant on that type"
+        [RelationName "owner", RelationName "viewer", RelationName "member", RelationName "owner"]
+        (matching (objectTypeFilter "space"))
+    assertEqual
+        "an exact subject relation matches only the userset grant"
+        [RelationName "member"]
+        (matching (mkFilter Nothing Nothing Nothing (Just "org") (Just "acme") (ExactSubjectRelation (RelationName "member")) Nothing))
+    assertEqual
+        "NoSubjectRelation excludes usersets but keeps wildcards and concrete subjects"
+        [RelationName "owner", RelationName "viewer", RelationName "owner"]
+        (matching (mkFilter (Just "space") Nothing Nothing (Just "user") Nothing NoSubjectRelation Nothing))
+    assertEqual
+        "a caveat-name constraint matches only caveated grants"
+        [RelationName "delegate"]
+        (matching (mkFilter (Just "intention") Nothing Nothing Nothing Nothing AnySubjectRelation (Just "within_autonomy")))
+    assertEqual
+        "an uncaveated grant never matches a caveat-name constraint"
+        []
+        (matching (mkFilter (Just "space") Nothing Nothing Nothing Nothing AnySubjectRelation (Just "within_autonomy")))
+
+{- | The widening is what keeps 'matchesFilter' and 'matchesRelationshipFilter' from
+drifting, so it is asserted rather than assumed.
+-}
+testWidenTupleFilterAgrees :: IO ()
+testWidenTupleFilterAgrees = do
+    let tupleFilters =
+            [ TupleFilter (ObjectType "space") Nothing Nothing Nothing Nothing AnySubjectRelation
+            , TupleFilter (ObjectType "space") (Just "project-x") (Just (RelationName "owner")) (Just (ObjectType "user")) (Just "alice") NoSubjectRelation
+            , TupleFilter (ObjectType "space") Nothing Nothing (Just (ObjectType "org")) (Just "acme") (ExactSubjectRelation (RelationName "member"))
+            , TupleFilter (ObjectType "intention") Nothing Nothing Nothing Nothing AnySubjectRelation
+            ]
+    traverse_
+        ( \tupleFilter ->
+            assertEqual
+                ("widenTupleFilter preserves matching for " <> show tupleFilter)
+                (matchesFilter tupleFilter <$> filterTuples)
+                (matchesRelationshipFilter (widenTupleFilter tupleFilter) <$> filterTuples)
+        )
+        tupleFilters
+    traverse_
+        ( \tupleFilter ->
+            assertBool
+                ("widenTupleFilter yields a filter the grammar accepts: " <> show tupleFilter)
+                (isRight (validateRelationshipFilter (widenTupleFilter tupleFilter)))
+        )
+        tupleFilters
+
+{- | Run an action against a fresh in-memory store seeded with 'filterTuples'.
+
+Each call gets its own store, so a test that deletes cannot leak into the next one.
+-}
+withFilterStore :: Eff '[TupleStore, Error EnError] a -> a
+withFilterStore action =
+    either (error . show) id $
+        runPureEff (runErrorNoCallStack @EnError (runTupleStoreInMemory filterTuples action))
+
+testRelationshipStoreOperations :: IO ()
+testRelationshipStoreOperations = do
+    let aliceFilter = subjectFilter "user" "alice"
+
+    assertEqual
+        "countRelationships counts every match, unbounded by a page"
+        2
+        (withFilterStore (countRelationships testRevision aliceFilter))
+
+    -- Paging: two matches at a limit of one must arrive across two pages, and the
+    -- second page must be exhausted rather than repeating the first.
+    let firstPage = withFilterStore (readRelationships testRevision aliceFilter 1 Nothing)
+    assertEqual "the first page carries one row" 1 (length firstPage.rows)
+    case firstPage.state of
+        HasMore cursor -> do
+            let secondPage = withFilterStore (readRelationships testRevision aliceFilter 1 (Just cursor))
+            assertEqual "the second page carries the remaining row" 1 (length secondPage.rows)
+            assertEqual "the second page is exhausted" Exhausted secondPage.state
+            assertEqual
+                "the two pages together are the whole match set, in order"
+                [RelationName "owner", RelationName "delegate"]
+                (fmap ((.relation) . (.tuple)) (firstPage.rows <> secondPage.rows))
+        other -> fail ("expected the first page to have more, got " <> show other)
+
+    -- Delete-by-filter retires exactly the matching grants and leaves the rest.
+    let (deleted, remaining) =
+            withFilterStore do
+                (count, _token) <- deleteRelationships aliceFilter
+                survivors <- readAllTuples testRevision 100 Nothing
+                pure (count, fmap ((.relation) . (.tuple)) survivors.rows)
+    assertEqual "deleteRelationships retires every match" 2 deleted
+    assertEqual
+        "deleteRelationships leaves every non-match"
+        [RelationName "viewer", RelationName "member", RelationName "owner"]
+        remaining
+
+    assertEqual
+        "a re-run of the same delete is a no-op"
+        0
+        ( withFilterStore do
+            _ <- deleteRelationships aliceFilter
+            (count, _token) <- deleteRelationships aliceFilter
+            pure count
+        )
 
 pagedRowCount :: Int
 pagedRowCount = 7
@@ -2190,6 +2420,21 @@ interpretFixtureTupleStore countRef errorObject tuples =
                         , tuple.relation == relation
                         , tuple.subject `elem` subjects
                         ]
+        ReadRelationships _ relationshipFilter limit cursor -> do
+            countRead
+            pure (pageTuples limit cursor (filter (matchesRelationshipFilter relationshipFilter) tuples))
+        CountRelationships _ relationshipFilter -> do
+            countRead
+            pure (fromIntegral (length (filter (matchesRelationshipFilter relationshipFilter) tuples)))
+        -- This fixture store is immutable — 'ApplyTupleWrites' above is a no-op that
+        -- mints a token — so a filtered delete reports what it would retire and retires
+        -- nothing. The engine tests this store serves never write. 'runTupleStoreInMemory'
+        -- in "En.Conformance.Kikan" is the stateful store, and it deletes for real.
+        DeleteRelationships relationshipFilter ->
+            pure
+                ( fromIntegral (length (filter (matchesRelationshipFilter relationshipFilter) tuples))
+                , ConsistencyToken "in-memory-write"
+                )
         ApplyTupleWrites _ ->
             pure (ConsistencyToken "in-memory-write")
         HeadRevision ->

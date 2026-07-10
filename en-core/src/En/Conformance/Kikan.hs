@@ -6,6 +6,7 @@ module En.Conformance.Kikan (
     touchTuple,
     deleteTupleByKey,
     matchesFilter,
+    matchesRelationshipFilter,
     preconditionHolds,
     runConsistencyStoreInMemoryStrict,
     inMemoryToken,
@@ -41,7 +42,7 @@ module En.Conformance.Kikan (
     testRevision,
 ) where
 
-import Data.List (find)
+import Data.List (find, partition)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isNothing)
 import Data.Text (Text)
@@ -50,12 +51,13 @@ import Data.Time (UTCTime, defaultTimeLocale, parseTimeOrError)
 import Effectful (Eff, (:>))
 import Effectful.Dispatch.Dynamic (interpret_, reinterpret_)
 import Effectful.Error.Static (Error, throwError)
-import Effectful.State.Static.Local (evalState, get, modify)
+import Effectful.State.Static.Local (evalState, get, modify, put)
 
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (..))
 import En.Effect.TupleStore (
     PageState (..),
     Precondition (..),
+    RelationshipFilter (..),
     StoreCursor (..),
     SubjectRelationFilter (..),
     TupleFilter (..),
@@ -66,6 +68,7 @@ import En.Effect.TupleStore (
     TupleWriteRequest (..),
     UsersetQuery (..),
     renderPrecondition,
+    widenTupleFilter,
  )
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph, compileSchema)
@@ -193,6 +196,20 @@ runTupleStoreInMemory initialTuples =
         ReadAllTuples _ limit cursor -> do
             tuples <- get
             pure (pageTuples limit cursor tuples)
+        ReadRelationships _ relationshipFilter limit cursor -> do
+            tuples <- get
+            pure (pageTuples limit cursor (filter (matchesRelationshipFilter relationshipFilter) tuples))
+        CountRelationships _ relationshipFilter -> do
+            tuples <- get
+            pure (fromIntegral (length (filter (matchesRelationshipFilter relationshipFilter) tuples)))
+        -- A real deletion, not a count: this store has been stateful since docs/plans/45
+        -- gave it touch semantics, so the delete-by-filter tests can assert that a
+        -- subsequent read no longer sees the retired grants.
+        DeleteRelationships relationshipFilter -> do
+            tuples <- get
+            let (retired, kept) = partition (matchesRelationshipFilter relationshipFilter) tuples
+            put kept
+            pure (fromIntegral (length retired), ConsistencyToken "in-memory-write")
         ProbeTuples _ object relation subjects -> do
             tuples <- get
             pure
@@ -249,20 +266,36 @@ preconditionHolds tuples = \case
     TupleMustExist tupleFilter -> any (matchesFilter tupleFilter) tuples
     TupleMustNotExist tupleFilter -> not (any (matchesFilter tupleFilter) tuples)
 
-{- | Whether a tuple matches a filter.
+{- | Whether a tuple matches a precondition's filter.
 
-The subject is flattened exactly as the PostgreSQL store stores it: a wildcard
-becomes the object id @*@ with no relation, and a userset carries its relation.
-Otherwise a filter would mean one thing in memory and another in the database.
+Defined by widening into 'matchesRelationshipFilter' rather than by re-implementing the
+comparison, so the two filter types cannot come to mean different things about the same
+tuple.
 -}
 matchesFilter :: TupleFilter -> Tuple -> Bool
-matchesFilter tupleFilter tuple =
-    tupleFilter.objectType == tuple.object.objectType
-        && matchesMaybe tupleFilter.objectId tuple.object.objectId
-        && matchesMaybe tupleFilter.relation tuple.relation
-        && matchesMaybe tupleFilter.subjectType subjectObject.objectType
-        && matchesMaybe tupleFilter.subjectId subjectObject.objectId
-        && matchesSubjectRelation tupleFilter.subjectRelation subjectRelationName
+matchesFilter =
+    matchesRelationshipFilter . widenTupleFilter
+
+{- | Whether a tuple matches a relationship filter. An absent constraint matches anything.
+
+The subject is flattened exactly as the PostgreSQL store stores it: a wildcard becomes
+the object id @*@ with no relation, and a userset carries its relation. Otherwise a
+filter would mean one thing in memory and another in the database — and a filter on
+@subjectType = "user", subjectId = "*"@ would fail to find the wildcard grants it names.
+
+A @caveatName@ constraint matches only tuples carrying a caveat of that name; an
+uncaveated tuple never matches one, which is what makes "every grant under caveat X"
+answerable.
+-}
+matchesRelationshipFilter :: RelationshipFilter -> Tuple -> Bool
+matchesRelationshipFilter relationshipFilter tuple =
+    matchesMaybe relationshipFilter.objectType tuple.object.objectType
+        && matchesMaybe relationshipFilter.objectId tuple.object.objectId
+        && matchesMaybe relationshipFilter.relation tuple.relation
+        && matchesMaybe relationshipFilter.subjectType subjectObject.objectType
+        && matchesMaybe relationshipFilter.subjectId subjectObject.objectId
+        && matchesSubjectRelation relationshipFilter.subjectRelation subjectRelationName
+        && matchesCaveatName relationshipFilter.caveatName
   where
     (subjectObject, subjectRelationName) =
         case tuple.subject of
@@ -270,6 +303,7 @@ matchesFilter tupleFilter tuple =
             SubjectSet object relationName -> (object, Just relationName)
             SubjectWildcard objectType -> (ObjectRef{objectType, objectId = "*"}, Nothing)
 
+    matchesMaybe :: (Eq a) => Maybe a -> a -> Bool
     matchesMaybe expected actual = maybe True (== actual) expected
 
     matchesSubjectRelation expected actual =
@@ -277,6 +311,12 @@ matchesFilter tupleFilter tuple =
             AnySubjectRelation -> True
             NoSubjectRelation -> isNothing actual
             ExactSubjectRelation relationName -> actual == Just relationName
+
+    -- An uncaveated tuple matches no caveat-name constraint, so 'Nothing' on the tuple
+    -- can never equal 'Just name' on the filter.
+    matchesCaveatName = \case
+        Nothing -> True
+        Just name -> ((.name) <$> tuple.caveat) == Just name
 
 {- | Page a filtered tuple list by a row-ordinal cursor.
 

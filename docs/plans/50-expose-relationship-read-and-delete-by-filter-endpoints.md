@@ -46,9 +46,10 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Define `RelationshipFilter` and its validation in `en-core/src/En/Effect/TupleStore.hs`; add the three new effect operations (`ReadRelationships`, `CountRelationships`, `DeleteRelationships`) with smart-constructor wrappers.
-- [ ] M1: Extend the in-memory interpreter `runTupleStoreInMemory` in `en-core/src/En/Conformance/Kikan.hs` to handle the three new operations.
-- [ ] M1: Add en-core unit tests for filter validation and in-memory filter matching (`en-core/test/Main.hs`).
+- [x] M0 (2026-07-09): baseline `cabal build all` green; reconciled this plan against the tree (see Surprises & Discoveries and the Decision Log), added the `intention` frontmatter field.
+- [x] M1 (2026-07-09): defined `RelationshipFilter`, `anyRelationshipFilter`, `widenTupleFilter`, and `validateRelationshipFilter` in `en-core/src/En/Effect/TupleStore.hs`; added the three effect operations (`ReadRelationships`, `CountRelationships`, `DeleteRelationships`) with smart-constructor wrappers.
+- [x] M1 (2026-07-09): extended the in-memory interpreter `runTupleStoreInMemory` in `en-core/src/En/Conformance/Kikan.hs` to handle the three new operations, rewriting `matchesFilter` as `matchesRelationshipFilter . widenTupleFilter` so one matcher serves both filter types. Also extended the read-only fixture interpreter in `en-core/test/Main.hs`, which the GADT made a compile error.
+- [x] M1 (2026-07-09): added en-core unit tests — `testRelationshipFilterValidation`, `testRelationshipFilterMatching`, `testWidenTupleFilterAgrees`, `testRelationshipStoreOperations`. `cabal test en-core` passes (both `en-core-interface-tests` and `en-core-conformance`).
 - [ ] M2: Implement the PostgreSQL sessions and statements for read, count, and transactional delete-by-filter in `en-postgres/src/En/Postgres/TupleStore.hs`.
 - [ ] M2: Extend `en-postgres/integration-test/Main.hs` with read-by-filter, count, and delete-by-filter scenarios (including snapshot visibility of the returned token).
 - [ ] M2: Capture `EXPLAIN` output for the index-served and seq-scan filter shapes and record it in Surprises & Discoveries.
