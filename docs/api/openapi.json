@@ -1,0 +1,2547 @@
+{
+  "components": {
+    "schemas": {
+      "BatchCheckPairWire": {
+        "properties": {
+          "object": {
+            "$ref": "#/components/schemas/ObjectRefWire"
+          },
+          "permission": {
+            "type": "string"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/SubjectWire"
+          }
+        },
+        "required": [
+          "subject",
+          "permission",
+          "object"
+        ],
+        "type": "object"
+      },
+      "BatchCheckRequestWire": {
+        "properties": {
+          "consistency": {
+            "$ref": "#/components/schemas/ConsistencyWire"
+          },
+          "context": {
+            "$ref": "#/components/schemas/CaveatContextWire"
+          },
+          "pairs": {
+            "items": {
+              "$ref": "#/components/schemas/BatchCheckPairWire"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "consistency",
+          "context",
+          "pairs"
+        ],
+        "type": "object"
+      },
+      "BatchCheckResponseWire": {
+        "properties": {
+          "checkedAt": {
+            "type": "string"
+          },
+          "decisions": {
+            "items": {
+              "$ref": "#/components/schemas/CheckDecisionWire"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "decisions",
+          "checkedAt"
+        ],
+        "type": "object"
+      },
+      "CaveatContextWire": {
+        "properties": {
+          "values": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/CaveatValueWire"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "values"
+        ],
+        "type": "object"
+      },
+      "CaveatObligationWire": {
+        "properties": {
+          "caveat": {
+            "type": "string"
+          },
+          "missingContext": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "caveat",
+          "missingContext"
+        ],
+        "type": "object"
+      },
+      "CaveatPayloadWire": {
+        "properties": {
+          "values": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/CaveatValueWire"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "values"
+        ],
+        "type": "object"
+      },
+      "CaveatValueWire": {
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "text"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "bool"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "integer"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "timestamp"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "$ref": "#/components/schemas/UTCTime"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "enum"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ChangeKindWire": {
+        "enum": [
+          "touch",
+          "delete"
+        ],
+        "type": "string"
+      },
+      "CheckDecisionWire": {
+        "oneOf": [
+          {
+            "properties": {
+              "result": {
+                "enum": [
+                  "allowed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "result": {
+                "enum": [
+                  "denied"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "obligations": {
+                "items": {
+                  "$ref": "#/components/schemas/CaveatObligationWire"
+                },
+                "type": "array"
+              },
+              "result": {
+                "enum": [
+                  "conditional"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "obligations"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CheckRequestWire": {
+        "properties": {
+          "consistency": {
+            "$ref": "#/components/schemas/ConsistencyWire"
+          },
+          "context": {
+            "$ref": "#/components/schemas/CaveatContextWire"
+          },
+          "object": {
+            "$ref": "#/components/schemas/ObjectRefWire"
+          },
+          "permission": {
+            "type": "string"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/SubjectWire"
+          }
+        },
+        "required": [
+          "consistency",
+          "context",
+          "subject",
+          "permission",
+          "object"
+        ],
+        "type": "object"
+      },
+      "CheckResponseWire": {
+        "properties": {
+          "checkedAt": {
+            "type": "string"
+          },
+          "decision": {
+            "$ref": "#/components/schemas/CheckDecisionWire"
+          }
+        },
+        "required": [
+          "decision",
+          "checkedAt"
+        ],
+        "type": "object"
+      },
+      "ConsistencyWire": {
+        "oneOf": [
+          {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "minimizeLatency"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "fullyConsistent"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "atLeastAsFresh"
+                ],
+                "type": "string"
+              },
+              "token": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "token"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "atExactSnapshot"
+                ],
+                "type": "string"
+              },
+              "token": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "token"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "DeleteRelationshipsRequestWire": {
+        "description": "dryRun has no default. A dry run reports how many relationships the filter matches and deletes nothing; dryRun=false retires every match and returns a consistency token that sees the revocation.",
+        "properties": {
+          "dryRun": {
+            "type": "boolean"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/RelationshipFilterWire"
+          }
+        },
+        "required": [
+          "filter",
+          "dryRun"
+        ],
+        "type": "object"
+      },
+      "DeleteRelationshipsResponseWire": {
+        "properties": {
+          "count": {
+            "type": "integer"
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "token": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "dryRun",
+          "count"
+        ],
+        "type": "object"
+      },
+      "DeleteTuplesRequestWire": {
+        "properties": {
+          "preconditions": {
+            "items": {
+              "$ref": "#/components/schemas/PreconditionWire"
+            },
+            "type": "array"
+          },
+          "tuples": {
+            "items": {
+              "$ref": "#/components/schemas/TupleWire"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tuples"
+        ],
+        "type": "object"
+      },
+      "ErrorEnvelopeWire": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "type": "object"
+      },
+      "ExpandNodeWire": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "subject"
+                ],
+                "type": "string"
+              },
+              "subject": {
+                "$ref": "#/components/schemas/SubjectWire"
+              }
+            },
+            "required": [
+              "kind",
+              "subject"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "children": {
+                "items": {
+                  "$ref": "#/components/schemas/ExpandNodeWire"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "enum": [
+                  "userset"
+                ],
+                "type": "string"
+              },
+              "object": {
+                "$ref": "#/components/schemas/ObjectRefWire"
+              },
+              "relation": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "object",
+              "relation",
+              "children"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "caveat": {
+                "type": "string"
+              },
+              "children": {
+                "items": {
+                  "$ref": "#/components/schemas/ExpandNodeWire"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "enum": [
+                  "caveated"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "caveat",
+              "children"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "children": {
+                "items": {
+                  "$ref": "#/components/schemas/ExpandNodeWire"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "enum": [
+                  "union"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "children"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "children": {
+                "items": {
+                  "$ref": "#/components/schemas/ExpandNodeWire"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "enum": [
+                  "intersection"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "children"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "granted": {
+                "items": {
+                  "$ref": "#/components/schemas/ExpandNodeWire"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "enum": [
+                  "exclusion"
+                ],
+                "type": "string"
+              },
+              "subtracted": {
+                "items": {
+                  "$ref": "#/components/schemas/ExpandNodeWire"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "granted",
+              "subtracted"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ExpandRequestWire": {
+        "properties": {
+          "consistency": {
+            "$ref": "#/components/schemas/ConsistencyWire"
+          },
+          "context": {
+            "$ref": "#/components/schemas/CaveatContextWire"
+          },
+          "cursor": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "object": {
+            "$ref": "#/components/schemas/ObjectRefWire"
+          },
+          "permission": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "consistency",
+          "object",
+          "permission",
+          "context",
+          "limit",
+          "cursor"
+        ],
+        "type": "object"
+      },
+      "ExpandStateWire": {
+        "oneOf": [
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "exhausted"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "hasMore"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "cursor"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "truncated"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "cursor"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ExpandTreeWire": {
+        "properties": {
+          "checkedAt": {
+            "type": "string"
+          },
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/ExpandNodeWire"
+            },
+            "type": "array"
+          },
+          "permission": {
+            "type": "string"
+          },
+          "root": {
+            "$ref": "#/components/schemas/ObjectRefWire"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ExpandStateWire"
+          }
+        },
+        "required": [
+          "root",
+          "permission",
+          "children",
+          "state",
+          "checkedAt"
+        ],
+        "type": "object"
+      },
+      "LookupObjectWire": {
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/CheckDecisionWire"
+          },
+          "object": {
+            "$ref": "#/components/schemas/ObjectRefWire"
+          }
+        },
+        "required": [
+          "object",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "LookupPageWire": {
+        "properties": {
+          "checkedAt": {
+            "type": "string"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/LookupObjectWire"
+            },
+            "type": "array"
+          },
+          "state": {
+            "$ref": "#/components/schemas/LookupStateWire"
+          }
+        },
+        "required": [
+          "objects",
+          "state",
+          "checkedAt"
+        ],
+        "type": "object"
+      },
+      "LookupRequestWire": {
+        "properties": {
+          "consistency": {
+            "$ref": "#/components/schemas/ConsistencyWire"
+          },
+          "context": {
+            "$ref": "#/components/schemas/CaveatContextWire"
+          },
+          "cursor": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deadlineMillis": {
+            "oneOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "objectType": {
+            "type": "string"
+          },
+          "permission": {
+            "type": "string"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/SubjectWire"
+          }
+        },
+        "required": [
+          "consistency",
+          "subject",
+          "permission",
+          "objectType",
+          "context",
+          "limit",
+          "cursor",
+          "deadlineMillis"
+        ],
+        "type": "object"
+      },
+      "LookupStateWire": {
+        "oneOf": [
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "exhausted"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "hasMore"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "cursor"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "truncated"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "cursor"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "LookupSubjectWire": {
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/CheckDecisionWire"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/SubjectWire"
+          }
+        },
+        "required": [
+          "subject",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "LookupSubjectsPageWire": {
+        "properties": {
+          "checkedAt": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/LookupSubjectsStateWire"
+          },
+          "subjects": {
+            "items": {
+              "$ref": "#/components/schemas/LookupSubjectWire"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "subjects",
+          "state",
+          "checkedAt"
+        ],
+        "type": "object"
+      },
+      "LookupSubjectsRequestWire": {
+        "properties": {
+          "consistency": {
+            "$ref": "#/components/schemas/ConsistencyWire"
+          },
+          "context": {
+            "$ref": "#/components/schemas/CaveatContextWire"
+          },
+          "cursor": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deadlineMillis": {
+            "oneOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "object": {
+            "$ref": "#/components/schemas/ObjectRefWire"
+          },
+          "permission": {
+            "type": "string"
+          },
+          "subjectType": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "consistency",
+          "object",
+          "permission",
+          "subjectType",
+          "context",
+          "limit",
+          "cursor",
+          "deadlineMillis"
+        ],
+        "type": "object"
+      },
+      "LookupSubjectsStateWire": {
+        "oneOf": [
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "exhausted"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "hasMore"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "cursor"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "truncated"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "cursor"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "MintGrantRequestWire": {
+        "description": "Mints a Biscuit decision token if the server's own check for this subject/permission/object is Allowed. subject must be a concrete \"id\" subject. ttlSeconds, if given, must be positive and no greater than the server maximum (else 400). Returns 403 when the decision is not Allowed, and 404 when grant minting is not configured.",
+        "properties": {
+          "audience": {
+            "type": "string"
+          },
+          "consistency": {
+            "$ref": "#/components/schemas/ConsistencyWire"
+          },
+          "context": {
+            "$ref": "#/components/schemas/CaveatContextWire"
+          },
+          "object": {
+            "$ref": "#/components/schemas/ObjectRefWire"
+          },
+          "permission": {
+            "type": "string"
+          },
+          "requestId": {
+            "type": "string"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/SubjectWire"
+          },
+          "ttlSeconds": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "consistency",
+          "context",
+          "subject",
+          "permission",
+          "object",
+          "audience"
+        ],
+        "type": "object"
+      },
+      "MintGrantResponseWire": {
+        "description": "token is the URL-safe base64 Biscuit to forward downstream in the X-En-Biscuit header. revocationIds are the token's built-in block revocation ids, hex-encoded. checkedAt is the consistency token the mint's check evaluated at, also signed into the grant.",
+        "properties": {
+          "checkedAt": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "$ref": "#/components/schemas/UTCTime"
+          },
+          "revocationIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "expiresAt",
+          "revocationIds",
+          "checkedAt"
+        ],
+        "type": "object"
+      },
+      "ObjectRefWire": {
+        "properties": {
+          "objectId": {
+            "type": "string"
+          },
+          "objectType": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "objectType",
+          "objectId"
+        ],
+        "type": "object"
+      },
+      "PreconditionWire": {
+        "oneOf": [
+          {
+            "properties": {
+              "filter": {
+                "$ref": "#/components/schemas/TupleFilterWire"
+              },
+              "kind": {
+                "enum": [
+                  "mustExist"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "filter"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "filter": {
+                "$ref": "#/components/schemas/TupleFilterWire"
+              },
+              "kind": {
+                "enum": [
+                  "mustNotExist"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "filter"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ReadRelationshipsRequestWire": {
+        "properties": {
+          "consistency": {
+            "$ref": "#/components/schemas/ConsistencyWire"
+          },
+          "cursor": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "filter": {
+            "$ref": "#/components/schemas/RelationshipFilterWire"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "consistency",
+          "filter",
+          "limit",
+          "cursor"
+        ],
+        "type": "object"
+      },
+      "ReadRelationshipsResponseWire": {
+        "properties": {
+          "checkedAt": {
+            "type": "string"
+          },
+          "relationships": {
+            "items": {
+              "$ref": "#/components/schemas/TupleWire"
+            },
+            "type": "array"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RelationshipsStateWire"
+          }
+        },
+        "required": [
+          "relationships",
+          "state",
+          "checkedAt"
+        ],
+        "type": "object"
+      },
+      "RelationshipFilterWire": {
+        "description": "Must constrain objectType or subjectType. objectId requires objectType; subjectId and a subjectRelation other than \"any\" require subjectType. A filter anchored on neither end would scan the whole store and is rejected with 400.",
+        "properties": {
+          "caveatName": {
+            "type": "string"
+          },
+          "objectId": {
+            "type": "string"
+          },
+          "objectType": {
+            "type": "string"
+          },
+          "relation": {
+            "type": "string"
+          },
+          "subjectId": {
+            "type": "string"
+          },
+          "subjectRelation": {
+            "$ref": "#/components/schemas/SubjectRelationFilterWire"
+          },
+          "subjectType": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "RelationshipsStateWire": {
+        "oneOf": [
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "exhausted"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "hasMore"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "cursor"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SchemaInfoWire": {
+        "description": "source is the verbatim schema text the server loaded, not a rendering of the compiled model. origin is the file it came from, or builtin-demo. hash is the fingerprint every consistency token is stamped with: when it changes, every token minted under the old one is refused. There is no checkedAt — this reads no tuples.",
+        "properties": {
+          "hash": {
+            "type": "string"
+          },
+          "loadedAt": {
+            "$ref": "#/components/schemas/UTCTime"
+          },
+          "origin": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "hash",
+          "origin",
+          "loadedAt"
+        ],
+        "type": "object"
+      },
+      "SubjectRelationFilterWire": {
+        "oneOf": [
+          {
+            "properties": {
+              "match": {
+                "enum": [
+                  "any"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "match"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "match": {
+                "enum": [
+                  "none"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "match"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "match": {
+                "enum": [
+                  "exact"
+                ],
+                "type": "string"
+              },
+              "relation": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "match",
+              "relation"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SubjectWire": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "id"
+                ],
+                "type": "string"
+              },
+              "objectId": {
+                "type": "string"
+              },
+              "objectType": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "objectType",
+              "objectId"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "set"
+                ],
+                "type": "string"
+              },
+              "objectId": {
+                "type": "string"
+              },
+              "objectType": {
+                "type": "string"
+              },
+              "relation": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "objectType",
+              "objectId",
+              "relation"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "wildcard"
+                ],
+                "type": "string"
+              },
+              "objectType": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "objectType"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "TupleCaveatWire": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/CaveatPayloadWire"
+          }
+        },
+        "required": [
+          "name",
+          "payload"
+        ],
+        "type": "object"
+      },
+      "TupleChangeWire": {
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ChangeKindWire"
+          },
+          "tuple": {
+            "$ref": "#/components/schemas/TupleWire"
+          }
+        },
+        "required": [
+          "kind",
+          "tuple"
+        ],
+        "type": "object"
+      },
+      "TupleFilterWire": {
+        "properties": {
+          "objectId": {
+            "type": "string"
+          },
+          "objectType": {
+            "type": "string"
+          },
+          "relation": {
+            "type": "string"
+          },
+          "subjectId": {
+            "type": "string"
+          },
+          "subjectRelation": {
+            "$ref": "#/components/schemas/SubjectRelationFilterWire"
+          },
+          "subjectType": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "objectType"
+        ],
+        "type": "object"
+      },
+      "TupleWire": {
+        "properties": {
+          "caveat": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TupleCaveatWire"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "object": {
+            "$ref": "#/components/schemas/ObjectRefWire"
+          },
+          "relation": {
+            "type": "string"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/SubjectWire"
+          }
+        },
+        "required": [
+          "object",
+          "relation",
+          "subject",
+          "caveat"
+        ],
+        "type": "object"
+      },
+      "UTCTime": {
+        "example": "2016-07-22T00:00:00Z",
+        "format": "yyyy-mm-ddThh:MM:ssZ",
+        "type": "string"
+      },
+      "WatchRequestWire": {
+        "description": "Supply cursor to resume a subscription, startToken to start from the snapshot a consistency token pins, or neither to start from now. Supplying both is rejected with 400. There is no consistency field: a poll's window is fixed by its start position and the store's head.",
+        "properties": {
+          "cursor": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "filter": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RelationshipFilterWire"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "startToken": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "limit"
+        ],
+        "type": "object"
+      },
+      "WatchResponseWire": {
+        "description": "changes carries no order: it is the set difference of the live tuple set across the batch's window. cursor is always present, including on an empty batch, and is the only thing to send back. An empty changes array does not mean the feed is caught up; a caught-up feed returns a cursor equal to the one it was given.",
+        "properties": {
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/TupleChangeWire"
+            },
+            "type": "array"
+          },
+          "checkedAt": {
+            "type": "string"
+          },
+          "cursor": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "changes",
+          "cursor",
+          "checkedAt"
+        ],
+        "type": "object"
+      },
+      "WriteTuplesRequestWire": {
+        "properties": {
+          "deletes": {
+            "items": {
+              "$ref": "#/components/schemas/TupleWire"
+            },
+            "type": "array"
+          },
+          "preconditions": {
+            "items": {
+              "$ref": "#/components/schemas/PreconditionWire"
+            },
+            "type": "array"
+          },
+          "tuples": {
+            "items": {
+              "$ref": "#/components/schemas/TupleWire"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tuples"
+        ],
+        "type": "object"
+      },
+      "WriteTuplesResponseWire": {
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Relationship-based authorization: check, lookup, expand, and write.",
+    "title": "en authorization API",
+    "version": "v1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/batch-check": {
+      "post": {
+        "operationId": "createV1BatchCheck",
+        "requestBody": {
+          "content": {
+            "application/json;charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchCheckRequestWire"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchCheckResponseWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchCheckResponseWire"
+                }
+              }
+            },
+            "description": "One decision per requested pair, in order"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Invalid request or `body`"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Write precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Resolution limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Tuple store unavailable"
+          }
+        }
+      }
+    },
+    "/v1/check": {
+      "post": {
+        "operationId": "createV1Check",
+        "requestBody": {
+          "content": {
+            "application/json;charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckRequestWire"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckResponseWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckResponseWire"
+                }
+              }
+            },
+            "description": "The authorization decision"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Invalid request or `body`"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Write precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Resolution limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Tuple store unavailable"
+          }
+        }
+      }
+    },
+    "/v1/expand": {
+      "post": {
+        "operationId": "createV1Expand",
+        "requestBody": {
+          "content": {
+            "application/json;charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/ExpandRequestWire"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExpandTreeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExpandTreeWire"
+                }
+              }
+            },
+            "description": "The permission's subject tree"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Invalid request or `body`"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Write precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Resolution limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Tuple store unavailable"
+          }
+        }
+      }
+    },
+    "/v1/grants": {
+      "post": {
+        "operationId": "createV1Grants",
+        "requestBody": {
+          "content": {
+            "application/json;charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/MintGrantRequestWire"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/MintGrantResponseWire"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Invalid `body`"
+          }
+        }
+      }
+    },
+    "/v1/lookup": {
+      "post": {
+        "operationId": "createV1Lookup",
+        "requestBody": {
+          "content": {
+            "application/json;charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/LookupRequestWire"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LookupPageWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/LookupPageWire"
+                }
+              }
+            },
+            "description": "A page of authorized objects"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Invalid request or `body`"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Write precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Resolution limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Tuple store unavailable"
+          }
+        }
+      }
+    },
+    "/v1/lookup-subjects": {
+      "post": {
+        "operationId": "createV1LookupSubjects",
+        "requestBody": {
+          "content": {
+            "application/json;charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/LookupSubjectsRequestWire"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LookupSubjectsPageWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/LookupSubjectsPageWire"
+                }
+              }
+            },
+            "description": "A page of authorized subjects"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Invalid request or `body`"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Write precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Resolution limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Tuple store unavailable"
+          }
+        }
+      }
+    },
+    "/v1/relationships": {
+      "post": {
+        "operationId": "createV1Relationships",
+        "requestBody": {
+          "content": {
+            "application/json;charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteTuplesRequestWire"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteTuplesResponseWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteTuplesResponseWire"
+                }
+              }
+            },
+            "description": "Consistency token for the write"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Invalid request or `body`"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Write precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Resolution limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Tuple store unavailable"
+          }
+        }
+      }
+    },
+    "/v1/relationships/delete": {
+      "post": {
+        "operationId": "createV1RelationshipsDelete",
+        "requestBody": {
+          "content": {
+            "application/json;charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/DeleteTuplesRequestWire"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteTuplesResponseWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteTuplesResponseWire"
+                }
+              }
+            },
+            "description": "Consistency token for the deletion"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Invalid request or `body`"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Write precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Resolution limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Tuple store unavailable"
+          }
+        }
+      }
+    },
+    "/v1/relationships/delete-by-filter": {
+      "post": {
+        "operationId": "createV1RelationshipsDeleteByFilter",
+        "requestBody": {
+          "content": {
+            "application/json;charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/DeleteRelationshipsRequestWire"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteRelationshipsResponseWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteRelationshipsResponseWire"
+                }
+              }
+            },
+            "description": "How many relationships the filter matched"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Invalid request or `body`"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Write precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Resolution limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Tuple store unavailable"
+          }
+        }
+      }
+    },
+    "/v1/relationships/query": {
+      "post": {
+        "operationId": "createV1RelationshipsQuery",
+        "requestBody": {
+          "content": {
+            "application/json;charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/ReadRelationshipsRequestWire"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadRelationshipsResponseWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadRelationshipsResponseWire"
+                }
+              }
+            },
+            "description": "A page of stored relationships"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Invalid request or `body`"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Write precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Resolution limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Tuple store unavailable"
+          }
+        }
+      }
+    },
+    "/v1/schema": {
+      "get": {
+        "operationId": "getV1Schema",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaInfoWire"
+                }
+              }
+            },
+            "description": ""
+          }
+        }
+      }
+    },
+    "/v1/watch": {
+      "post": {
+        "operationId": "createV1Watch",
+        "requestBody": {
+          "content": {
+            "application/json;charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/WatchRequestWire"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WatchResponseWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/WatchResponseWire"
+                }
+              }
+            },
+            "description": "A batch of tuple changes, and a cursor to resume from"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Invalid request or `body`"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Write precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Resolution limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                }
+              }
+            },
+            "description": "Tuple store unavailable"
+          }
+        }
+      }
+    }
+  }
+}

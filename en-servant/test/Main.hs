@@ -13,6 +13,7 @@ import Data.Functor ((<&>))
 import Data.List qualified as List
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
+import Data.OpenApi (ToSchema, validateToJSON)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -131,6 +132,7 @@ main = do
     wireContractTests
     errorModelTests
     openApiDocumentTests
+    toJsonMatchesToSchema
 
     let env =
             Env
@@ -570,6 +572,149 @@ writePreconditionTests env = do
             , subjectId = Just subjectId
             , subjectRelation = Just NoSubjectRelationWire
             }
+
+{- | The third OpenAPI conformance property: every wire DTO's 'ToJSON' produces JSON that
+validates against its own hand-written 'ToSchema'.
+
+en is precisely the case this guards — both its aeson and its schema are hand-written (the
+aeson in the slices, the schema as orphans in "En.Servant.OpenApi"), so a field renamed on one
+side only is invisible until a generated client fails to decode. 'validateToJSON' returns the
+list of ways an encoded value violates its schema; it must be empty for every DTO. The
+'ToSchema' instances arrive via the (instance-bearing) import of "En.Servant.OpenApi".
+-}
+toJsonMatchesToSchema :: IO ()
+toJsonMatchesToSchema = do
+    conforms "ObjectRefWire" objRef
+    conforms "SubjectWire/id" subj
+    conforms "SubjectWire/set" (SubjectSetWire objRef "member")
+    conforms "SubjectWire/wildcard" (SubjectWildcardWire "user")
+    conforms "CaveatValueWire" (ValueTextWire "hello")
+    conforms "CaveatPayloadWire" payload
+    conforms "CaveatContextWire" ctx
+    conforms "TupleCaveatWire" caveat
+    conforms "TupleWire" tuple
+    conforms "ConsistencyWire/minimize" MinimizeLatencyWire
+    conforms "ConsistencyWire/atLeastAsFresh" (AtLeastAsFreshWire "tok")
+    conforms "CheckRequestWire" checkRequest
+    conforms "CaveatObligationWire" obligation
+    conforms "CheckDecisionWire/allowed" AllowedWire
+    conforms "CheckDecisionWire/conditional" (ConditionalWire [obligation])
+    conforms "CheckResponseWire" CheckResponseWire{decision = AllowedWire, checkedAt = "tok"}
+    conforms "MintGrantRequestWire" mintRequest
+    conforms "MintGrantResponseWire" MintGrantResponseWire{token = "en.tok", expiresAt = noon, revocationIds = ["ab"], checkedAt = "tok"}
+    conforms "BatchCheckPairWire" batchPair
+    conforms "BatchCheckRequestWire" BatchCheckRequestWire{consistency = MinimizeLatencyWire, context = ctx, pairs = [batchPair]}
+    conforms "BatchCheckResponseWire" BatchCheckResponseWire{decisions = [AllowedWire], checkedAt = "tok"}
+    conforms "LookupRequestWire" lookupRequest
+    conforms "LookupObjectWire" lookupObject
+    conforms "LookupStateWire/exhausted" LookupExhaustedWire
+    conforms "LookupStateWire/hasMore" (LookupHasMoreWire "c")
+    conforms "LookupPageWire" LookupPageWire{objects = [lookupObject], state = LookupExhaustedWire, checkedAt = "tok"}
+    conforms "LookupSubjectsRequestWire" lookupSubjectsRequest
+    conforms "LookupSubjectWire" lookupSubject
+    conforms "LookupSubjectsStateWire" SubjectsExhaustedWire
+    conforms "LookupSubjectsPageWire" LookupSubjectsPageWire{subjects = [lookupSubject], state = SubjectsExhaustedWire, checkedAt = "tok"}
+    conforms "ExpandRequestWire" expandRequest
+    conforms "ExpandNodeWire/subject" (ExpandSubjectWire subj)
+    conforms "ExpandNodeWire/union" (ExpandUnionWire [ExpandSubjectWire subj])
+    conforms "ExpandStateWire" ExpandExhaustedWire
+    conforms "ExpandTreeWire" ExpandTreeWire{root = objRef, permission = "view", children = [], state = ExpandExhaustedWire, checkedAt = "tok"}
+    conforms "SubjectRelationFilterWire" NoSubjectRelationWire
+    conforms "TupleFilterWire" tupleFilter
+    conforms "RelationshipFilterWire" relFilter
+    conforms "ReadRelationshipsRequestWire" ReadRelationshipsRequestWire{consistency = MinimizeLatencyWire, filter = relFilter, limit = 100, cursor = Nothing}
+    conforms "RelationshipsStateWire" RelationshipsExhaustedWire
+    conforms "ReadRelationshipsResponseWire" ReadRelationshipsResponseWire{relationships = [tuple], state = RelationshipsExhaustedWire, checkedAt = "tok"}
+    conforms "DeleteRelationshipsRequestWire" DeleteRelationshipsRequestWire{filter = relFilter, dryRun = True}
+    conforms "DeleteRelationshipsResponseWire" DeleteRelationshipsResponseWire{dryRun = True, count = 3, token = Nothing}
+    conforms "WatchRequestWire" WatchRequestWire{cursor = Nothing, startToken = Nothing, filter = Just relFilter, limit = 100}
+    conforms "ChangeKindWire" TouchWire
+    conforms "TupleChangeWire" TupleChangeWire{kind = TouchWire, tuple = tuple}
+    conforms "WatchResponseWire" WatchResponseWire{changes = [TupleChangeWire{kind = TouchWire, tuple = tuple}], cursor = "c", checkedAt = "tok"}
+    conforms "SchemaInfoWire" SchemaInfoWire{source = "object user {}\n", hash = "fnv1a64:abc", origin = "builtin-demo", loadedAt = noon}
+    conforms "PreconditionWire" (TupleMustExistWire tupleFilter)
+    conforms "WriteTuplesRequestWire" WriteTuplesRequestWire{tuples = [tuple], deletes = Nothing, preconditions = Nothing}
+    conforms "DeleteTuplesRequestWire" DeleteTuplesRequestWire{tuples = [tuple], preconditions = Nothing}
+    conforms "WriteTuplesResponseWire" WriteTuplesResponseWire{token = "en.tok"}
+    conforms "ErrorEnvelopeWire" (ErrorEnvelopeWire "unknown_relation" "unknown relation" False)
+  where
+    noon = UTCTime (fromGregorian 2026 7 7) (secondsToDiffTime (12 * 3600))
+    objRef = ObjectRefWire{objectType = "space", objectId = "project-x"}
+    userRef = ObjectRefWire{objectType = "user", objectId = "alice"}
+    subj = SubjectIdWire userRef
+    ctx = CaveatContextWire Map.empty
+    payload = CaveatPayloadWire (Map.fromList [("now", ValueTextWire "v")])
+    caveat = TupleCaveatWire{name = "business_hours", payload = payload}
+    tuple = TupleWire{object = objRef, relation = "viewer", subject = subj, caveat = Nothing}
+    obligation = CaveatObligationWire{caveat = "business_hours", missingContext = ["now"]}
+    batchPair = BatchCheckPairWire{subject = subj, permission = "view", object = objRef}
+    lookupObject = LookupObjectWire{object = objRef, decision = AllowedWire}
+    lookupSubject = LookupSubjectWire{subject = subj, decision = AllowedWire}
+    tupleFilter =
+        TupleFilterWire
+            { objectType = "space"
+            , objectId = Just "project-x"
+            , relation = Just "viewer"
+            , subjectType = Just "user"
+            , subjectId = Just "alice"
+            , subjectRelation = Just NoSubjectRelationWire
+            }
+    relFilter = subjectFilterWire "user" "alice"
+    checkRequest =
+        CheckRequestWire
+            { consistency = MinimizeLatencyWire
+            , context = ctx
+            , subject = subj
+            , permission = "view"
+            , object = objRef
+            }
+    mintRequest =
+        MintGrantRequestWire
+            { consistency = MinimizeLatencyWire
+            , context = ctx
+            , subject = subj
+            , permission = "view"
+            , object = objRef
+            , audience = "doc-service"
+            , ttlSeconds = Just 120
+            , requestId = Just "req-1"
+            }
+    lookupRequest =
+        LookupRequestWire
+            { consistency = MinimizeLatencyWire
+            , subject = subj
+            , permission = "view"
+            , objectType = "space"
+            , context = ctx
+            , limit = 10
+            , cursor = Nothing
+            , deadlineMillis = Nothing
+            }
+    lookupSubjectsRequest =
+        LookupSubjectsRequestWire
+            { consistency = MinimizeLatencyWire
+            , object = objRef
+            , permission = "view"
+            , subjectType = "user"
+            , context = ctx
+            , limit = 10
+            , cursor = Nothing
+            , deadlineMillis = Nothing
+            }
+    expandRequest =
+        ExpandRequestWire
+            { consistency = MinimizeLatencyWire
+            , object = objRef
+            , permission = "view"
+            , context = ctx
+            , limit = 10
+            , cursor = Nothing
+            }
+
+    conforms :: (ToJSON a, ToSchema a) => String -> a -> IO ()
+    conforms label value = case validateToJSON value of
+        [] -> pure ()
+        errs -> fail (label <> " does not match its schema: " <> show errs)
 
 {- | End-to-end routing and the error-envelope hook, driven through the real WAI
 'Application' rather than by calling handlers directly.

@@ -26,8 +26,9 @@ module En.Servant.OpenApi (
     appWithOpenApi,
 ) where
 
-import Control.Lens ((&), (.~), (?~))
+import Control.Lens ((%~), (&), (.~), (?~), _Just)
 import Data.Aeson qualified as Aeson
+import Data.Char (toUpper)
 import Data.HashMap.Strict.InsOrd qualified as InsOrdHashMap
 import Data.OpenApi (
     AdditionalProperties (..),
@@ -44,9 +45,13 @@ import Data.OpenApi (
     declareSchemaRef,
     description,
     enum_,
+    get,
     info,
     items,
     oneOf,
+    operationId,
+    paths,
+    post,
     properties,
     required,
     title,
@@ -56,6 +61,7 @@ import Data.OpenApi (
 import Data.OpenApi.Declare (Declare)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
+import Data.Text qualified as Text
 import Data.Time (UTCTime)
 import Effectful (IOE)
 import Effectful qualified
@@ -147,6 +153,42 @@ enOpenApi =
         & info . title .~ "en authorization API"
         & info . version .~ "v1"
         & info . description ?~ "Relationship-based authorization: check, lookup, expand, and write."
+        & withOperationIds
+
+{- | Assign a stable @operationId@ to every operation, derived deterministically from its
+method and path, so a code generator consuming the checked-in @docs/api/openapi.json@ emits
+deterministic method names that do not churn when the document is regenerated. (en's own
+Haskell client is servant's @genericClient@, whose names come from the 'EnApi' record fields,
+so this matters only for a non-Haskell client generated from the artifact.)
+
+en's operations are all @POST@ but @GET \/v1\/schema@, so in practice only the @post@ arm and
+the one @get@ arm fire; a @get@ arm is kept for parity. An id is set only where one is not
+already present, so a hand-assigned id would win.
+-}
+withOperationIds :: OpenApi -> OpenApi
+withOperationIds =
+    paths %~ InsOrdHashMap.mapWithKey setForPath
+  where
+    setForPath path item =
+        item
+            & post . _Just . operationId %~ orSet ("create" <> key)
+            & get . _Just . operationId %~ orSet ("get" <> key)
+      where
+        key = camel path
+    orSet identifier = Just . maybe identifier id
+
+{- | Turn a path into a PascalCase identifier fragment: @\/v1\/relationships\/delete@ becomes
+@V1RelationshipsDelete@. Splits on @\/@ and @-@ and capitalizes each segment, so distinct
+paths always yield distinct fragments.
+-}
+camel :: FilePath -> Text
+camel =
+    Text.concat . map capitalize . filter (not . Text.null) . Text.split isSep . Text.pack
+  where
+    isSep c = c == '/' || c == '-'
+    capitalize segment = case Text.uncons segment of
+        Just (c, rest) -> Text.cons (toUpper c) rest
+        Nothing -> segment
 
 appWithOpenApi ::
     ( ConsistencyStore Effectful.:> es

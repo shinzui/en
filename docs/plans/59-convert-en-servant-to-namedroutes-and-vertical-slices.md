@@ -139,13 +139,20 @@ trailing it.
       and a dated Revision Note naming plan 59 was appended. The `ServedAPI` OpenAPI-mount `:<|>`
       is intentionally kept (correct mounting use); the `MultiVerb` response content plan 35
       specifies is untouched.
-- [ ] Milestone 5: bring en's OpenAPI derivation up to the full canonical recipe — add stable
-      `operationId`s to `enOpenApi`, add an `en-openapi` executable that writes a checked-in
-      `docs/api/openapi.json` (sorted keys, trailing newline), commit the artifact, add a drift
-      check (`cabal run en-openapi && git diff --exit-code`) to the justfile / CI, and add the
-      one conformance test en lacks (every DTO's `ToJSON` validates against its `ToSchema`). The
-      derivation itself is unchanged — it still comes from `toOpenApi apiProxy`, on the pinned
-      `shinzui` forks. `cabal build all` and `cabal test all` pass.
+- [x] Milestone 5 (done 2026-07-10): brought en's OpenAPI setup up to the full canonical recipe.
+      Confirmed the fork pins (`shinzui/openapi-hs`, `shinzui/servant-openapi-hs`; no Hackage
+      `openapi3`). Added `withOperationIds` to `enOpenApi` (deterministic `createV1…`/`getV1Schema`
+      ids via the `Data.OpenApi` lenses + a `camel` helper — see the Decision Log on why en adds
+      these though meibo lacks them). Added an `en-openapi` executable
+      (`en-servant/app/OpenApi.hs`) that writes `docs/api/openapi.json` (sorted keys, trailing
+      newline) and checked the artifact in — it begins `{"openapi":"3.1.0"…}`, lists the twelve
+      paths, and carries `400/412/422/503` under every `MultiVerb` operation (the visible proof the
+      forks are in play). Added a `just openapi` drift check (`cabal run en-openapi && git diff
+      --exit-code`) and the third conformance test `toJsonMatchesToSchema` (every wire DTO's
+      `ToJSON` validates against its hand-written `ToSchema`, via `Data.OpenApi.validateToJSON`).
+      The derivation is unchanged (`toOpenApi apiProxy`). `cabal build all`, `cabal test all`, and
+      `just openapi` all pass. Added `openapi-hs` to the test stanza and an `en-openapi` executable
+      stanza (`aeson-pretty`, `directory`).
 
 
 ## Surprises & Discoveries
@@ -219,6 +226,21 @@ trailing it.
   nagare is therefore validated by **review of its unchanged import lists** against `En.Client`'s
   and `En.Servant.API`'s preserved interfaces, not by a local build; `kikan-en` is validated by
   a real `cabal build all`.
+
+- Discovery (2026-07-10, at Milestone 5): **meibo — the plan's "fullest reference" — does not
+  actually set `operationId`s.** Milestone 5 says to add stable `operationId`s "mirroring meibo's
+  `withOperationIds`" so en "matches meibo". But `meibo-api/src/Meibo/Api/OpenApi.hs` has no
+  `withOperationIds`, and meibo's checked-in `docs/api/openapi.json` contains **zero**
+  `operationId`s (`grep -c operationId` = 0). So the plan's premise is false, and "match meibo"
+  would mean *omitting* `operationId`s. Two things are nonetheless true: the plan lists them as an
+  explicit deliverable with an acceptance grep, and they genuinely help a *non-Haskell* client
+  generated from the checked-in artifact (which is the entire reason M5 checks the artifact in).
+  en's own client is unaffected either way — it is servant's `genericClient`, whose method names
+  come from the `EnApi`/slice record fields, not from `operationId`. Decision recorded below:
+  add them, but framed honestly (not "mirroring meibo"). The other four M5 items (checked-in
+  artifact, generator executable, drift check, `validateToJSON` test) *do* match meibo verbatim —
+  meibo's `app/OpenApi.hs`, its `meibo-openapi` executable stanza, and its `OpenApiSpec`
+  `toJsonMatchesToSchema` were used as the templates.
 
 - Discovery (2026-07-10, resolved at Milestone 1 build): **`servant-openapi-hs` provides
   `HasOpenApi (NamedRoutes EnApi)` directly.** `En.Servant.OpenApi` compiled unchanged with
@@ -345,6 +367,20 @@ trailing it.
   separated so the type-change diffs stay readable and because it is orthogonal to the route
   restructure (it can land any time after Milestone 1 stabilizes the derivation).
   Date: 2026-07-09
+
+- Decision (2026-07-10): add stable `operationId`s in Milestone 5 despite the discovery that
+  meibo does not have them. Rationale: the plan lists `operationId`s as an explicit deliverable
+  with an acceptance check, and they are genuinely useful for a non-Haskell client generated from
+  the checked-in `docs/api/openapi.json` — the artifact's whole reason for existing. The plan's
+  stated rationale ("so a generated *client's* method names do not churn") does not hold for en's
+  own client (`genericClient`, named from record fields), and its framing ("mirroring meibo") is
+  factually wrong, so the implementation and its Haddock say plainly that this is for external
+  artifact consumers, not that it mirrors meibo. `withOperationIds` is implemented directly with
+  the `Data.OpenApi` lenses (`paths`/`post`/`get`/`operationId`) and a local `camel`
+  path→PascalCase helper rather than copied from meibo, since meibo has nothing to copy. Result:
+  every operation carries a deterministic id (`createV1Check`, `getV1Schema`, …). This makes en
+  slightly *exceed* meibo here, which the plan's "rather than trailing it" explicitly permits.
+  Date: 2026-07-10
 
 - Decision (2026-07-10): the plan's six-operation scope is superseded by the live twelve; the
   extra operations map to slices (for Milestone 3) as follows. Tuple slice `En.Tuple.Api`:

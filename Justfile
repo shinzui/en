@@ -112,3 +112,12 @@ test-server:
       | jq -r '.decision.result'); \
     test "$decision" = "allowed"; \
     echo "server smoke test passed: $decision"
+
+# The document is derived (never hand-written) by `cabal run en-openapi`. A red result
+# means someone changed the API type and did not regenerate the checked-in artifact.
+#
+# Regenerate docs/api/openapi.json from the route types and fail if it drifted
+[group("testing")]
+openapi:
+  cabal run -v0 en-openapi
+  git diff --exit-code -- docs/api/openapi.json

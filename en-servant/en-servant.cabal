@@ -71,6 +71,19 @@ library
     , time
     , transformers
 
+-- Writes docs/api/openapi.json. An executable rather than a test so the artifact is a
+-- deterministic build product, and a `just openapi` git-diff check catches drift.
+executable en-openapi
+  import:         warnings, shared
+  main-is:        OpenApi.hs
+  hs-source-dirs: app
+  build-depends:
+    , aeson-pretty
+    , base
+    , bytestring
+    , directory
+    , en-servant
+
 test-suite en-servant-tests
   import:         warnings, shared
   type:           exitcode-stdio-1.0
@@ -88,6 +101,7 @@ test-suite en-servant-tests
     , en-core
     , en-servant
     , http-types
+    , openapi-hs
     , servant
     , servant-server
     , text
