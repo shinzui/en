@@ -48,7 +48,7 @@ import En.Error (EnError (..))
 import En.Lookup (LookupCursor (..), LookupLimit (..), LookupObject (..), LookupPage (..), LookupRequest (..), LookupState (..))
 import En.Lookup qualified as Lookup
 import En.Postgres.Database (Database, runDatabaseConnection)
-import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgSnapshot, parsePgSnapshot, renderPgSnapshot, runConsistencyStorePostgres, tokenMetadataFromPayload, transactionVisible)
+import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgSnapshot, parsePgSnapshot, renderPgSnapshot, retainedHistoryVisible, runConsistencyStorePostgres, tokenMetadataFromPayload, transactionVisible)
 import En.Postgres.TupleStore (pruneTransactionsBatchSession, reapDeletedTuplesBatchSession, runTupleStorePostgres)
 import En.Postgres.Watch qualified as Watch
 import En.Reachability (ReachabilityGraph, compile)
@@ -83,6 +83,8 @@ main = do
         runSnapshotRepeatabilityScenario database connection
         runMaintenanceBatchScenario connection
         runConsistencyFetchCountScenario connection
+        resetSchema connection
+        runHorizonMonotonicityScenario database connection
         resetSchema connection
         runReadAllTuplesScenario connection
         resetSchema connection
@@ -165,6 +167,7 @@ runTupleStoreScenario connection = do
     assertEqual "write token read sees tuple count" 2 (length rowsAtWrite)
     assertEqual "write token read is exhausted" Exhausted stateAtWrite
     runSnapshotOracleScenario connection
+    runRetainedHistoryOracleScenario connection
     {- A minted token survives the round trip through the real PostgreSQL codec and
     the real garbage-collection-window check. 'mintToken' is the inverse of
     'decodeToken', so what it produces for a revision the datastore just resolved
@@ -257,6 +260,23 @@ runTupleStoreScenario connection = do
         "stale snapshot token is rejected after GC horizon advances"
         (Left (InvalidConsistencyToken "token is older than the garbage-collection window"))
         staleResult
+    {- The reported bug (docs/plans/60), end to end. On a store whose garbage-collection
+    window holds no anchor row -- here forced by @gcWindow = "0 seconds"@ -- 'oldestRetainedXid'
+    falls back to @pg_snapshot_xmin(pg_current_snapshot())@, which for an idle store equals the
+    head snapshot's @xmax@. A @checkedAt@ token minted from that head revision was refused the
+    instant it was spent, with no write in between and nothing reaped. Under M1 it is accepted:
+    every transaction below the horizon is visible in the head snapshot, so nothing reaped is
+    live. The @staleResult@ assertion just above is the converse -- a genuinely pruned snapshot
+    is still refused -- so the fix is not merely a deleted check. -}
+    idleHeadTokenResult <- runPg connection staleConfig do
+        ResolvedConsistency{revision} <- ConsistencyStore.resolveConsistency FullyConsistent
+        minted <- ConsistencyStore.mintToken revision
+        metadata <- ConsistencyStore.decodeToken minted
+        ConsistencyStore.validateToken metadata
+    assertEqual
+        "a head-revision token validates on an idle store whose GC window holds no anchor"
+        (Right ())
+        idleHeadTokenResult
     let publicTuple =
             Tuple
                 { object = projectPublic
@@ -1641,6 +1661,18 @@ lockRacedRowStatement =
         Encoders.noParams
         (Decoders.rowList (Decoders.column (Decoders.nonNullable Decoders.int8)))
 
+{- | Assign and return this transaction's xid, forcing xid allocation so a held
+transaction pins @pg_snapshot_xmin@. Used by 'runHorizonMonotonicityScenario'.
+-}
+currentXactIdStatement :: Statement () Int64
+currentXactIdStatement =
+    Statement.preparable
+        """
+        SELECT pg_current_xact_id()::text::bigint
+        """
+        Encoders.noParams
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
+
 {- | Storage refuses to answer rather than answering wrongly.
 
 Three ways the store used to lie, each now a typed error or a harmless no-op: a
@@ -2136,6 +2168,96 @@ runSnapshotOracleScenario connection =
     assertPair (left, right) = do
         oracle <- oracleCompare connection left right
         assertEqual ("snapshot comparator agrees with PostgreSQL oracle for " <> Text.unpack (renderPgSnapshot left) <> " vs " <> Text.unpack (renderPgSnapshot right)) oracle (comparePgSnapshot left right)
+
+{- | Is 'oldestRetainedXid' non-decreasing? Every horizon rule -- the old @xmax <= horizon@
+rule and M1's 'retainedHistoryVisible' alike -- is sound only if the horizon never moves
+backwards: reaping at @T1@ physically destroys rows below @H(T1)@, and validation at @T2 > T1@
+reasons about @H(T2)@; the safety argument needs @H(T1) <= H(T2)@, or a token validated under a
+lower later horizon can be told a reaped row is still live.
+
+The suspect is 'oldestRetainedXidStatement''s @coalesce(min(xid), pg_snapshot_xmin(...))@
+fallback. This scenario constructs the adversarial case the plan names: a long-running
+transaction that has been assigned an xid (via @pg_current_xact_id()@) and holds it open,
+pinning @pg_snapshot_xmin@ low, while every @en_transaction@ anchor row ages out of a fixed
+retention window. The window is a real @"1 seconds"@ throughout; only wall-clock time passes
+between the two observations, exactly as it would in production.
+-}
+runHorizonMonotonicityScenario :: Pg.Database -> Connection.Connection -> IO ()
+runHorizonMonotonicityScenario database connection = do
+    config <- testConfig
+    let shortWindow = config{gcWindow = "1 seconds"}
+        anchorTuple =
+            Tuple
+                { object = ObjectRef (ObjectType "space") "monotonicity"
+                , relation = RelationName "viewer"
+                , subject = SubjectId (ObjectRef (ObjectType "user") "monotonicity-alice")
+                , caveat = Nothing
+                }
+    holder <- acquire database
+    runSessionOrFail holder (Session.script "BEGIN")
+    heldXid <- runSessionOrFail holder (Session.statement () currentXactIdStatement)
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [anchorTuple])
+    -- The anchor row is inside the window: min(xid) governs.
+    horizonBefore <- runPgOrFail connection shortWindow TupleStore.oldestRetainedXid
+    -- Age the anchor row out of the one-second window, holder still open.
+    threadDelay 1_200_000
+    horizonAfter <- runPgOrFail connection shortWindow TupleStore.oldestRetainedXid
+    runSessionOrFail holder (Session.script "ROLLBACK")
+    Connection.release holder
+    {- The finding (docs/plans/60, M1): the horizon is __not__ monotonic. With the anchor row
+    inside the window the horizon is @min(xid)@, which is above the held xid; once the row ages
+    out the horizon falls to @pg_snapshot_xmin@, which the held transaction pins at or below
+    that xid. A held transaction older than the window is enough to walk the horizon backwards.
+    Both the old rule and M1's rule share this dependency (see the plan's Decision Log and its
+    prospective Milestone 4, the monotone high-water mark). -}
+    assertBool
+        ( "the held xid sits below the in-window horizon; got heldXid="
+            <> show heldXid
+            <> " horizonBefore="
+            <> show horizonBefore
+        )
+        (fromIntegral heldXid < horizonBefore)
+    assertBool
+        ( "the horizon moves backwards once the anchor ages out under a held transaction; got before="
+            <> show horizonBefore
+            <> " after="
+            <> show horizonAfter
+        )
+        (horizonAfter < horizonBefore)
+    assertBool
+        ( "the horizon falls to the held transaction's xid; got heldXid="
+            <> show heldXid
+            <> " horizonAfter="
+            <> show horizonAfter
+        )
+        (horizonAfter <= fromIntegral heldXid)
+
+{- | 'retainedHistoryVisible' against the same PostgreSQL oracle 'runSnapshotOracleScenario'
+uses. The predicate is a statement /about/ visibility -- "every transaction below the horizon
+is visible in the snapshot" -- so it can be proved against the authority rather than against a
+re-implementation of the thing under test.
+
+For each generated snapshot @S@ and each horizon @H@ in @[0 .. S.xmax + 2]@, ask the database
+which transactions below @H@ it considers visible in @S@ (@pg_visible_in_snapshot@), and assert
+'retainedHistoryVisible' agrees. This is the garbage-collection safety condition, stated
+exactly, checked against PostgreSQL's own verdict.
+-}
+runRetainedHistoryOracleScenario :: Connection.Connection -> IO ()
+runRetainedHistoryOracleScenario connection =
+    traverse_ assertSnapshot (take 120 (fst <$> generatedSnapshotPairs))
+  where
+    assertSnapshot snapshot = do
+        visibility <- visibleRows connection snapshot (fromIntegral (snapshot.xmax + 2))
+        traverse_ (assertHorizon snapshot visibility) [0 .. snapshot.xmax + 2]
+    assertHorizon snapshot visibility horizon =
+        assertEqual
+            ( "retainedHistoryVisible agrees with PostgreSQL for horizon "
+                <> show horizon
+                <> " in "
+                <> Text.unpack (renderPgSnapshot snapshot)
+            )
+            (and [visible | (txid, visible) <- visibility, txid < horizon])
+            (retainedHistoryVisible horizon snapshot)
 
 oracleCompare :: Connection.Connection -> PgSnapshot -> PgSnapshot -> IO RevisionOrder
 oracleCompare connection left right = do
