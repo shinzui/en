@@ -49,9 +49,9 @@ This section must always reflect the actual current state of the work.
 - [x] Check docs/plans/53-add-a-watch-changelog-api.md status; decide keep-vs-drop for `relation_tuple_created_xid_idx`; record the outcome in BOTH Decision Logs. — **KEEP; mirrored in both logs.**
 - [x] Create the drop migration with `just make-migration drop-dead-live-indexes`; add its Justfile guard; mirror the removal in the integration test's `schemaSql`. — `20260709232320_drop-dead-live-indexes.sql`; drops **both** `*_live_idx`; guard is the fifth stanza; idempotence confirmed ("dead live indexes already dropped").
 - [x] Re-run the EXPLAIN sweep post-drop to confirm no plan regressed to a sequential scan. — no regressions; the reaper's plan flip was proven (by counterfactual re-creation of the indexes) to be an autovacuum statistics effect, not a consequence of the drop.
-- [ ] Refactor `ResolveConsistency` in `en-postgres/src/En/Postgres/Revision.hs` to fetch per mode; generalize the TTL cache and put the horizon behind it.
-- [ ] Add the operation-counting integration assertion (per-mode fetch counts) and record before/after counts.
-- [ ] Run `cabal build all`, `cabal test all`, `just start-and-test`; record transcripts.
+- [x] Refactor `ResolveConsistency` in `en-postgres/src/En/Postgres/Revision.hs` to fetch per mode; generalize the TTL cache. — done. **The horizon is deliberately NOT put behind the cache**: this plan's TTL-cache Decision Log entry had the safety direction inverted. See Surprises & Discoveries and the 2026-07-09 Decision Log entry.
+- [x] Add the operation-counting integration assertion (per-mode fetch counts) and record before/after counts. — `runConsistencyFetchCountScenario`; before/after recorded in Outcomes.
+- [x] Run `cabal build all`, `cabal test all`, `just start-and-test`; record transcripts.
 
 
 ## Surprises & Discoveries
@@ -139,6 +139,35 @@ through hasql's prepared statements, took the index. It is recorded because the 
 margin is the planner's cost comparison rather than anything in the SQL, and because a
 future edit that makes the generic plan look cheap would silently put a full-table lock scan
 inside a write transaction. Discovered 2026-07-09.
+
+**A TTL-cached garbage-collection horizon is permissive, not conservative — this plan's
+Decision Log had the direction inverted.** The 2026-07-07 entry justified putting the horizon
+behind the optimized-revision TTL cache on the grounds that "a stale-by-TTL horizon is
+strictly conservative for token validation … it can only *under*-state how much history is
+retained, never accept a too-old token". Both halves are backwards.
+
+`oldestRetainedXidStatement` is `min(xid) FROM en_transaction WHERE created_at >= now() -
+gcWindow`. Wall-clock only advances, so transactions age out of the window from below and the
+horizon **rises monotonically**. `validateTokenMetadata` rejects a token when
+`snapshot.xmax <= oldestRetainedXid` — a *larger* horizon rejects *more* tokens. Therefore a
+cached horizon, being older and hence **smaller**, rejects **fewer** tokens: it honours tokens
+whose history the reaper has already destroyed, for up to one TTL. A smaller horizon
+*over*-states retention (it claims history reaches further back than it does), and it accepts
+precisely the too-old tokens the check exists to catch.
+
+The consequence is not merely theoretical. It would widen the GC TOCTOU race EP-47 documented
+as finding C7 — currently bounded by request duration — to `TTL + request duration`, and it
+would do so through a knob (`EN_OPTIMIZED_REVISION_CACHE_TTL_MS`) whose documented meaning is
+"how stale may a revision be". An operator raising it to cut read latency would silently also
+extend how long an expired consistency token keeps working. One knob, two meanings, one of
+them safety-relevant.
+
+The horizon cache was therefore **not built**. It is also not needed for this plan's own
+acceptance criteria: the fetch-count table asserts `AtLeastAsFresh = 2` fetches, meaning the
+horizon is fetched, and lazy resolution alone hits all four targets (1/1/1/2) by removing the
+horizon fetch from the token-less modes entirely — which are the hot check path. `TtlCache a`
+is still generalized as the plan asked, so a horizon cache can be added later behind its own
+knob and its own honest safety argument. Discovered 2026-07-09.
 
 **`reapDeletedTuplesBatchStatement` hash-joins a full table scan to delete 1,000 rows
 (out of scope here; for docs/plans/37).** The post-drop sweep showed the reaper's batch
@@ -290,6 +319,21 @@ Record every decision made while working on the plan.
   within measurement noise — the write win exists only if both go. Recovery is a
   `CREATE INDEX CONCURRENTLY` away and loses no data. Escalated to the user before acting.
   Date: 2026-07-09
+- Decision: The garbage-collection horizon is NOT cached, reversing this plan's 2026-07-07
+  "cache the horizon behind the same TTL" decision. `TtlCache a` is still generalized, and
+  `OptimizedRevisionCache` remains its sole instantiation.
+  Rationale: That entry's safety argument is inverted. The horizon rises monotonically as
+  transactions age out of the GC window, and `validateTokenMetadata` rejects when
+  `snapshot.xmax <= horizon`, so a TTL-stale (smaller) horizon rejects *fewer* tokens — it
+  honours tokens whose history the reaper destroyed, for up to one TTL. That widens EP-47's
+  documented C7 TOCTOU window from request-duration to TTL + request-duration, and does it
+  through `EN_OPTIMIZED_REVISION_CACHE_TTL_MS`, a knob that today means only "how stale may a
+  revision be". Overloading it to also mean "how long past garbage collection may an expired
+  token be honored" is a footgun for any operator tuning read latency. The cache is also
+  unnecessary: lazy resolution alone meets the full 1/1/1/2 acceptance table, because the
+  horizon fetch vanishes from the token-less modes that dominate the check path. Escalated to
+  the user before acting.
+  Date: 2026-07-09
 - Decision: `relation_tuple_object_live_idx` is dropped as strictly subsumed, not merely
   unused.
   Rationale: Its key `(object_type, object_id, relation, id)` under `WHERE deleted_xid IS
@@ -369,6 +413,60 @@ trials: 0.573 s with all indexes → 0.378 s with both `*_live_idx` dropped (−
 index storage reclaimed. Dropping `object_live_idx` alone measured within noise of baseline,
 so the win required dropping both — which is what made the `subject_live_idx` counterfactual
 worth running rather than deferring to the plan's keep-the-index gate.
+
+### Milestone 3: per-mode store-fetch counts
+
+Enforced by `runConsistencyFetchCountScenario` in `en-postgres/integration-test/Main.hs`,
+which interposes on `TupleStore` and tallies `HeadRevision`, `OptimizedRevision` and
+`OldestRetainedXid` by name. Each maps to one database session in the interpreter, so an
+operation count is a round-trip count. The "before" column is not a citation — it is the
+tally the same assertion produced when the pre-refactor eager interpreter was reinstated:
+`fromList [("HeadRevision",1),("OldestRetainedXid",1),("OptimizedRevision",1)]` for *every*
+mode.
+
+| Mode | Before | After | What it fetches now |
+|---|---|---|---|
+| `MinimizeLatency` | 3 | **1** | `OptimizedRevision` |
+| `FullyConsistent` | 3 | **1** | `HeadRevision` |
+| `AtExactSnapshot token` | 3 | **1** | `OldestRetainedXid` |
+| `AtLeastAsFresh token` | 3 | **2** | `OldestRetainedXid`, `OptimizedRevision` |
+
+A token-less request now performs no horizon fetch and no token validation, which is the
+"token-less requests don't need the GC horizon" half of C3. The revision each mode selects is
+unchanged — the suite's existing consistency scenarios (stale-token rejection,
+read-your-writes at a token, snapshot repeatability) pass untouched.
+
+Both new assertions were run once against the bug they claim to catch, per the master plan's
+standing rule:
+
+- Making `MinimizeLatency` force `getHead` fails the unit test with
+  `expected: ["getOptimized"] / actual: ["getHead","getOptimized"]`.
+- Restoring the eager three-fetch interpreter fails the integration assertion with
+  `expected: fromList [("OptimizedRevision",1)]` against the unconditional three.
+
+### Verification
+
+```text
+cabal build all                    exit 0
+cabal test all                     exit 0   (all suites PASS)
+cabal test en-postgres-revision-tests      exit 0
+cabal test en-postgres-integration-tests   exit 0
+just run-migrations (2nd run)      "dead live indexes already dropped"
+just start-and-test                server smoke test passed: allowed
+```
+
+Exit codes were checked directly rather than grepped for `FAIL`, per the master plan's note
+that a suite which fails to compile never prints one.
+
+### Gaps
+
+- The horizon cache the plan specified was not built; the reasoning is in Surprises &
+  Discoveries and the Decision Log. `TtlCache a` is generalized and ready for it.
+- `reapDeletedTuplesBatchStatement` plans a full-table hash join (19× slower than the
+  nested-loop alternative). Out of scope here; recorded for
+  docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md.
+- The precondition statements' sargability depends on PostgreSQL preferring a custom plan to
+  a generic one. True today by a ~500× cost margin, but nothing in the SQL enforces it.
 
 
 ## Context and Orientation

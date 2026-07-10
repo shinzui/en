@@ -10,6 +10,7 @@ import Control.Exception (finally)
 import Data.Either (isRight)
 import Data.Foldable (traverse_)
 import Data.Functor.Contravariant ((>$<))
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.List (sort)
 import Data.Map.Strict qualified as Map
@@ -17,7 +18,8 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Word (Word64)
-import Effectful (Eff, IOE, runEff)
+import Effectful (Eff, IOE, liftIO, runEff, (:>))
+import Effectful.Dispatch.Dynamic (interpose, passthrough)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Numeric (readDec)
 
@@ -30,7 +32,7 @@ import En.Effect.TupleStore (
     StoreCursor (..),
     TuplePage (..),
     TupleRow (..),
-    TupleStore,
+    TupleStore (..),
     TupleWriteRequest (..),
     UsersetQuery (..),
     exactTupleFilter,
@@ -70,6 +72,7 @@ main = do
         runDecodeStrictnessScenario connection
         runSnapshotRepeatabilityScenario database connection
         runMaintenanceBatchScenario connection
+        runConsistencyFetchCountScenario connection
         resetSchema connection
         runReadAllTuplesScenario connection
         resetSchema connection
@@ -1315,6 +1318,80 @@ maintenanceSeedSql =
     VALUES ('1000'::xid8, 'test'), ('1001'::xid8, 'test');
     """
 
+{- | Every consistency mode fetches only what it needs (docs/plans/49, finding C3).
+
+Before this plan @ResolveConsistency@ ran @optimizedRevision@, @headRevision@ and
+@oldestRetainedXid@ unconditionally -- three store operations, and because the
+interpreter maps each to one database session, three sequential round trips on
+every read regardless of mode. The counts below are the enforced ceiling.
+
+The interposer counts store /operations/, which is the honest unit: the horizon is
+not cached (see 'En.Postgres.Revision.TtlCache'), and the optimized-revision cache
+is absent from this stack, so one operation is one round trip here.
+-}
+runConsistencyFetchCountScenario :: Connection.Connection -> IO ()
+runConsistencyFetchCountScenario connection = do
+    validCheckSchema <- either (fail . show) pure (Schema.validateSchema checkSchema)
+    let config =
+            ConsistencyConfig
+                { datastoreId = DatastoreId "test-datastore"
+                , schemaHash = Schema.schemaHash validCheckSchema
+                , gcWindow = "24 hours"
+                }
+    token <- runPgOrFail connection config (TupleStore.writeTuples [countingTuple])
+
+    -- runPgCounting fails the suite on a Left, so reaching the assertion already
+    -- means the mode resolved; what is under test is the fetch tally.
+    let expectFetches label request expected = do
+            (_, counts) <- runPgCounting connection config (ConsistencyStore.resolveConsistency request)
+            assertEqual label expected counts
+
+    expectFetches
+        "MinimizeLatency resolves with a single store fetch"
+        MinimizeLatency
+        (Map.fromList [("OptimizedRevision", 1)])
+    expectFetches
+        "FullyConsistent resolves with a single store fetch"
+        FullyConsistent
+        (Map.fromList [("HeadRevision", 1)])
+    expectFetches
+        "AtExactSnapshot fetches only the garbage-collection horizon"
+        (AtExactSnapshot token)
+        (Map.fromList [("OldestRetainedXid", 1)])
+    expectFetches
+        "AtLeastAsFresh fetches the horizon and the optimized revision, never head"
+        (AtLeastAsFresh token)
+        (Map.fromList [("OldestRetainedXid", 1), ("OptimizedRevision", 1)])
+  where
+    countingTuple =
+        Tuple
+            { object = ObjectRef{objectType = ObjectType "document", objectId = "fetch-count"}
+            , relation = RelationName "viewer"
+            , subject = SubjectId ObjectRef{objectType = ObjectType "user", objectId = "counter"}
+            , caveat = Nothing
+            }
+
+{- | Count the 'TupleStore' revision operations an action issues.
+
+Mirrors the shape of 'En.Effect.CachedTupleStore.cachedTupleStore': intercept the
+three operations under test, forward everything else with 'passthrough' so the
+interposer stays transparent to writes and reads.
+-}
+countingTupleStore ::
+    (TupleStore :> es, IOE :> es) =>
+    IORef (Map.Map Text Int) ->
+    Eff es a ->
+    Eff es a
+countingTupleStore counter =
+    interpose \env -> \case
+        HeadRevision -> bump "HeadRevision" >> passthrough env HeadRevision
+        OptimizedRevision -> bump "OptimizedRevision" >> passthrough env OptimizedRevision
+        OldestRetainedXid -> bump "OldestRetainedXid" >> passthrough env OldestRetainedXid
+        operation -> passthrough env operation
+  where
+    bump name =
+        liftIO (modifyIORef' counter (Map.insertWith (+) name 1))
+
 type PostgresEffects = '[ConsistencyStore, TupleStore, Error EnError, Database, IOE]
 
 runPg :: Connection.Connection -> ConsistencyConfig -> Eff PostgresEffects a -> IO (Either EnError a)
@@ -1324,6 +1401,25 @@ runPg connection config =
         . runErrorNoCallStack
         . runTupleStorePostgres config
         . runConsistencyStorePostgres config
+
+-- | 'runPg', with the store operations the action issues tallied by name.
+runPgCounting ::
+    Connection.Connection ->
+    ConsistencyConfig ->
+    Eff PostgresEffects a ->
+    IO (a, Map.Map Text Int)
+runPgCounting connection config action = do
+    counter <- newIORef Map.empty
+    result <-
+        runEff
+            . runDatabaseConnection connection
+            . runErrorNoCallStack
+            . runTupleStorePostgres config
+            . countingTupleStore counter
+            $ runConsistencyStorePostgres config action
+    resolved <- either (fail . show) pure result
+    counts <- readIORef counter
+    pure (resolved, counts)
 
 runPgOrFail :: Connection.Connection -> ConsistencyConfig -> Eff PostgresEffects a -> IO a
 runPgOrFail connection config action =

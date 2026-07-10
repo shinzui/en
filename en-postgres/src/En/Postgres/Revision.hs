@@ -9,11 +9,16 @@ module En.Postgres.Revision (
     TokenDecodeError (..),
     ConsistencyConfig (..),
     OptimizedRevisionConfig (..),
+    TtlCache,
     OptimizedRevisionCache,
+    ResolveEnv (..),
     parsePgSnapshot,
     renderPgSnapshot,
     revisionFromPgSnapshot,
     revisionToPgSnapshot,
+    newTtlCache,
+    lookupTtlCache,
+    storeTtlCache,
     newOptimizedRevisionCache,
     lookupOptimizedRevisionCache,
     storeOptimizedRevisionCache,
@@ -89,16 +94,38 @@ data OptimizedRevisionConfig = OptimizedRevisionConfig
     }
     deriving stock (Eq, Show)
 
-data OptimizedRevisionCache = OptimizedRevisionCache
+{- | A single-cell cache whose entry expires once older than the configured TTL.
+
+Polymorphic so a second value type can ride the same mechanism, but note what
+'OptimizedRevisionConfig' means before instantiating it for anything but a
+revision. Its TTL answers "how stale may this value be", and staleness is only
+benign when a stale value is /more/ conservative than a fresh one. That holds for
+the optimized revision — reading at an older snapshot returns older data, which is
+exactly what 'MinimizeLatency' asks for.
+
+It does /not/ hold for the garbage-collection horizon
+('En.Effect.TupleStore.oldestRetainedXid'), which is why the horizon is not cached
+here. See the 2026-07-09 Decision Log entry in
+@docs/plans/49-trim-dead-indexes-and-resolve-consistency-lazily.md@: the horizon
+rises monotonically as transactions age out of the window, 'validateTokenMetadata'
+rejects a token when @snapshot.xmax <= horizon@, and so a stale (smaller) horizon
+rejects /fewer/ tokens — it honours tokens whose history the reaper has already
+destroyed. A TTL on the horizon is a TTL on how long an expired token keeps
+working.
+-}
+data TtlCache a = TtlCache
     { config :: !OptimizedRevisionConfig
     , clock :: !(IO UTCTime)
-    , state :: !(IORef (Maybe CachedOptimizedRevision))
+    , state :: !(IORef (Maybe (CachedValue a)))
     }
 
-data CachedOptimizedRevision = CachedOptimizedRevision
-    { revision :: !Revision
+data CachedValue a = CachedValue
+    { value :: !a
     , loadedAt :: !UTCTime
     }
+
+-- | The 'Revision' instantiation of 'TtlCache', the only one in the tree.
+type OptimizedRevisionCache = TtlCache Revision
 
 data TokenDecodeError
     = TokenBadPrefix
@@ -138,13 +165,13 @@ revisionToPgSnapshot :: Revision -> Either Text PgSnapshot
 revisionToPgSnapshot =
     parsePgSnapshot . revisionEncoding
 
-newOptimizedRevisionCache :: OptimizedRevisionConfig -> IO UTCTime -> IO OptimizedRevisionCache
-newOptimizedRevisionCache config clock = do
+newTtlCache :: OptimizedRevisionConfig -> IO UTCTime -> IO (TtlCache a)
+newTtlCache config clock = do
     state <- newIORef Nothing
-    pure OptimizedRevisionCache{config, clock, state}
+    pure TtlCache{config, clock, state}
 
-lookupOptimizedRevisionCache :: OptimizedRevisionCache -> IO (Maybe Revision)
-lookupOptimizedRevisionCache cache
+lookupTtlCache :: TtlCache a -> IO (Maybe a)
+lookupTtlCache cache
     | not cache.config.enabled || cache.config.ttl <= 0 = pure Nothing
     | otherwise = do
         now <- cache.clock
@@ -152,15 +179,27 @@ lookupOptimizedRevisionCache cache
         pure do
             entry <- cached
             if diffUTCTime now entry.loadedAt <= cache.config.ttl
-                then Just entry.revision
+                then Just entry.value
                 else Nothing
 
-storeOptimizedRevisionCache :: OptimizedRevisionCache -> Revision -> IO ()
-storeOptimizedRevisionCache cache revision
+storeTtlCache :: TtlCache a -> a -> IO ()
+storeTtlCache cache value
     | not cache.config.enabled || cache.config.ttl <= 0 = pure ()
     | otherwise = do
         now <- cache.clock
-        writeIORef cache.state (Just CachedOptimizedRevision{revision, loadedAt = now})
+        writeIORef cache.state (Just CachedValue{value, loadedAt = now})
+
+newOptimizedRevisionCache :: OptimizedRevisionConfig -> IO UTCTime -> IO OptimizedRevisionCache
+newOptimizedRevisionCache =
+    newTtlCache
+
+lookupOptimizedRevisionCache :: OptimizedRevisionCache -> IO (Maybe Revision)
+lookupOptimizedRevisionCache =
+    lookupTtlCache
+
+storeOptimizedRevisionCache :: OptimizedRevisionCache -> Revision -> IO ()
+storeOptimizedRevisionCache =
+    storeTtlCache
 
 newOptimizedRevisionReader ::
     OptimizedRevisionConfig ->
@@ -267,37 +306,82 @@ validateTokenMetadata config now oldestRetainedXid metadata
             then Left (InvalidConsistencyToken "token is older than the garbage-collection window")
             else Right ()
 
+{- | The four things a consistency mode might need, each fetched on demand.
+
+Every field is an action rather than a value, which is the whole point: no mode
+needs all four, and 'ResolveConsistency' used to fetch three of them
+unconditionally — three sequential round trips per read, on a pool whose
+connections are shared. Making the inputs lazy by construction keeps the
+mode-to-requirement mapping in 'resolveConsistencyRequest', where it can be read
+and unit-tested, instead of duplicating a @case@ in the interpreter.
+-}
+data ResolveEnv m = ResolveEnv
+    { getOptimized :: m Revision
+    , getHead :: m Revision
+    , getHorizon :: m Word64
+    , getNow :: m UTCTime
+    }
+
+{- | Resolve a consistency request, fetching only what the mode demands.
+
+The revision each mode selects is unchanged; only the fetching moved. Per mode:
+
+* @MinimizeLatency@ runs @getOptimized@ alone.
+* @FullyConsistent@ runs @getHead@ alone.
+* @AtExactSnapshot@ decodes the token, then runs @getNow@ and @getHorizon@ to
+  validate it. It never reads the optimized or head revision — the token /is/ the
+  answer.
+* @AtLeastAsFresh@ decodes and validates as above, then runs @getOptimized@ for the
+  comparison. It never reads head.
+
+A token-less request therefore performs no horizon fetch and no token validation:
+the horizon exists only to reject tokens older than retained history, and there is
+no token to reject.
+-}
 resolveConsistencyRequest ::
-    Revision ->
-    Revision ->
+    (Monad m) =>
+    ResolveEnv m ->
     (ConsistencyToken -> Either EnError TokenMetadata) ->
-    (TokenMetadata -> Either EnError ()) ->
+    (UTCTime -> Word64 -> TokenMetadata -> Either EnError ()) ->
     Consistency ->
-    Either EnError ResolvedConsistency
-resolveConsistencyRequest optimized headRevision decode validate request =
+    m (Either EnError ResolvedConsistency)
+resolveConsistencyRequest env decode validate request =
     case request of
         MinimizeLatency ->
-            Right ResolvedConsistency{consistency = request, revision = optimized}
+            resolvedAt <$> env.getOptimized
         FullyConsistent ->
-            Right ResolvedConsistency{consistency = request, revision = headRevision}
-        AtExactSnapshot token -> do
-            metadata <- decode token
-            validate metadata
-            Right ResolvedConsistency{consistency = request, revision = metadata.revision}
-        AtLeastAsFresh token -> do
-            metadata <- decode token
-            validate metadata
-            order <-
-                mapLeft
-                    (InvalidConsistencyToken . ("could not compare token revision: " <>))
-                    (comparePostgresRevision optimized metadata.revision)
-            let selectedRevision =
-                    case order of
-                        RAfter -> optimized
-                        REqual -> optimized
-                        RBefore -> metadata.revision
-                        RConcurrent -> metadata.revision
-            Right ResolvedConsistency{consistency = request, revision = selectedRevision}
+            resolvedAt <$> env.getHead
+        AtExactSnapshot token ->
+            withValidToken token \metadata ->
+                pure (resolvedAt metadata.revision)
+        AtLeastAsFresh token ->
+            withValidToken token \metadata -> do
+                optimized <- env.getOptimized
+                pure (freshestOf optimized metadata.revision)
+  where
+    resolvedAt revision =
+        Right ResolvedConsistency{consistency = request, revision}
+
+    freshestOf optimized tokenRevision = do
+        order <-
+            mapLeft
+                (InvalidConsistencyToken . ("could not compare token revision: " <>))
+                (comparePostgresRevision optimized tokenRevision)
+        resolvedAt case order of
+            RAfter -> optimized
+            REqual -> optimized
+            RBefore -> tokenRevision
+            RConcurrent -> tokenRevision
+
+    withValidToken token continue =
+        case decode token of
+            Left err -> pure (Left err)
+            Right metadata -> do
+                now <- env.getNow
+                horizon <- env.getHorizon
+                case validate now horizon metadata of
+                    Left err -> pure (Left err)
+                    Right () -> continue metadata
 
 runConsistencyStorePostgres ::
     (TupleStore :> es, IOE :> es, Error EnError :> es) =>
@@ -312,18 +396,24 @@ runConsistencyStorePostgres config =
             now <- liftIO getCurrentTime
             oldestXid <- TupleStore.oldestRetainedXid
             either throwError pure (validateTokenMetadata config now oldestXid metadata)
+        -- Each getter is one database session, so the fetches 'resolveConsistencyRequest'
+        -- forces are the round trips this request pays: one for 'MinimizeLatency',
+        -- 'FullyConsistent' and 'AtExactSnapshot', two for 'AtLeastAsFresh'.
         ResolveConsistency request -> do
-            now <- liftIO getCurrentTime
-            optimized <- TupleStore.optimizedRevision
-            currentHead <- TupleStore.headRevision
-            oldestXid <- TupleStore.oldestRetainedXid
-            either throwError pure $
+            let env =
+                    ResolveEnv
+                        { getOptimized = TupleStore.optimizedRevision
+                        , getHead = TupleStore.headRevision
+                        , getHorizon = TupleStore.oldestRetainedXid
+                        , getNow = liftIO getCurrentTime
+                        }
+            resolved <-
                 resolveConsistencyRequest
-                    optimized
-                    currentHead
+                    env
                     tokenMetadataFromPayload
-                    (validateTokenMetadata config now oldestXid)
+                    (validateTokenMetadata config)
                     request
+            either throwError pure resolved
         -- 'expiresAt' is 'Nothing', exactly as write tokens are minted
         -- ('En.Postgres.TupleStore.tokenFromAnchor'). The garbage-collection
         -- window is not a wall-clock stamp on the token; it is enforced at

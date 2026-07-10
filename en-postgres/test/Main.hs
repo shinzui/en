@@ -13,6 +13,7 @@ import En.Postgres.Revision (
     ConsistencyConfig (..),
     OptimizedRevisionConfig (..),
     PgSnapshot (..),
+    ResolveEnv (..),
     TokenPayload (..),
     comparePgSnapshot,
     decodeToken,
@@ -90,15 +91,15 @@ main = do
     assertEqual
         "exact snapshot resolves to token revision"
         (Right ResolvedConsistency{consistency = AtExactSnapshot (encodeToken payload), revision = payload.revision})
-        (resolveConsistencyRequest optimizedRevision headRevision metadataFromToken validateMetadata (AtExactSnapshot (encodeToken payload)))
+        =<< resolve optimizedRevision (AtExactSnapshot (encodeToken payload))
     assertEqual
         "fully consistent resolves to head revision"
         (Right ResolvedConsistency{consistency = FullyConsistent, revision = headRevision})
-        (resolveConsistencyRequest optimizedRevision headRevision metadataFromToken validateMetadata FullyConsistent)
+        =<< resolve optimizedRevision FullyConsistent
     assertEqual
         "at least as fresh uses optimized revision when it is after the token"
         (Right ResolvedConsistency{consistency = AtLeastAsFresh (encodeToken payload), revision = optimizedRevision})
-        (resolveConsistencyRequest optimizedRevision headRevision metadataFromToken validateMetadata (AtLeastAsFresh (encodeToken payload)))
+        =<< resolve optimizedRevision (AtLeastAsFresh (encodeToken payload))
     let concurrentPayload =
             TokenPayload
                 { datastoreId = payload.datastoreId
@@ -110,7 +111,31 @@ main = do
     assertEqual
         "at least as fresh honors token revision when optimized is concurrent"
         (Right ResolvedConsistency{consistency = AtLeastAsFresh (encodeToken concurrentPayload), revision = concurrentPayload.revision})
-        (resolveConsistencyRequest concurrentOptimized headRevision metadataFromToken validateMetadata (AtLeastAsFresh (encodeToken concurrentPayload)))
+        =<< resolve concurrentOptimized (AtLeastAsFresh (encodeToken concurrentPayload))
+
+    -- The mode-to-requirement mapping (docs/plans/49, finding C3). Each getter is one
+    -- database round trip in the real interpreter, except 'getNow', which is a clock
+    -- read. What matters is that no mode forces a getter its answer does not depend on.
+    assertEqual
+        "minimize latency reads only the optimized revision"
+        ["getOptimized"]
+        =<< gettersRun optimizedRevision MinimizeLatency
+    assertEqual
+        "fully consistent reads only the head revision"
+        ["getHead"]
+        =<< gettersRun optimizedRevision FullyConsistent
+    assertEqual
+        "at exact snapshot reads only the horizon, never a revision"
+        ["getNow", "getHorizon"]
+        =<< gettersRun optimizedRevision (AtExactSnapshot (encodeToken payload))
+    assertEqual
+        "at least as fresh reads the horizon and the optimized revision, never head"
+        ["getNow", "getHorizon", "getOptimized"]
+        =<< gettersRun optimizedRevision (AtLeastAsFresh (encodeToken payload))
+    assertEqual
+        "a token that fails to decode fetches nothing at all"
+        []
+        =<< gettersRun optimizedRevision (AtExactSnapshot (ConsistencyToken "en1.primary.schema.bad"))
     assertEqual
         "wrong datastore is rejected"
         (Left (InvalidConsistencyToken "token datastore does not match this en datastore"))
@@ -181,8 +206,33 @@ main = do
                         , expiresAt = tokenPayload.expiresAt
                         }
             Left err -> Left (InvalidConsistencyToken (showText err))
-    validateMetadata =
-        validateTokenMetadata config now 0
+
+    -- \| A 'ResolveEnv' over 'IO' that appends each getter's name as it runs.
+    --
+    --    Standing in for the writer monad the plan sketched: what is being tested is a
+    --    side effect (which getters ran), so the env has to be able to have one.
+    --
+    recordingEnv optimized ref =
+        ResolveEnv
+            { getOptimized = record ref "getOptimized" >> pure optimized
+            , getHead = record ref "getHead" >> pure headRevision
+            , getHorizon = record ref "getHorizon" >> pure 0
+            , getNow = record ref "getNow" >> pure now
+            }
+    record ref name =
+        modifyIORef' ref (<> [name :: Text.Text])
+
+    runResolve optimized request = do
+        ref <- newIORef []
+        resolved <- resolveConsistencyRequest (recordingEnv optimized ref) metadataFromToken (validateTokenMetadata config) request
+        getters <- readIORef ref
+        pure (resolved, getters)
+
+    resolve optimized request =
+        fst <$> runResolve optimized request
+
+    gettersRun optimized request =
+        snd <$> runResolve optimized request
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
 assertEqual label expected actual
