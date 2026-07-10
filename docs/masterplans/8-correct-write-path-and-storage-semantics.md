@@ -73,7 +73,7 @@ that en-core consumers embed against).
 | EP-46 | Add write preconditions and atomic mixed writes | docs/plans/46-add-write-preconditions-and-atomic-mixed-writes.md | EP-45 | None | Complete |
 | EP-47 | Fail loudly on storage decode errors and tighten write snapshots | docs/plans/47-fail-loudly-on-storage-decode-errors-and-tighten-write-snapshots.md | None | None | Complete |
 | EP-48 | Batch tuple writes and add bulk import and export | docs/plans/48-batch-tuple-writes-and-add-bulk-import-and-export.md | EP-45 | EP-46 | Complete |
-| EP-49 | Trim dead indexes and resolve consistency lazily | docs/plans/49-trim-dead-indexes-and-resolve-consistency-lazily.md | None | None | In Progress |
+| EP-49 | Trim dead indexes and resolve consistency lazily | docs/plans/49-trim-dead-indexes-and-resolve-consistency-lazily.md | None | None | Complete |
 
 
 ## Dependency Graph
@@ -102,7 +102,16 @@ EP-49 removes `relation_tuple_object_live_idx`, `relation_tuple_subject_live_idx
 possibly `relation_tuple_created_xid_idx` — but the watch changelog plan
 (docs/plans/53-add-a-watch-changelog-api.md, master plan 9) is the likely consumer of
 `created_xid` indexing, so EP-49 must check that plan's status before dropping it and
-record the coordination in both plans' Decision Logs.
+record the coordination in both plans' Decision Logs. **Resolved 2026-07-09:** EP-49 dropped
+both `*_live_idx` indexes (migration
+`en-migrations/db/migrations/20260709232320_drop-dead-live-indexes.sql`) and **kept**
+`relation_tuple_created_xid_idx`, reserved for EP-53; the mirror entries are in both Decision
+Logs and a `COMMENT ON INDEX` carries the reservation in the live schema. The surviving set is
+`relation_tuple_pkey`, `relation_tuple_live_unique`, `relation_tuple_object_hist_idx`,
+`relation_tuple_subject_hist_idx`, `relation_tuple_deleted_xid_idx`, and the reserved
+`relation_tuple_created_xid_idx`. Note that `subject_live_idx` was *not* dead — EP-46 created a
+consumer for it — and was dropped on counterfactual evidence rather than on a zero scan count;
+see Surprises & Discoveries.
 
 **EP-48 raised the stakes on that index review.** Every batch write statement now depends
 on `relation_tuple_live_unique` being the index a `LATERAL` probe reaches, and EP-48
@@ -157,8 +166,8 @@ in the generated OpenAPI document. Any later plan adding a status must do the sa
 - [x] EP-47: write tokens denote exact snapshots (gap marked in-progress); GC TOCTOU invariant documented
 - [x] EP-48: N-tuple writes are O(1) round trips (203 → 6 statements for 100 tuples); bulk import/export commands exist
 - [x] EP-48: batch statements are pinned to index probes by LATERAL, so the plan cannot degrade with batch or table size
-- [ ] EP-49: dead indexes removed (after watch-plan coordination); EXPLAIN confirms remaining index coverage
-- [ ] EP-49: consistency resolution fetches only what the requested mode needs
+- [x] EP-49: dead indexes removed (after watch-plan coordination); EXPLAIN confirms remaining index coverage
+- [x] EP-49: consistency resolution fetches only what the requested mode needs
 
 
 ## Surprises & Discoveries
@@ -315,6 +324,72 @@ the two cannot drift. Any later plan adding an `en-server` subcommand should rea
 binary linking the pre-fix library. Build the executable before timing it. Discovered while
 implementing EP-48, 2026-07-09.
 
+**A plan's "this index is dead" gate outlived the code it was written against (EP-49, and a
+lesson for any audit plan).** EP-49 predicted both partial `*_live_idx` indexes would appear in
+no query plan, and installed a stop sign: if one *does* appear, keep it. The stop sign fired —
+but for a reason EP-49 could not have known, because EP-46 landed in between and added
+subject-scoped precondition filters (`TupleFilter` makes `objectId` optional while `objectType`
+is mandatory), which the planner serves from `relation_tuple_subject_live_idx`. The gate's text
+said keep; the gate's *purpose* was "do not regress a plan". A counterfactual — drop the index
+inside a rolled-back transaction, re-EXPLAIN — showed `relation_tuple_subject_hist_idx` taking
+over with a byte-identical `Index Cond`, equal buffers, and lower latency. Used is not needed.
+Both indexes were dropped; a 20,000-row insert went 0.573 s → 0.378 s, and dropping only the
+genuinely-dead one measured within noise. **The generalizable rule: an audit that asks "is this
+index scanned?" is asking the wrong question. Ask "does removing it change any plan?" — the
+counterfactual is cheap, exact, and immune to a sibling plan having quietly created a consumer.**
+Discovered while implementing EP-49, 2026-07-09.
+
+**EP-49's TTL-cached horizon would have been a security regression; the plan's own rationale was
+inverted (affects any later plan that caches `oldestRetainedXid`).** EP-49's Decision Log
+mandated putting the GC horizon behind the optimized-revision TTL cache, reasoning a stale
+horizon "can only *under*-state how much history is retained, never accept a too-old token".
+Both halves are backwards. `oldestRetainedXidStatement` is `min(xid)` over transactions inside
+the GC window, so as wall-clock advances the horizon **rises monotonically**;
+`validateTokenMetadata` rejects when `snapshot.xmax <= horizon`, so a *larger* horizon rejects
+*more*. A TTL-stale horizon is therefore **smaller, and rejects fewer tokens** — it honours
+tokens whose history the reaper already destroyed, for up to one TTL. That widens EP-47's
+documented C7 TOCTOU window from request-duration to `TTL + request-duration`, through
+`EN_OPTIMIZED_REVISION_CACHE_TTL_MS`, a knob whose documented meaning is "how stale may a
+revision be". An operator raising it to cut read latency would silently extend how long an
+expired consistency token keeps working. The cache was not built; `TtlCache a` is generalized so
+it can be added later behind its own knob. **Any later plan that wants to cache the horizon must
+supply a fresh safety argument and its own configuration knob — never this one.** Lazy resolution
+alone met the full acceptance table (1/1/1/2), because the horizon fetch vanishes entirely from
+the token-less modes that dominate the check path. Discovered while implementing EP-49,
+2026-07-09.
+
+**The reaper's batch statement hash-joins a full table scan (binds
+docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-pruning.md, master
+plan 6).** EP-49's EXPLAIN sweep found `reapDeletedTuplesBatchStatement` planning as a `Hash Join`
+whose outer side is a `Seq Scan` of all 250,023 rows, to reap a `LIMIT 1000` victim set: 23.7 ms.
+`SET enable_seqscan = off` yields the obvious nested loop over `relation_tuple_pkey` at 1.233 ms —
+**19× faster**. PostgreSQL's estimates are nearly tied (6684.93 vs 6903.11) and it picks the
+slower plan, costing 1,000 cached primary-key probes as random I/O. The seq-scan side grows with
+the table while the nested loop does not, so this worsens with scale. This is EP-48's `LATERAL`
+lesson in a statement EP-48 never touched, and the remedy is the same shape: drive the join from
+the victims CTE through a `LATERAL` probe. Out of scope for this master plan (reaper scheduling is
+EP-37's), recorded so EP-37 inherits it. Note also that the sweep initially *appeared* to show
+EP-49 causing this — the plan changed between the pre- and post-drop runs because autovacuum moved
+the `deleted_xid` statistics. Recreating the dropped indexes in a rolled-back transaction produced
+a byte-identical plan, proving the drop innocent. **A before/after EXPLAIN across a schema change
+is not a controlled experiment unless statistics are held still or the counterfactual is run in
+the same session.** Discovered while implementing EP-49, 2026-07-09.
+
+**The precondition statements are sargable only because PostgreSQL re-plans them per execution
+(affects any plan touching `TupleFilter` SQL).** `lockMatchingLiveTupleStatement` and
+`matchingLiveTupleExistsStatement` are `Statement.preparable`, and their
+`($n::text IS NULL OR col = $n)` idiom becomes an index condition only after the planner folds a
+known-NULL parameter away — which a *custom* plan does and a *generic* plan cannot. Under
+`plan_cache_mode = force_generic_plan` both collapse to a parallel sequential scan of the whole
+table (250,019 rows removed by filter, 19.3 ms versus 0.059 ms), and the `lock` variant does it
+holding `FOR UPDATE` inside a write transaction. This is not a live defect — PostgreSQL adopts a
+generic plan only when its estimated cost is no worse than the custom average, and here generic is
+~500× dearer, so custom wins permanently; the driven-workload `idx_scan` counters confirm the real
+server takes the index. It is recorded because the safety margin lives in the planner's cost
+comparison rather than in the SQL, and an edit that makes the generic plan look cheap would put a
+full-table lock scan inside every guarded write with no other symptom. Discovered while
+implementing EP-49, 2026-07-09.
+
 
 ## Decision Log
 
@@ -354,8 +429,87 @@ implementing EP-48, 2026-07-09.
 - Decision: Bulk import and export read StoreConfig, not ServerConfig; en-server subcommands never require serving credentials.
   Rationale: A command that binds no port has no API keys, rate limit, or TLS material to configure. loadServerConfig's fail-closed behavior is correct for a server and was refusing a bulk load.
   Date: 2026-07-09
+- Decision: The EP-49 ↔ EP-53 coordination is resolved as KEEP: relation_tuple_created_xid_idx survives, reserved for the watch changelog feed. Mirror entries are recorded in both plans' Decision Logs, and a COMMENT ON INDEX records the reservation in the live schema.
+  Rationale: docs/plans/53 is Not Started, but its Decision Log affirmatively claims the index — its window query bounds each arm with `created_xid >= $start_xmin::xid8` precisely to keep it load-bearing, and states "this plan is the consumer that keeps it". That is the affirmative claim EP-49's gate looked for. Dropping and re-adding an index on a large table is avoidable churn. If EP-53 later abandons the xmin-bounded design, EP-53 owns the drop.
+  Date: 2026-07-09
+- Decision: An index audit is settled by counterfactual removal, not by scan counters. relation_tuple_subject_live_idx was dropped despite appearing in a live query plan.
+  Rationale: EP-49's gate assumed an index the planner chooses is an index the planner needs. EP-46 falsified that by adding subject-scoped precondition filters that select the index; dropping it hands the identical Index Cond to relation_tuple_subject_hist_idx with equal buffers and lower latency. Nothing regresses, so the gate's purpose is met while its text is not. Both live indexes had to go together for the write win (0.573 s → 0.378 s on a 20k-row insert); dropping the unambiguously dead one alone was within measurement noise.
+  Date: 2026-07-09
+- Decision: The garbage-collection horizon is not cached. EP-49's mandate to put it behind the optimized-revision TTL is reversed; TtlCache is still generalized to `TtlCache a`.
+  Rationale: EP-49's safety argument was inverted. The horizon rises monotonically and validateTokenMetadata rejects when snapshot.xmax <= horizon, so a TTL-stale (smaller) horizon rejects fewer tokens — it honours tokens whose history the reaper destroyed, for up to one TTL, widening EP-47's C7 window. Worse, it would do so through EN_OPTIMIZED_REVISION_CACHE_TTL_MS, overloading a read-latency knob with a token-expiry meaning. Lazy resolution alone delivers finding C3's full acceptance table (1/1/1/2). Any future horizon cache needs its own knob and its own argument.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+All five child plans are Complete. Every finding this master plan claimed is addressed:
+Theme C (C1, C3, C5–C9) plus gaps E1 and E9 of
+`docs/reviews/2026-07-07-architecture-performance-review.md`.
+
+**What exists now that did not before.** A write of an existing tuple with a different caveat
+replaces it atomically, keyed on object/relation/subject alone (C1, EP-45). Writers attach
+must-exist and must-not-exist preconditions and mix writes with deletes in one atomic request
+and one token (E1, EP-46). Storage decode failures — malformed caveat payloads, malformed
+cursors — are typed errors rather than silently-empty defaults that could flip an
+authorization decision (C8, EP-47). Write tokens denote exact, repeatable snapshots (C5,
+EP-47). N-tuple writes cost O(1) round trips, 203 → 6 statements for 100 tuples, and
+`en-server import`/`export` exist for migration into and out of en (C6, E9, EP-48). The index
+set matches the query set, and consistency resolution fetches only what the requested mode
+needs (C9, C3, EP-49). C7 is documented rather than closed, deliberately and with the
+reasoning recorded.
+
+**Measured.** Write path: 203 → 6 statements per 100-tuple write; a 5,000-entry batch
+statement 55,792 ms → 14.4 ms once pinned to a `LATERAL` index probe; a 100,000-tuple
+re-import 272 s → 3.57 s; a 20,000-row insert 0.573 s → 0.378 s after the dead indexes went,
+with ~36 MB of index storage reclaimed. Read path: consistency resolution 3 → 1 round trips
+for `MinimizeLatency`, `FullyConsistent` and `AtExactSnapshot`, 3 → 2 for `AtLeastAsFresh`.
+
+**The decomposition held.** EP-45 before EP-46 was the right hard dependency and paid for
+itself immediately: EP-45's discovery that zero-row statement counts cannot stand in for a
+row's absence became a constraint EP-48 inherited, and preconditions specified against
+`ON CONFLICT DO NOTHING` would have encoded semantics EP-45 then changed. EP-47 and EP-49 were
+correctly identified as independent. The one seam that leaked was EP-46 → EP-49: EP-46 added
+statement shapes that made an index EP-49 had already condemned load-bearing, and only the
+EXPLAIN gate caught it. A plan that names specific code artifacts as dead is making a claim
+about a working tree it will not meet.
+
+**Three lessons worth carrying forward, each learned by a plan being wrong in writing.**
+
+1. *Round-trip count and cost are independent axes.* EP-48 delivered C6's round-trip reduction
+   in a change that simultaneously introduced a 55-second statement, because a `Function Scan`
+   carries no statistics and the planner guessed. Every batched statement over `relation_tuple`
+   is now pinned to a `LATERAL` probe, and the acceptance bar for a batched statement is its
+   EXPLAIN plan at production batch and table sizes — never its round-trip count.
+
+2. *An index audit must ask "does removing it change any plan?", not "is it scanned?"* EP-49
+   asked the second question, got "yes" for `subject_live_idx`, and would have kept 20 MB of
+   write amplification buying a plan measurably slower than its fallback. The counterfactual —
+   drop inside a rolled-back transaction, re-EXPLAIN — is cheap, exact, and immune to a sibling
+   plan having quietly created a consumer. It also proved the drop innocent of a reaper plan
+   regression that autovacuum had caused.
+
+3. *A cache's safety argument must name the direction of staleness.* EP-49's plan asserted a
+   TTL-stale GC horizon is "strictly conservative". It is the precise opposite: the horizon
+   rises monotonically, validation rejects below it, so a stale horizon accepts expired tokens.
+   Shipping it would have widened a documented TOCTOU race through a knob labelled for read
+   latency. The lazy-resolution work delivered C3's full acceptance table without it.
+
+**Tests can certify nothing, in more ways than a plan anticipates.** This initiative found:
+a concurrency scenario that never established overlap (EP-46); `cabal test all | grep FAIL`
+reporting success for suites that failed to compile (EP-46); a malformed-payload scenario
+reading at a revision minted before it planted the row, so no decode ever ran (EP-47); a retry
+ladder laundering a duplicate-key bug until a fourth copy was added (EP-48); a single-connection
+suite leaving the convergence check, the fallback, and the ordinal mapping unreachable (EP-48);
+and a seed script whose row count was an artifact of its own `ON CONFLICT` clause (EP-49). The
+standing rule EP-46 introduced — run every new scenario once against the bug it claims to catch
+— caught the last three and was applied to both of EP-49's new assertions.
+
+**Left open, with owners.** `reapDeletedTuplesBatchStatement` plans a full-table hash join, 19×
+slower than the nested loop `enable_seqscan = off` reveals; it belongs to
+docs/plans/37 (master plan 6) and is recorded in Surprises & Discoveries. The precondition
+statements are sargable only because PostgreSQL prefers a custom plan to a generic one, a
+margin that lives in the cost model rather than the SQL. C7's GC TOCTOU remains reachable in
+principle, bounded by the `EN_GC_WINDOW` ≫ request-duration invariant EP-47 documented in the
+deployment guide, the spec §7, and the operations guide. `relation_tuple_created_xid_idx` is
+retained on EP-53's promise; if that plan abandons its `created_xid`-bounded window, it owns
+the drop.
