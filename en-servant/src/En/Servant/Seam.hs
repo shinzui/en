@@ -33,7 +33,7 @@ import Servant (Handler, ServerError (..), err400, err403, err404, err412, err42
 import System.IO (stderr)
 
 import En.Budget (EvaluationBudget)
-import En.Check (CheckDecision)
+import En.Check (CheckOutcome)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
@@ -49,7 +49,7 @@ type AppEffects = '[ConsistencyStore, TupleStore, Error EnError, Database, IOE]
 data Env es = Env
     { runPorts :: !(forall a. Eff es a -> IO (Either EnError a))
     , graph :: !ReachabilityGraph
-    , checkOperation :: !(ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckDecision)
+    , checkOperation :: !(ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckOutcome)
     , lookupWithDeadlineOperation :: !(Lookup.Deadline (Eff es) -> ReachabilityGraph -> Consistency -> Lookup.LookupRequest -> Eff es Lookup.LookupPage)
     , budget :: !EvaluationBudget
     {- ^ Static evaluation bounds. The operations above are already partially

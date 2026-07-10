@@ -102,8 +102,8 @@ import Servant (
 import Servant.API.MultiVerb (AsUnion (..), MultiVerb, Respond)
 import Servant.Server (ErrorFormatter, ErrorFormatters (..), defaultErrorFormatters)
 
-import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..), checkMany)
-import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
+import En.Check (BatchOutcome (..), BatchPair (..), CaveatObligation (..), CheckDecision (..), CheckOutcome (..), checkMany)
+import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), mintToken, resolveConsistency)
 import En.Effect.TupleStore (
     PageState (..),
     Precondition (..),
@@ -600,17 +600,25 @@ instance FromJSON CaveatObligationWire where
     parseJSON = withObject "CaveatObligationWire" \o ->
         CaveatObligationWire <$> o .: "caveat" <*> o .: "missingContext"
 
-newtype CheckResponseWire = CheckResponseWire
-    { decision :: CheckDecisionWire
+{- | A decision, and the consistency token naming the snapshot it was decided at.
+
+@checkedAt@ is what makes a read chainable: send it back as
+@{"consistency": {"requirement": "atLeastAsFresh", "token": …}}@ on a follow-up
+read and that read is guaranteed to observe everything this one observed.
+-}
+data CheckResponseWire = CheckResponseWire
+    { decision :: !CheckDecisionWire
+    , checkedAt :: !Text
     }
     deriving stock (Eq, Show)
 
 instance ToJSON CheckResponseWire where
-    toJSON wire = Aeson.object ["decision" .= wire.decision]
-    toEncoding wire = pairs ("decision" .= wire.decision)
+    toJSON wire = Aeson.object ["decision" .= wire.decision, "checkedAt" .= wire.checkedAt]
+    toEncoding wire = pairs ("decision" .= wire.decision <> "checkedAt" .= wire.checkedAt)
 
 instance FromJSON CheckResponseWire where
-    parseJSON = withObject "CheckResponseWire" \o -> CheckResponseWire <$> o .: "decision"
+    parseJSON = withObject "CheckResponseWire" \o ->
+        CheckResponseWire <$> o .: "decision" <*> o .: "checkedAt"
 
 data BatchCheckPairWire = BatchCheckPairWire
     { subject :: !SubjectWire
@@ -654,17 +662,24 @@ instance FromJSON BatchCheckRequestWire where
     parseJSON = withObject "BatchCheckRequestWire" \o ->
         BatchCheckRequestWire <$> o .: "consistency" <*> o .: "context" <*> o .: "pairs"
 
-newtype BatchCheckResponseWire = BatchCheckResponseWire
-    { decisions :: [CheckDecisionWire]
+{- | Decisions in input order, and the one snapshot the whole batch was decided at.
+
+One @checkedAt@, not one per pair: the engine resolves consistency once and
+evaluates every pair against that revision, so per-pair tokens would be copies.
+-}
+data BatchCheckResponseWire = BatchCheckResponseWire
+    { decisions :: ![CheckDecisionWire]
+    , checkedAt :: !Text
     }
     deriving stock (Eq, Show)
 
 instance ToJSON BatchCheckResponseWire where
-    toJSON wire = Aeson.object ["decisions" .= wire.decisions]
-    toEncoding wire = pairs ("decisions" .= wire.decisions)
+    toJSON wire = Aeson.object ["decisions" .= wire.decisions, "checkedAt" .= wire.checkedAt]
+    toEncoding wire = pairs ("decisions" .= wire.decisions <> "checkedAt" .= wire.checkedAt)
 
 instance FromJSON BatchCheckResponseWire where
-    parseJSON = withObject "BatchCheckResponseWire" \o -> BatchCheckResponseWire <$> o .: "decisions"
+    parseJSON = withObject "BatchCheckResponseWire" \o ->
+        BatchCheckResponseWire <$> o .: "decisions" <*> o .: "checkedAt"
 
 data LookupRequestWire = LookupRequestWire
     { consistency :: !ConsistencyWire
@@ -752,19 +767,28 @@ instance FromJSON LookupStateWire where
             "truncated" -> LookupTruncatedWire <$> o .: "cursor"
             other -> unknownVariant "lookup status" other ["exhausted", "hasMore", "truncated"]
 
+{- | A page of authorized objects, and the snapshot the lookup reads at.
+
+Every page of one traversal carries the same @checkedAt@: the cursor pins the
+snapshot, and a continuation reads at the revision its cursor's validated token
+names.
+-}
 data LookupPageWire = LookupPageWire
     { objects :: ![LookupObjectWire]
     , state :: !LookupStateWire
+    , checkedAt :: !Text
     }
     deriving stock (Eq, Show)
 
 instance ToJSON LookupPageWire where
-    toJSON wire = Aeson.object ["objects" .= wire.objects, "state" .= wire.state]
-    toEncoding wire = pairs ("objects" .= wire.objects <> "state" .= wire.state)
+    toJSON wire =
+        Aeson.object ["objects" .= wire.objects, "state" .= wire.state, "checkedAt" .= wire.checkedAt]
+    toEncoding wire =
+        pairs ("objects" .= wire.objects <> "state" .= wire.state <> "checkedAt" .= wire.checkedAt)
 
 instance FromJSON LookupPageWire where
     parseJSON = withObject "LookupPageWire" \o ->
-        LookupPageWire <$> o .: "objects" <*> o .: "state"
+        LookupPageWire <$> o .: "objects" <*> o .: "state" <*> o .: "checkedAt"
 
 data ExpandRequestWire = ExpandRequestWire
     { consistency :: !ConsistencyWire
@@ -912,11 +936,13 @@ instance FromJSON ExpandStateWire where
             "truncated" -> ExpandTruncatedWire <$> o .: "cursor"
             other -> unknownVariant "expand status" other ["exhausted", "hasMore", "truncated"]
 
+-- | The permission's subject tree, and the snapshot it was expanded at.
 data ExpandTreeWire = ExpandTreeWire
     { root :: !ObjectRefWire
     , permission :: !Text
     , children :: ![ExpandNodeWire]
     , state :: !ExpandStateWire
+    , checkedAt :: !Text
     }
     deriving stock (Eq, Show)
 
@@ -927,6 +953,7 @@ instance ToJSON ExpandTreeWire where
             , "permission" .= wire.permission
             , "children" .= wire.children
             , "state" .= wire.state
+            , "checkedAt" .= wire.checkedAt
             ]
     toEncoding wire =
         pairs
@@ -934,11 +961,17 @@ instance ToJSON ExpandTreeWire where
                 <> "permission" .= wire.permission
                 <> "children" .= wire.children
                 <> "state" .= wire.state
+                <> "checkedAt" .= wire.checkedAt
             )
 
 instance FromJSON ExpandTreeWire where
     parseJSON = withObject "ExpandTreeWire" \o ->
-        ExpandTreeWire <$> o .: "root" <*> o .: "permission" <*> o .: "children" <*> o .: "state"
+        ExpandTreeWire
+            <$> o .: "root"
+            <*> o .: "permission"
+            <*> o .: "children"
+            <*> o .: "state"
+            <*> o .: "checkedAt"
 
 {- | How a filter constrains the subject's relation.
 
@@ -1209,19 +1242,31 @@ instance FromJSON RelationshipsStateWire where
             "hasMore" -> RelationshipsHasMoreWire <$> o .: "cursor"
             other -> unknownVariant "relationships status" other ["exhausted", "hasMore"]
 
+-- | A page of stored relationships, and the snapshot they were read at.
 data ReadRelationshipsResponseWire = ReadRelationshipsResponseWire
     { relationships :: ![TupleWire]
     , state :: !RelationshipsStateWire
+    , checkedAt :: !Text
     }
     deriving stock (Eq, Show)
 
 instance ToJSON ReadRelationshipsResponseWire where
-    toJSON wire = Aeson.object ["relationships" .= wire.relationships, "state" .= wire.state]
-    toEncoding wire = pairs ("relationships" .= wire.relationships <> "state" .= wire.state)
+    toJSON wire =
+        Aeson.object
+            [ "relationships" .= wire.relationships
+            , "state" .= wire.state
+            , "checkedAt" .= wire.checkedAt
+            ]
+    toEncoding wire =
+        pairs
+            ( "relationships" .= wire.relationships
+                <> "state" .= wire.state
+                <> "checkedAt" .= wire.checkedAt
+            )
 
 instance FromJSON ReadRelationshipsResponseWire where
     parseJSON = withObject "ReadRelationshipsResponseWire" \o ->
-        ReadRelationshipsResponseWire <$> o .: "relationships" <*> o .: "state"
+        ReadRelationshipsResponseWire <$> o .: "relationships" <*> o .: "state" <*> o .: "checkedAt"
 
 {- | A delete-by-filter request. @dryRun@ is mandatory and has no default.
 
@@ -1311,11 +1356,13 @@ readRelationshipsHandler env request = enHandler do
     consistency <- orInvalid (consistencyFromWire request.consistency)
     relationshipFilter <- orInvalid (relationshipFilterFromWire request.filter)
     limit <- orInvalid (positiveLimit request.limit)
-    page <-
+    (checkedAt, page) <-
         engine env do
             ResolvedConsistency{revision} <- resolveConsistency consistency
-            readRelationships revision relationshipFilter limit (StoreCursor <$> request.cursor)
-    pure (relationshipsPageToWire page)
+            checkedAt <- mintToken revision
+            page <- readRelationships revision relationshipFilter limit (StoreCursor <$> request.cursor)
+            pure (checkedAt, page)
+    pure (relationshipsPageToWire checkedAt page)
 
 {- | Dry-run and deletion are one endpoint because they must ask the store the same
 question. Splitting them into @\/count@ and @\/delete@ would invite a caller to count
@@ -1349,7 +1396,7 @@ checkHandler env request = enHandler do
     context <- orInvalid (contextFromWire request.context)
     subject <- orInvalid (subjectFromWire request.subject)
     object <- orInvalid (objectRefFromWire request.object)
-    decision <-
+    outcome <-
         engine
             env
             ( env.checkOperation
@@ -1360,7 +1407,8 @@ checkHandler env request = enHandler do
                 (RelationName request.permission)
                 object
             )
-    pure CheckResponseWire{decision = decisionToWire decision}
+    let ConsistencyToken checkedAt = outcome.checkedAt
+    pure CheckResponseWire{decision = decisionToWire outcome.decision, checkedAt}
 
 batchCheckHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) => Env es -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
 batchCheckHandler env request = enHandler do
@@ -1372,7 +1420,7 @@ batchCheckHandler env request = enHandler do
     consistency <- orInvalid (consistencyFromWire request.consistency)
     context <- orInvalid (contextFromWire request.context)
     batchPairs <- traverseOrInvalid pairFromWire request.pairs
-    decisions <-
+    outcome <-
         engine
             env
             ( checkMany
@@ -1381,11 +1429,16 @@ batchCheckHandler env request = enHandler do
                 context
                 batchPairs
             )
+    let ConsistencyToken checkedAt = outcome.checkedAt
     -- Fail closed on the wire: a pair the engine could not evaluate is reported
     -- as a denial. The engine now preserves the error, so
     -- docs/plans/35-version-the-wire-contract-and-type-the-error-model.md can
     -- add a per-pair error channel without touching evaluation.
-    pure BatchCheckResponseWire{decisions = either (const DeniedWire) decisionToWire <$> decisions}
+    pure
+        BatchCheckResponseWire
+            { decisions = either (const DeniedWire) decisionToWire <$> outcome.decisions
+            , checkedAt
+            }
   where
     pairFromWire :: BatchCheckPairWire -> Either Text BatchPair
     pairFromWire wire =
@@ -1565,11 +1618,12 @@ positiveLimit limit
     | limit <= 0 = Left "limit must be positive"
     | otherwise = Right limit
 
-relationshipsPageToWire :: TuplePage -> ReadRelationshipsResponseWire
-relationshipsPageToWire TuplePage{rows, state} =
+relationshipsPageToWire :: ConsistencyToken -> TuplePage -> ReadRelationshipsResponseWire
+relationshipsPageToWire (ConsistencyToken checkedAt) TuplePage{rows, state} =
     ReadRelationshipsResponseWire
         { relationships = tupleToWire . (.tuple) <$> rows
         , state = relationshipsStateToWire state
+        , checkedAt
         }
 
 relationshipsStateToWire :: PageState -> RelationshipsStateWire
@@ -1664,10 +1718,11 @@ obligationToWire CaveatObligation{caveat = CaveatName caveat, missingContext} =
     CaveatObligationWire{caveat, missingContext}
 
 lookupPageToWire :: Lookup.LookupPage -> LookupPageWire
-lookupPageToWire Lookup.LookupPage{objects, state} =
+lookupPageToWire Lookup.LookupPage{objects, state, checkedAt = ConsistencyToken checkedAt} =
     LookupPageWire
         { objects = lookupObjectToWire <$> objects
         , state = lookupStateToWire state
+        , checkedAt
         }
 
 lookupObjectToWire :: Lookup.LookupObject -> LookupObjectWire
@@ -1682,12 +1737,13 @@ lookupStateToWire =
         Lookup.LookupTruncated (Lookup.LookupCursor cursor) -> LookupTruncatedWire cursor
 
 expandTreeToWire :: Expand.ExpandTree -> ExpandTreeWire
-expandTreeToWire Expand.ExpandTree{root, permission = RelationName permission, children, state} =
+expandTreeToWire Expand.ExpandTree{root, permission = RelationName permission, children, state, checkedAt = ConsistencyToken checkedAt} =
     ExpandTreeWire
         { root = objectRefToWire root
         , permission
         , children = expandNodeToWire <$> children
         , state = expandStateToWire state
+        , checkedAt
         }
 
 expandNodeToWire :: Expand.ExpandNode -> ExpandNodeWire

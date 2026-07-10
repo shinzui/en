@@ -137,9 +137,18 @@ data LookupState
     | LookupTruncated !LookupCursor
     deriving stock (Eq, Ord, Show)
 
+{- | One page of a lookup, and the snapshot the whole lookup reads at.
+
+'checkedAt' is the same token the outgoing cursor pins, so every page of one
+traversal reports the same value: a lookup resolves consistency once, and a
+continuation reads at the revision its cursor's /validated/ token names. A caller
+can chain a follow-up read at @AtLeastAsFresh@ this token and be certain of
+observing everything the page observed.
+-}
 data LookupPage = LookupPage
     { objects :: ![LookupObject]
     , state :: !LookupState
+    , checkedAt :: !ConsistencyToken
     }
     deriving stock (Eq, Show)
 
@@ -365,6 +374,7 @@ interruptedPage cursorState token =
                         , frontier = []
                         }
                 )
+        , checkedAt = token
         }
 
 {- | The traversal's budget ran out. Raised inside the reverse walk and caught by
@@ -911,7 +921,7 @@ pageLookup budget deadline (LookupLimit rawLimit) cursorState token objects = do
             | hasMore && hasBudget = LookupHasMore (encodeLookupCursor nextCursor)
             | hasMore = LookupTruncated (encodeLookupCursor nextCursor)
             | otherwise = LookupExhausted
-    pure LookupPage{objects = visible, state}
+    pure LookupPage{objects = visible, state, checkedAt = token}
 
 lastMaybe :: [a] -> Maybe a
 lastMaybe =

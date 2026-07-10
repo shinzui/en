@@ -46,7 +46,7 @@ import Servant (
  )
 
 import En.Budget (defaultEvaluationBudget)
-import En.Check (CheckDecision (..), check)
+import En.Check (CheckDecision (..), CheckOutcome (..), check)
 import En.Conformance.Kikan qualified as Kikan
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
 import En.Effect.TupleStore (TupleStore)
@@ -154,9 +154,11 @@ resolveSecret env subject secretId =
 resolveWithGate :: Env ExampleEffects -> Subject -> ObjectRef -> DocumentView -> IO (Either ResolverError DocumentView)
 resolveWithGate Env{runPorts, graph, checkOperation} subject object result =
     runPorts (checkOperation graph MinimizeLatency emptyContext subject (RelationName "view") object) >>= \case
-        Right Allowed -> pure (Right result)
-        Right Denied -> pure (Left ResolverForbidden)
-        Right (Conditional _) -> pure (Left ResolverForbidden)
+        Right outcome ->
+            case outcome.decision of
+                Allowed -> pure (Right result)
+                Denied -> pure (Left ResolverForbidden)
+                Conditional _ -> pure (Left ResolverForbidden)
         Left _ -> pure (Left ResolverForbidden)
 
 runTupleStoreInMemory :: (Error EnError Effectful.:> es) => [Tuple] -> Eff (TupleStore : es) a -> Eff es a

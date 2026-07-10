@@ -325,7 +325,7 @@ instance ToSchema CheckDecisionWire where
 instance ToSchema CheckResponseWire where
     declareNamedSchema _ = do
         decision <- declareSchemaRef (Proxy @CheckDecisionWire)
-        pure (NamedSchema (Just "CheckResponseWire") (objectSchema [("decision", decision)]))
+        pure (NamedSchema (Just "CheckResponseWire") (objectSchema [("decision", decision), ("checkedAt", textRef)]))
 
 instance ToSchema BatchCheckPairWire where
     declareNamedSchema _ = do
@@ -347,7 +347,7 @@ instance ToSchema BatchCheckRequestWire where
 instance ToSchema BatchCheckResponseWire where
     declareNamedSchema _ = do
         decision <- declareSchemaRef (Proxy @CheckDecisionWire)
-        pure (NamedSchema (Just "BatchCheckResponseWire") (objectSchema [("decisions", arrayOf decision)]))
+        pure (NamedSchema (Just "BatchCheckResponseWire") (objectSchema [("decisions", arrayOf decision), ("checkedAt", textRef)]))
 
 instance ToSchema LookupRequestWire where
     declareNamedSchema _ = do
@@ -380,7 +380,7 @@ instance ToSchema LookupPageWire where
     declareNamedSchema _ = do
         object <- declareSchemaRef (Proxy @LookupObjectWire)
         state <- declareSchemaRef (Proxy @LookupStateWire)
-        pure (NamedSchema (Just "LookupPageWire") (objectSchema [("objects", arrayOf object), ("state", state)]))
+        pure (NamedSchema (Just "LookupPageWire") (objectSchema [("objects", arrayOf object), ("state", state), ("checkedAt", textRef)]))
 
 instance ToSchema ExpandRequestWire where
     declareNamedSchema _ = do
@@ -441,6 +441,7 @@ instance ToSchema ExpandTreeWire where
                     , ("permission", textRef)
                     , ("children", arrayOf node)
                     , ("state", state)
+                    , ("checkedAt", textRef)
                     ]
 
 instance ToSchema SubjectRelationFilterWire where
@@ -521,7 +522,7 @@ instance ToSchema ReadRelationshipsResponseWire where
         state <- declareSchemaRef (Proxy @RelationshipsStateWire)
         pure $
             NamedSchema (Just "ReadRelationshipsResponseWire") $
-                objectSchema [("relationships", arrayOf tuple), ("state", state)]
+                objectSchema [("relationships", arrayOf tuple), ("state", state), ("checkedAt", textRef)]
 
 instance ToSchema DeleteRelationshipsRequestWire where
     declareNamedSchema _ = do

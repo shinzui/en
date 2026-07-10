@@ -25,11 +25,13 @@ case result of
 module En.Client (
     EnClient (..),
     enClient,
+    chainFrom,
     module En.Servant.API,
 ) where
 
 import Prelude hiding (lookup)
 
+import Data.Text (Text)
 import Servant.API ((:<|>) (..))
 import Servant.Client (ClientM, client)
 
@@ -71,3 +73,17 @@ enClient =
         :<|> batchCheck
         :<|> lookup
         :<|> expand = client apiProxy
+
+{- | Ask for a read at least as fresh as a previous response's @checkedAt@.
+
+Every read response carries the token it was evaluated at. Feeding that token to
+the next read chains the two: the second observes everything the first observed.
+
+@
+EnOk decided <- runClientM (enClient.check request) clientEnv
+EnOk page <- runClientM (enClient.lookup followUp{consistency = chainFrom decided.checkedAt}) clientEnv
+@
+-}
+chainFrom :: Text -> ConsistencyWire
+chainFrom =
+    AtLeastAsFreshWire

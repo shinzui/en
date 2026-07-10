@@ -429,6 +429,15 @@ main = do
     resolveCount <- newIORef 0
     assertEqual "batch with counted consistency still returns decisions" (Right [Right Allowed, Right Denied, Right Denied, Right Denied]) =<< checkMany (countingConsistencyStore resolveCount consistencyStore) tupleStore graph MinimizeLatency requestContext mixedBatch
     assertEqual "batch resolves consistency once" 1 =<< readIORef resolveCount
+    {- E3. Every read reports the snapshot it was decided at, so a caller can chain a
+    follow-up read at 'AtLeastAsFresh' that token.
+
+    The batch carries /one/ token however many pairs it holds, and it is the same
+    token a single check at the same consistency reports, because 'checkMany'
+    resolves consistency once and evaluates every pair against that revision. A
+    per-pair token would be four copies of one value pretending to be four facts. -}
+    assertEqual "a check reports the snapshot it was decided at" (Right testToken) . fmap (.checkedAt) =<< checkOutcome consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
+    assertEqual "a batch reports exactly one token, equal to a single check's" (Right testToken) . fmap (.checkedAt) =<< batchOutcome consistencyStore tupleStore graph MinimizeLatency requestContext mixedBatch
     let overlappingBatch =
             [ BatchPair (SubjectId user) (RelationName "view") space
             , BatchPair (SubjectId user) (RelationName "owner") space
@@ -684,7 +693,16 @@ main = do
     let childCursor = encodeLookupCursor LookupCursorState{version = 2, token = testToken, lastObject = Just childSpace, frontier = []}
     assertEqual "lookup paginates deterministically first page" (Right (lookupPage [allowed childSpace] (LookupHasMore childCursor))) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) Nothing)
     assertEqual "lookup paginates deterministically second page" (Right (lookupPage [allowed space] LookupExhausted)) =<< lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) (Just childCursor))
+    {- E3, the paging half. A lookup resolves consistency once and every page reads
+    that snapshot, so page two reports the token page one did -- taken from the
+    cursor's /validated/ token rather than resolved afresh, which is what makes a
+    multi-page lookup one answer rather than several. -}
+    firstPageToken <- fmap (fmap (.checkedAt)) (lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) Nothing))
+    secondPageToken <- fmap (fmap (.checkedAt)) (lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) (Just childCursor)))
+    assertEqual "a resumed lookup page reports the first page's token" firstPageToken secondPageToken
+    assertEqual "a lookup page reports the snapshot it was evaluated at" (Right testToken) firstPageToken
     spaceExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest space (RelationName "view") requestContext (ExpandLimit 20) Nothing)
+    assertEqual "expand reports the snapshot it was taken at" (Right testToken) (fmap (.checkedAt) spaceExpansion)
     assertBool "expand includes direct owner subject" (treeHasSubject (SubjectId user) spaceExpansion)
     childExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest childSpace (RelationName "view") requestContext (ExpandLimit 20) Nothing)
     assertBool "expand includes parent userset" (treeHasUserset space (RelationName "view") childExpansion)
@@ -776,6 +794,7 @@ sampleLookupPage =
     LookupPage
         { objects = [allowed space]
         , state = LookupTruncated (LookupCursor "cursor")
+        , checkedAt = testToken
         }
 
 sampleExpandRequest :: ExpandRequest
@@ -795,6 +814,7 @@ sampleExpandTree =
         , permission = RelationName "view"
         , children = []
         , state = ExpandExhausted
+        , checkedAt = testToken
         }
 
 sampleCaveatDefinition :: CaveatDefinition
@@ -1725,7 +1745,7 @@ checkCachedEngine ::
     ObjectRef ->
     IO (Either EnError CheckDecision)
 checkCachedEngine cStore tStore cacheEnv graph consistency context subject relation object =
-    runEngine cStore tStore (Check.checkCached cacheEnv graph consistency context subject relation object)
+    fmap (.decision) <$> runEngine cStore tStore (Check.checkCached cacheEnv graph consistency context subject relation object)
 
 lookupCachedEngine ::
     ConsistencyInterpreter ->
@@ -1742,9 +1762,13 @@ lookupRequest :: Subject -> RelationName -> ObjectType -> CaveatContext -> Looku
 lookupRequest subject permission objectType context limit cursor =
     LookupRequest{subject, permission, objectType, context, limit, cursor}
 
+{- | The page every in-memory lookup in this suite produces: 'testToken' is what
+both in-memory consistency stores mint for 'testRevision', which is the only
+revision they resolve to.
+-}
 lookupPage :: [LookupObject] -> LookupState -> LookupPage
 lookupPage objects state =
-    LookupPage{objects, state}
+    LookupPage{objects, state, checkedAt = testToken}
 
 type TestEffects = '[ConsistencyStore, TupleStore, Error EnError, IOE]
 
@@ -1769,6 +1793,20 @@ check ::
     ObjectRef ->
     IO (Either EnError CheckDecision)
 check cStore tStore graph consistency context subject relation object =
+    fmap (.decision) <$> checkOutcome cStore tStore graph consistency context subject relation object
+
+-- | 'check', keeping the token it was decided at. See 'Check.CheckOutcome'.
+checkOutcome ::
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    ReachabilityGraph ->
+    Consistency ->
+    CaveatContext ->
+    Subject ->
+    RelationName ->
+    ObjectRef ->
+    IO (Either EnError Check.CheckOutcome)
+checkOutcome cStore tStore graph consistency context subject relation object =
     runEngine cStore tStore (Check.check graph consistency context subject relation object)
 
 checkBudgeted ::
@@ -1783,7 +1821,7 @@ checkBudgeted ::
     ObjectRef ->
     IO (Either EnError CheckDecision)
 checkBudgeted budget cStore tStore graph consistency context subject relation object =
-    runEngine cStore tStore (Check.checkWithBudget budget graph consistency context subject relation object)
+    fmap (.decision) <$> runEngine cStore tStore (Check.checkWithBudget budget graph consistency context subject relation object)
 
 probe ::
     ConsistencyInterpreter ->
@@ -1804,6 +1842,18 @@ checkMany ::
     [BatchPair] ->
     IO (Either EnError [Either EnError CheckDecision])
 checkMany cStore tStore graph consistency context pairs =
+    fmap (.decisions) <$> batchOutcome cStore tStore graph consistency context pairs
+
+-- | 'checkMany', keeping the one token the whole batch was decided at.
+batchOutcome ::
+    ConsistencyInterpreter ->
+    TupleInterpreter ->
+    ReachabilityGraph ->
+    Consistency ->
+    CaveatContext ->
+    [BatchPair] ->
+    IO (Either EnError Check.BatchOutcome)
+batchOutcome cStore tStore graph consistency context pairs =
     runEngine cStore tStore (Check.checkMany graph consistency context pairs)
 
 lookupEngine ::

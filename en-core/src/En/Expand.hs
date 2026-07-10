@@ -25,11 +25,11 @@ import Effectful (Eff, (:>))
 import Effectful.Error.Static (Error, throwError)
 
 import En.Budget (EvaluationBudget (..), defaultEvaluationBudget)
-import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
+import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), mintToken, resolveConsistency)
 import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, readObjectRelation)
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
-import En.Revision (Consistency, Revision)
+import En.Revision (Consistency, ConsistencyToken, Revision)
 import En.Schema (CaveatName, ObjectType (..), Relation (..), RelationName (..), Rewrite (..))
 import En.Tuple (CaveatContext, ObjectRef (..), Subject (..), Tuple (..), TupleCaveat (..))
 
@@ -84,11 +84,18 @@ data ExpandNode
       ExpandExclusion ![ExpandNode] ![ExpandNode]
     deriving stock (Eq, Show)
 
+{- | An expansion, and the snapshot it was taken at.
+
+'checkedAt' pins the revision 'expand' resolved. An auditor reading this tree can
+name the moment it describes, and re-read at @AtLeastAsFresh@ that token to
+compare against a later one.
+-}
 data ExpandTree = ExpandTree
     { root :: !ObjectRef
     , permission :: !RelationName
     , children :: ![ExpandNode]
     , state :: !ExpandState
+    , checkedAt :: !ConsistencyToken
     }
     deriving stock (Eq, Show)
 
@@ -111,16 +118,18 @@ expandWithBudget ::
     Eff es ExpandTree
 expandWithBudget budget graph consistency request = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
-    either throwError pure =<< runExpand budget graph revision request
+    checkedAt <- mintToken revision
+    either throwError pure =<< runExpand budget graph revision checkedAt request
 
 runExpand ::
     (TupleStore :> es) =>
     EvaluationBudget ->
     ReachabilityGraph ->
     Revision ->
+    ConsistencyToken ->
     ExpandRequest ->
     Eff es (Either EnError ExpandTree)
-runExpand budget graph revision request = do
+runExpand budget graph revision checkedAt request = do
     children <- expandRelation graph revision request.object request.permission (initialState budget)
     pure $
         ( \nodes ->
@@ -130,6 +139,7 @@ runExpand budget graph revision request = do
                     , permission = request.permission
                     , children = visible
                     , state
+                    , checkedAt
                     }
         )
             <$> children

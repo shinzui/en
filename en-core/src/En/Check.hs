@@ -1,6 +1,8 @@
 -- | Forward evaluation: does a subject have a permission on an object?
 module En.Check (
     CheckDecision (..),
+    CheckOutcome (..),
+    BatchOutcome (..),
     CaveatObligation (..),
     BatchPair (..),
     CheckCacheEnv (..),
@@ -32,11 +34,11 @@ import En.Cache (Cache, SubproblemKey (..), insertCache, lookupCache)
 import En.Caveat (applyResidual)
 import En.Decision (CaveatObligation (..), CheckDecision (..), ResidualDecision (..))
 import En.Decision qualified as Decision
-import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
+import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), mintToken, resolveConsistency)
 import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, UsersetQuery (..), probeTuples, readObjectRelation, readStartingWithUser)
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
-import En.Revision (Consistency, DatastoreId, Revision (..))
+import En.Revision (Consistency, ConsistencyToken, DatastoreId, Revision (..))
 import En.Schema (CaveatName (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..))
 import En.Tuple (
     CaveatContext (..),
@@ -58,6 +60,34 @@ data BatchPair = BatchPair
     , object :: !ObjectRef
     }
     deriving stock (Eq, Ord, Show)
+
+{- | A decision, and the snapshot it was decided at.
+
+'checkedAt' is a token pinning the revision 'resolveConsistency' chose for this
+call. It is what a caller passes back as @AtLeastAsFresh@ to make a follow-up read
+observe everything this one observed -- and it is what an 'En.Biscuit' grant needs
+to record the snapshot a decision was made at. Without it a decision is an answer
+to a question about a moment the caller cannot name.
+-}
+data CheckOutcome = CheckOutcome
+    { decision :: !CheckDecision
+    , checkedAt :: !ConsistencyToken
+    }
+    deriving stock (Eq, Show)
+
+{- | A batch's decisions, and the one snapshot all of them were decided at.
+
+One token, not one per pair: 'checkMany' resolves consistency once and evaluates
+every pair against that revision, so per-pair tokens would be copies of each other.
+
+Each decision is an 'Either' because a pair that fails to evaluate does not fail
+the batch -- see 'checkMany'.
+-}
+data BatchOutcome = BatchOutcome
+    { decisions :: ![Either EnError CheckDecision]
+    , checkedAt :: !ConsistencyToken
+    }
+    deriving stock (Eq, Show)
 
 data CheckCacheEnv = CheckCacheEnv
     { cacheDatastoreId :: !DatastoreId
@@ -81,7 +111,7 @@ check ::
     Subject ->
     RelationName ->
     ObjectRef ->
-    Eff es CheckDecision
+    Eff es CheckOutcome
 check =
     checkWithBudget defaultEvaluationBudget
 
@@ -95,11 +125,13 @@ checkWithBudget ::
     Subject ->
     RelationName ->
     ObjectRef ->
-    Eff es CheckDecision
+    Eff es CheckOutcome
 checkWithBudget budget graph consistency context subject permission object = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
+    checkedAt <- mintToken revision
     (residual, _memo) <- runCheckMemo budget graph revision subject permission object Map.empty
-    either throwError pure (residual >>= applyResidual graph.caveats context)
+    decision <- either throwError pure (residual >>= applyResidual graph.caveats context)
+    pure CheckOutcome{decision, checkedAt}
 
 {- | Cached variant of 'check'. Cache hits are keyed by datastore id, schema
 hash, resolved revision, subject, relation, and object -- deliberately /not/ by
@@ -121,7 +153,7 @@ checkCached ::
     Subject ->
     RelationName ->
     ObjectRef ->
-    Eff es CheckDecision
+    Eff es CheckOutcome
 checkCached =
     checkCachedWithBudget defaultEvaluationBudget
 
@@ -136,11 +168,13 @@ checkCachedWithBudget ::
     Subject ->
     RelationName ->
     ObjectRef ->
-    Eff es CheckDecision
+    Eff es CheckOutcome
 checkCachedWithBudget budget cacheEnv graph consistency context subject permission object = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
+    checkedAt <- mintToken revision
     (residual, _memo) <- runCheckMemoWithCache budget (Just (decisionCacheOps cacheEnv graph)) graph revision subject permission object Map.empty
-    either throwError pure (residual >>= applyResidual graph.caveats context)
+    decision <- either throwError pure (residual >>= applyResidual graph.caveats context)
+    pure CheckOutcome{decision, checkedAt}
 
 {- | Evaluate many checks against one resolved consistency snapshot.
 
@@ -160,6 +194,9 @@ This function therefore needs no @Error EnError@ capability of its own -- it
 raises nothing that is not already raised by the interpreters it runs under, and
 reports everything else as a value.
 
+The 'BatchOutcome' carries one 'BatchOutcome.checkedAt' token for the whole batch,
+because the whole batch was decided at one revision.
+
 The within-call memo holds 'ResidualDecision's, which carry no caveat context, so
 sharing them between the pairs of one batch is safe for the same reason sharing
 them between requests is: the context is applied per pair, after the traversal.
@@ -176,7 +213,7 @@ checkMany ::
     Consistency ->
     CaveatContext ->
     [BatchPair] ->
-    Eff es [Either EnError CheckDecision]
+    Eff es BatchOutcome
 checkMany =
     checkManyWithBudget defaultEvaluationBudget
 
@@ -188,18 +225,23 @@ checkManyWithBudget ::
     Consistency ->
     CaveatContext ->
     [BatchPair] ->
-    Eff es [Either EnError CheckDecision]
+    Eff es BatchOutcome
 checkManyWithBudget budget graph consistency context pairs = do
     ResolvedConsistency{revision} <- resolveConsistency consistency
+    checkedAt <- mintToken revision
     (residualsByPair, _memo) <-
         foldM
             (evaluateDistinct revision)
             (Map.empty, Map.empty)
             (dedupePairs pairs)
     pure
-        [ Map.findWithDefault (Right RDenied) pair residualsByPair >>= applyResidual graph.caveats context
-        | pair <- pairs
-        ]
+        BatchOutcome
+            { decisions =
+                [ Map.findWithDefault (Right RDenied) pair residualsByPair >>= applyResidual graph.caveats context
+                | pair <- pairs
+                ]
+            , checkedAt
+            }
   where
     evaluateDistinct revision (residualsByPair, memo) pair = do
         (residual, memo') <-

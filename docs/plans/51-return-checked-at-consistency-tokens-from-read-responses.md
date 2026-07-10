@@ -5,6 +5,7 @@ title: "Return checked-at consistency tokens from read responses"
 kind: exec-plan
 created_at: 2026-07-07T15:25:10Z
 master_plan: "docs/masterplans/9-complete-the-en-api-surface.md"
+intention: intention_01kx4y4empedt9g83mprcrew89
 ---
 
 # Return checked-at consistency tokens from read responses
@@ -44,16 +45,16 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Add `MintToken` to the `ConsistencyStore` effect in `en-core/src/En/Effect/ConsistencyStore.hs` with a `mintToken` smart constructor.
-- [ ] M1: Implement `MintToken` in the PostgreSQL interpreter (`en-postgres/src/En/Postgres/Revision.hs`, `runConsistencyStorePostgres`) via the existing `encodeToken`.
-- [ ] M1: Implement `MintToken` in the in-memory interpreter (`en-core/src/En/Conformance/Kikan.hs`, `runConsistencyStoreInMemory`).
-- [ ] M1: Add a Postgres round-trip test: `mintToken` of a resolved revision decodes and validates via `tokenMetadataFromPayload`/`validateTokenMetadata` (`en-postgres/test/Main.hs` or the integration suite).
-- [ ] M2: Change `En.Check.check`/`checkCached` to return `CheckOutcome` and `checkMany` to return `BatchOutcome`; adapt internal callers.
-- [ ] M2: Add `checkedAt :: ConsistencyToken` to `En.Lookup.LookupPage` and `En.Expand.ExpandTree`; thread the token through both algorithms, including the cursor-resume path in lookup.
-- [ ] M2: Update en-core interface and conformance tests for the new result shapes; add a test that a batch check yields exactly one token.
-- [ ] M3: Update `Env.checkOperation`/`lookupWithDeadlineOperation` signatures in `en-servant/src/En/Servant/Seam.hs` and their construction in `en-server/app/Main.hs`; adapt `en-servant/src/En/Servant/Authorize.hs` if it consumes `checkOperation`.
-- [ ] M3: Add `checkedAt` to `CheckResponseWire`, `BatchCheckResponseWire`, `LookupPageWire`, and `ExpandTreeWire` in `en-servant/src/En/Servant/API.hs`; update handlers and `en-servant/test/Main.hs`.
-- [ ] M3: Confirm `en-client/src/En/Client.hs` needs only recompilation (the client record is derived from the API type) and add the `chainFrom` convenience helper.
+- [x] M1 (2026-07-09, pre-landed by docs/plans/42): `MintToken` exists on the `ConsistencyStore` effect in `en-core/src/En/Effect/ConsistencyStore.hs` with a `mintToken` smart constructor.
+- [x] M1 (2026-07-09, pre-landed by docs/plans/42): `MintToken` is implemented in the PostgreSQL interpreter (`en-postgres/src/En/Postgres/Revision.hs:423`) via `encodeToken`, exactly as this plan specified.
+- [x] M1 (2026-07-09, pre-landed by docs/plans/42): `MintToken` is implemented in both in-memory interpreters (`runConsistencyStoreInMemory` and `runConsistencyStoreInMemoryStrict` in `en-core/src/En/Conformance/Kikan.hs`) and in `en-example/src/En/Example/Host.hs`.
+- [x] M1 (2026-07-09): Postgres round-trip test added to `en-postgres/integration-test/Main.hs` — resolving `FullyConsistent`, minting its revision, then `decodeToken` + `validateToken` through `runConsistencyStorePostgres` returns the same revision. It goes through the effect rather than the pure `tokenMetadataFromPayload`/`validateTokenMetadata` pair, which exercises the real garbage-collection-window check as well as the codec.
+- [x] M2 (2026-07-09): `En.Check.check`/`checkWithBudget`/`checkCached`/`checkCachedWithBudget` return `CheckOutcome`; `checkMany`/`checkManyWithBudget` return `BatchOutcome`. `checkAtRevision*` deliberately unchanged (see Surprises). Internal callers adapted: `en-biscuit/src/En/Biscuit/Mint.hs`, `en-servant/src/En/Servant/Authorize.hs`, `en-example/src/En/Example/Host.hs`.
+- [x] M2 (2026-07-09): `checkedAt :: ConsistencyToken` added to `En.Lookup.LookupPage` and `En.Expand.ExpandTree`. Lookup already threaded a token for its cursor, so both `pageLookup` and `interruptedPage` simply record it; expand mints from its resolved revision.
+- [x] M2 (2026-07-09): en-core interface and conformance tests updated. New assertions: a check reports `testToken`; a `checkMany` over four pairs reports exactly one token equal to a single check's; a resumed lookup page reports the first page's token; expand reports its snapshot.
+- [x] M3 (2026-07-09): `Env.checkOperation` in `en-servant/src/En/Servant/Seam.hs` returns `Eff es CheckOutcome`. `Authorize.requirePermission` and `En.Example.Host.resolveWithGate` project `.decision`. `en-server/app/Main.hs` needed no change, as predicted.
+- [x] M3 (2026-07-09): `checkedAt` added to `CheckResponseWire`, `BatchCheckResponseWire`, `LookupPageWire`, `ExpandTreeWire`, and `ReadRelationshipsResponseWire`; handlers, `ToSchema` instances, and `en-servant/test/Main.hs` updated. `CheckResponseWire` and `BatchCheckResponseWire` stopped being newtypes.
+- [x] M3 (2026-07-09): `en-client/src/En/Client.hs` needed only recompilation; `chainFrom` added and exported.
 - [ ] M4: Run the write → check → lookup chaining transcript against a live server and paste the observed output into Validation and Acceptance.
 
 
@@ -62,7 +63,63 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- 2026-07-09: **Milestone 1 was already implemented, by a plan in a different master
+  plan.** `docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md`
+  (master plan 7) landed as commit `b2ab2c5`, "fix(en-core): validate lookup cursors
+  instead of obeying them". Closing the forgeable-cursor hole required the datastore to be
+  able to *mint* a token for a revision so the cursor could carry one, which is the same
+  primitive this plan's M1 exists to add. It landed with exactly the encoding this plan
+  specified — `encodeToken TokenPayload{datastoreId, schemaHash, revision, expiresAt = Nothing}`
+  — and with a Haddock comment naming `checked_at` as a future consumer:
+
+  ```haskell
+  -- en-core/src/En/Effect/ConsistencyStore.hs
+  MintToken :: Revision -> ConsistencyStore m ConsistencyToken
+  ```
+
+  Interpreters exist in `en-postgres/src/En/Postgres/Revision.hs:423`,
+  `en-core/src/En/Conformance/Kikan.hs` (both the permissive and the strict in-memory
+  stores), and `en-example/src/En/Example/Host.hs` (both the working and the
+  fault-injecting store). Only the Postgres round-trip test M1 asked for is missing.
+  M1's three code items are therefore checked off as pre-landed rather than reimplemented.
+
+- 2026-07-09: **The fourth Decision Log entry below is now moot, and its recorded
+  concern is closed.** It says a lookup cursor-resume mints a token "from the revision
+  decoded out of the cursor", and warns that finding B9 (forgeable cursors) means a forged
+  cursor yields a token for a forged revision. EP-42 fixed this: `LookupCursorState` now
+  carries a `ConsistencyToken` rather than a raw revision, and `resolveCursor` in
+  `en-core/src/En/Lookup.hs` decodes *and validates* it through the datastore before the
+  continuation reads at it. A resumed page therefore reuses the cursor's already-validated
+  token verbatim, and `checkedAt` on page two is byte-identical to page one's by
+  construction rather than by re-derivation. The plan's intent survives; the hazard does not.
+
+- 2026-07-09: **`checkMany` no longer returns `[CheckDecision]`.** This plan's M2 specifies
+  `BatchOutcome { decisions :: ![CheckDecision] }`, but master plan 7's engine hardening
+  changed the engine to preserve per-pair failures:
+
+  ```haskell
+  -- en-core/src/En/Check.hs
+  checkMany :: … -> Eff es [Either EnError CheckDecision]
+  ```
+
+  `BatchOutcome` therefore carries `decisions :: ![Either EnError CheckDecision]`. The
+  `batchCheckHandler` in `en-servant/src/En/Servant/API.hs` still collapses a `Left` to
+  `DeniedWire` on the wire, so no observable behavior changes — only the field's type. The
+  plan's third Decision Log entry (one token per batch, not one per pair) is unaffected:
+  `checkMany` still calls `resolveConsistency` exactly once.
+
+- 2026-07-09: **`checkAtRevision` and its cached variant need no token and must not mint
+  one.** They take an already-resolved `Revision` and exist so that a lookup's per-candidate
+  confirmations read the snapshot the lookup pinned. Minting there would produce one token
+  per confirmed candidate, all equal, all discarded. So the `CheckForCandidate` newtype in
+  `en-core/src/En/Lookup.hs` keeps its `Either EnError CheckDecision` payload and no
+  projection is needed at the two wrapper sites — contrary to this plan's M2 prose, which
+  predates `checkAtRevisionWithBudget` being the thing `CheckForCandidate` wraps directly.
+
+- 2026-07-09: **EP-50 landed first, so `ReadRelationshipsResponseWire` gains `checkedAt`
+  here.** Its handler already resolves consistency and holds the revision, so the field
+  costs one `mintToken` call and no extra store round trip (`MintToken` is a pure encode in
+  every interpreter — `pure (encodeToken …)`, no database session).
 
 
 ## Decision Log
@@ -87,6 +144,21 @@ Record every decision made while working on the plan.
 - Decision: `checkMany`'s per-pair fail-closed behavior (errors become `Denied`, review B5) is left untouched; only the return shape changes.
   Rationale: Reworking batch error semantics is engine-hardening work owned by master plan 7. This plan changes what reads *return*, not how they evaluate.
   Date: 2026-07-07
+- Decision: `BatchOutcome.decisions` has type `[Either EnError CheckDecision]`, not the `[CheckDecision]` this plan's Milestone 2 wrote.
+  Rationale: Master plan 7's engine hardening already changed `checkMany` to preserve per-pair failures, and this plan's own decision above says not to rework that. Carrying the `Either` through is the shape-only change the decision above promises. The wire is unchanged: `batchCheckHandler` still collapses a `Left` to `DeniedWire`.
+  Date: 2026-07-09
+- Decision: `checkAtRevision` and `checkCachedAtRevision` keep returning a bare `Either EnError CheckDecision` and mint nothing.
+  Rationale: They take an already-resolved `Revision` — the whole reason they exist is that a lookup's per-candidate confirmations must read the snapshot the lookup pinned rather than re-resolving. Minting inside them would produce one identical token per confirmed candidate, all discarded. `En.Lookup.CheckForCandidate` wraps them directly, so no projection is needed there either.
+  Date: 2026-07-09
+- Decision: `ReadRelationshipsResponseWire` (EP-50's relationship-query response) gains `checkedAt` in this plan's M3, as this plan's Interfaces section directs.
+  Rationale: EP-50 landed first and deliberately omitted the field pending this plan. Its handler already calls `resolveConsistency` and holds the revision, so the field costs one `mintToken` and no extra store round trip — `MintToken` is `pure (encodeToken …)` in every interpreter, never a database session.
+  Date: 2026-07-09
+- Decision: `mintCheckedObjectGrant` in `en-biscuit/src/En/Biscuit/Mint.hs` is adapted to the new `CheckOutcome` by projecting `.decision`, and is *not* changed to stamp the grant with `outcome.checkedAt`.
+  Rationale: That function currently mints an `EnGrant` carrying the caller-supplied `grant.consistencyToken`, which need not be the snapshot the decision it just made was made at — precisely the defect this plan's Purpose describes. Fixing it is a behavior change to an authorization-token library, and `docs/plans/57-mint-biscuit-grants-over-http.md` (master plan 10) hard-depends on this plan for exactly that purpose. Silently re-stamping a security token's snapshot from inside a plan scoped to "what reads return" would be the wrong place to make that call. A comment at the call site records it for EP-57.
+  Date: 2026-07-09
+- Decision: en-core and en-servant land in one commit rather than one per milestone.
+  Rationale: Changing `check`'s return type breaks every downstream package at compile time. A commit containing only M2 would not build, violating the requirement that each commit leave the codebase in a working state.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective

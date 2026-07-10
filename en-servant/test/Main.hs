@@ -23,17 +23,19 @@ import En.Cache (Cache, CacheConfig (..), CacheStats (..), SubproblemKey, cacheS
 import En.Check (CheckCacheEnv (..), CheckDecision, check, checkCached)
 import En.Conformance.Kikan (
     fixtureTuples,
+    inMemoryToken,
     kikanGraph,
     memberOwner,
     runConsistencyStoreInMemory,
     runTupleStoreInMemory,
+    testRevision,
  )
 import En.Decision (ResidualDecision)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
-import En.Revision (DatastoreId (..))
+import En.Revision (ConsistencyToken (..), DatastoreId (..))
 import En.Schema (ObjectType (..))
 import En.Servant.API (
     BatchCheckPairWire (..),
@@ -117,7 +119,7 @@ main = do
                 }
     assertEqual
         "batch endpoint returns decisions in order"
-        (Right (EnOk BatchCheckResponseWire{decisions = [AllowedWire, DeniedWire]}))
+        (Right (EnOk BatchCheckResponseWire{decisions = [AllowedWire, DeniedWire], checkedAt = testCheckedAt}))
         =<< runHandler (batch request)
 
     -- checkMany now hands the transport an Either per pair. The wire contract is
@@ -134,7 +136,7 @@ main = do
                 }
     assertEqual
         "an unevaluable pair fails closed without affecting the others"
-        (Right (EnOk BatchCheckResponseWire{decisions = [AllowedWire, DeniedWire, DeniedWire]}))
+        (Right (EnOk BatchCheckResponseWire{decisions = [AllowedWire, DeniedWire, DeniedWire], checkedAt = testCheckedAt}))
         =<< runHandler (batch failingPairRequest)
 
     -- The oversized batch is a returned value, not a thrown ServerError: that is the
@@ -185,6 +187,7 @@ main = do
                     , permission = "audit"
                     , children = [ExpandIntersectionWire [conjunct "owner", conjunct "member"]]
                     , state = ExpandExhaustedWire
+                    , checkedAt = testCheckedAt
                     }
             )
         )
@@ -194,7 +197,7 @@ main = do
         Right (EnOk tree) ->
             assertEqual
                 "the audit tree a client receives, byte for byte"
-                "{\"root\":{\"objectType\":\"space\",\"objectId\":\"audited-space\"},\"permission\":\"audit\",\"children\":[{\"kind\":\"intersection\",\"children\":[{\"kind\":\"userset\",\"object\":{\"objectType\":\"space\",\"objectId\":\"audited-space\"},\"relation\":\"owner\",\"children\":[{\"kind\":\"subject\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"member-owner\"}}]},{\"kind\":\"userset\",\"object\":{\"objectType\":\"space\",\"objectId\":\"audited-space\"},\"relation\":\"member\",\"children\":[{\"kind\":\"subject\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"member-owner\"}}]}]}],\"state\":{\"status\":\"exhausted\"}}"
+                "{\"root\":{\"objectType\":\"space\",\"objectId\":\"audited-space\"},\"permission\":\"audit\",\"children\":[{\"kind\":\"intersection\",\"children\":[{\"kind\":\"userset\",\"object\":{\"objectType\":\"space\",\"objectId\":\"audited-space\"},\"relation\":\"owner\",\"children\":[{\"kind\":\"subject\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"member-owner\"}}]},{\"kind\":\"userset\",\"object\":{\"objectType\":\"space\",\"objectId\":\"audited-space\"},\"relation\":\"member\",\"children\":[{\"kind\":\"subject\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"member-owner\"}}]}]}],\"state\":{\"status\":\"exhausted\"},\"checkedAt\":\"in-memory:test:test-revision\"}"
                 (encode tree)
         other -> fail ("expand endpoint did not answer: " <> show other)
 
@@ -213,11 +216,35 @@ main = do
                 , permission = "view"
                 , object = ObjectRefWire{objectType = "space", objectId = "project-x"}
                 }
-    assertEqual "cached check endpoint returns Allowed first" (Right (EnOk CheckResponseWire{decision = AllowedWire})) =<< runHandler (checkEndpoint checkRequest)
+    assertEqual "cached check endpoint returns Allowed first" (Right (EnOk CheckResponseWire{decision = AllowedWire, checkedAt = testCheckedAt})) =<< runHandler (checkEndpoint checkRequest)
     checkStatsAfterFirst <- cacheStats cachedCheckEnv.cacheDecisions
-    assertEqual "cached check endpoint returns Allowed second" (Right (EnOk CheckResponseWire{decision = AllowedWire})) =<< runHandler (checkEndpoint checkRequest)
+    assertEqual "cached check endpoint returns Allowed second" (Right (EnOk CheckResponseWire{decision = AllowedWire, checkedAt = testCheckedAt})) =<< runHandler (checkEndpoint checkRequest)
     checkStatsAfterSecond <- cacheStats cachedCheckEnv.cacheDecisions
     assertBool "cached check endpoint uses decision cache" (checkStatsAfterSecond.hits > checkStatsAfterFirst.hits)
+
+    {- E3, the headline property: a read's token is accepted as a later read's
+    freshness bound. Check, take the token the response says it was decided at, and
+    ask for a lookup at least as fresh as it. The chain closes, which is what a caller
+    needs in order to build "read your own writes, then read your own reads". -}
+    checkedToken <-
+        runHandler (checkHandler env checkRequest) >>= \case
+            Right (EnOk response) -> pure response.checkedAt
+            other -> fail ("check endpoint did not answer: " <> show other)
+    assertOk "a lookup at least as fresh as a check's token is served"
+        =<< runHandler
+            ( lookupHandler
+                env
+                LookupRequestWire
+                    { consistency = AtLeastAsFreshWire checkedToken
+                    , subject = SubjectIdWire (objectToWire memberOwner)
+                    , permission = "audit"
+                    , objectType = "space"
+                    , context = CaveatContextWire Map.empty
+                    , limit = 10
+                    , cursor = Nothing
+                    , deadlineMillis = Nothing
+                    }
+            )
 
     cachedLookupEnv <- newCheckCacheEnv
     let lookupCachedEnv =
@@ -753,7 +780,7 @@ wireContractTests = do
         "CaveatObligationWire"
         "{\"caveat\":\"business_hours\",\"missingContext\":[\"now\"]}"
         CaveatObligationWire{caveat = "business_hours", missingContext = ["now"]}
-    golden "CheckResponseWire" "{\"decision\":{\"result\":\"allowed\"}}" CheckResponseWire{decision = AllowedWire}
+    golden "CheckResponseWire" "{\"decision\":{\"result\":\"allowed\"},\"checkedAt\":\"tok\"}" CheckResponseWire{decision = AllowedWire, checkedAt = "tok"}
 
     golden
         "BatchCheckPairWire"
@@ -765,8 +792,8 @@ wireContractTests = do
         BatchCheckRequestWire{consistency = MinimizeLatencyWire, context = emptyContext, pairs = [viewPair]}
     golden
         "BatchCheckResponseWire"
-        "{\"decisions\":[{\"result\":\"allowed\"},{\"result\":\"denied\"}]}"
-        BatchCheckResponseWire{decisions = [AllowedWire, DeniedWire]}
+        "{\"decisions\":[{\"result\":\"allowed\"},{\"result\":\"denied\"}],\"checkedAt\":\"tok\"}"
+        BatchCheckResponseWire{decisions = [AllowedWire, DeniedWire], checkedAt = "tok"}
 
     golden
         "LookupRequestWire"
@@ -791,8 +818,8 @@ wireContractTests = do
     rejects "LookupStateWire" (decode "{\"status\":\"partial\"}" :: Maybe LookupStateWire)
     golden
         "LookupPageWire"
-        "{\"objects\":[{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"decision\":{\"result\":\"allowed\"}}],\"state\":{\"status\":\"exhausted\"}}"
-        LookupPageWire{objects = [allowedObject], state = LookupExhaustedWire}
+        "{\"objects\":[{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"decision\":{\"result\":\"allowed\"}}],\"state\":{\"status\":\"exhausted\"},\"checkedAt\":\"tok\"}"
+        LookupPageWire{objects = [allowedObject], state = LookupExhaustedWire, checkedAt = "tok"}
 
     golden
         "ExpandRequestWire"
@@ -837,8 +864,8 @@ wireContractTests = do
     rejects "ExpandStateWire" (decode "{\"status\":\"partial\"}" :: Maybe ExpandStateWire)
     golden
         "ExpandTreeWire"
-        "{\"root\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"permission\":\"view\",\"children\":[],\"state\":{\"status\":\"exhausted\"}}"
-        ExpandTreeWire{root = projectX, permission = "view", children = [], state = ExpandExhaustedWire}
+        "{\"root\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"permission\":\"view\",\"children\":[],\"state\":{\"status\":\"exhausted\"},\"checkedAt\":\"tok\"}"
+        ExpandTreeWire{root = projectX, permission = "view", children = [], state = ExpandExhaustedWire, checkedAt = "tok"}
 
     {- A request carrying no preconditions and no deletes must serialize to exactly the
     bytes it did before those fields existed: the optional fields are omitted, not
@@ -927,10 +954,11 @@ wireContractTests = do
 
     golden
         "ReadRelationshipsResponseWire"
-        "{\"relationships\":[{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"relation\":\"viewer\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"caveat\":null}],\"state\":{\"status\":\"exhausted\"}}"
+        "{\"relationships\":[{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"relation\":\"viewer\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"caveat\":null}],\"state\":{\"status\":\"exhausted\"},\"checkedAt\":\"tok\"}"
         ReadRelationshipsResponseWire
             { relationships = [viewerTuple]
             , state = RelationshipsExhaustedWire
+            , checkedAt = "tok"
             }
 
     golden
@@ -973,7 +1001,7 @@ wireContractTests = do
             , subject = aliceSubject
             , caveat = Just businessHoursCaveat
             }
-    roundTrip "CheckResponseWire/conditional" CheckResponseWire{decision = conditionalDecision}
+    roundTrip "CheckResponseWire/conditional" CheckResponseWire{decision = conditionalDecision, checkedAt = "tok"}
   where
     noon = UTCTime (fromGregorian 2026 7 7) (secondsToDiffTime (12 * 3600))
     projectX = ObjectRefWire{objectType = "space", objectId = "project-x"}
@@ -1001,6 +1029,17 @@ wireContractTests = do
         ConditionalWire [CaveatObligationWire{caveat = "business_hours", missingContext = ["now"]}]
     viewPair = BatchCheckPairWire{subject = aliceSubject, permission = "view", object = projectX}
     allowedObject = LookupObjectWire{object = projectX, decision = AllowedWire}
+
+{- | The @checkedAt@ every handler in this suite reports.
+
+'runConsistencyStoreInMemory' resolves every read to 'testRevision' and mints the
+token for it, so this is what a read response's token must be. Derived rather than
+written out so it cannot drift from what the interpreter actually mints.
+-}
+testCheckedAt :: Text
+testCheckedAt =
+    let ConsistencyToken token = inMemoryToken (DatastoreId "test") testRevision
+     in token
 
 {- | Assert the exact encoded bytes, then that the value survives a decode of them.
 Exact bytes are meaningful because every 'ToJSON' instance defines 'toEncoding'

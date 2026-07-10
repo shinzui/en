@@ -62,7 +62,7 @@ import Auth.Biscuit (SecretKey, mkBiscuit, serializeB64)
 import Effectful (Eff, IOE, (:>))
 import Effectful.Error.Static (runErrorNoCallStack)
 
-import En.Check (check)
+import En.Check (CheckOutcome (..), check)
 import En.Decision (CaveatObligation, CheckDecision (..))
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
@@ -213,7 +213,11 @@ mintCheckedObjectGrant config graph consistency context grant = do
             (check graph consistency context grant.subject grant.permission grant.object)
     case outcome of
         Left enErr -> pure (Left (EngineError enErr))
-        Right decision -> mintObjectGrant config decision grant
+        -- 'checked.checkedAt' names the snapshot this decision was made at, and is
+        -- not necessarily 'grant.consistencyToken', which the caller chose. Stamping
+        -- the grant with it is the right thing and is deliberately not done here:
+        -- see docs/plans/57-mint-biscuit-grants-over-http.md.
+        Right checked -> mintObjectGrant config checked.decision grant
 
 {- | Rebuild an 'EnGrant' with a new expiry. Record /construction/ (not update)
 so no @-Wambiguous-fields@ from the field name shared with 'EnScopedGrant'.

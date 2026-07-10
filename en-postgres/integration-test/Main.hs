@@ -23,9 +23,9 @@ import Effectful.Dispatch.Dynamic (interpose, passthrough)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Numeric (readDec)
 
-import En.Check (CheckDecision (..), check)
+import En.Check (CheckDecision (..), CheckOutcome (..), check)
 import En.Conformance.Kikan (matchesRelationshipFilter)
-import En.Effect.ConsistencyStore (ConsistencyStore, TokenMetadata (..))
+import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), TokenMetadata (..))
 import En.Effect.ConsistencyStore qualified as ConsistencyStore
 import En.Effect.TupleStore (
     PageState (..),
@@ -152,11 +152,40 @@ runTupleStoreScenario connection = do
     assertEqual "write token read sees tuple count" 2 (length rowsAtWrite)
     assertEqual "write token read is exhausted" Exhausted stateAtWrite
     runSnapshotOracleScenario connection
+    {- A minted token survives the round trip through the real PostgreSQL codec and
+    the real garbage-collection-window check. 'mintToken' is the inverse of
+    'decodeToken', so what it produces for a revision the datastore just resolved
+    must decode back to that revision and validate against this datastore's identity,
+    schema hash, and GC horizon. If it did not, every @checkedAt@ below would be an
+    opaque string a client could not spend. -}
+    mintRoundTrip <- runPg connection config do
+        ResolvedConsistency{revision} <- ConsistencyStore.resolveConsistency FullyConsistent
+        minted <- ConsistencyStore.mintToken revision
+        metadata <- ConsistencyStore.decodeToken minted
+        ConsistencyStore.validateToken metadata
+        pure (revision, metadata.revision)
+    case mintRoundTrip of
+        Right (resolved, decoded) ->
+            assertEqual "a minted token decodes and validates back to its revision" resolved decoded
+        other -> fail ("minting a token for a resolved revision failed: " <> show other)
+
     let graph = compile validCheckSchema
-    checkDecision <- runPg connection config (check graph (AtLeastAsFresh writeToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX)
-    assertEqual "postgres-backed check sees written tuple" (Right Allowed) checkDecision
+    checkOutcome <- runPg connection config (check graph (AtLeastAsFresh writeToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX)
+    assertEqual "postgres-backed check sees written tuple" (Right Allowed) (fmap (.decision) checkOutcome)
+    {- E3, end to end against PostgreSQL: the token a check reports is a token a later
+    read accepts as its freshness bound. This is the write -> check -> lookup chain a
+    client builds "read your own reads" out of, and the one an @EnGrant@ needs in order
+    to record the snapshot its decision was made at. -}
+    checkedAtToken <- either (\err -> fail ("check failed: " <> show err)) (pure . (.checkedAt)) checkOutcome
+    assertEqual
+        "a check's checkedAt token is accepted as a later read's freshness bound"
+        (Right Allowed)
+        . fmap (.decision)
+        =<< runPg connection config (check graph (AtLeastAsFresh checkedAtToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX)
+
     lookupFirstPage <- runPg connection config (Lookup.lookup graph (AtLeastAsFresh writeToken) (lookupRequest Nothing))
     projectXCursor <- expectLookupHasMore "postgres-backed lookup returns first cursor page" [LookupObject{object = projectX, decision = Allowed}] lookupFirstPage
+    firstPageToken <- either (\err -> fail ("lookup failed: " <> show err)) (pure . (.checkedAt)) lookupFirstPage
     lookupSecondPage <- runPg connection config (Lookup.lookup graph (AtLeastAsFresh writeToken) (lookupRequest (Just projectXCursor)))
     assertEqual
         "postgres-backed lookup resumes from cursor"
@@ -164,9 +193,23 @@ runTupleStoreScenario connection = do
             LookupPage
                 { objects = [LookupObject{object = projectY, decision = Allowed}]
                 , state = LookupExhausted
+                , checkedAt = firstPageToken
                 }
         )
         lookupSecondPage
+    {- The resumed page reports the token the first page did, and it does so because the
+    cursor carries that very token and the continuation reads at the revision the
+    /validated/ token names. One lookup, one snapshot, however many pages. -}
+    assertEqual
+        "a resumed lookup page reports the first page's token"
+        (Right firstPageToken)
+        (fmap (.checkedAt) lookupSecondPage)
+    -- And a lookup's own token is spendable, exactly as a check's is.
+    assertEqual
+        "a lookup page's checkedAt token is accepted as a later read's freshness bound"
+        (Right Allowed)
+        . fmap (.decision)
+        =<< runPg connection config (check graph (AtLeastAsFresh firstPageToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX)
     {- Cursor validation against the real PostgreSQL validator, not a test double.
     Flipping one character inside the cursor's token field preserves the field's
     length prefix, so the cursor still parses -- and is then refused by `decodeToken`,
