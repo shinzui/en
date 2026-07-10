@@ -38,9 +38,9 @@ import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError (..))
 import En.Postgres.Revision (
     ConsistencyConfig (..),
-    PgSnapshot (..),
     escapeText,
     parsePgSnapshot,
+    retainedHistoryVisible,
     revisionToPgSnapshot,
     unescapeText,
  )
@@ -135,31 +135,27 @@ decodeWatchCursor cursorText =
             Right _ -> Right (Revision text)
 
 {- | The two fail-closed guards. Both differ from
-'En.Postgres.Revision.validateTokenMetadata', and both differences are load-bearing.
+'En.Postgres.Revision.validateTokenMetadata', but only the second difference is
+load-bearing now.
 
 The datastore check refuses a cursor minted elsewhere. It is the same check.
 
 The horizon check refuses a window whose start lies behind what the reaper has already
 destroyed: those rows are physically gone, so the set difference across the window cannot be
 computed, and returning a partial one would tell a consumer its cache is up to date when it
-is not. But the /condition/ is @horizon <= start.xmin@, where a token demands
-@horizon < revision.xmax@. The window's condition is derivable, and the token's is not
-sufficient here:
+is not. It asks 'En.Postgres.Revision.retainedHistoryVisible' of the window /start/ — the
+same predicate, at the same horizon, that a consistency token is judged by. A watch window
+and a read token ask the identical question ("can every row the reaper may already have
+destroyed be proven absent from this snapshot's live set?"), so they answer it with the
+identical function; see that predicate's derivation for why it is exact.
 
-The reaper removes rows whose @deleted_xid < horizon@. A window starting at @S@ owes an
-event about a row only if that row's membership differs between @S@ and the window's end,
-which for a reaped row means its deletion must not be visible in @S@. If @horizon <= S.xmin@
-then every reaped row has @deleted_xid < S.xmin@, hence is visible in @S@ by definition of
-@xmin@, hence is not live at @S@; its creation is older still, so no touch is owed either.
-Nothing reaped is ever owed, and the window is exact.
-
-The token's @xmax@ rule does not give this. A snapshot @849:851:849@ has @xmax@ above a
-horizon of @850@ and would pass it, yet lists @849@ in-progress — so a row deleted at @849@
-is live at @S@, is below the horizon, and is reapable. The window would silently lose its
-deletion. Conversely the @xmax@ rule is too strict at the other end: a subscription's cursor
-is minted from 'TupleStore.headRevision', whose @xmax@ is the next unassigned xid, so the
-first write after 'StartFromNow' pushes the horizon up to meet it and expires a feed one
-poll old. Both failures are fixed by asking the question the window actually asks.
+This retires the bespoke @snapshot.xmin < oldestRetainedXid@ rule @docs/plans/53@ derived
+for the watch feed. That rule was sound — @horizon <= xmin@ implies
+'retainedHistoryVisible' — but strictly conservative, and it existed only because the token
+rule was itself wrong and could not be reused. Now that the token rule is correct, both
+sites share it. (The mid-drain positions a drain still owes happened at revisions between
+the window's edges, and it is the start that says how far back the feed must see, so the
+start is still what the horizon is compared against.)
 
 The schema hash is deliberately not checked at all. A tuple change is schema-independent
 data. Expiring every watch consumer on a schema reload (see
@@ -175,10 +171,10 @@ validateWatchCursor config oldestRetainedXid datastoreId cursorState
             Left err ->
                 Left (InvalidConsistencyToken ("watch cursor revision is not a PostgreSQL snapshot: " <> err))
             Right snapshot
-                | snapshot.xmin < oldestRetainedXid ->
-                    Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window")
-                | otherwise ->
+                | retainedHistoryVisible oldestRetainedXid snapshot ->
                     Right cursorState
+                | otherwise ->
+                    Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window")
 
 windowStart :: WatchCursorState -> Revision
 windowStart = \case

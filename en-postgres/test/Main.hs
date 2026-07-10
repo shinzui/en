@@ -23,6 +23,7 @@ import En.Postgres.Revision (
     parsePgSnapshot,
     renderPgSnapshot,
     resolveConsistencyRequest,
+    retainedHistoryVisible,
     revisionFromPgSnapshot,
     transactionVisible,
     validateTokenMetadata,
@@ -160,6 +161,40 @@ main = do
         "token older than GC horizon is rejected"
         (Left (InvalidConsistencyToken "token is older than the garbage-collection window"))
         (validateTokenMetadata config now 20 metadata)
+    {- The reported bug: a token minted from a head revision on an idle store has
+    @xmax == horizon@ and no in-flight transaction below the horizon, so every
+    transaction below it is visible and nothing reaped is live. The old
+    @xmax <= horizon@ rule refused it; 'retainedHistoryVisible' accepts it. -}
+    assertEqual
+        "a head-revision token whose xmax equals the horizon is accepted"
+        (Right ())
+        (validateTokenMetadata config now 27807 (metadataAtRevision (Revision "27807:27807:")))
+    {- The converse the fix must not sacrifice: a snapshot with an in-flight
+    transaction below the horizon (@849@ at horizon @850@) names a row that may
+    already be reaped, so it is still refused even though its @xmax@ exceeds the
+    horizon. -}
+    assertEqual
+        "a token with an in-flight transaction below the horizon is still rejected"
+        (Left (InvalidConsistencyToken "token is older than the garbage-collection window"))
+        (validateTokenMetadata config now 850 (metadataAtRevision (Revision "849:851:849")))
+
+    -- 'retainedHistoryVisible' boundaries, stated directly.
+    assertEqual
+        "retainedHistoryVisible accepts horizon == xmax"
+        True
+        (retainedHistoryVisible 20 PgSnapshot{xmin = 10, xmax = 20, xip = []})
+    assertEqual
+        "retainedHistoryVisible refuses horizon == xmax + 1"
+        False
+        (retainedHistoryVisible 21 PgSnapshot{xmin = 10, xmax = 20, xip = []})
+    assertEqual
+        "retainedHistoryVisible refuses an xip entry at horizon - 1"
+        False
+        (retainedHistoryVisible 15 PgSnapshot{xmin = 10, xmax = 20, xip = [14]})
+    assertEqual
+        "retainedHistoryVisible accepts an xip entry at horizon"
+        True
+        (retainedHistoryVisible 15 PgSnapshot{xmin = 10, xmax = 20, xip = [15]})
   where
     config =
         ConsistencyConfig
@@ -201,6 +236,14 @@ main = do
             , datastoreId = metadata.datastoreId
             , schemaHash = metadata.schemaHash
             , expiresAt = Just now
+            }
+    metadataAtRevision rev =
+        TokenMetadata
+            { token = metadata.token
+            , revision = rev
+            , datastoreId = metadata.datastoreId
+            , schemaHash = metadata.schemaHash
+            , expiresAt = metadata.expiresAt
             }
     metadataFromToken token =
         case decodeToken token of
@@ -327,27 +370,34 @@ testWatchCursorCodec = do
         (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
         (validateWatchCursor config 120 datastore draining)
 
-    {- The boundary is @horizon <= start.xmin@, not the @horizon < revision.xmax@ a token
-    demands. At @horizon == xmin@ every reapable row (@deleted_xid < horizon@) is below
-    @xmin@ and therefore visible in the window's start snapshot, so it is not live there and
-    the window owes no event about it. One xid higher and a reaped row could still be live
-    at the start, and the window would silently lose its deletion.
+    {- A watch cursor is now judged by the identical predicate a consistency token is —
+    'En.Postgres.Revision.retainedHistoryVisible', at the identical horizon — so the two no
+    longer diverge on the horizon. 'start' below is @100:120:110@: @xmin = 100@, @xmax = 120@,
+    with @110@ in flight.
 
-    The @xmax@ rule would also expire a one-poll-old subscription: its cursor is minted from
-    the head revision, whose @xmax@ is the next unassigned xid, and the very first write
-    afterwards raises the horizon to meet it. 'start' below has @xmin = 100@, @xmax = 120@. -}
+    Every transaction below the horizon must be visible in the window's start snapshot. The
+    in-flight @110@ is invisible there, so a horizon above @110@ names a row (one deleted at
+    @110@) that could already be reaped while still live at the start — and is refused. A
+    horizon at or below @110@ is accepted. This retires @docs/plans/53@'s conservative
+    @horizon <= start.xmin@ rule: a horizon of @101@, which that rule refused, is accepted
+    now, because @101@ is still visible in the start snapshot and nothing reaped below it is
+    live there. -}
     assertEqual
-        "the horizon check is inclusive at the window start's xmin"
+        "a horizon at the window start's xmin is accepted"
         (Right atStart)
         (validateWatchCursor config 100 datastore atStart)
     assertEqual
-        "one xid past the window start's xmin is refused"
-        (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
+        "a horizon one past the start's xmin is accepted now, where the old conservative rule refused it"
+        (Right atStart)
         (validateWatchCursor config 101 datastore atStart)
     assertEqual
-        "a horizon between the window start's xmin and xmax is refused, though a token would pass"
+        "a horizon at the in-flight transaction is accepted"
+        (Right atStart)
+        (validateWatchCursor config 110 datastore atStart)
+    assertEqual
+        "a horizon just past the in-flight transaction is refused"
         (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
-        (validateWatchCursor config 119 datastore atStart)
+        (validateWatchCursor config 111 datastore atStart)
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
 assertEqual label expected actual

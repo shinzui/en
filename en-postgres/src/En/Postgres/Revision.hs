@@ -24,6 +24,7 @@ module En.Postgres.Revision (
     storeOptimizedRevisionCache,
     newOptimizedRevisionReader,
     transactionVisible,
+    retainedHistoryVisible,
     snapshotIncludes,
     comparePgSnapshot,
     comparePostgresRevision,
@@ -228,6 +229,71 @@ transactionVisible txid PgSnapshot{xmin, xmax, xip}
     | txid >= xmax = False
     | otherwise = txid `notElem` xip
 
+{- | Is every transaction id below @horizon@ visible in @snapshot@?
+
+This is the exact garbage-collection safety condition, and it is the one predicate
+that governs both consistency-token validation ('validateTokenMetadata') and watch
+cursors ('En.Postgres.Watch.validateWatchCursor'). Both ask the identical question of
+the identical horizon, so they answer it with the identical function.
+
+== Why this is the right question
+
+@horizon@ is @oldestRetainedXid@: the reaper physically deletes a soft-deleted row
+only when its @deleted_xid < horizon@ (@reapDeletedTuplesStatement@ in
+"En.Postgres.TupleStore"). Such a reaped row is dangerous to a reader at snapshot @S@
+only if it is still /live/ at @S@ — that is, if its deletion is __not__ visible in @S@.
+
+If every transaction below @horizon@ is visible in @S@, then every reaped row's
+deletion (which happened below @horizon@) is visible in @S@, so no reaped row is live
+at @S@, so @S@ can be served exactly from the surviving rows. (A reaped row's creation
+is older than its deletion, hence visible too; it therefore contributes nothing at @S@
+in either direction.) Conversely, if some @t < horizon@ is invisible in @S@, a row
+deleted at @t@ is live at @S@ and may already be gone, so @S@ must be refused.
+
+== Why the enumeration collapses to two clauses
+
+\"Every @t < horizon@ is visible in @S@\" is @all (\\t -> transactionVisible t S)
+[0 .. horizon - 1]@. A transaction @t@ is invisible in @S@ exactly when @t >= S.xmax@,
+or when @S.xmin <= t < S.xmax@ and @t@ is listed in @S.xip@. So the enumeration holds
+iff no invisible transaction sits below the horizon:
+
+  * No @t@ with @t >= S.xmax@ is below the horizon — i.e. @horizon <= S.xmax@.
+  * No @xip@ entry in @[S.xmin, S.xmax)@ is below the horizon — i.e. every @xip@ entry
+    is either below @S.xmin@ (visible, so harmless) or at/above @horizon@.
+
+which is exactly
+
+@
+retainedHistoryVisible horizon snapshot =
+    horizon <= snapshot.xmax
+        && all (\\txid -> txid < snapshot.xmin || txid >= horizon) snapshot.xip
+@
+
+The second clause skips @xip@ entries below @xmin@: 'transactionVisible' already
+reports those visible, and a real @pg_snapshot@ never carries them, but 'parsePgSnapshot'
+accepts them and this predicate must agree with 'transactionVisible', not with
+PostgreSQL's invariants.
+
+== Why the old @snapshot.xmax <= horizon@ rule could not simply be adjusted
+
+It errs in both directions, so no tightening or loosening of the comparison recovers it:
+
+  * It rejects @27807:27807:@ at horizon @27807@ (@xmax == horizon@) — yet every
+    transaction below @27807@ is visible, nothing reaped is live, and the snapshot is
+    safe. This is the reported bug: a @checkedAt@ token minted from a head revision on
+    an idle store is refused the instant it is spent.
+  * It accepts @849:851:849@ at horizon @850@ (@xmax > horizon@) — yet @849@ is
+    in-flight and therefore invisible, so a row deleted at @849@ is live at the
+    snapshot and reapable, and the reader would be served a snapshot missing a grant it
+    should see.
+
+Only asking the exact question answers both.
+-}
+retainedHistoryVisible :: Word64 -> PgSnapshot -> Bool
+retainedHistoryVisible horizon snapshot =
+    horizon <= snapshot.xmax
+        && all (\txid -> txid < snapshot.xmin || txid >= horizon) snapshot.xip
+
 comparePgSnapshot :: PgSnapshot -> PgSnapshot -> RevisionOrder
 comparePgSnapshot left right =
     case (snapshotIncludes left right, snapshotIncludes right left) of
@@ -304,9 +370,9 @@ validateTokenMetadata config now oldestRetainedXid metadata
             mapLeft
                 (InvalidConsistencyToken . ("token revision is not a PostgreSQL snapshot: " <>))
                 (revisionToPgSnapshot metadata.revision)
-        if snapshot.xmax <= oldestRetainedXid
-            then Left (InvalidConsistencyToken "token is older than the garbage-collection window")
-            else Right ()
+        if retainedHistoryVisible oldestRetainedXid snapshot
+            then Right ()
+            else Left (InvalidConsistencyToken "token is older than the garbage-collection window")
 
 {- | The four things a consistency mode might need, each fetched on demand.
 
