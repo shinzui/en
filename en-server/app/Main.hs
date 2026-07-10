@@ -33,6 +33,7 @@ import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleR
 import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError)
 import En.Lookup qualified as Lookup
+import En.LookupSubjects qualified as LookupSubjects
 import En.Migrations (migrationsDir)
 import En.Postgres.Database (Database, runDatabasePool, runSession)
 import En.Postgres.Datastore (resolveDatastoreIdSession)
@@ -262,12 +263,18 @@ runServe serverConfig validSchema pool config = do
                 Lookup.lookupWithDeadlineCachedAndBudget budget checkCacheEnv deadline graph' consistency request
             | otherwise =
                 Lookup.lookupWithDeadlineAndBudget budget deadline graph' consistency request
+        lookupSubjectsWithDeadlineOperation deadline graph' consistency request
+            | decisionConfig.enabled =
+                LookupSubjects.lookupSubjectsWithDeadlineCachedAndBudget budget checkCacheEnv deadline graph' consistency request
+            | otherwise =
+                LookupSubjects.lookupSubjectsWithDeadlineAndBudget budget deadline graph' consistency request
         serverEnv =
             Env
                 { runPorts = runAppIO
                 , graph
                 , checkOperation
                 , lookupWithDeadlineOperation
+                , lookupSubjectsWithDeadlineOperation
                 , budget
                 , maxBatchSize = serverConfig.maxBatchSize
                 , deadlineDefaultMillis = serverConfig.deadlineDefaultMillis

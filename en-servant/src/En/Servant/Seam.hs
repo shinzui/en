@@ -38,6 +38,7 @@ import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
+import En.LookupSubjects qualified as LookupSubjects
 import En.Postgres.Database (Database)
 import En.Reachability (ReachabilityGraph)
 import En.Revision (Consistency)
@@ -51,6 +52,10 @@ data Env es = Env
     , graph :: !ReachabilityGraph
     , checkOperation :: !(ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckOutcome)
     , lookupWithDeadlineOperation :: !(Lookup.Deadline (Eff es) -> ReachabilityGraph -> Consistency -> Lookup.LookupRequest -> Eff es Lookup.LookupPage)
+    , lookupSubjectsWithDeadlineOperation :: !(Lookup.Deadline (Eff es) -> ReachabilityGraph -> Consistency -> LookupSubjects.LookupSubjectsRequest -> Eff es LookupSubjects.LookupSubjectsPage)
+    {- ^ Takes a 'Lookup.Deadline', not a deadline of its own: the two traversals poll the
+    same kind of live clock, and one @deadlineMillis@ ceiling governs both.
+    -}
     , budget :: !EvaluationBudget
     {- ^ Static evaluation bounds. The operations above are already partially
     applied to this budget by whoever built the 'Env'; the field is carried so a

@@ -47,8 +47,8 @@ This section must always reflect the actual current state of the work.
 - [x] M1 (2026-07-09): Implement intersection/exclusion candidate confirmation via forward check, and wildcard surfacing rules.
 - [x] M1 (2026-07-09): Implement paging (`Exhausted`/`HasMore`/`Truncated`), the cursor codec, and the deadline hook; add the module to `en-core/en-core.cabal` exposed-modules.
 - [x] M1 (2026-07-09): Conformance tests over the kikan fixtures: group nesting through `org#member`, caveated delegate (Allowed and Conditional), exclusion (`member_not_owner`), intersection (`audit`), pagination determinism; plus a local wildcard-schema test, a malformed-cursor test, and a foreign-token cursor test under the strict consistency store.
-- [ ] M2: Wire DTOs, `POST /lookup-subjects` route, handler, and `Env.lookupSubjectsOperation` in `en-servant/src/En/Servant/API.hs` and `en-servant/src/En/Servant/Seam.hs`; wire cached/uncached variants in `en-server/app/Main.hs`; extend `en-servant/test/Main.hs`.
-- [ ] M2: Add the `lookupSubjects` field to `EnClient` in `en-client/src/En/Client.hs`.
+- [x] M2 (2026-07-09): Wire DTOs, `POST /v1/lookup-subjects` route, handler, and `Env.lookupSubjectsWithDeadlineOperation` in `en-servant/src/En/Servant/API.hs` and `en-servant/src/En/Servant/Seam.hs`; hand-written `ToSchema` instances in `en-servant/src/En/Servant/OpenApi.hs`; cached/uncached variants wired in `en-server/app/Main.hs`; uncached in `en-example/src/En/Example/Host.hs`; golden and handler tests in `en-servant/test/Main.hs`.
+- [x] M2 (2026-07-09): Add the `lookupSubjects` field to `EnClient` in `en-client/src/En/Client.hs`.
 - [ ] M3: Run the end-to-end curl transcript against a live server and paste the observed output into Validation and Acceptance.
 
 
@@ -89,6 +89,32 @@ implementation. Provide concise evidence.
   Test suite en-core-conformance: PASS
   1 of 1 test suites (1 of 1 test cases) passed.
   ```
+
+- 2026-07-09 (M2): adding `LookupSubjectsRequestWire` broke an *existing* test that had
+  nothing to do with this plan. `en-servant/test/Main.hs` built its deadline-clamp request
+  with `lookupRequest{deadlineMillis = Just 86400000, limit = 1}`, and that pair of fields
+  named a unique record until this type arrived carrying both. GHC narrows a record update
+  by its field set and then by the field types; when several parents survive it falls back
+  to the type expected of the update, warns `-Wambiguous-fields`, and says the mechanism is
+  going away.
+
+  ```text
+  test/Main.hs:301:25: error: [GHC-99339]
+      • Ambiguous record update with fields ‘deadlineMillis’ and ‘limit’
+        These fields appear in both datatypes
+          ‘LookupRequestWire’ and ‘LookupSubjectsRequestWire’
+  ```
+
+  The clamp request is now a full literal. Three older updates in that file
+  (`lookupRequest{cursor = …}` twice, and one on `TupleFilterWire`) already ride the
+  deprecated mechanism and now have company; the whole file wants one sweep when GHC drops
+  it, not a piecemeal rewrite here.
+
+- 2026-07-09 (M2): the OpenAPI document is compile-and-test-enforced twice over. Adding a
+  route to `EnAPI` without a hand-written `ToSchema` instance fails to build, and
+  `en-servant/test/Main.hs` separately asserts the served path list, so the new operation
+  had to be added to `servedPaths` before the suite would pass. Both guards fired, which is
+  what they are for.
 
 
 ## Decision Log

@@ -35,6 +35,7 @@ import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
+import En.LookupSubjects qualified as LookupSubjects
 import En.Revision (ConsistencyToken (..), DatastoreId (..))
 import En.Schema (ObjectType (..))
 import En.Servant.API (
@@ -62,6 +63,10 @@ import En.Servant.API (
     LookupPageWire (..),
     LookupRequestWire (..),
     LookupStateWire (..),
+    LookupSubjectWire (..),
+    LookupSubjectsPageWire (..),
+    LookupSubjectsRequestWire (..),
+    LookupSubjectsStateWire (..),
     ObjectRefWire (..),
     PreconditionWire (..),
     ReadRelationshipsRequestWire (..),
@@ -102,6 +107,7 @@ main = do
                 , graph = kikanGraph
                 , checkOperation = check
                 , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
+                , lookupSubjectsWithDeadlineOperation = LookupSubjects.lookupSubjectsWithDeadline
                 , budget = defaultEvaluationBudget
                 , maxBatchSize = 10
                 , deadlineDefaultMillis = 3000
@@ -292,7 +298,20 @@ main = do
     -- with two auditable spaces guarantees a next page -- which is what makes the
     -- distinction observable at all. `pageLookup` reports `hasMore` when the budget
     -- survives and `truncated` when it does not; an exhausted page would say neither.
-    let greedyRequest = lookupRequest{deadlineMillis = Just 86400000, limit = 1}
+    -- Spelled out rather than updated from `lookupRequest`: `deadlineMillis` and `limit`
+    -- no longer name a unique record now that `LookupSubjectsRequestWire` carries both,
+    -- and GHC's type-directed disambiguation of such an update is on its way out.
+    let greedyRequest =
+            LookupRequestWire
+                { consistency = MinimizeLatencyWire
+                , subject = SubjectIdWire (objectToWire memberOwner)
+                , permission = "audit"
+                , objectType = "space"
+                , context = CaveatContextWire Map.empty
+                , limit = 1
+                , cursor = Nothing
+                , deadlineMillis = Just 86400000
+                }
         clampedEnv = env{deadlineMaxMillis = 0}
     assertEqual
         "the server clamps a client-supplied lookup deadline"
@@ -303,7 +322,119 @@ main = do
         (Right True)
         =<< fmap (fmap hasMore) (runHandler (lookupHandler env greedyRequest))
 
+    lookupSubjectsTests env
     writePreconditionTests env
+
+{- | @\/v1\/lookup-subjects@ over the wire, against the in-memory store.
+
+The algorithm's correctness — operators, caveats, wildcards — is pinned by the
+conformance suite in @en-core/conformance/Main.hs@. What is pinned here is everything
+between the socket and the engine: the exact bytes a client receives, the four ways a
+request is rejected before evaluation, the decision cache the server wires in, and the
+deadline ceiling the server owns rather than the caller.
+-}
+lookupSubjectsTests :: Env TestEffects -> IO ()
+lookupSubjectsTests env = do
+    -- Group nesting: `space:userset-member-space#member` grants the userset
+    -- `org:acme#member`, and `agency-alice` is a member of it. The answer is the flat
+    -- concrete user, not the userset that led to her.
+    runHandler (lookupSubjectsHandler env groupNesting) >>= \case
+        Right (EnOk page) ->
+            assertEqual
+                "the sharing-dialog answer a client receives, byte for byte"
+                "{\"subjects\":[{\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"agency-alice\"},\"decision\":{\"result\":\"allowed\"}}],\"state\":{\"status\":\"exhausted\"},\"checkedAt\":\"in-memory:test:test-revision\"}"
+                (encode page)
+        other -> fail ("lookup-subjects endpoint did not answer: " <> show other)
+
+    assertEqual
+        "an empty subjectType is a client error"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf (lookupSubjectsHandler env groupNesting{subjectType = ""})
+    assertEqual
+        "an empty permission is a client error"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf (lookupSubjectsHandler env groupNesting{permission = ""})
+    -- A zero limit would answer with an empty page whose cursor equals the caller's own,
+    -- so a client draining pages would spin forever without advancing.
+    assertEqual
+        "a non-positive limit is a client error"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf (lookupSubjectsHandler env groupNesting{limit = 0})
+    -- The wire hands the cursor to the engine unread, so the engine's validation is what
+    -- protects the endpoint. `enErrorToFault` maps `InvalidConsistencyToken` to a 400.
+    assertEqual
+        "an unparsable lookup-subjects cursor is a client error"
+        (Just "invalid_consistency_token")
+        =<< clientErrorCodeOf (lookupSubjectsHandler env groupNesting{cursor = Just "not-a-cursor"})
+
+    -- `audit = owner & member` is an intersection, so every candidate costs a confirming
+    -- check. Those confirmations are what the decision cache serves on the second call.
+    cachedSubjectsCache <- newCheckCacheEnv
+    let cachedSubjectsEnv =
+            env{lookupSubjectsWithDeadlineOperation = LookupSubjects.lookupSubjectsWithDeadlineCached cachedSubjectsCache}
+        auditRequest :: LookupSubjectsRequestWire
+        auditRequest = groupNesting{object = auditedSpace, permission = "audit"}
+    assertOk "cached lookup-subjects returns a page first" =<< runHandler (lookupSubjectsHandler cachedSubjectsEnv auditRequest)
+    statsAfterFirst <- cacheStats cachedSubjectsCache.cacheDecisions
+    assertOk "cached lookup-subjects returns a page second" =<< runHandler (lookupSubjectsHandler cachedSubjectsEnv auditRequest)
+    statsAfterSecond <- cacheStats cachedSubjectsCache.cacheDecisions
+    assertBool
+        "cached lookup-subjects uses the decision cache for confirmations"
+        (statsAfterSecond.hits > statsAfterFirst.hits)
+
+    -- The server owns the time budget. A `deadlineMaxMillis` of zero is an already-expired
+    -- one, so if the clamp reaches the engine the page reports `truncated` however much
+    -- time the client asked for. `space:exclusion-space#member` has two members and
+    -- `limit = 1` guarantees a next page, which is what makes the distinction observable.
+    let greedyRequest :: LookupSubjectsRequestWire
+        greedyRequest =
+            groupNesting
+                { object = exclusionSpace
+                , permission = "member"
+                , limit = 1
+                , deadlineMillis = Just 86400000
+                }
+        clampedEnv = env{deadlineMaxMillis = 0}
+    assertEqual
+        "the server clamps a client-supplied lookup-subjects deadline"
+        (Right True)
+        =<< fmap (fmap subjectsTruncated) (runHandler (lookupSubjectsHandler clampedEnv greedyRequest))
+    assertEqual
+        "the same request under the default ceiling keeps its budget"
+        (Right True)
+        =<< fmap (fmap subjectsHasMore) (runHandler (lookupSubjectsHandler env greedyRequest))
+  where
+    groupNesting =
+        LookupSubjectsRequestWire
+            { consistency = MinimizeLatencyWire
+            , object = ObjectRefWire{objectType = "space", objectId = "userset-member-space"}
+            , permission = "view"
+            , subjectType = "user"
+            , context = CaveatContextWire Map.empty
+            , limit = 10
+            , cursor = Nothing
+            , deadlineMillis = Nothing
+            }
+    auditedSpace = ObjectRefWire{objectType = "space", objectId = "audited-space"}
+    exclusionSpace = ObjectRefWire{objectType = "space", objectId = "exclusion-space"}
+
+-- | Did the lookup-subjects traversal stop early because its deadline had elapsed?
+subjectsTruncated :: EnResult LookupSubjectsPageWire -> Bool
+subjectsTruncated = \case
+    EnOk page ->
+        case page.state of
+            SubjectsTruncatedWire _ -> True
+            _ -> False
+    _ -> False
+
+-- | Did it leave a next page with budget to spare?
+subjectsHasMore :: EnResult LookupSubjectsPageWire -> Bool
+subjectsHasMore = \case
+    EnOk page ->
+        case page.state of
+            SubjectsHasMoreWire _ -> True
+            _ -> False
+    _ -> False
 
 {- | Preconditions over the wire, against the in-memory store.
 
@@ -463,6 +594,7 @@ openApiDocumentTests = do
         , "/v1/check"
         , "/v1/expand"
         , "/v1/lookup"
+        , "/v1/lookup-subjects"
         , "/v1/relationships"
         , "/v1/relationships/delete"
         , "/v1/relationships/delete-by-filter"
@@ -822,6 +954,39 @@ wireContractTests = do
         LookupPageWire{objects = [allowedObject], state = LookupExhaustedWire, checkedAt = "tok"}
 
     golden
+        "LookupSubjectsRequestWire"
+        "{\"consistency\":{\"mode\":\"minimizeLatency\"},\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"permission\":\"view\",\"subjectType\":\"user\",\"context\":{\"values\":{}},\"limit\":10,\"cursor\":null,\"deadlineMillis\":null}"
+        LookupSubjectsRequestWire
+            { consistency = MinimizeLatencyWire
+            , object = projectX
+            , permission = "view"
+            , subjectType = "user"
+            , context = emptyContext
+            , limit = 10
+            , cursor = Nothing
+            , deadlineMillis = Nothing
+            }
+    golden
+        "LookupSubjectWire"
+        "{\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"decision\":{\"result\":\"allowed\"}}"
+        allowedSubject
+    -- A wildcard grant rides 'SubjectWildcardWire', so it is distinguishable from a
+    -- concrete subject with no new discriminator. A client that renders `kind: "id"`
+    -- would print the literal `*` as a user id if the two shared a shape.
+    golden
+        "LookupSubjectWire/wildcard"
+        "{\"subject\":{\"kind\":\"wildcard\",\"objectType\":\"user\"},\"decision\":{\"result\":\"allowed\"}}"
+        LookupSubjectWire{subject = SubjectWildcardWire "user", decision = AllowedWire}
+    golden "LookupSubjectsStateWire/exhausted" "{\"status\":\"exhausted\"}" SubjectsExhaustedWire
+    golden "LookupSubjectsStateWire/hasMore" "{\"status\":\"hasMore\",\"cursor\":\"c1\"}" (SubjectsHasMoreWire "c1")
+    golden "LookupSubjectsStateWire/truncated" "{\"status\":\"truncated\",\"cursor\":\"c2\"}" (SubjectsTruncatedWire "c2")
+    rejects "LookupSubjectsStateWire" (decode "{\"status\":\"partial\"}" :: Maybe LookupSubjectsStateWire)
+    golden
+        "LookupSubjectsPageWire"
+        "{\"subjects\":[{\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"decision\":{\"result\":\"allowed\"}}],\"state\":{\"status\":\"exhausted\"},\"checkedAt\":\"tok\"}"
+        LookupSubjectsPageWire{subjects = [allowedSubject], state = SubjectsExhaustedWire, checkedAt = "tok"}
+
+    golden
         "ExpandRequestWire"
         "{\"consistency\":{\"mode\":\"fullyConsistent\"},\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"permission\":\"view\",\"context\":{\"values\":{}},\"limit\":10,\"cursor\":null}"
         ExpandRequestWire
@@ -1029,6 +1194,7 @@ wireContractTests = do
         ConditionalWire [CaveatObligationWire{caveat = "business_hours", missingContext = ["now"]}]
     viewPair = BatchCheckPairWire{subject = aliceSubject, permission = "view", object = projectX}
     allowedObject = LookupObjectWire{object = projectX, decision = AllowedWire}
+    allowedSubject = LookupSubjectWire{subject = aliceSubject, decision = AllowedWire}
 
 {- | The @checkedAt@ every handler in this suite reports.
 
@@ -1085,6 +1251,7 @@ data Handlers = Handlers
     , check :: CheckRequestWire -> Handler (EnResult CheckResponseWire)
     , batchCheck :: BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
     , lookup :: LookupRequestWire -> Handler (EnResult LookupPageWire)
+    , lookupSubjects :: LookupSubjectsRequestWire -> Handler (EnResult LookupSubjectsPageWire)
     , expand :: ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
     }
 
@@ -1098,6 +1265,7 @@ handlers env =
         , check = checkEndpoint
         , batchCheck = batchCheckEndpoint
         , lookup = lookupEndpoint
+        , lookupSubjects = lookupSubjectsEndpoint
         , expand = expandEndpoint
         }
   where
@@ -1108,6 +1276,7 @@ handlers env =
         :<|> checkEndpoint
         :<|> batchCheckEndpoint
         :<|> lookupEndpoint
+        :<|> lookupSubjectsEndpoint
         :<|> expandEndpoint = server env
 
 batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
@@ -1118,6 +1287,9 @@ checkHandler env = (handlers env).check
 
 lookupHandler :: Env TestEffects -> LookupRequestWire -> Handler (EnResult LookupPageWire)
 lookupHandler env = (handlers env).lookup
+
+lookupSubjectsHandler :: Env TestEffects -> LookupSubjectsRequestWire -> Handler (EnResult LookupSubjectsPageWire)
+lookupSubjectsHandler env = (handlers env).lookupSubjects
 
 writeTuplesHandler :: Env TestEffects -> WriteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
 writeTuplesHandler env = (handlers env).writeTuples

@@ -52,6 +52,7 @@ import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (.
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
+import En.LookupSubjects qualified as LookupSubjects
 import En.Reachability (compileSchema)
 import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
@@ -115,6 +116,7 @@ mkEnv cStore tStore =
         , graph = either (error . show) id (compileSchema exampleSchema)
         , checkOperation = check
         , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
+        , lookupSubjectsWithDeadlineOperation = LookupSubjects.lookupSubjectsWithDeadline
         , budget = defaultEvaluationBudget
         , maxBatchSize = 400
         , deadlineDefaultMillis = 3000

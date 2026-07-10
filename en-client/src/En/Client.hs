@@ -45,6 +45,7 @@ data EnClient = EnClient
     , check :: CheckRequestWire -> ClientM (EnResult CheckResponseWire)
     , batchCheck :: BatchCheckRequestWire -> ClientM (EnResult BatchCheckResponseWire)
     , lookup :: LookupRequestWire -> ClientM (EnResult LookupPageWire)
+    , lookupSubjects :: LookupSubjectsRequestWire -> ClientM (EnResult LookupSubjectsPageWire)
     , expand :: ExpandRequestWire -> ClientM (EnResult ExpandTreeWire)
     }
 
@@ -62,6 +63,7 @@ enClient =
         , check
         , batchCheck
         , lookup
+        , lookupSubjects
         , expand
         }
   where
@@ -72,6 +74,7 @@ enClient =
         :<|> check
         :<|> batchCheck
         :<|> lookup
+        :<|> lookupSubjects
         :<|> expand = client apiProxy
 
 {- | Ask for a read at least as fresh as a previous response's @checkedAt@.

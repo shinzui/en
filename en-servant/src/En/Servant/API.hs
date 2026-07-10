@@ -30,6 +30,10 @@ module En.Servant.API (
     LookupObjectWire (..),
     LookupStateWire (..),
     LookupPageWire (..),
+    LookupSubjectsRequestWire (..),
+    LookupSubjectWire (..),
+    LookupSubjectsStateWire (..),
+    LookupSubjectsPageWire (..),
     ExpandRequestWire (..),
     ExpandNodeWire (..),
     ExpandStateWire (..),
@@ -124,6 +128,7 @@ import En.Effect.TupleStore (
 import En.Error (EnError)
 import En.Expand qualified as Expand
 import En.Lookup qualified as Lookup
+import En.LookupSubjects qualified as LookupSubjects
 import En.Revision (Consistency (..), ConsistencyToken (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
 import En.Servant.Seam (
@@ -153,7 +158,7 @@ API type. Making them part of the type is what puts them in the generated OpenAP
 document and in @en-client@'s result type, instead of leaving them as untyped
 'Servant.ServerError's thrown from a handler.
 
-All six operations share this list even though a write cannot in practice exceed a
+Every operation shares this list even though a write cannot in practice exceed a
 traversal bound (422), and a read can never fail a write precondition (412).
 'En.Error.EnError' is one closed sum shared by every operation, so the type system
 cannot prove the write path never yields 'ResolutionLimitExceeded' nor that the read
@@ -261,6 +266,9 @@ type EnAPI =
                 :<|> "lookup"
                     :> ReqBody '[JSON] LookupRequestWire
                     :> MultiVerb 'POST '[JSON] (EnResponses "A page of authorized objects" LookupPageWire) (EnResult LookupPageWire)
+                :<|> "lookup-subjects"
+                    :> ReqBody '[JSON] LookupSubjectsRequestWire
+                    :> MultiVerb 'POST '[JSON] (EnResponses "A page of authorized subjects" LookupSubjectsPageWire) (EnResult LookupSubjectsPageWire)
                 :<|> "expand"
                     :> ReqBody '[JSON] ExpandRequestWire
                     :> MultiVerb 'POST '[JSON] (EnResponses "The permission's subject tree" ExpandTreeWire) (EnResult ExpandTreeWire)
@@ -278,6 +286,7 @@ server env =
         :<|> checkHandler env
         :<|> batchCheckHandler env
         :<|> lookupHandler env
+        :<|> lookupSubjectsHandler env
         :<|> expandHandler env
 
 app :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> Application
@@ -789,6 +798,128 @@ instance ToJSON LookupPageWire where
 instance FromJSON LookupPageWire where
     parseJSON = withObject "LookupPageWire" \o ->
         LookupPageWire <$> o .: "objects" <*> o .: "state" <*> o .: "checkedAt"
+
+{- | "Who has access to this object?"
+
+@subjectType@ names one object type and is required, which keeps the traversal bounded
+and the answer homogeneous. @deadlineMillis@ is the live time budget, handled exactly as
+@\/v1\/lookup@ handles it: omitted means the server default, and a value above the
+server's ceiling is clamped rather than rejected.
+-}
+data LookupSubjectsRequestWire = LookupSubjectsRequestWire
+    { consistency :: !ConsistencyWire
+    , object :: !ObjectRefWire
+    , permission :: !Text
+    , subjectType :: !Text
+    , context :: !CaveatContextWire
+    , limit :: !Int
+    , cursor :: !(Maybe Text)
+    , deadlineMillis :: !(Maybe Int)
+    }
+    deriving stock (Eq, Show)
+
+instance ToJSON LookupSubjectsRequestWire where
+    toJSON wire =
+        Aeson.object
+            [ "consistency" .= wire.consistency
+            , "object" .= wire.object
+            , "permission" .= wire.permission
+            , "subjectType" .= wire.subjectType
+            , "context" .= wire.context
+            , "limit" .= wire.limit
+            , "cursor" .= wire.cursor
+            , "deadlineMillis" .= wire.deadlineMillis
+            ]
+    toEncoding wire =
+        pairs
+            ( "consistency" .= wire.consistency
+                <> "object" .= wire.object
+                <> "permission" .= wire.permission
+                <> "subjectType" .= wire.subjectType
+                <> "context" .= wire.context
+                <> "limit" .= wire.limit
+                <> "cursor" .= wire.cursor
+                <> "deadlineMillis" .= wire.deadlineMillis
+            )
+
+instance FromJSON LookupSubjectsRequestWire where
+    parseJSON = withObject "LookupSubjectsRequestWire" \o ->
+        LookupSubjectsRequestWire
+            <$> o .: "consistency"
+            <*> o .: "object"
+            <*> o .: "permission"
+            <*> o .: "subjectType"
+            <*> o .: "context"
+            <*> o .: "limit"
+            <*> o .:? "cursor"
+            <*> o .:? "deadlineMillis"
+
+{- | One subject holding the permission, and on what terms.
+
+A wildcard grant arrives here as @{"kind": "wildcard", "objectType": "user"}@ — the
+'SubjectWildcardWire' constructor 'SubjectWire' already has — so it is distinguishable
+from a concrete subject without a new discriminator. It is never expanded into concrete
+subjects: the set of users is not en's data.
+-}
+data LookupSubjectWire = LookupSubjectWire
+    { subject :: !SubjectWire
+    , decision :: !CheckDecisionWire
+    }
+    deriving stock (Eq, Show)
+
+instance ToJSON LookupSubjectWire where
+    toJSON wire = Aeson.object ["subject" .= wire.subject, "decision" .= wire.decision]
+    toEncoding wire = pairs ("subject" .= wire.subject <> "decision" .= wire.decision)
+
+instance FromJSON LookupSubjectWire where
+    parseJSON = withObject "LookupSubjectWire" \o ->
+        LookupSubjectWire <$> o .: "subject" <*> o .: "decision"
+
+data LookupSubjectsStateWire
+    = SubjectsExhaustedWire
+    | SubjectsHasMoreWire !Text
+    | SubjectsTruncatedWire !Text
+    deriving stock (Eq, Show)
+
+instance ToJSON LookupSubjectsStateWire where
+    toJSON = \case
+        SubjectsExhaustedWire -> Aeson.object ["status" .= ("exhausted" :: Text)]
+        SubjectsHasMoreWire cursor -> Aeson.object ["status" .= ("hasMore" :: Text), "cursor" .= cursor]
+        SubjectsTruncatedWire cursor -> Aeson.object ["status" .= ("truncated" :: Text), "cursor" .= cursor]
+    toEncoding = \case
+        SubjectsExhaustedWire -> pairs ("status" .= ("exhausted" :: Text))
+        SubjectsHasMoreWire cursor -> pairs ("status" .= ("hasMore" :: Text) <> "cursor" .= cursor)
+        SubjectsTruncatedWire cursor -> pairs ("status" .= ("truncated" :: Text) <> "cursor" .= cursor)
+
+instance FromJSON LookupSubjectsStateWire where
+    parseJSON = withObject "LookupSubjectsStateWire" \o ->
+        o .: "status" >>= \case
+            "exhausted" -> pure SubjectsExhaustedWire
+            "hasMore" -> SubjectsHasMoreWire <$> o .: "cursor"
+            "truncated" -> SubjectsTruncatedWire <$> o .: "cursor"
+            other -> unknownVariant "lookup-subjects status" other ["exhausted", "hasMore", "truncated"]
+
+{- | A page of authorized subjects, and the snapshot the lookup reads at.
+
+Every page of one traversal carries the same @checkedAt@: the cursor pins the snapshot,
+and a continuation reads at the revision its cursor's validated token names.
+-}
+data LookupSubjectsPageWire = LookupSubjectsPageWire
+    { subjects :: ![LookupSubjectWire]
+    , state :: !LookupSubjectsStateWire
+    , checkedAt :: !Text
+    }
+    deriving stock (Eq, Show)
+
+instance ToJSON LookupSubjectsPageWire where
+    toJSON wire =
+        Aeson.object ["subjects" .= wire.subjects, "state" .= wire.state, "checkedAt" .= wire.checkedAt]
+    toEncoding wire =
+        pairs ("subjects" .= wire.subjects <> "state" .= wire.state <> "checkedAt" .= wire.checkedAt)
+
+instance FromJSON LookupSubjectsPageWire where
+    parseJSON = withObject "LookupSubjectsPageWire" \o ->
+        LookupSubjectsPageWire <$> o .: "subjects" <*> o .: "state" <*> o .: "checkedAt"
 
 data ExpandRequestWire = ExpandRequestWire
     { consistency :: !ConsistencyWire
@@ -1474,6 +1605,39 @@ lookupHandler env request = enHandler do
             )
     pure (lookupPageToWire page)
 
+{- | "Who can view this?" — the flat, cursored subject set.
+
+Unlike @\/v1\/lookup@, this validates @limit@. A zero limit returns an empty page whose
+cursor equals the caller's own, so a drain loop over it never terminates and never
+advances; the same reason 'positiveLimit' guards the relationship read.
+-}
+lookupSubjectsHandler :: (IOE Effectful.:> es) => Env es -> LookupSubjectsRequestWire -> Handler (EnResult LookupSubjectsPageWire)
+lookupSubjectsHandler env request = enHandler do
+    consistency <- orInvalid (consistencyFromWire request.consistency)
+    context <- orInvalid (contextFromWire request.context)
+    object <- orInvalid (objectRefFromWire request.object)
+    permission <- orInvalid (nonEmptyRelation "permission" request.permission)
+    subjectType <- orInvalid (nonEmptyObjectType "subjectType" request.subjectType)
+    limit <- orInvalid (positiveLimit request.limit)
+    deadline <- lift (lookupDeadline env request.deadlineMillis)
+    page <-
+        engine
+            env
+            ( env.lookupSubjectsWithDeadlineOperation
+                deadline
+                env.graph
+                consistency
+                LookupSubjects.LookupSubjectsRequest
+                    { object
+                    , permission
+                    , subjectType
+                    , context
+                    , limit
+                    , cursor = LookupSubjects.LookupSubjectsCursor <$> request.cursor
+                    }
+            )
+    pure (lookupSubjectsPageToWire page)
+
 {- | The time budget for one lookup, measured on the monotonic clock.
 
 The server owns the ceiling. An unbounded client-supplied budget is a hostage problem:
@@ -1618,6 +1782,16 @@ positiveLimit limit
     | limit <= 0 = Left "limit must be positive"
     | otherwise = Right limit
 
+nonEmptyRelation :: Text -> Text -> Either Text RelationName
+nonEmptyRelation label value
+    | Text.null value = Left (label <> " must not be empty")
+    | otherwise = Right (RelationName value)
+
+nonEmptyObjectType :: Text -> Text -> Either Text ObjectType
+nonEmptyObjectType label value
+    | Text.null value = Left (label <> " must not be empty")
+    | otherwise = Right (ObjectType value)
+
 relationshipsPageToWire :: ConsistencyToken -> TuplePage -> ReadRelationshipsResponseWire
 relationshipsPageToWire (ConsistencyToken checkedAt) TuplePage{rows, state} =
     ReadRelationshipsResponseWire
@@ -1735,6 +1909,25 @@ lookupStateToWire =
         Lookup.LookupExhausted -> LookupExhaustedWire
         Lookup.LookupHasMore (Lookup.LookupCursor cursor) -> LookupHasMoreWire cursor
         Lookup.LookupTruncated (Lookup.LookupCursor cursor) -> LookupTruncatedWire cursor
+
+lookupSubjectsPageToWire :: LookupSubjects.LookupSubjectsPage -> LookupSubjectsPageWire
+lookupSubjectsPageToWire LookupSubjects.LookupSubjectsPage{subjects, state, checkedAt = ConsistencyToken checkedAt} =
+    LookupSubjectsPageWire
+        { subjects = lookupSubjectToWire <$> subjects
+        , state = lookupSubjectsStateToWire state
+        , checkedAt
+        }
+
+lookupSubjectToWire :: LookupSubjects.LookupSubject -> LookupSubjectWire
+lookupSubjectToWire LookupSubjects.LookupSubject{subject, decision} =
+    LookupSubjectWire{subject = subjectToWire subject, decision = decisionToWire decision}
+
+lookupSubjectsStateToWire :: LookupSubjects.LookupSubjectsState -> LookupSubjectsStateWire
+lookupSubjectsStateToWire =
+    \case
+        LookupSubjects.SubjectsExhausted -> SubjectsExhaustedWire
+        LookupSubjects.SubjectsHasMore (LookupSubjects.LookupSubjectsCursor cursor) -> SubjectsHasMoreWire cursor
+        LookupSubjects.SubjectsTruncated (LookupSubjects.LookupSubjectsCursor cursor) -> SubjectsTruncatedWire cursor
 
 expandTreeToWire :: Expand.ExpandTree -> ExpandTreeWire
 expandTreeToWire Expand.ExpandTree{root, permission = RelationName permission, children, state, checkedAt = ConsistencyToken checkedAt} =

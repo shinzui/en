@@ -99,6 +99,10 @@ import En.Servant.API (
     LookupPageWire,
     LookupRequestWire,
     LookupStateWire,
+    LookupSubjectWire,
+    LookupSubjectsPageWire,
+    LookupSubjectsRequestWire,
+    LookupSubjectsStateWire,
     ObjectRefWire,
     PreconditionWire,
     ReadRelationshipsRequestWire,
@@ -382,6 +386,41 @@ instance ToSchema LookupPageWire where
         state <- declareSchemaRef (Proxy @LookupStateWire)
         pure (NamedSchema (Just "LookupPageWire") (objectSchema [("objects", arrayOf object), ("state", state), ("checkedAt", textRef)]))
 
+instance ToSchema LookupSubjectsRequestWire where
+    declareNamedSchema _ = do
+        consistency <- declareSchemaRef (Proxy @ConsistencyWire)
+        object <- declareSchemaRef (Proxy @ObjectRefWire)
+        context <- declareSchemaRef (Proxy @CaveatContextWire)
+        pure $
+            NamedSchema (Just "LookupSubjectsRequestWire") $
+                objectSchema
+                    [ ("consistency", consistency)
+                    , ("object", object)
+                    , ("permission", textRef)
+                    , ("subjectType", textRef)
+                    , ("context", context)
+                    , ("limit", primitive OpenApiInteger)
+                    , ("cursor", nullable textRef)
+                    , ("deadlineMillis", nullable (primitive OpenApiInteger))
+                    ]
+
+instance ToSchema LookupSubjectWire where
+    declareNamedSchema _ = do
+        subject <- declareSchemaRef (Proxy @SubjectWire)
+        decision <- declareSchemaRef (Proxy @CheckDecisionWire)
+        pure (NamedSchema (Just "LookupSubjectWire") (objectSchema [("subject", subject), ("decision", decision)]))
+
+instance ToSchema LookupSubjectsStateWire where
+    declareNamedSchema _ = pure (sumSchema "LookupSubjectsStateWire" pageStateVariants)
+
+instance ToSchema LookupSubjectsPageWire where
+    declareNamedSchema _ = do
+        subject <- declareSchemaRef (Proxy @LookupSubjectWire)
+        state <- declareSchemaRef (Proxy @LookupSubjectsStateWire)
+        pure $
+            NamedSchema (Just "LookupSubjectsPageWire") $
+                objectSchema [("subjects", arrayOf subject), ("state", state), ("checkedAt", textRef)]
+
 instance ToSchema ExpandRequestWire where
     declareNamedSchema _ = do
         consistency <- declareSchemaRef (Proxy @ConsistencyWire)
@@ -587,7 +626,7 @@ instance ToSchema ErrorEnvelopeWire where
                     , ("retryable", primitive OpenApiBoolean)
                     ]
 
--- | Lookup and expand share one page-state grammar.
+-- | Lookup, lookup-subjects, and expand share one page-state grammar.
 pageStateVariants :: [Schema]
 pageStateVariants =
     [ objectSchema [("status", literal "exhausted")]
