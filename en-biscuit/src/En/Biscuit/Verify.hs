@@ -14,7 +14,9 @@ decision was already made upstream and is carried in the signed token.
 
 'verifyGrant' verifies, in order:
 
-  1. the issuer signature ('Auth.Biscuit.parseB64' with the trusted public key);
+  1. the issuer signature ('Auth.Biscuit.parseWith', selecting the trusted issuer
+     public key from the keyset by the token's root key id — so an operator can
+     rotate the issuer key by config alone);
   2. token expiry against the request clock;
   3. the token subject matches the authenticated subject;
   4. the token audience matches the expected audience;
@@ -68,18 +70,19 @@ import Data.Time (UTCTime)
 
 import Auth.Biscuit (
     Biscuit,
+    BiscuitEncoding (..),
     Block,
     FromValue (..),
     Open,
     OpenOrSealed,
-    PublicKey,
+    ParserConfig (..),
     Verified,
     addBlock,
     authorizeBiscuit,
     authorizer,
     block,
     getSingleVariableValue,
-    parseB64,
+    parseWith,
     query,
     queryRawBiscuitFacts,
  )
@@ -87,6 +90,7 @@ import Auth.Biscuit.Datalog.AST (Query)
 import Auth.Biscuit.Datalog.Executor (Bindings)
 
 import En.Biscuit.Grant (Audience (..), RequestId (..), RevocationId (..))
+import En.Biscuit.Keys (IssuerKeySet, selectIssuerKey)
 import En.Revision (ConsistencyToken (..), SchemaHash (..))
 import En.Schema (ObjectType (..), RelationName (..))
 import En.Tuple (ObjectRef (..), Subject (..))
@@ -179,24 +183,37 @@ data EnBiscuitVerifyError
       RestrictionFailed Text
     deriving stock (Eq, Show)
 
-{- | Verify a serialized token against the trusted issuer public key and the
-request. Returns the recovered grant on success, or the first failing check.
+{- | Verify a serialized token against a trusted issuer keyset and the request.
+The token's root key id selects which key in the keyset checks the signature
+('selectIssuerKey'), so rotating the issuer key is a keyset config change, not a
+verifier redeploy. Returns the recovered grant on success, or the first failing
+check.
 -}
 verifyGrant ::
     (MonadIO m) =>
-    PublicKey ->
+    IssuerKeySet ->
     ByteString ->
     VerifyRequest m ->
     m (Either EnBiscuitVerifyError VerifiedGrant)
-verifyGrant publicKey token request =
-    case parseB64 publicKey token of
+verifyGrant keySet token request = do
+    parsed <-
+        parseWith
+            ParserConfig
+                { encoding = UrlBase64
+                , -- Built-in block-revocation-id checking is wired in M3; until
+                  -- then no token is revoked by its block ids.
+                  isRevoked = const (pure False)
+                , getPublicKey = selectIssuerKey keySet
+                }
+            token
+    case parsed of
         Left parseErr -> pure (Left (SignatureInvalid (tshow parseErr)))
         Right biscuit ->
             case extractAndCheck biscuit request of
                 Left err -> pure (Left err)
                 Right (grant, mRevocationId) -> do
-                    isRevoked <- maybe (pure False) request.revoked mRevocationId
-                    if isRevoked
+                    appRevoked <- maybe (pure False) request.revoked mRevocationId
+                    if appRevoked
                         then pure (Left Revoked)
                         else do
                             restriction <- runRestrictions biscuit request

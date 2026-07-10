@@ -36,6 +36,7 @@ import Auth.Biscuit (
     Biscuit,
     Block,
     OpenOrSealed,
+    PublicKey,
     SecretKey,
     Verified,
     addBlock,
@@ -43,6 +44,7 @@ import Auth.Biscuit (
     authorizer,
     block,
     mkBiscuit,
+    mkBiscuitWith,
     newSecret,
     parseB64,
     parseSecretKeyHex,
@@ -67,7 +69,7 @@ import En.Biscuit.Grant (
     grantBlock,
     grantFactsText,
  )
-import En.Biscuit.Keys (IssuerKeyId (..))
+import En.Biscuit.Keys (IssuerKeyId (..), IssuerKeySet (..), singleKey)
 import En.Biscuit.Mint (
     EnBiscuitMintError (..),
     MintConfig (..),
@@ -113,6 +115,9 @@ main = do
     keyIdRoundTripTest
     verifyObjectTests
     verifyScopedTests
+    keyRotationTest
+    keySelectionAttackTest
+    legacyTokenTest
     attenuationTests
     shomeiFlowTest
     attenuationForgedRightTest
@@ -471,7 +476,7 @@ verifyObjectTests = do
                 verifyNow
                 (const (pure False))
 
-    valid <- verifyGrant public token ok
+    valid <- verifyGrant (keySetFor public) token ok
     case valid of
         Right VerifiedGrant{subject = s, operation = op} -> do
             assertEqual "verify: recovered subject" aliceSubject s
@@ -479,15 +484,15 @@ verifyObjectTests = do
         Left e -> die ("verify valid: expected success, got " <> show e)
 
     assertVerifyError "wrong audience" WrongAudience
-        =<< verifyGrant public token ok{expectedAudience = Audience "other-service"}
+        =<< verifyGrant (keySetFor public) token ok{expectedAudience = Audience "other-service"}
     assertVerifyError "wrong subject" WrongSubject
-        =<< verifyGrant public token ok{expectedSubject = SubjectId (ObjectRef (ObjectType "user") "bob")}
+        =<< verifyGrant (keySetFor public) token ok{expectedSubject = SubjectId (ObjectRef (ObjectType "user") "bob")}
     assertVerifyError "wrong resource" ResourceNotInScope
-        =<< verifyGrant public token ok{resource = ObjectRef (ObjectType "document") "other"}
+        =<< verifyGrant (keySetFor public) token ok{resource = ObjectRef (ObjectType "document") "other"}
     assertVerifyError "unaccepted schema" UnacceptedSchemaHash
-        =<< verifyGrant public token ok{acceptedSchemaHashes = Set.singleton (SchemaHash "sha-zzz")}
+        =<< verifyGrant (keySetFor public) token ok{acceptedSchemaHashes = Set.singleton (SchemaHash "sha-zzz")}
     assertVerifyError "revoked" Revoked
-        =<< verifyGrant public token ok{revoked = \r -> pure (r == RevocationId "rev-1")}
+        =<< verifyGrant (keySetFor public) token ok{revoked = \r -> pure (r == RevocationId "rev-1")}
 
     -- Expired needs a request clock after expiry (now + defaultTtl = 01:00Z).
     let expiredReq =
@@ -500,7 +505,7 @@ verifyObjectTests = do
                 acceptedSchemas
                 afterExpiry
                 (const (pure False))
-    assertVerifyError "expired" Expired =<< verifyGrant public token expiredReq
+    assertVerifyError "expired" Expired =<< verifyGrant (keySetFor public) token expiredReq
 
 {- | Verify a scoped token: a request for a container in scope succeeds; a
 resource outside the scope fails.
@@ -530,7 +535,7 @@ verifyScopedTests = do
     let token = minted.token
 
     inScope <-
-        verifyGrant public token $
+        verifyGrant (keySetFor public) token $
             mkVerifyRequest
                 aliceSubject
                 (Audience "billing-service")
@@ -545,7 +550,7 @@ verifyScopedTests = do
         Left e -> die ("verify scoped in-scope: expected success, got " <> show e)
 
     outOfScope <-
-        verifyGrant public token $
+        verifyGrant (keySetFor public) token $
             mkVerifyRequest
                 aliceSubject
                 (Audience "billing-service")
@@ -556,6 +561,85 @@ verifyScopedTests = do
                 verifyNow
                 (const (pure False))
     assertVerifyError "scoped resource outside scope" ResourceNotInScope outOfScope
+
+{- | The rotation story: an operator can rotate the issuer key by config alone.
+Token TA (key A, id 1) and token TB (key B, id 2) both verify against a single
+keyset trusting both keys — the overlap window, with the verifier constructed
+once and never reconfigured between the two calls. Retiring key A from the keyset
+then rejects TA while TB still verifies. No verifier binary is rebuilt.
+-}
+keyRotationTest :: IO ()
+keyRotationTest = do
+    secretA <- loadSecret
+    secretB <- loadSecretB
+    let pubA = toPublic secretA
+        pubB = toPublic secretB
+        configFor secret keyId =
+            MintConfig{issuerSecretKey = secret, issuerKeyId = keyId, defaultTtl = 3600, now = pure sampleExpiry}
+    mintedA <- either (die . show) pure =<< mintObjectGrant (configFor secretA (IssuerKeyId 1)) Allowed forgeableObjectGrant
+    mintedB <- either (die . show) pure =<< mintObjectGrant (configFor secretB (IssuerKeyId 2)) Allowed forgeableObjectGrant
+    let ta = mintedA.token
+        tb = mintedB.token
+
+    -- Overlap window: one keyset trusts both keys. Constructed once, used twice.
+    let overlap =
+            IssuerKeySet
+                { keysById = Map.fromList [(IssuerKeyId 1, pubA), (IssuerKeyId 2, pubB)]
+                , legacyKey = Nothing
+                }
+    assertVerified "rotation: overlap keyset verifies the key-A token"
+        =<< verifyGrant overlap ta roadmapRequest
+    assertVerified "rotation: overlap keyset verifies the key-B token"
+        =<< verifyGrant overlap tb roadmapRequest
+
+    -- Retire key A: only TB verifies now; TA fails signature selection.
+    let retired = singleKey (IssuerKeyId 2) pubB
+    assertVerified "rotation: retired keyset still verifies the key-B token"
+        =<< verifyGrant retired tb roadmapRequest
+    assertSignatureInvalid "rotation: retired keyset rejects the key-A token"
+        =<< verifyGrant retired ta roadmapRequest
+
+{- | A holder must not be able to steer which issuer key the verifier reaches for.
+A token signed by key A but claiming root key id 2 (the id the verifier maps to
+key B) models an attacker rewriting the envelope's key id. The verifier selects
+key B by that id, and A's signature fails against B — fail closed. Selection is
+attacker-visible metadata, so this is a new surface introduced by the keyset; it
+must reject explicitly, not by accident.
+-}
+keySelectionAttackTest :: IO ()
+keySelectionAttackTest = do
+    secretA <- loadSecret
+    secretB <- loadSecretB
+    let pubB = toPublic secretB
+    grantBlk <- either (die . show) pure (grantBlock (ObjectGrant forgeableObjectGrant))
+    biscuit <- mkBiscuitWith (Just 2) secretA grantBlk
+    let token = serializeB64 biscuit
+        keySet = singleKey (IssuerKeyId 2) pubB
+    assertSignatureInvalid "key selection: an A-signed token claiming key id 2 must not verify under key B"
+        =<< verifyGrant keySet token roadmapRequest
+
+{- | Legacy tokens minted before key ids existed carry no root key id. They verify
+against a keyset whose 'legacyKey' is set, and fail against one without it — so
+the fleet can keep honoring in-flight legacy tokens through a rotation while new
+tokens carry ids.
+-}
+legacyTokenTest :: IO ()
+legacyTokenTest = do
+    secretLegacy <- loadSecret
+    secretOther <- loadSecretB
+    let pubLegacy = toPublic secretLegacy
+        pubOther = toPublic secretOther
+    grantBlk <- either (die . show) pure (grantBlock (ObjectGrant forgeableObjectGrant))
+    -- mkBiscuit is mkBiscuitWith Nothing: no root key id in the envelope.
+    biscuit <- mkBiscuit secretLegacy grantBlk
+    let token = serializeB64 biscuit
+        withLegacy =
+            IssuerKeySet{keysById = Map.singleton (IssuerKeyId 1) pubOther, legacyKey = Just pubLegacy}
+        withoutLegacy = singleKey (IssuerKeyId 1) pubOther
+    assertVerified "legacy: a token with no key id verifies against a keyset carrying the legacy key"
+        =<< verifyGrant withLegacy token roadmapRequest
+    assertSignatureInvalid "legacy: the same token fails against a keyset without the legacy key"
+        =<< verifyGrant withoutLegacy token roadmapRequest
 
 {- | Attenuate a scoped token to one resource and one service; the narrowed
 request still verifies, but the original broader requests do not.
@@ -592,7 +676,7 @@ attenuationTests = do
     let token = serializeB64 narrowed
 
     narrowedOk <-
-        verifyGrant public token $
+        verifyGrant (keySetFor public) token $
             mkVerifyRequest
                 aliceSubject
                 (Audience "billing-service")
@@ -607,7 +691,7 @@ attenuationTests = do
         Left e -> die ("attenuation: narrowed request should verify, got " <> show e)
 
     otherResource <-
-        verifyGrant public token $
+        verifyGrant (keySetFor public) token $
             mkVerifyRequest
                 aliceSubject
                 (Audience "billing-service")
@@ -620,7 +704,7 @@ attenuationTests = do
     assertRestrictionFailed "attenuation blocks the other in-scope resource" otherResource
 
     otherService <-
-        verifyGrant public token $
+        verifyGrant (keySetFor public) token $
             mkVerifyRequest
                 aliceSubject
                 (Audience "billing-service")
@@ -683,14 +767,14 @@ shomeiFlowTest = do
                 (const (pure False))
 
     -- Downstream authenticated the same caller -> the decision proof verifies.
-    sameCaller <- verifyGrant public token (requestFor "alice")
+    sameCaller <- verifyGrant (keySetFor public) token (requestFor "alice")
     case sameCaller of
         Right _ -> pure ()
         Left e -> die ("shomei flow: same-subject request should verify, got " <> show e)
 
     -- Downstream authenticated a different caller -> fail closed (identity
     -- established by the downstream does not match the token's subject).
-    impostor <- verifyGrant public token (requestFor "mallory")
+    impostor <- verifyGrant (keySetFor public) token (requestFor "mallory")
     assertVerifyError "shomei flow: different caller" WrongSubject impostor
 
 {- | Attenuation scoping, forged @en_right@. A holder appends a block asserting a
@@ -716,12 +800,12 @@ attenuationForgedRightTest = do
     assertBool "forged en_right: an un-annotated query must not see the holder block" (Set.null scoped)
 
     assertVerifyError "forged en_right: widened resource" ResourceNotInScope
-        =<< verifyGrant public forgedObject (roadmapRequest{resource = ObjectRef (ObjectType "document") "secret"})
+        =<< verifyGrant (keySetFor public) forgedObject (roadmapRequest{resource = ObjectRef (ObjectType "document") "secret"})
     -- The genuine request must still succeed: had the forged fact been visible,
     -- two `en_right` rows would make extraction ambiguous and surface
     -- MalformedGrant rather than a verified grant.
     assertVerified "forged en_right: the genuine request still verifies"
-        =<< verifyGrant public forgedObject roadmapRequest
+        =<< verifyGrant (keySetFor public) forgedObject roadmapRequest
 
     -- Forged permission: admin on the granted resource.
     (forgedPerm, parsedPerm) <-
@@ -731,9 +815,9 @@ attenuationForgedRightTest = do
     assertBool "forged permission: the forged fact must be present in the token" (not (Set.null permControl))
 
     assertVerifyError "forged permission: widened operation" OperationNotAuthorized
-        =<< verifyGrant public forgedPerm (objectRequest (RelationName "admin") roadmapRef verifyNow)
+        =<< verifyGrant (keySetFor public) forgedPerm (objectRequest (RelationName "admin") roadmapRef verifyNow)
     assertVerified "forged permission: the genuine operation still verifies"
-        =<< verifyGrant public forgedPerm roadmapRequest
+        =<< verifyGrant (keySetFor public) forgedPerm roadmapRequest
 
 {- | Attenuation scoping, forged @en_expires_at@. A holder cannot extend the life
 of a token by asserting a later expiry.
@@ -754,8 +838,8 @@ attenuationForgedExpiryTest = do
     -- afterExpiry (02:00Z) is past the real expiry (01:00Z) and far short of the
     -- forged one (2027). The verifier must read the real one.
     assertVerifyError "forged expiry: past the real expiry" Expired
-        =<< verifyGrant public token (objectRequest (RelationName "view") roadmapRef afterExpiry)
-    assertVerified "forged expiry: before the real expiry" =<< verifyGrant public token roadmapRequest
+        =<< verifyGrant (keySetFor public) token (objectRequest (RelationName "view") roadmapRef afterExpiry)
+    assertVerified "forged expiry: before the real expiry" =<< verifyGrant (keySetFor public) token roadmapRequest
 
 {- | Attenuation scoping, forged @en_revocation_id@, in both directions: a holder
 can neither shadow a real revocation id to escape revocation, nor plant one in a
@@ -776,7 +860,7 @@ attenuationForgedRevocationTest = do
             [block|en_revocation_id("rev-clean");|]
     let revokesRev1 r = pure (r == RevocationId "rev-1")
     assertVerifyError "forged revocation: shadowing does not evade revocation" Revoked
-        =<< verifyGrant public shadowed roadmapRequest{revoked = revokesRev1}
+        =<< verifyGrant (keySetFor public) shadowed roadmapRequest{revoked = revokesRev1}
 
     -- Planting: the authority names no revocation id, so the verifier must never
     -- consult the caller's revocation check at all.
@@ -788,7 +872,7 @@ attenuationForgedRevocationTest = do
     asked <- newIORef []
     let recordAsk r = modifyIORef' asked (r :) >> pure False
     assertVerified "planted revocation: the token still verifies"
-        =<< verifyGrant public planted roadmapRequest{revoked = recordAsk}
+        =<< verifyGrant (keySetFor public) planted roadmapRequest{revoked = recordAsk}
     consulted <- readIORef asked
     assertEqual "planted revocation: the forged id never reached the revocation check" [] consulted
 
@@ -810,9 +894,9 @@ attenuationForgedScopeTest = do
     assertEqual "forged scope: an un-annotated query sees only the authority's two" 2 (Set.size scoped)
 
     assertVerifyError "forged scope: the added container is out of scope" ResourceNotInScope
-        =<< verifyGrant public token (scopedRequest (ObjectRef (ObjectType "folder") "f9"))
+        =<< verifyGrant (keySetFor public) token (scopedRequest (ObjectRef (ObjectType "folder") "f9"))
     assertVerified "forged scope: a genuine container still verifies"
-        =<< verifyGrant public token (scopedRequest (ObjectRef (ObjectType "folder") "f1"))
+        =<< verifyGrant (keySetFor public) token (scopedRequest (ObjectRef (ObjectType "folder") "f1"))
 
 {- | Attenuation scoping, forged @en_subject@. A holder cannot re-point a grant at
 another principal.
@@ -832,9 +916,9 @@ attenuationForgedSubjectTest = do
 
     let mallory = SubjectId (ObjectRef (ObjectType "user") "mallory")
     assertVerifyError "forged subject: mallory cannot use alice's grant" WrongSubject
-        =<< verifyGrant public token roadmapRequest{expectedSubject = mallory}
+        =<< verifyGrant (keySetFor public) token roadmapRequest{expectedSubject = mallory}
     assertVerified "forged subject: alice's own request still verifies"
-        =<< verifyGrant public token roadmapRequest
+        =<< verifyGrant (keySetFor public) token roadmapRequest
 
 {- | The same guarantee for consumers that never touch en's verifier: a plain
 @allow if@ policy is scoped to the authority block too, so a forged fact cannot
@@ -883,16 +967,16 @@ narrowingDirectionTest = do
 
     -- The parent passes f1 and fails f9. The attack block cannot flip f9.
     assertVerified "narrowing: the parent token authorizes a genuine container"
-        =<< verifyGrant public parent (scopedRequest f1)
+        =<< verifyGrant (keySetFor public) parent (scopedRequest f1)
     assertVerifyError "narrowing: the parent token rejects a container it never held" ResourceNotInScope
-        =<< verifyGrant public parent (scopedRequest f9)
+        =<< verifyGrant (keySetFor public) parent (scopedRequest f9)
     assertVerifyError "narrowing: a forged fact plus a matching check cannot widen the scope" ResourceNotInScope
-        =<< verifyGrant public attacked (scopedRequest f9)
+        =<< verifyGrant (keySetFor public) attacked (scopedRequest f9)
 
     -- And the block's own check can only narrow: it now rejects f1, which the
     -- parent allowed.
     assertRestrictionFailed "narrowing: the attacker's own check narrows their token"
-        =<< verifyGrant public attacked (scopedRequest f1)
+        =<< verifyGrant (keySetFor public) attacked (scopedRequest f1)
 
 {- | Mint an authority block for @grant@, then let a holder append @forged@. The
 result is exactly what a malicious bearer can produce from a genuine token.
@@ -992,6 +1076,12 @@ laterExpiry = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 3600)
 aliceSubject :: Subject
 aliceSubject = SubjectId (ObjectRef (ObjectType "user") "alice")
 
+{- | A single-key keyset under key id 1, the default the mint tests sign with.
+Most verify tests trust exactly the issuer that minted their token.
+-}
+keySetFor :: PublicKey -> IssuerKeySet
+keySetFor = singleKey (IssuerKeyId 1)
+
 acceptedSchemas :: Set SchemaHash
 acceptedSchemas = Set.singleton (SchemaHash "sha-abc")
 
@@ -1029,6 +1119,15 @@ assertRestrictionFailed label result =
         Left (RestrictionFailed _) -> pure ()
         other -> die (label <> ": expected RestrictionFailed, got " <> showVerify other)
 
+{- | Assert a signature/parse rejection without pinning the underlying
+@ParseError@ text, which the library owns.
+-}
+assertSignatureInvalid :: String -> Either EnBiscuitVerifyError VerifiedGrant -> IO ()
+assertSignatureInvalid label result =
+    case result of
+        Left (SignatureInvalid _) -> pure ()
+        other -> die (label <> ": expected SignatureInvalid, got " <> showVerify other)
+
 showVerify :: Either EnBiscuitVerifyError VerifiedGrant -> String
 showVerify (Left err) = "Left " <> show err
 showVerify (Right _) = "Right <verified grant>"
@@ -1045,6 +1144,16 @@ loadSecret =
         (die "could not parse the deterministic secret key")
         pure
         (parseSecretKeyHex "a2c4ead323536b925f3488ee83e0888b79c2761405ca7c0c9a018c7c1905eecc")
+
+{- | A second deterministic issuer key, distinct from 'loadSecret', for the
+rotation and key-selection tests. Any 32 bytes is a valid ed25519 secret.
+-}
+loadSecretB :: IO SecretKey
+loadSecretB =
+    maybe
+        (die "could not parse the second deterministic secret key")
+        pure
+        (parseSecretKeyHex "b2c4ead323536b925f3488ee83e0888b79c2761405ca7c0c9a018c7c1905eecd")
 
 {- | A default object grant; @consistencyToken@/@schemaHash@ match the mint
 authorizers above.

@@ -51,10 +51,10 @@ This section must always reflect the actual current state of the work.
 - [x] M1 (2026-07-10): Introduce the `MintedGrant` result (token bytes, stamped expiry, block revocation ids) and change all mint functions to return it.
 - [x] M1 (2026-07-10): Update `en-biscuit/test/Main.hs` for the new mint result type; all existing tests pass.
 - [x] M1 (2026-07-10): Add a test asserting a minted token round-trips its key id (`keyIdRoundTripTest`: mint under `IssuerKeyId 7`, `parseB64` with the matching public key succeeds; the M2 rotation test completes the keyset-selection proof).
-- [ ] M2: Define `IssuerKeySet` in a new module `en-biscuit/src/En/Biscuit/Keys.hs` and expose it from `En.Biscuit`.
-- [ ] M2: Change `verifyGrant` to accept `IssuerKeySet` and parse via `Auth.Biscuit.parseWith`.
-- [ ] M2: Add the rotation test: keys A and B, one keyset, both tokens verify; keyset without A rejects only the key-A token.
-- [ ] M2: Add a key-selection attack test (raised by EP-56, see Surprises & Discoveries): a token minted under key A, with its `rootKeyId` rewritten to name key B, must be rejected — a holder must not be able to steer which key the verifier reaches for.
+- [x] M2 (2026-07-10): Define `IssuerKeySet` (plus `singleKey`/`selectIssuerKey`) in `en-biscuit/src/En/Biscuit/Keys.hs` and expose it from `En.Biscuit`. (The module and these symbols landed with M1's commit; M2 wires them into verification.)
+- [x] M2 (2026-07-10): Change `verifyGrant` to accept `IssuerKeySet` and parse via `Auth.Biscuit.parseWith` (`ParserConfig{encoding = UrlBase64, isRevoked = const (pure False), getPublicKey = selectIssuerKey keySet}`; `isRevoked` becomes the real block-id check in M3). All EP-56 verify call sites updated mechanically via a `keySetFor` helper — their fact-scoping assertions are unchanged.
+- [x] M2 (2026-07-10): Add the rotation test (`keyRotationTest`): keys A and B, one overlap keyset verifies both tokens with the verifier built once; keyset without A rejects only the key-A token. Plus `legacyTokenTest`: a no-key-id token verifies with `legacyKey` set, fails without it.
+- [x] M2 (2026-07-10): Add the key-selection attack test (`keySelectionAttackTest`): a token signed by key A but claiming root key id 2 (which the keyset maps to key B) is rejected `SignatureInvalid` — a holder cannot steer the verifier onto a key that would accept a forged signature.
 - [ ] M3: Add `revokedBlockIds` to `VerifyRequest` and wire it into `ParserConfig.isRevoked` so every verify consults built-in revocation ids.
 - [ ] M3: Map the `RevokedBiscuit` parse error to the existing `Revoked` verify error; keep the application-level `revoked` check as an optional extra.
 - [ ] M3: Add tests: token without application `revocationId` is revocable by block id; application-level revocation still works.
