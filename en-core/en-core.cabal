@@ -63,6 +63,7 @@ library
     En.Schema.Render
     En.Schema.TH
     En.Schema.Types
+    En.SchemaCheck
     En.Tuple
     En.Watch
 

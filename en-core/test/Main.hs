@@ -122,6 +122,13 @@ import En.Schema.Builder qualified as Schema
 import En.Schema.Parse qualified as SchemaParse
 import En.Schema.Render (renderMarkdown, renderMermaid, renderReachabilityMermaid)
 import En.Schema.TH (mkValidSchema, schema)
+import En.SchemaCheck (
+    OrphanReason (..),
+    TupleOrphan (..),
+    checkTupleAgainstSchema,
+    renderTupleOrphan,
+    validateTuplesAgainstSchema,
+ )
 import En.Tuple (
     CaveatContext (..),
     CaveatPayload (..),
@@ -335,6 +342,8 @@ main = do
     testRelationshipStoreOperations
     testDedupeObligations
     testResidualDecision
+    testSchemaCheck
+    testValidateTuplesAgainstSchema
     validKikan <- either (fail . show) pure (validateSchema kikanSchema)
     validKikanManual <- either (fail . show) pure (validateSchema kikanSchemaManual)
     validKikanReordered <- either (fail . show) pure (validateSchema kikanSchemaReordered)
@@ -1229,6 +1238,222 @@ testRelationshipFilterValidation = do
     rejects
         "filter subjectRelation requires subjectType"
         (mkFilter (Just "space") Nothing Nothing Nothing Nothing NoSubjectRelation Nothing)
+
+{- | The candidate schema every 'checkTupleAgainstSchema' case is judged against.
+
+@post#reader@ deliberately accepts three subject shapes — a concrete user, the user
+wildcard, and a @group#member@ userset — so a tuple can be legal on @reader@ and orphaned
+on @author@, which accepts only the first.
+-}
+schemaCheckSchema :: Schema
+schemaCheckSchema =
+    either (error . ("invalid schema-check fixture: " <>) . show) id $ do
+        clearance <-
+            Schema.caveatWith
+                "clearance"
+                [ Schema.parameter "level" (ParameterEnum ["low", "high"])
+                , Schema.parameter "active" ParameterBool
+                ]
+                Schema.predTrue
+        userObject <- Schema.object "user" []
+        groupObject <- Schema.object "group" [Schema.relation "member" [Schema.subject "user"] Schema.this]
+        postObject <-
+            Schema.object
+                "post"
+                [ Schema.relation "author" [Schema.subject "user"] Schema.this
+                , Schema.relation
+                    "reader"
+                    [Schema.subject "user", Schema.wildcardSubject "user", Schema.userset "group" "member"]
+                    Schema.this
+                , Schema.permission "view" (Schema.anyOf (Schema.computed "author") [Schema.computed "reader"])
+                ]
+        Schema.buildWithCaveats [clearance] [userObject, groupObject, postObject]
+
+{- | @\<objectType\>:1#\<relation\>\@\<subject\>@, optionally caveated.
+
+The object type is a parameter rather than something a caller patches in with a record
+update: @object@ is a field of five types in this test module, and a record update on it
+resolves only by type-directed disambiguation that GHC is removing.
+-}
+schemaCheckTupleOn :: Text -> Text -> Subject -> Maybe TupleCaveat -> Tuple
+schemaCheckTupleOn objectType relation subject caveat =
+    Tuple
+        { object = ObjectRef{objectType = ObjectType objectType, objectId = "1"}
+        , relation = RelationName relation
+        , subject
+        , caveat
+        }
+
+-- | 'schemaCheckTupleOn' on @post@, the type the fixture schema models.
+schemaCheckTuple :: Text -> Subject -> Maybe TupleCaveat -> Tuple
+schemaCheckTuple =
+    schemaCheckTupleOn "post"
+
+clearancePayload :: [(Text, CaveatValue)] -> Maybe TupleCaveat
+clearancePayload entries =
+    Just TupleCaveat{name = CaveatName "clearance", payload = CaveatPayload (Map.fromList entries)}
+
+testSchemaCheck :: IO ()
+testSchemaCheck = do
+    valid <- either (fail . show) pure (validateSchema schemaCheckSchema)
+    let reasonOf tuple = (.reason) <$> checkTupleAgainstSchema valid tuple
+        aliceUser = SubjectId ObjectRef{objectType = ObjectType "user", objectId = "alice"}
+        engMembers = SubjectSet ObjectRef{objectType = ObjectType "group", objectId = "eng"} (RelationName "member")
+        userWildcard = SubjectWildcard (ObjectType "user")
+
+    -- The negative case: a fully legal tuple is not an orphan. Every assertion below is only
+    -- meaningful because this one holds.
+    assertEqual
+        "a concrete subject on a relation that allows it is not an orphan"
+        Nothing
+        (reasonOf (schemaCheckTuple "author" aliceUser Nothing))
+    assertEqual
+        "a wildcard subject on a relation that allows it is not an orphan"
+        Nothing
+        (reasonOf (schemaCheckTuple "reader" userWildcard Nothing))
+    assertEqual
+        "a userset subject on a relation that allows it is not an orphan"
+        Nothing
+        (reasonOf (schemaCheckTuple "reader" engMembers Nothing))
+    assertEqual
+        "a well-typed caveat payload is not an orphan"
+        Nothing
+        (reasonOf (schemaCheckTuple "author" aliceUser (clearancePayload [("level", ValueEnum "high"), ("active", ValueBool True)])))
+    -- Adding a caveat parameter must stay a compatible change, so a payload that omits a
+    -- declared parameter is legal. This is the assertion that says so.
+    assertEqual
+        "a payload omitting a declared parameter is not an orphan"
+        Nothing
+        (reasonOf (schemaCheckTuple "author" aliceUser (clearancePayload [("level", ValueEnum "low")])))
+
+    assertEqual
+        "an object type absent from the schema orphans its tuples"
+        (Just (OrphanUnknownObjectType (ObjectType "comment")))
+        (reasonOf (schemaCheckTupleOn "comment" "author" aliceUser Nothing))
+    assertEqual
+        "a relation absent from an existing object type orphans its tuples"
+        (Just (OrphanUnknownRelation (ObjectType "post") (RelationName "editor")))
+        (reasonOf (schemaCheckTuple "editor" aliceUser Nothing))
+    assertEqual
+        "a subject whose object type is absent orphans its tuple"
+        (Just (OrphanUnknownSubjectType (ObjectType "service")))
+        (reasonOf (schemaCheckTuple "author" (SubjectId ObjectRef{objectType = ObjectType "service", objectId = "bot"}) Nothing))
+    assertEqual
+        "a userset over an absent object type orphans its tuple"
+        (Just (OrphanUnknownSubjectType (ObjectType "team")))
+        ( reasonOf
+            (schemaCheckTuple "reader" (SubjectSet ObjectRef{objectType = ObjectType "team", objectId = "x"} (RelationName "member")) Nothing)
+        )
+    assertEqual
+        "a userset over an absent relation orphans its tuple"
+        (Just (OrphanUnknownRelation (ObjectType "group") (RelationName "admin")))
+        ( reasonOf
+            (schemaCheckTuple "reader" (SubjectSet ObjectRef{objectType = ObjectType "group", objectId = "eng"} (RelationName "admin")) Nothing)
+        )
+
+    -- Narrowing allowedSubjects. `author` accepts a concrete user and nothing else, so each
+    -- of the other two shapes is disallowed there while being legal on `reader`.
+    assertEqual
+        "a userset subject on a relation that allows only concrete subjects is disallowed"
+        (Just (OrphanDisallowedSubject engMembers))
+        (reasonOf (schemaCheckTuple "author" engMembers Nothing))
+    assertEqual
+        "a wildcard subject on a relation with no wildcard allowance is disallowed"
+        (Just (OrphanDisallowedSubject userWildcard))
+        (reasonOf (schemaCheckTuple "author" userWildcard Nothing))
+    -- A permission is a Relation with no allowed subjects, so a tuple written on one is
+    -- disallowed rather than unknown. Nothing can be directly assigned to a computed set.
+    assertEqual
+        "a tuple written on a permission is a disallowed subject"
+        (Just (OrphanDisallowedSubject aliceUser))
+        (reasonOf (schemaCheckTuple "view" aliceUser Nothing))
+
+    assertEqual
+        "a caveat absent from the schema orphans its tuple"
+        (Just (OrphanUnknownCaveat (CaveatName "gone")))
+        ( reasonOf
+            (schemaCheckTuple "author" aliceUser (Just TupleCaveat{name = CaveatName "gone", payload = CaveatPayload Map.empty}))
+        )
+    assertEqual
+        "a payload value of the wrong type orphans its tuple"
+        (Just (OrphanCaveatPayloadMismatch (CaveatName "clearance") ["active: expected bool, stored integer"]))
+        (reasonOf (schemaCheckTuple "author" aliceUser (clearancePayload [("active", ValueInteger 1)])))
+    assertEqual
+        "a payload key that is not a declared parameter orphans its tuple"
+        (Just (OrphanCaveatPayloadMismatch (CaveatName "clearance") ["colour: not a parameter of this caveat"]))
+        (reasonOf (schemaCheckTuple "author" aliceUser (clearancePayload [("colour", ValueText "red")])))
+    -- Narrowing an enum's members strands payloads carrying a dropped member.
+    assertEqual
+        "a payload enum value outside the declared members orphans its tuple"
+        (Just (OrphanCaveatPayloadMismatch (CaveatName "clearance") ["level: expected enum(low|high), stored enum value medium"]))
+        (reasonOf (schemaCheckTuple "author" aliceUser (clearancePayload [("level", ValueEnum "medium")])))
+    -- Every offending key is reported, ordered by key, not just the first.
+    assertEqual
+        "every offending payload key is reported, ordered by key"
+        ( Just
+            ( OrphanCaveatPayloadMismatch
+                (CaveatName "clearance")
+                [ "active: expected bool, stored text"
+                , "zzz: not a parameter of this caveat"
+                ]
+            )
+        )
+        (reasonOf (schemaCheckTuple "author" aliceUser (clearancePayload [("zzz", ValueBool True), ("active", ValueText "yes")])))
+
+    -- One reason per tuple: an absent object type shadows the relation and subject questions,
+    -- which cannot be asked of a type the schema does not have.
+    assertEqual
+        "an orphan reports exactly the first thing wrong with it"
+        (Just (OrphanUnknownObjectType (ObjectType "comment")))
+        (reasonOf (schemaCheckTupleOn "comment" "editor" (SubjectId ObjectRef{objectType = ObjectType "service", objectId = "bot"}) Nothing))
+
+    assertEqual
+        "an orphan renders as one operator-readable line"
+        "ORPHAN post:1#editor@user:alice — relation post#editor not in candidate schema"
+        (renderTupleOrphan TupleOrphan{tuple = schemaCheckTuple "editor" aliceUser Nothing, reason = OrphanUnknownRelation (ObjectType "post") (RelationName "editor")})
+    assertEqual
+        "a caveated orphan names its caveat in the rendered tuple"
+        "ORPHAN post:1#author@user:alice[gone] — caveat gone not in candidate schema"
+        ( renderTupleOrphan
+            TupleOrphan
+                { tuple = schemaCheckTuple "author" aliceUser (Just TupleCaveat{name = CaveatName "gone", payload = CaveatPayload Map.empty})
+                , reason = OrphanUnknownCaveat (CaveatName "gone")
+                }
+        )
+
+{- | The pass drains every page of the store, not just the first.
+
+The in-memory store pages at whatever limit it is given, so a fixture larger than one page
+is the only way to catch a drain that stops early — which is what a 'Truncated' state
+mishandled as "done" would do.
+-}
+testValidateTuplesAgainstSchema :: IO ()
+testValidateTuplesAgainstSchema = do
+    valid <- either (fail . show) pure (validateSchema schemaCheckSchema)
+    let aliceUser = SubjectId ObjectRef{objectType = ObjectType "user", objectId = "alice"}
+        legal = schemaCheckTuple "author" aliceUser Nothing
+        orphanRelation = schemaCheckTuple "editor" aliceUser Nothing
+        orphanSubject = schemaCheckTuple "author" (SubjectId ObjectRef{objectType = ObjectType "service", objectId = "bot"}) Nothing
+        run :: [Tuple] -> Either EnError [TupleOrphan]
+        run tuples =
+            runPureEff (runErrorNoCallStack (runTupleStoreInMemory tuples (validateTuplesAgainstSchema valid testRevision)))
+
+    assertEqual
+        "a store whose every tuple fits the schema yields no orphans"
+        (Right [])
+        (run [legal])
+    assertEqual
+        "the pass reports each orphan once, and leaves legal tuples alone"
+        ( Right
+            [ TupleOrphan{tuple = orphanRelation, reason = OrphanUnknownRelation (ObjectType "post") (RelationName "editor")}
+            , TupleOrphan{tuple = orphanSubject, reason = OrphanUnknownSubjectType (ObjectType "service")}
+            ]
+        )
+        (run [legal, orphanRelation, orphanSubject])
+    assertEqual
+        "an empty store yields no orphans"
+        (Right [])
+        (run [])
 
 testRelationshipFilterMatching :: IO ()
 testRelationshipFilterMatching = do
