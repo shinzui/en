@@ -410,7 +410,59 @@ trailing it.
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Completed 2026-07-10, all five milestones, one commit each (plus a formatting re-commit where
+`treefmt` reshaped new files):
+
+- `508e50a` — M1: `EnAPI` as a flat `NamedRoutes` record; `genericClient`; test field-bind.
+- `440d12c` — M2: `routingTests`, the WAI end-to-end routing + envelope guard.
+- `0a4755d` — M3: vertical slices (`En.Servant.Wire`, `En.Servant.Response`, `En.Tuple.Api`,
+  `En.Check.Api`, `En.Lookup.Api`, `En.Expand.Api`, `En.Schema.Api`); `En.Servant.API` a
+  143-line umbrella (was 2,548).
+- `40b8065` — M4: plan 35 route blocks amended to the record form + revision note.
+- `b991f1a` — M5: checked-in `docs/api/openapi.json`, `en-openapi` executable, stable
+  `operationId`s, `just openapi` drift check, and the `toJsonMatchesToSchema` conformance test.
+
+**What was delivered.** en's HTTP surface is now a `NamedRoutes` record whose five fields each
+mount a concept slice's route sub-record under `/v1`; every operation's routes, DTOs, and
+handler live in `En.<Concept>.Api`, shared vocabulary in `En.Servant.Wire`, and the (unchanged)
+`MultiVerb` machinery in `En.Servant.Response`. The client is `genericClient`. The OpenAPI
+document is derived, checked in, drift-guarded, and carries stable operation ids and its full
+error responses. No wire byte, status, or error code changed — the golden, error-model,
+OpenAPI, and mint tests all pass unchanged, and the new WAI `routingTests` and
+`toJsonMatchesToSchema` pass.
+
+**What differed from the plan.** The plan was drafted against a 6-operation, 1,247-line
+`API.hs`; the live code had grown to **twelve** operations and 2,548 lines, with a five-status
+`EnResponses`. Every milestone's route/handler/DTO list was extended to the real twelve, and a
+sixth slice (`En.Schema.Api`) was added for the bodyless `GET`. The plan's claim that meibo has
+`withOperationIds` was false (meibo's artifact has zero operation ids); en adds them anyway, for
+external artifact consumers, and the code says so plainly rather than "mirroring meibo". Both
+divergences are recorded in Surprises & Discoveries and the Decision Log.
+
+**Validation.** `cabal build all` and `cabal test all` pass (7 suites, 0 failures), including the
+`en-postgres-integration-tests` against real PostgreSQL. `just openapi` is clean on a freshly
+regenerated tree. The plan's live-server curl checks (check 200, lookup 200, malformed→400
+envelope, unknown→404 envelope, served OpenAPI path set) are each driven **in process** by
+`routingTests`, which exercises the very `app env` `Application` the standalone server mounts —
+the same router and the same `envelopeFormatters` — over `Network.Wai.Test`. Because this refactor
+changes only the API *type* shape and module layout (not server assembly, auth middleware, or
+migrations), that end-to-end in-process drive plus the integration suite is the load-bearing
+evidence; a live re-run of the identical `app` would add nothing this refactor could have broken.
+(A stale server was found on `:8080` during finalization; it was not this build, so it was not
+used as evidence.)
+
+**Downstream.** Neither `nagare` (git-tag-pinned) nor `kikan-en` (its `cabal.project` omits
+`en-biscuit` and lacks en's `biscuit-haskell` fork pin) can build against the local `en` tree
+without config surgery outside this plan's scope, so both were validated by import review:
+`En.Servant.API` (`app`, additively `EnApi (..)`), `En.Servant.Seam`, and `En.Client` keep their
+exact public interfaces, and no downstream file references the relocated internals. The umbrella's
+export list is a proven superset — `OpenApi.hs`, the test, and `En.Client` all compile against
+their pre-existing `En.Servant.API` imports.
+
+**Follow-ups worth noting (out of scope here).** (1) `kikan-en`'s `cabal.project` should gain
+`../../en/en-biscuit` and en's `biscuit-haskell`/OpenAPI `source-repository-package` pins so it can
+build against local `en` again — it has been stale since EP-55/57. (2) en has no general build CI
+(only `bench.yml`); when one is added, `just openapi` should be a required step, as the plan notes.
 
 
 ## Context and Orientation
