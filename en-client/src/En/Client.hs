@@ -48,6 +48,8 @@ data EnClient = EnClient
     , lookupSubjects :: LookupSubjectsRequestWire -> ClientM (EnResult LookupSubjectsPageWire)
     , expand :: ExpandRequestWire -> ClientM (EnResult ExpandTreeWire)
     , watch :: WatchRequestWire -> ClientM (EnResult WatchResponseWire)
+    , readSchema :: ClientM SchemaInfoWire
+    -- ^ Not an 'EnResult': @GET \/v1\/schema@ has no failure alternative to return into.
     }
 
 {- | The pattern match below is positional: its order must be the order of the operations
@@ -67,6 +69,7 @@ enClient =
         , lookupSubjects
         , expand
         , watch
+        , readSchema
         }
   where
     writeTuples
@@ -78,7 +81,8 @@ enClient =
         :<|> lookup
         :<|> lookupSubjects
         :<|> expand
-        :<|> watch = client apiProxy
+        :<|> watch
+        :<|> readSchema = client apiProxy
 
 {- | Ask for a read at least as fresh as a previous response's @checkedAt@.
 

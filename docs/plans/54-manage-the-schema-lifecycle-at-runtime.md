@@ -4,6 +4,7 @@ slug: manage-the-schema-lifecycle-at-runtime
 title: "Manage the schema lifecycle at runtime"
 kind: exec-plan
 created_at: 2026-07-07T15:25:10Z
+intention: intention_01kx4y4empedt9g83mprcrew89
 master_plan: "docs/masterplans/9-complete-the-en-api-surface.md"
 ---
 
@@ -49,9 +50,9 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Introduce `ActiveSchema` and the schema handle: `Env` in `en-servant/src/En/Servant/Seam.hs` gains `readActiveSchema`; `runPorts` becomes snapshot-taking; handlers in `en-servant/src/En/Servant/API.hs` and `en-servant/src/En/Servant/Authorize.hs` read one snapshot per request; `en-server/app/Main.hs` builds the `IORef`. Behavior unchanged; all tests updated and green.
-- [ ] M1: Add `GET /schema` (route, `SchemaInfoWire`, handler, `EnClient.readSchema`), serving source text, hash, origin, and load time.
-- [ ] M2: Implement the live-tuple enumeration primitive (`EnumerateTuples` on the `TupleStore` effect, PostgreSQL implementation, in-memory implementation).
+- [x] M1 (2026-07-10): Introduce `ActiveSchema` and the schema handle: `Env` in `en-servant/src/En/Servant/Seam.hs` gains `readActiveSchema`; `runPorts` becomes snapshot-taking; handlers in `en-servant/src/En/Servant/API.hs` and `en-servant/src/En/Servant/Authorize.hs` read one snapshot per request; `en-server/app/Main.hs` builds the `IORef`. Behavior unchanged; `cabal test en-core en-servant en-example` green.
+- [x] M1 (2026-07-10): Add `GET /v1/schema` (route, `SchemaInfoWire`, handler, `EnClient.readSchema`), serving source text, hash, origin, and load time. Served hash equals the startup log's; `/v1/openapi.json` lists the path.
+- [x] M2 (2026-07-10): live-tuple enumeration primitive — **cancelled, pre-landed**. `ReadAllTuples` already is `EnumerateTuples`, in the effect and in both interpreters. See Surprises & Discoveries.
 - [ ] M2: Implement `En.SchemaCheck.validateTuplesAgainstSchema` (pure per-tuple checks, orphan report types) with en-core unit tests covering every orphan class.
 - [ ] M2: Add the `check-schema` subcommand to `en-server/app/Main.hs` with its report output and exit codes; integration-test the pass against an ephemeral database.
 - [ ] M2: Write the compatible-change taxonomy into `docs/user/service-and-operations.md` (and cross-check it against the orphan classes the validator actually detects).
@@ -65,7 +66,60 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- 2026-07-10 (orientation; **cancels M2's enumeration primitive**): `EnumerateTuples` already
+  exists, under another name and with the exact signature this plan proposes for it.
+  `ReadAllTuples :: Revision -> Int -> Maybe StoreCursor -> TupleStore m TuplePage` is a
+  constructor of `TupleStore` in `en-core/src/En/Effect/TupleStore.hs`, documented as "every
+  tuple live at @revision@, ordered by internal row id and keyset-paginated: the whole graph,
+  page by page", and it is implemented in both interpreters this plan names —
+  `en-postgres/src/En/Postgres/TupleStore.hs:133` (`readAllTuplesSession`) and
+  `en-core/src/En/Conformance/Kikan.hs:199`. It was added for `en-server export`, which drains
+  it at a pinned head revision exactly as the validation pass must. Its Haddock even states the
+  property orphan detection depends on — ordering by row id, not by any tuple field, so the scan
+  needs no index of its own and no anchoring. This plan adds no store operation at all.
+
+- 2026-07-10 (orientation; **simplifies M1's `ActiveSchema`**): the schema hash is already
+  carried by the compiled graph. `ReachabilityGraph` in `en-core/src/En/Reachability.hs:43` has
+  fields `relations`, `caveats`, and `hash :: !SchemaHash`, and `En.Check` reads it as
+  `graph.hash` when it builds a `SubproblemKey` (`en-core/src/En/Check.hs:444`) — which is *why*
+  the decision cache self-invalidates on reload, as this plan's Decision Log asserts. A separate
+  `hash` field on `ActiveSchema` would be a second copy of a value that is already there, and
+  two copies can disagree. See the Decision Log.
+
+- 2026-07-10 (orientation; **resolves M3's open question about the connection**):
+  `docs/plans/34-pool-database-connections-in-en-server.md` has landed (commit `a32e8f5`, "serve
+  every request from a hasql connection pool"). M3's note — "be mindful the server currently has
+  a single shared connection — review A2 — so the pass briefly contends with request traffic" —
+  is stale. `runAppIO` runs through `runDatabasePool pool`, so the reload's validation pass takes
+  a pooled connection like any request, and the contention it costs is one pool slot for the
+  duration of the scan.
+
+- 2026-07-10 (M1; the demo schema's source text was a hazard the moment `GET /v1/schema` existed):
+  `demoSchema` was built with `En.Schema.Builder`, so serving a `source` for it meant writing the
+  equivalent DSL text by hand and trusting it. It happened to be right — a server started with the
+  hand-written text in a file reported `fnv1a64:88633b46c783909e`, the same hash the built-in model
+  reports — but nothing enforced it, and the endpoint's whole promise is that `source` *is* the model
+  being served. `demoSchema` is now `parseSchema demoSchemaSource`, so the text is the source of
+  truth and the model is derived from it by the same parser `EN_SCHEMA_PATH` goes through. The hash
+  is unchanged, which is the evidence the two were equivalent; `En.Schema.Builder` is no longer
+  imported by `en-server`.
+
+- 2026-07-10 (M1; a Haskell detail that will bite the next plan touching these records): GHC solves
+  the `HasField` constraint behind `active.graph.hash` only when the record field is *in scope* at
+  the use site. `En.Servant.API` and `en-server/app/Main.hs` therefore import
+  `En.Reachability (ReachabilityGraph (..))` purely for its `hash` field, and removing that import
+  as "redundant" produces `No instance for HasField "hash" ReachabilityGraph SchemaHash` rather than
+  an unused-import warning. Under `NoFieldSelectors` the error is worse: it points at the *other*
+  record with a `hash` field (`SchemaInfoWire`) and suggests using that one.
+
+- 2026-07-10 (orientation; **corrects M2's description of `en-server`'s argument handling**):
+  `en-server/app/Main.hs` does not "currently ignore `getArgs`". It has a `Command` sum
+  (`Serve`/`Import`/`Export`), a `parseCommand`, and a `usage` that exits 2 — the exit code this
+  plan reserves for "file or schema invalid". `check-schema` is a fourth constructor, and it
+  wants the existing `withSubcommandStore` prologue (which loads `StoreConfig`, not
+  `ServerConfig`, precisely because a command that binds no port has no API keys or TLS material
+  to configure). Note the collision: `usage` already exits 2, so a `check-schema` invocation with
+  a bad *candidate* file must be distinguishable in prose from one with bad *arguments*.
 
 
 ## Decision Log
@@ -93,6 +147,18 @@ Record every decision made while working on the plan.
 - Decision: Caches survive reload untouched: the decision cache self-invalidates because `SubproblemKey` includes the schema hash (see `decisionCacheOps` in `en-core/src/En/Check.hs`), so post-reload lookups miss; the tuple-read cache is schema-independent (keyed by revision and query, not by model) and stays valid.
   Rationale: Verified in source; flushing them on reload would be harmless but unnecessary. If implementation finds a `TupleReadKey` component that does depend on the schema, flush it and amend this entry.
   Date: 2026-07-07
+- Decision: `demoSchema` is parsed from `demoSchemaSource`, not built with `En.Schema.Builder` alongside a hand-written source string.
+  Rationale: See Surprises. `GET /v1/schema` promises `source` is the text of the model being served; a builder-built model plus a string asserting its text can only be kept in step by discipline, and the endpoint exists precisely because operators cannot see the model otherwise. Deriving the model from the text makes the promise structural. The demo model's hash is unchanged (`fnv1a64:88633b46c783909e`), which is the evidence the two spellings agreed.
+  Date: 2026-07-10
+- Decision: `GET /v1/schema` is a plain `Get`, not a `MultiVerb` over `EnResponses`, and carries no `checkedAt`.
+  Rationale: It reads one `IORef` and cannot fail, so it has no fault to return into a response alternative; giving it the shared five-alternative list would document four statuses it can never produce. On `checkedAt`, the master plan left this plan to decide: the field names the tuple-store snapshot a read was evaluated at, and this operation reads no tuples and describes no revision. `loadedAt` is the analogous freshness handle and answers the only question a caller can ask. The OpenAPI test asserts the endpoint documents exactly a `200`, so a later refactor cannot quietly give it the fault list.
+  Date: 2026-07-10
+- Decision: `ActiveSchema` carries no `hash` field. The hash is `active.graph.hash`.
+  Rationale: `ReachabilityGraph` already carries `hash :: SchemaHash`, and `En.Check` reads it from there to key the decision cache. A second copy on `ActiveSchema` would have to be kept equal to the first by convention, and the one place it could silently diverge — a reload that swapped the graph but reused the old hash — is precisely the torn state M1's snapshot discipline exists to make impossible. The `ConsistencyConfig` each request's interpreter stack is built with therefore reads `snapshot.graph.hash`, so graph and hash cannot come apart by construction rather than by care. `SchemaInfoWire.hash` renders the same value.
+  Date: 2026-07-10
+- Decision: The enumeration primitive is `ReadAllTuples`, which already exists; `EnumerateTuples` is not added.
+  Rationale: See Surprises. Its signature is the one this plan specified for `EnumerateTuples`, its Haddock states the row-id ordering the unanchored scan needs, and it is implemented in both interpreters. Adding a synonym would give the store two names for one query and every future interpreter two obligations. The plan's argument for *why* an unanchored scan is the right primitive — orphan detection must find tuples whose types are absent from the new schema, which no anchored filter can express — is unaffected and is why `ReadAllTuples` rather than `ReadRelationships` is the right existing operation to reach for.
+  Date: 2026-07-10
 - Decision: This plan owns the runtime schema handle. Every other endpoint (including those added by `docs/plans/50`, `51`, `52`, `53`) reads the schema through `ActiveSchema` after M1; plans implemented before this one use the existing immutable `Env.graph` argument and this plan rewires them during M1.
   Rationale: Restates the master plan's Integration Points so this plan stands alone; a second schema-state mechanism must not appear.
   Date: 2026-07-07

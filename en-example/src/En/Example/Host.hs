@@ -7,6 +7,7 @@ module En.Example.Host (
     ResolverError (..),
     GuardedAPI,
     exampleSchema,
+    exampleActiveSchema,
     ExampleEffects,
     runTupleStoreInMemory,
     runConsistencyStoreInMemory,
@@ -28,6 +29,7 @@ module En.Example.Host (
 import Data.Aeson (FromJSON, ToJSON)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
+import Data.Time (UTCTime (..), fromGregorian)
 import Effectful (Eff, IOE, runEff)
 import Effectful qualified
 import Effectful.Dispatch.Dynamic (interpret_)
@@ -58,7 +60,7 @@ import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), R
 import En.Schema (CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
 import En.Schema.Builder qualified as Schema
 import En.Servant.Authorize (requirePermission)
-import En.Servant.Seam (Env (..))
+import En.Servant.Seam (ActiveSchema (..), Env (..))
 import En.Tuple (
     CaveatContext (..),
     ObjectRef (..),
@@ -110,11 +112,24 @@ type ConsistencyInterpreter =
 type TupleInterpreter =
     forall a. Eff '[TupleStore, Error EnError, IOE] a -> Eff '[Error EnError, IOE] a
 
+{- | The schema this host serves. Fixed for the process: an embedded host compiles its
+model in, so there is nothing to reload and 'Env.readActiveSchema' is a constant.
+-}
+exampleActiveSchema :: ActiveSchema
+exampleActiveSchema =
+    ActiveSchema
+        { graph = either (error . show) id (compileSchema exampleSchema)
+        , source = "-- compiled in; see En.Example.Host.exampleSchema"
+        , origin = "en-example"
+        , loadedAt = UTCTime (fromGregorian 2026 1 1) 0
+        }
+
 mkEnv :: ConsistencyInterpreter -> TupleInterpreter -> Env ExampleEffects
 mkEnv cStore tStore =
     Env
-        { runPorts = runEff . runErrorNoCallStack . tStore . cStore
-        , graph = either (error . show) id (compileSchema exampleSchema)
+        { -- The snapshot is ignored: this host's interpreters embed no schema hash.
+          runPorts = \_active -> runEff . runErrorNoCallStack . tStore . cStore
+        , readActiveSchema = pure exampleActiveSchema
         , checkOperation = check
         , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
         , lookupSubjectsWithDeadlineOperation = LookupSubjects.lookupSubjectsWithDeadline
@@ -158,8 +173,9 @@ resolveSecret env subject secretId =
     resolveWithGate env subject (secretRef secretId) (DocumentView secretId)
 
 resolveWithGate :: Env ExampleEffects -> Subject -> ObjectRef -> DocumentView -> IO (Either ResolverError DocumentView)
-resolveWithGate Env{runPorts, graph, checkOperation} subject object result =
-    runPorts (checkOperation graph MinimizeLatency emptyContext subject (RelationName "view") object) >>= \case
+resolveWithGate Env{runPorts, readActiveSchema, checkOperation} subject object result = do
+    active <- readActiveSchema
+    runPorts active (checkOperation active.graph MinimizeLatency emptyContext subject (RelationName "view") object) >>= \case
         Right outcome ->
             case outcome.decision of
                 Allowed -> pure (Right result)

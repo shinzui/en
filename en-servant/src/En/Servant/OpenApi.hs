@@ -110,6 +110,7 @@ import En.Servant.API (
     ReadRelationshipsResponseWire,
     RelationshipFilterWire,
     RelationshipsStateWire,
+    SchemaInfoWire,
     SubjectRelationFilterWire,
     SubjectWire,
     TupleCaveatWire,
@@ -633,6 +634,20 @@ instance ToSchema WatchResponseWire where
                            \batch, and is the only thing to send back. An empty changes array does not \
                            \mean the feed is caught up; a caught-up feed returns a cursor equal to the \
                            \one it was given."
+
+instance ToSchema SchemaInfoWire where
+    declareNamedSchema _ = do
+        timestamp <- declareSchemaRef (Proxy @UTCTime)
+        pure $
+            NamedSchema (Just "SchemaInfoWire") $
+                objectSchema
+                    [("source", textRef), ("hash", textRef), ("origin", textRef), ("loadedAt", timestamp)]
+                    & description
+                        ?~ "source is the verbatim schema text the server loaded, not a rendering of \
+                           \the compiled model. origin is the file it came from, or builtin-demo. hash \
+                           \is the fingerprint every consistency token is stamped with: when it changes, \
+                           \every token minted under the old one is refused. There is no checkedAt — this \
+                           \reads no tuples."
 
 instance ToSchema PreconditionWire where
     declareNamedSchema _ = do

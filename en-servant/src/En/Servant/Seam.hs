@@ -3,6 +3,7 @@
 -- | The seam between en's effectful engine stack and servant's 'Handler'.
 module En.Servant.Seam (
     AppEffects,
+    ActiveSchema (..),
     Env (..),
     EnServer,
     ErrorEnvelopeWire (..),
@@ -27,6 +28,7 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO qualified as Text
+import Data.Time (UTCTime)
 import Effectful (Eff, IOE)
 import Effectful.Error.Static (Error)
 import Servant (Handler, ServerError (..), err400, err403, err404, err412, err422, err503, throwError)
@@ -48,9 +50,41 @@ import En.Watch qualified as Watch
 
 type AppEffects = '[ConsistencyStore, TupleStore, Error EnError, Database, IOE]
 
+{- | The authorization model a request is served under, and where it came from.
+
+One value, read once per request, so the graph a handler evaluates against and the schema
+hash the store interpreters mint and validate consistency tokens under always describe the
+same model. A host that swaps this value between requests — @en-server@ does, on @SIGHUP@ —
+gives in-flight requests the old model for free: a request holds its snapshot, and a swap
+affects only later reads.
+
+There is no @hash@ field: 'ReachabilityGraph' carries one, and a second copy could disagree
+with it. Ask for @active.graph.hash@.
+
+@source@ is the verbatim text the operator wrote, not a rendering of @graph@. @origin@ names
+where it was read from — a file path, or @builtin-demo@ for the fallback model @en-server@
+serves when @EN_SCHEMA_PATH@ is unset.
+-}
+data ActiveSchema = ActiveSchema
+    { graph :: !ReachabilityGraph
+    , source :: !Text
+    , origin :: !Text
+    , loadedAt :: !UTCTime
+    }
+    deriving stock (Eq, Show)
+
 data Env es = Env
-    { runPorts :: !(forall a. Eff es a -> IO (Either EnError a))
-    , graph :: !ReachabilityGraph
+    { runPorts :: !(forall a. ActiveSchema -> Eff es a -> IO (Either EnError a))
+    {- ^ Run an engine action under one schema snapshot. The snapshot is an argument rather
+    than something the interpreters read for themselves because the store interpreters embed
+    the schema hash in every token they mint and check it on every token they are shown: if a
+    handler chose its graph and an interpreter chose its hash independently, a reload landing
+    between the two would evaluate the old model and mint under the new one.
+    -}
+    , readActiveSchema :: !(IO ActiveSchema)
+    {- ^ Take a snapshot. Called exactly once per request, at its start. A handler that called
+    it twice could straddle a reload.
+    -}
     , checkOperation :: !(ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckOutcome)
     , lookupWithDeadlineOperation :: !(Lookup.Deadline (Eff es) -> ReachabilityGraph -> Consistency -> Lookup.LookupRequest -> Eff es Lookup.LookupPage)
     , lookupSubjectsWithDeadlineOperation :: !(Lookup.Deadline (Eff es) -> ReachabilityGraph -> Consistency -> LookupSubjects.LookupSubjectsRequest -> Eff es LookupSubjects.LookupSubjectsPage)
@@ -214,20 +248,20 @@ logEnError = \case
     StoreError detail -> Text.hPutStrLn stderr ("en: store error: " <> detail)
     _ -> pure ()
 
-{- | Run an engine action, throwing on failure.
+{- | Run an engine action under a snapshot, throwing on failure.
 
 For embedded host routes, which have no response alternative to return a fault into.
 @EnAPI@'s own handlers use 'runEngineEither'.
 -}
-runEngine :: Env es -> Eff es a -> Handler a
-runEngine env action = do
-    result <- runEngineEither env action
+runEngine :: Env es -> ActiveSchema -> Eff es a -> Handler a
+runEngine env active action = do
+    result <- runEngineEither env active action
     either (throwError . faultToServerError) pure result
 
--- | Run an engine action, returning its failure as a value.
-runEngineEither :: Env es -> Eff es a -> Handler (Either EnFault a)
-runEngineEither Env{runPorts} action = do
-    result <- liftIO (runPorts action)
+-- | Run an engine action under a snapshot, returning its failure as a value.
+runEngineEither :: Env es -> ActiveSchema -> Eff es a -> Handler (Either EnFault a)
+runEngineEither Env{runPorts} active action = do
+    result <- liftIO (runPorts active action)
     case result of
         Right value -> pure (Right value)
         Left err -> do

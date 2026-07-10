@@ -72,7 +72,7 @@ verifiable without the others.
 | EP-51 | Return checked-at consistency tokens from read responses | docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md | None | None | Complete |
 | EP-52 | Add a lookup-subjects API | docs/plans/52-add-a-lookup-subjects-api.md | None | None | Complete |
 | EP-53 | Add a watch changelog API | docs/plans/53-add-a-watch-changelog-api.md | None | None | Complete |
-| EP-54 | Manage the schema lifecycle at runtime | docs/plans/54-manage-the-schema-lifecycle-at-runtime.md | None | EP-50 | Not Started |
+| EP-54 | Manage the schema lifecycle at runtime | docs/plans/54-manage-the-schema-lifecycle-at-runtime.md | None | EP-50 | In Progress |
 
 
 ## Dependency Graph

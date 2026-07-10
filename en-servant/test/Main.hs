@@ -36,7 +36,8 @@ import En.Effect.TupleStore (ChangePage (..), RelationshipFilter, TupleStore, he
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
-import En.Revision (ConsistencyToken (..), DatastoreId (..))
+import En.Reachability (ReachabilityGraph (..))
+import En.Revision (ConsistencyToken (..), DatastoreId (..), SchemaHash (..))
 import En.Schema (ObjectType (..))
 import En.Servant.API (
     BatchCheckPairWire (..),
@@ -74,6 +75,7 @@ import En.Servant.API (
     ReadRelationshipsResponseWire (..),
     RelationshipFilterWire (..),
     RelationshipsStateWire (..),
+    SchemaInfoWire (..),
     SubjectRelationFilterWire (..),
     SubjectWire (..),
     TupleCaveatWire (..),
@@ -88,6 +90,7 @@ import En.Servant.API (
  )
 import En.Servant.OpenApi (enOpenApi)
 import En.Servant.Seam (
+    ActiveSchema (..),
     EnFault (..),
     ErrorEnvelopeWire (..),
     enErrorToFault,
@@ -104,12 +107,12 @@ main = do
 
     let env =
             Env
-                { runPorts =
+                { runPorts = \_active ->
                     runEff
                         . runErrorNoCallStack
                         . runTupleStoreInMemory fixtureTuples
                         . runConsistencyStoreInMemory
-                , graph = kikanGraph
+                , readActiveSchema = pure testActiveSchema
                 , checkOperation = check
                 , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
                 , lookupSubjectsWithDeadlineOperation = LookupSubjects.lookupSubjectsWithDeadline
@@ -519,6 +522,7 @@ writePreconditionTests env = do
 
     relationshipEndpointTests env
     watchEndpointTests env
+    schemaEndpointTests env
   where
     bobOwnerTuple =
         TupleWire
@@ -549,7 +553,7 @@ openApiDocumentTests = do
 
     assertEqual
         "openapi document lists exactly the served operations"
-        servedPaths
+        (List.sort ("/v1/schema" : postPaths))
         (List.sort (objectKeys (document `at` "paths")))
 
     mapM_
@@ -559,7 +563,14 @@ openApiDocumentTests = do
                 ["200", "400", "412", "422", "503"]
                 (List.sort (objectKeys (document `at` "paths" `at` Key.fromText path `at` "post" `at` "responses")))
         )
-        servedPaths
+        postPaths
+
+    -- GET /v1/schema reads an IORef. It has no EnResponses alternatives to document,
+    -- and asserting that is what keeps a later refactor from quietly giving it some.
+    assertEqual
+        "the schema endpoint is a GET with only a 200"
+        ["200"]
+        (List.sort (objectKeys (document `at` "paths" `at` "/v1/schema" `at` "get" `at` "responses")))
 
     assertBool
         "openapi document defines the error envelope"
@@ -581,6 +592,7 @@ openApiDocumentTests = do
         , "ChangeKindWire"
         , "TupleChangeWire"
         , "WatchResponseWire"
+        , "SchemaInfoWire"
         ]
 
     -- `limit` is the only required field of a watch request. A schema that also required
@@ -614,7 +626,8 @@ openApiDocumentTests = do
             (asTextList (document `at` "components" `at` "schemas" `at` "DeleteRelationshipsRequestWire" `at` "required"))
         )
   where
-    servedPaths =
+    -- Every operation but GET /v1/schema, which has no request body and cannot fault.
+    postPaths =
         [ "/v1/batch-check"
         , "/v1/check"
         , "/v1/expand"
@@ -677,6 +690,27 @@ emptyFilterWire =
 subjectFilterWire :: Text -> Text -> RelationshipFilterWire
 subjectFilterWire subjectType subjectId =
     relationshipFilterWire Nothing Nothing Nothing (Just subjectType) (Just subjectId) Nothing Nothing
+
+{- | @GET \/v1\/schema@ reports the snapshot 'Env.readActiveSchema' hands it.
+
+The hash is not a field of 'ActiveSchema'; it is @graph.hash@, so this also pins that the
+endpoint reports the hash of the graph it is actually serving rather than one carried
+alongside it. A reload swaps the graph, and the reported hash follows by construction.
+-}
+schemaEndpointTests :: Env TestEffects -> IO ()
+schemaEndpointTests env = do
+    let SchemaHash expectedHash = testActiveSchema.graph.hash
+    assertEqual
+        "the schema endpoint reports the active snapshot"
+        ( Right
+            SchemaInfoWire
+                { source = testActiveSchema.source
+                , hash = expectedHash
+                , origin = testActiveSchema.origin
+                , loadedAt = testActiveSchema.loadedAt
+                }
+        )
+        =<< runHandler (handlers env).readSchema
 
 {- | The watch endpoint's wire surface, over 'stubWatch'.
 
@@ -1282,6 +1316,17 @@ wireContractTests = do
         "{\"changes\":[],\"cursor\":\"enwatch1.store.at.100:120:..\",\"checkedAt\":\"en1.abc\"}"
         WatchResponseWire{changes = [], cursor = "enwatch1.store.at.100:120:..", checkedAt = "en1.abc"}
 
+    -- No `checkedAt`: this response describes the server's model, not a tuple-store snapshot.
+    golden
+        "SchemaInfoWire"
+        "{\"source\":\"object user {}\\n\",\"hash\":\"fnv1a64:abc\",\"origin\":\"/etc/en/blog.en\",\"loadedAt\":\"2026-07-07T12:00:00Z\"}"
+        SchemaInfoWire
+            { source = "object user {}\n"
+            , hash = "fnv1a64:abc"
+            , origin = "/etc/en/blog.en"
+            , loadedAt = noon
+            }
+
     golden
         "PreconditionWire/mustExist"
         "{\"kind\":\"mustExist\",\"filter\":{\"objectType\":\"space\",\"objectId\":\"project-x\",\"relation\":\"member\",\"subjectType\":\"user\",\"subjectId\":\"alice\",\"subjectRelation\":{\"match\":\"none\"}}}"
@@ -1390,6 +1435,7 @@ data Handlers = Handlers
     , lookupSubjects :: LookupSubjectsRequestWire -> Handler (EnResult LookupSubjectsPageWire)
     , expand :: ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
     , watch :: WatchRequestWire -> Handler (EnResult WatchResponseWire)
+    , readSchema :: Handler SchemaInfoWire
     }
 
 handlers :: Env TestEffects -> Handlers
@@ -1405,6 +1451,7 @@ handlers env =
         , lookupSubjects = lookupSubjectsEndpoint
         , expand = expandEndpoint
         , watch = watchEndpoint
+        , readSchema = readSchemaEndpoint
         }
   where
     writeTuplesEndpoint
@@ -1416,7 +1463,8 @@ handlers env =
         :<|> lookupEndpoint
         :<|> lookupSubjectsEndpoint
         :<|> expandEndpoint
-        :<|> watchEndpoint = server env
+        :<|> watchEndpoint
+        :<|> readSchemaEndpoint = server env
 
 batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
 batchHandler env = (handlers env).batchCheck
@@ -1453,6 +1501,26 @@ tested against a real PostgreSQL in @en-postgres/integration-test/Main.hs@.
 The cursor is a constant. A drain loop is not being tested; a cursor being /present/ on
 every response is.
 -}
+
+{- | The schema every handler test is served under.
+
+A constant, so 'Env.readActiveSchema' is @pure@ and no test can observe a reload. The
+reload machinery itself belongs to @en-server@; what this suite pins is that a handler
+takes its graph from the snapshot rather than from 'Env'.
+-}
+testActiveSchema :: ActiveSchema
+testActiveSchema =
+    ActiveSchema
+        { graph = kikanGraph
+        , source = "object user {}\n"
+        , origin = "test-fixture"
+        , loadedAt = testLoadedAt
+        }
+
+testLoadedAt :: UTCTime
+testLoadedAt =
+    UTCTime (fromGregorian 2026 7 10) (secondsToDiffTime 0)
+
 stubWatch :: WatchStart -> Maybe RelationshipFilter -> Int -> Eff TestEffects WatchBatch
 stubWatch _start relationshipFilter limit = do
     revision <- headRevision

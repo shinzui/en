@@ -5,6 +5,7 @@ module En.Servant.API (
     EnAPI,
     apiProxy,
     EnServer,
+    ActiveSchema (..),
     Env (..),
     server,
     app,
@@ -55,6 +56,7 @@ module En.Servant.API (
     ChangeKindWire (..),
     TupleChangeWire (..),
     WatchResponseWire (..),
+    SchemaInfoWire (..),
     relationshipFilterFromWire,
     objectRefToWire,
     objectRefFromWire,
@@ -97,6 +99,7 @@ import GHC.TypeLits (Symbol)
 import Servant (
     Application,
     Context (..),
+    Get,
     Handler,
     JSON,
     Proxy (..),
@@ -135,9 +138,14 @@ import En.Error (EnError)
 import En.Expand qualified as Expand
 import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
-import En.Revision (Consistency (..), ConsistencyToken (..))
+
+-- 'ReachabilityGraph' is imported for its @hash@ field, not its constructor: GHC solves the
+-- @HasField "hash"@ constraint behind @active.graph.hash@ only when the field is in scope.
+import En.Reachability (ReachabilityGraph (..))
+import En.Revision (Consistency (..), ConsistencyToken (..), SchemaHash (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
 import En.Servant.Seam (
+    ActiveSchema (..),
     EnFault (..),
     EnServer,
     Env (..),
@@ -246,6 +254,9 @@ are separate operations rather than one that branches on the body, because "revo
 three grants" and "revoke everything matching this pattern" must not differ by a typo.
 The spelling diverges from SpiceDB, whose @DeleteRelationships@ is the filtered one; the
 unfiltered path was here first and @v1@ is frozen.
+
+@GET \/v1\/schema@ is the one operation that is not a @POST@ and not a 'MultiVerb': it reads
+the server's own configuration out of memory, takes no body, and cannot fail.
 -}
 type EnAPI =
     "v1"
@@ -282,6 +293,7 @@ type EnAPI =
                 :<|> "watch"
                     :> ReqBody '[JSON] WatchRequestWire
                     :> MultiVerb 'POST '[JSON] (EnResponses "A batch of tuple changes, and a cursor to resume from" WatchResponseWire) (EnResult WatchResponseWire)
+                :<|> "schema" :> Get '[JSON] SchemaInfoWire
            )
 
 apiProxy :: Proxy EnAPI
@@ -299,6 +311,7 @@ server env =
         :<|> lookupSubjectsHandler env
         :<|> expandHandler env
         :<|> watchHandler env
+        :<|> schemaHandler env
 
 app :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> Application
 app env =
@@ -1578,6 +1591,47 @@ instance FromJSON WatchResponseWire where
     parseJSON = withObject "WatchResponseWire" \o ->
         WatchResponseWire <$> o .: "changes" <*> o .: "cursor" <*> o .: "checkedAt"
 
+{- | The authorization model the server is currently serving.
+
+@source@ is the verbatim text the operator wrote, not a rendering of the compiled model:
+there is no @Schema -> Text@ serializer for the loadable DSL, and the text is in any case
+what a candidate schema should be diffed against. @origin@ is the file path it was read
+from, or @builtin-demo@ when @EN_SCHEMA_PATH@ is unset. @loadedAt@ moves on every reload
+that swaps the model.
+
+This response carries no @checkedAt@ (see 'CheckResponseWire'). That field names the tuple
+store snapshot a read was evaluated at, and this is not a read of the tuple store — it is
+server metadata, held in memory, describing no revision. @loadedAt@ is the analogous
+freshness handle, and it answers the only question a caller can ask of it.
+-}
+data SchemaInfoWire = SchemaInfoWire
+    { source :: !Text
+    , hash :: !Text
+    , origin :: !Text
+    , loadedAt :: !UTCTime
+    }
+    deriving stock (Eq, Show)
+
+instance ToJSON SchemaInfoWire where
+    toJSON wire =
+        Aeson.object
+            [ "source" .= wire.source
+            , "hash" .= wire.hash
+            , "origin" .= wire.origin
+            , "loadedAt" .= wire.loadedAt
+            ]
+    toEncoding wire =
+        pairs
+            ( "source" .= wire.source
+                <> "hash" .= wire.hash
+                <> "origin" .= wire.origin
+                <> "loadedAt" .= wire.loadedAt
+            )
+
+instance FromJSON SchemaInfoWire where
+    parseJSON = withObject "SchemaInfoWire" \o ->
+        SchemaInfoWire <$> o .: "source" <*> o .: "hash" <*> o .: "origin" <*> o .: "loadedAt"
+
 newtype WriteTuplesResponseWire = WriteTuplesResponseWire
     { token :: Text
     }
@@ -1602,17 +1656,19 @@ enHandler body =
 
 writeTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> WriteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
 writeTuplesHandler env request = enHandler do
+    active <- activeSchema env
     writes <- traverseOrInvalid tupleFromWire request.tuples
     deletes <- traverseOrInvalid tupleFromWire (fromMaybe [] request.deletes)
     preconditions <- traverseOrInvalid preconditionFromWire (fromMaybe [] request.preconditions)
-    token <- engine env (applyTupleWrites TupleWriteRequest{preconditions, writes, deletes})
+    token <- engine env active (applyTupleWrites TupleWriteRequest{preconditions, writes, deletes})
     pure (tokenToWire token)
 
 deleteTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> DeleteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
 deleteTuplesHandler env request = enHandler do
+    active <- activeSchema env
     deletes <- traverseOrInvalid tupleFromWire request.tuples
     preconditions <- traverseOrInvalid preconditionFromWire (fromMaybe [] request.preconditions)
-    token <- engine env (applyTupleWrites TupleWriteRequest{preconditions, writes = [], deletes})
+    token <- engine env active (applyTupleWrites TupleWriteRequest{preconditions, writes = [], deletes})
     pure (tokenToWire token)
 
 readRelationshipsHandler ::
@@ -1621,11 +1677,12 @@ readRelationshipsHandler ::
     ReadRelationshipsRequestWire ->
     Handler (EnResult ReadRelationshipsResponseWire)
 readRelationshipsHandler env request = enHandler do
+    active <- activeSchema env
     consistency <- orInvalid (consistencyFromWire request.consistency)
     relationshipFilter <- orInvalid (relationshipFilterFromWire request.filter)
     limit <- orInvalid (positiveLimit request.limit)
     (checkedAt, page) <-
-        engine env do
+        engine env active do
             ResolvedConsistency{revision} <- resolveConsistency consistency
             checkedAt <- mintToken revision
             page <- readRelationships revision relationshipFilter limit (StoreCursor <$> request.cursor)
@@ -1646,20 +1703,22 @@ deleteRelationshipsHandler ::
     DeleteRelationshipsRequestWire ->
     Handler (EnResult DeleteRelationshipsResponseWire)
 deleteRelationshipsHandler env request = enHandler do
+    active <- activeSchema env
     relationshipFilter <- orInvalid (relationshipFilterFromWire request.filter)
     if request.dryRun
         then do
             count <-
-                engine env do
+                engine env active do
                     ResolvedConsistency{revision} <- resolveConsistency FullyConsistent
                     countRelationships revision relationshipFilter
             pure DeleteRelationshipsResponseWire{dryRun = True, count, token = Nothing}
         else do
-            (count, ConsistencyToken token) <- engine env (deleteRelationships relationshipFilter)
+            (count, ConsistencyToken token) <- engine env active (deleteRelationships relationshipFilter)
             pure DeleteRelationshipsResponseWire{dryRun = False, count, token = Just token}
 
 checkHandler :: Env es -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
 checkHandler env request = enHandler do
+    active <- activeSchema env
     consistency <- orInvalid (consistencyFromWire request.consistency)
     context <- orInvalid (contextFromWire request.context)
     subject <- orInvalid (subjectFromWire request.subject)
@@ -1667,8 +1726,9 @@ checkHandler env request = enHandler do
     outcome <-
         engine
             env
+            active
             ( env.checkOperation
-                env.graph
+                active.graph
                 consistency
                 context
                 subject
@@ -1680,6 +1740,7 @@ checkHandler env request = enHandler do
 
 batchCheckHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) => Env es -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
 batchCheckHandler env request = enHandler do
+    active <- activeSchema env
     if length request.pairs > env.maxBatchSize
         then
             throwE
@@ -1691,8 +1752,9 @@ batchCheckHandler env request = enHandler do
     outcome <-
         engine
             env
+            active
             ( checkMany
-                env.graph
+                active.graph
                 consistency
                 context
                 batchPairs
@@ -1720,6 +1782,7 @@ batchCheckHandler env request = enHandler do
 
 lookupHandler :: (IOE Effectful.:> es) => Env es -> LookupRequestWire -> Handler (EnResult LookupPageWire)
 lookupHandler env request = enHandler do
+    active <- activeSchema env
     consistency <- orInvalid (consistencyFromWire request.consistency)
     context <- orInvalid (contextFromWire request.context)
     subject <- orInvalid (subjectFromWire request.subject)
@@ -1727,9 +1790,10 @@ lookupHandler env request = enHandler do
     page <-
         engine
             env
+            active
             ( env.lookupWithDeadlineOperation
                 deadline
-                env.graph
+                active.graph
                 consistency
                 Lookup.LookupRequest
                     { subject
@@ -1750,6 +1814,7 @@ advances; the same reason 'positiveLimit' guards the relationship read.
 -}
 lookupSubjectsHandler :: (IOE Effectful.:> es) => Env es -> LookupSubjectsRequestWire -> Handler (EnResult LookupSubjectsPageWire)
 lookupSubjectsHandler env request = enHandler do
+    active <- activeSchema env
     consistency <- orInvalid (consistencyFromWire request.consistency)
     context <- orInvalid (contextFromWire request.context)
     object <- orInvalid (objectRefFromWire request.object)
@@ -1760,9 +1825,10 @@ lookupSubjectsHandler env request = enHandler do
     page <-
         engine
             env
+            active
             ( env.lookupSubjectsWithDeadlineOperation
                 deadline
-                env.graph
+                active.graph
                 consistency
                 LookupSubjects.LookupSubjectsRequest
                     { object
@@ -1796,14 +1862,16 @@ lookupDeadline env maybeDeadlineMillis = do
 
 expandHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es) => Env es -> ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
 expandHandler env request = enHandler do
+    active <- activeSchema env
     consistency <- orInvalid (consistencyFromWire request.consistency)
     context <- orInvalid (contextFromWire request.context)
     object <- orInvalid (objectRefFromWire request.object)
     tree <-
         engine
             env
+            active
             ( Expand.expand
-                env.graph
+                active.graph
                 consistency
                 Expand.ExpandRequest
                     { object
@@ -1824,11 +1892,30 @@ cursor equals the caller's own, so a drain loop over it never terminates and nev
 -}
 watchHandler :: Env es -> WatchRequestWire -> Handler (EnResult WatchResponseWire)
 watchHandler env request = enHandler do
+    active <- activeSchema env
     start <- orInvalid (watchStartFromWire request.cursor request.startToken)
     relationshipFilter <- orInvalid (traverse relationshipFilterFromWire request.filter)
     limit <- orInvalid (positiveLimit request.limit)
-    batch <- engine env (env.watchOperation start relationshipFilter (min env.maxBatchSize limit))
+    batch <- engine env active (env.watchOperation start relationshipFilter (min env.maxBatchSize limit))
     pure (watchBatchToWire batch)
+
+{- | The model this server is serving, right now.
+
+Not an 'EnResult': it reads one 'ActiveSchema' out of memory and cannot fail, so it has no
+fault to return into a response alternative. Everything on 'EnAPI' that can fail speaks the
+error envelope; this operation cannot.
+-}
+schemaHandler :: Env es -> Handler SchemaInfoWire
+schemaHandler env = do
+    active <- liftIO env.readActiveSchema
+    let SchemaHash hash = active.graph.hash
+    pure
+        SchemaInfoWire
+            { source = active.source
+            , hash
+            , origin = active.origin
+            , loadedAt = active.loadedAt
+            }
 
 objectRefToWire :: ObjectRef -> ObjectRefWire
 objectRefToWire ObjectRef{objectType = ObjectType objectType, objectId} =
@@ -2144,9 +2231,23 @@ expandStateToWire =
         Expand.ExpandTruncated (Expand.ExpandCursor cursor) -> ExpandTruncatedWire cursor
 
 -- | Run an engine action, surfacing an 'En.Error.EnError' as an 'EnFault'.
-engine :: Env es -> Eff es a -> ExceptT EnFault Handler a
-engine env action =
-    ExceptT (runEngineEither env action)
+
+{- | Run an engine action under the request's schema snapshot.
+
+Every handler takes the snapshot once, at its start, and threads that one value through
+both its evaluation ('ActiveSchema.graph') and its store interpreters (which build their
+'En.Postgres.Revision.ConsistencyConfig' from @active.graph.hash@). A handler that called
+'activeSchema' twice, or that passed one snapshot to 'engine' while reading a graph from
+another, could straddle a schema reload and mint a token under a model it did not evaluate.
+-}
+engine :: Env es -> ActiveSchema -> Eff es a -> ExceptT EnFault Handler a
+engine env active action =
+    ExceptT (runEngineEither env active action)
+
+-- | The schema this request is served under. Called once per handler. See 'engine'.
+activeSchema :: Env es -> ExceptT EnFault Handler ActiveSchema
+activeSchema env =
+    liftIO env.readActiveSchema
 
 -- | A wire-to-engine conversion failure is a client fault, not an engine error.
 orInvalid :: Either Text a -> ExceptT EnFault Handler a

@@ -8,6 +8,7 @@ import Data.ByteString.Lazy qualified as LazyByteString
 import Data.ByteString.Lazy.Char8 qualified as LazyChar8
 import Data.Char (isSpace)
 import Data.Foldable (traverse_)
+import Data.IORef (newIORef, readIORef)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Data.Time (DiffTime, getCurrentTime)
@@ -40,14 +41,16 @@ import En.Postgres.Datastore (resolveDatastoreIdSession)
 import En.Postgres.Revision (ConsistencyConfig (..), OptimizedRevisionCache, OptimizedRevisionConfig (..), newOptimizedRevisionCache, runConsistencyStorePostgres)
 import En.Postgres.TupleStore (runTupleStorePostgres, runTupleStorePostgresWithOptimizedRevisionCacheHandle)
 import En.Postgres.Watch qualified as Watch
-import En.Reachability (compile)
+
+-- @ReachabilityGraph (..)@ brings its @hash@ field into scope, which is what lets GHC solve
+-- the @HasField@ constraint behind @active.graph.hash@.
+import En.Reachability (ReachabilityGraph (..), compile)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (Schema, ValidSchema, schemaHash, validateSchema)
-import En.Schema.Builder qualified as Schema
 import En.Schema.Parse (parseSchema)
 import En.Servant.API (tupleFromWire, tupleToWire)
 import En.Servant.OpenApi (appWithOpenApi)
-import En.Servant.Seam (AppEffects, Env (..))
+import En.Servant.Seam (ActiveSchema (..), AppEffects, Env (..))
 import En.Tuple (Tuple)
 import Hasql.Connection.Settings qualified as Settings
 import Hasql.Errors qualified as Hasql
@@ -95,13 +98,25 @@ main = do
         Just (Import path batchSize) -> withSubcommandStore (runImport path batchSize)
         Just Export -> withSubcommandStore runExport
 
+{- | A schema as it was read: the validated model, plus the text and origin
+@GET \/v1\/schema@ reports.
+
+The compiled 'En.Reachability.ReachabilityGraph' is not here. It is derived once, when an
+'ActiveSchema' is built, and it is what carries the schema hash from then on.
+-}
+data LoadedSchema = LoadedSchema
+    { source :: !Text.Text
+    , origin :: !Text.Text
+    , validSchema :: !ValidSchema
+    }
+
 {- | The shared prologue of the bulk subcommands.
 
 Reads 'loadStoreConfig' rather than 'loadServerConfig': a command that binds no
 port has no API keys, rate limit, or TLS material to configure, and
 'loadServerConfig' fails closed without them -- correctly, for a server.
 -}
-withSubcommandStore :: (ValidSchema -> Pool.Pool -> ConsistencyConfig -> IO ()) -> IO ()
+withSubcommandStore :: (LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()) -> IO ()
 withSubcommandStore action = do
     (storeConfig, warnings) <- loadStoreConfig >>= either configFailure pure
     traverse_ toStderr warnings
@@ -148,11 +163,13 @@ everything all three commands need and none of them should do differently.
 Diagnostics travel through @say@ rather than 'Text.putStrLn' so that a command
 whose stdout is a data stream can route them to stderr.
 -}
-withStore :: (Text.Text -> IO ()) -> StoreConfig -> (ValidSchema -> Pool.Pool -> ConsistencyConfig -> IO ()) -> IO ()
+withStore :: (Text.Text -> IO ()) -> StoreConfig -> (LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()) -> IO ()
 withStore say storeConfig action = do
-    (schemaSource, rawSchema) <- loadSchema storeConfig.schemaPath
+    (schemaSource, sourceText, rawSchema) <- loadSchema storeConfig.schemaPath
     validSchema <-
         either (configFailure . ("Invalid schema: " <>) . Text.pack . show) pure (validateSchema rawSchema)
+    let loadedSchema =
+            LoadedSchema{source = sourceText, origin = schemaOrigin schemaSource, validSchema}
     say (describeSchemaSource schemaSource)
     say ("Schema hash: " <> renderSchemaHash (schemaHash validSchema))
     let poolConfig = storeConfig.pool
@@ -191,12 +208,20 @@ withStore say storeConfig action = do
                 , schemaHash = schemaHash validSchema
                 , gcWindow = storeConfig.gcWindow
                 }
-    action validSchema pool config `finally` Pool.release pool
+    action loadedSchema pool config `finally` Pool.release pool
 
-runServe :: ServerConfig -> ValidSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
-runServe serverConfig validSchema pool config = do
-    let graph = compile validSchema
-        poolConfig = serverConfig.store.pool
+runServe :: ServerConfig -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
+runServe serverConfig loadedSchema pool config = do
+    loadedAt <- getCurrentTime
+    activeSchemaRef <-
+        newIORef
+            ActiveSchema
+                { graph = compile loadedSchema.validSchema
+                , source = loadedSchema.source
+                , origin = loadedSchema.origin
+                , loadedAt
+                }
+    let poolConfig = serverConfig.store.pool
         optimizedRevisionTtlMs = serverConfig.optimizedRevisionTtlMs
         tupleReadMaxEntries = serverConfig.tupleReadMaxEntries
         decisionMaxEntries = serverConfig.decisionMaxEntries
@@ -223,27 +248,42 @@ runServe serverConfig validSchema pool config = do
                 { cacheDatastoreId = config.datastoreId
                 , cacheDecisions = decisionCache
                 }
-        runAppIO :: Eff AppEffects a -> IO (Either EnError a)
-        runAppIO action =
-            runEff
-                ( runDatabasePool
-                    pool
-                    ( runErrorNoCallStack
-                        ( runTupleStoreLayer
-                            optimizedRevisionCache
-                            (tupleReadLayer tupleReadCache (runConsistencyStorePostgres config action))
+        {- Both store interpreters are built from the snapshot the caller holds, so the
+        schema hash they stamp into every minted token -- and check on every presented
+        one -- is the hash of the very graph the handler evaluated against. A reload that
+        lands between a handler's snapshot read and its store call cannot tear them apart,
+        because there is only one snapshot and the handler is holding it. -}
+        runAppIO :: ActiveSchema -> Eff AppEffects a -> IO (Either EnError a)
+        runAppIO active action =
+            let activeConfig = config{schemaHash = active.graph.hash}
+             in runEff
+                    ( runDatabasePool
+                        pool
+                        ( runErrorNoCallStack
+                            ( runTupleStoreLayer
+                                activeConfig
+                                optimizedRevisionCache
+                                (tupleReadLayer tupleReadCache (runConsistencyStorePostgres activeConfig action))
+                            )
                         )
                     )
-                )
+        -- Run against whatever schema is active right now: for the maintenance loop and
+        -- the readiness probe, neither of which is a request and neither of which mints a
+        -- token a client will ever hold.
+        runAppNow :: Eff AppEffects a -> IO (Either EnError a)
+        runAppNow action = do
+            active <- readIORef activeSchemaRef
+            runAppIO active action
         runTupleStoreLayer ::
+            ConsistencyConfig ->
             OptimizedRevisionCache ->
             Eff (TupleStore : '[Error EnError, Database, IOE]) a ->
             Eff '[Error EnError, Database, IOE] a
-        runTupleStoreLayer cache action
+        runTupleStoreLayer activeConfig cache action
             | optimizedRevisionConfig.enabled =
-                runTupleStorePostgresWithOptimizedRevisionCacheHandle config cache action
+                runTupleStorePostgresWithOptimizedRevisionCacheHandle activeConfig cache action
             | otherwise =
-                runTupleStorePostgres config action
+                runTupleStorePostgres activeConfig action
         tupleReadLayer ::
             Cache TupleReadKey TuplePage ->
             Eff '[TupleStore, Error EnError, Database, IOE] a ->
@@ -272,13 +312,20 @@ runServe serverConfig validSchema pool config = do
         serverEnv =
             Env
                 { runPorts = runAppIO
-                , graph
+                , readActiveSchema = readIORef activeSchemaRef
                 , checkOperation
                 , lookupWithDeadlineOperation
                 , lookupSubjectsWithDeadlineOperation
                 , -- The feed reads the store and mints its own cursors; there is no
                   -- decision cache to substitute, so it is `watch` partially applied to
                   -- the datastore identity its cursors are stamped with.
+                  --
+                  -- The startup `config` is safe to capture here even though its schema hash
+                  -- goes stale on reload: `watch` reads only `datastoreId` from it, and a
+                  -- watch cursor deliberately carries no schema hash to check (a tuple change
+                  -- is schema-independent data). The tokens it mints and validates go through
+                  -- the `ConsistencyStore` interpreter, which `runAppIO` rebuilt from the
+                  -- request's snapshot.
                   watchOperation = Watch.watch config
                 , budget
                 , maxBatchSize = serverConfig.maxBatchSize
@@ -287,7 +334,7 @@ runServe serverConfig validSchema pool config = do
                 }
         ping :: IO Bool
         ping = do
-            result <- runAppIO (runSession (Session.script "SELECT 1"))
+            result <- runAppNow (runSession (Session.script "SELECT 1"))
             pure (case result of Right (Right ()) -> True; _ -> False)
         -- Readiness goes through the Database effect, so it exercises the pool a real
         -- request would use rather than a connection held aside for probing.
@@ -354,7 +401,7 @@ runServe serverConfig validSchema pool config = do
     -- cancels the maintenance thread and `withStore`'s `finally` releases the pool.
     -- Every maintenance batch is its own committed transaction, so cancelling mid-pass
     -- loses only the batch in flight; the next start resumes from what was committed.
-    withAsync (runMaintenanceLoop serverConfig.maintenance runAppIO) \_maintenance ->
+    withAsync (runMaintenanceLoop serverConfig.maintenance runAppNow) \_maintenance ->
         serve serverConfig.tls serverConfig.port wrappedApp
 
 {- | Run a store action against the pool: the effect stack a subcommand needs.
@@ -385,8 +432,8 @@ validating the whole file first, would hold every tuple in memory and forfeit th
 point of streaming. The line is named in the error, and the prefix is harmless --
 re-running the corrected file re-applies it as a no-op.
 -}
-runImport :: FilePath -> Int -> ValidSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
-runImport path batchSize _validSchema pool config = do
+runImport :: FilePath -> Int -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
+runImport path batchSize _loadedSchema pool config = do
     contents <- LazyByteString.readFile path
     let numbered = zip [1 :: Int ..] (LazyChar8.lines contents)
         populated = [line | line <- numbered, not (LazyChar8.all isSpace (snd line))]
@@ -429,8 +476,8 @@ stdout is switched to block buffering: it is a redirect or a pipe here, never a
 terminal a human is watching line by line, and the line buffering the serving
 path needs would cost a write syscall per tuple.
 -}
-runExport :: ValidSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
-runExport _validSchema pool config = do
+runExport :: LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
+runExport _loadedSchema pool config = do
     hSetBuffering stdout (BlockBuffering Nothing)
     outcome <- runStoreIO pool config do
         revision <- TupleStore.headRevision
@@ -552,10 +599,28 @@ data SchemaSource
     = BuiltInDemoSchema
     | SchemaFile FilePath
 
-loadSchema :: Maybe FilePath -> IO (SchemaSource, Schema)
+{- | Where a schema came from, as @GET \/v1\/schema@ reports it.
+
+The demo model has no file, so it reports @builtin-demo@ rather than a path a caller could
+mistake for one.
+-}
+schemaOrigin :: SchemaSource -> Text.Text
+schemaOrigin = \case
+    BuiltInDemoSchema -> "builtin-demo"
+    SchemaFile path -> Text.pack path
+
+{- | Read and parse the schema, keeping the source text.
+
+The text is kept rather than re-rendered from the parsed model: there is no
+@Schema -> Text@ serializer for the loadable DSL, and it is the operator's own text that
+@GET \/v1\/schema@ should return and that a candidate schema should be diffed against. The
+built-in demo model therefore carries a hand-written source string that must stay in step
+with 'demoSchema' — the startup path parses neither, so nothing checks it but this comment.
+-}
+loadSchema :: Maybe FilePath -> IO (SchemaSource, Text.Text, Schema)
 loadSchema =
     \case
-        Nothing -> pure (BuiltInDemoSchema, demoSchema)
+        Nothing -> pure (BuiltInDemoSchema, demoSchemaSource, demoSchema)
         Just path -> do
             readResult <- try (Text.readFile path) :: IO (Either IOException Text.Text)
             contents <-
@@ -575,7 +640,7 @@ loadSchema =
                             <> ": "
                             <> Text.pack (show err)
                 Right parsed ->
-                    pure (SchemaFile path, parsed)
+                    pure (SchemaFile path, contents, parsed)
 
 describeSchemaSource :: SchemaSource -> Text.Text
 describeSchemaSource =
@@ -603,14 +668,25 @@ renderSchemaHash :: SchemaHash -> Text.Text
 renderSchemaHash (SchemaHash value) =
     value
 
+{- | The fallback model, as text.
+
+This is the source of truth for the demo schema, and 'demoSchema' is derived from it by
+the same parser a real @EN_SCHEMA_PATH@ goes through. The other direction — a model built
+with "En.Schema.Builder" plus a hand-written string claiming to be its text — is what
+@GET \/v1\/schema@ makes dangerous: the endpoint promises @source@ is the model the server
+is serving, and nothing but discipline would have kept the two in step.
+-}
+demoSchemaSource :: Text.Text
+demoSchemaSource =
+    Text.unlines
+        [ "object user {}"
+        , ""
+        , "object space {"
+        , "  relation viewer: user"
+        , "  permission view = viewer"
+        , "}"
+        ]
+
 demoSchema :: Schema
 demoSchema =
-    either (error . ("invalid demo schema: " <>) . show) id $ do
-        userObject <- Schema.object "user" []
-        spaceObject <-
-            Schema.object
-                "space"
-                [ Schema.relation "viewer" [Schema.subject "user"] Schema.this
-                , Schema.permission "view" (Schema.computed "viewer")
-                ]
-        Schema.build [userObject, spaceObject]
+    either (error . ("invalid demo schema: " <>) . show) id (parseSchema demoSchemaSource)

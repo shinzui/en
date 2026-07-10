@@ -3,12 +3,13 @@ module En.Servant.Authorize (
     requirePermission,
 ) where
 
+import Control.Monad.IO.Class (liftIO)
 import Servant (Handler, throwError)
 
 import En.Check (CheckDecision (..), CheckOutcome (..))
 import En.Revision (Consistency)
 import En.Schema (RelationName)
-import En.Servant.Seam (Env (..), permissionDenied, runEngine)
+import En.Servant.Seam (ActiveSchema (..), Env (..), permissionDenied, runEngine)
 import En.Tuple (CaveatContext, ObjectRef, Subject)
 
 requirePermission ::
@@ -20,13 +21,15 @@ requirePermission ::
     ObjectRef ->
     Handler ()
 requirePermission env consistency context subject permission object = do
+    active <- liftIO env.readActiveSchema
     -- A gate wants the answer, not the snapshot it was answered at. The token is
     -- for callers who will chain a later read against this one.
     outcome <-
         runEngine
             env
+            active
             ( env.checkOperation
-                env.graph
+                active.graph
                 consistency
                 context
                 subject
