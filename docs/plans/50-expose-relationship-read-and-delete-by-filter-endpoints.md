@@ -50,9 +50,9 @@ This section must always reflect the actual current state of the work.
 - [x] M1 (2026-07-09): defined `RelationshipFilter`, `anyRelationshipFilter`, `widenTupleFilter`, and `validateRelationshipFilter` in `en-core/src/En/Effect/TupleStore.hs`; added the three effect operations (`ReadRelationships`, `CountRelationships`, `DeleteRelationships`) with smart-constructor wrappers.
 - [x] M1 (2026-07-09): extended the in-memory interpreter `runTupleStoreInMemory` in `en-core/src/En/Conformance/Kikan.hs` to handle the three new operations, rewriting `matchesFilter` as `matchesRelationshipFilter . widenTupleFilter` so one matcher serves both filter types. Also extended the read-only fixture interpreter in `en-core/test/Main.hs`, which the GADT made a compile error.
 - [x] M1 (2026-07-09): added en-core unit tests — `testRelationshipFilterValidation`, `testRelationshipFilterMatching`, `testWidenTupleFilterAgrees`, `testRelationshipStoreOperations`. `cabal test en-core` passes (both `en-core-interface-tests` and `en-core-conformance`).
-- [ ] M2: Implement the PostgreSQL sessions and statements for read, count, and transactional delete-by-filter in `en-postgres/src/En/Postgres/TupleStore.hs`.
-- [ ] M2: Extend `en-postgres/integration-test/Main.hs` with read-by-filter, count, and delete-by-filter scenarios (including snapshot visibility of the returned token).
-- [ ] M2: Capture `EXPLAIN` output for the index-served and seq-scan filter shapes and record it in Surprises & Discoveries.
+- [x] M2 (2026-07-09): implemented `readRelationshipsSession`, `countRelationshipsSession`, and `deleteRelationshipsSession` in `en-postgres/src/En/Postgres/TupleStore.hs`, with `compileFilter` composing each statement's predicate and encoder from the fields actually present.
+- [x] M2 (2026-07-09): extended `en-postgres/integration-test/Main.hs` with `runRelationshipFilterScenario` — eleven non-empty filter shapes and four deliberately-empty ones, each cross-checked against `matchesRelationshipFilter`; keyset pagination; delete-by-filter with the pre-delete snapshot still seeing the retired grants and the returned token not; and delete idempotence. `cabal test en-postgres-integration-tests` passes.
+- [x] M2 (2026-07-09): captured `EXPLAIN (ANALYZE, BUFFERS)` for the composed and null-guard forms and for the delete `UPDATE`; recorded in Surprises & Discoveries. The null-guard form under a generic plan costs 3527 buffers and 40.6 ms against the composed form's 4 buffers and 0.033 ms.
 - [ ] M3: Add wire DTOs, the two routes, and handlers in `en-servant/src/En/Servant/API.hs`; extend `en-servant/test/Main.hs`.
 - [ ] M3: Add `readRelationships` and `deleteRelationships` to `EnClient` in `en-client/src/En/Client.hs`.
 - [ ] M4: Run the end-to-end curl transcripts ("list grants for alice", "offboard alice") against a locally running `en-server` and paste the observed output into Validation and Acceptance.
@@ -89,6 +89,72 @@ implementation. Provide concise evidence.
   5. `deleteTuplesSession` no longer exists. docs/plans/46 collapsed writes and deletes
      into `ApplyTupleWrites`, interpreted by `applyTupleWritesSession`. That session is
      the shape delete-by-filter mirrors.
+
+- 2026-07-09, M2 (`EXPLAIN` evidence: the null-guard form really does collapse): measured
+  against a 250,000-row copy of `relation_tuple` carrying the production index set, on the
+  local development PostgreSQL. The composed predicate this plan ships takes the anchor's
+  index; the `($n::text IS NULL OR column = $n)` form takes it only under a *custom* plan,
+  and hasql's prepared statements are exactly what lets PostgreSQL stop building those.
+
+  Composed form, object-anchored (`objectType`, `objectId`):
+
+  ```text
+  Limit (actual rows=3 loops=1)
+    Buffers: shared hit=4
+    ->  Index Scan using relation_tuple_object_hist_idx on rt_bench
+          Index Cond: ((object_type = 'space') AND (object_id = 'obj-1000') AND (id > 0))
+          Filter: pg_visible_in_snapshot(...)
+  Execution Time: 0.033 ms
+  ```
+
+  Null-guard form, same filter, `plan_cache_mode = force_generic_plan`:
+
+  ```text
+  Limit (actual rows=3 loops=1)
+    Buffers: shared hit=3527
+    ->  Gather Merge  ->  Parallel Index Scan using rt_bench_pkey on rt_bench
+          Index Cond: (id > $2)
+          Filter: (($4 IS NULL OR object_type = $4) AND ($5 IS NULL OR object_id = $5) AND …)
+          Rows Removed by Filter: 124998
+  Execution Time: 40.582 ms
+  ```
+
+  The anchor never becomes an index condition: it is demoted to a filter, and the scan
+  reads the whole primary key. That is 3527 buffers against 4, and 40.582 ms against
+  0.033 ms — a factor of about 1200 on each — for a query returning three rows. Under
+  `force_custom_plan` the same prepared statement plans identically to the composed form
+  (`Buffers: shared hit=4`), which is precisely why the fault would not appear in
+  development: PostgreSQL builds custom plans for the first five executions of a prepared
+  statement and only then considers a generic one. The endpoint would have degraded on its
+  sixth call, in production, with no error.
+
+  A subject-anchored composed read takes `relation_tuple_subject_hist_idx`
+  (`Buffers: shared hit=8`, 0.018 ms), and adding the `caveatName` constraint keeps that
+  index and applies the caveat as a residual `Filter` on the five rows the anchor selected
+  (`Rows Removed by Filter: 5`) — the documented cost, on a bounded row set, as intended.
+
+- 2026-07-09, M2 (the delete `UPDATE` is served, despite the dropped live indexes): the
+  concern recorded at M0 is resolved. `EXPLAIN` on the delete-by-filter `UPDATE` shows an
+  object-anchored delete taking `relation_tuple_live_unique` (the surviving partial index)
+  and a subject-anchored one taking `relation_tuple_subject_hist_idx`, each applying
+  `deleted_xid IS NULL` as a residual filter:
+
+  ```text
+  Update on rt_bench
+    ->  Index Scan using relation_tuple_live_unique on rt_bench
+          Index Cond: ((object_type = 'space') AND (object_id = 'obj-1000'))
+          Filter: (deleted_xid IS NULL)
+
+  Update on rt_bench
+    ->  Index Scan using relation_tuple_subject_hist_idx on rt_bench
+          Index Cond: ((subject_type = 'user') AND (subject_id = 'user-42'))
+          Filter: (deleted_xid IS NULL)
+  ```
+
+  Both are index scans anchored on the filter's leading columns, so the residual is applied
+  to the rows the anchor already selected rather than to the table. Reinstating the partial
+  live indexes docs/plans/49 dropped would buy nothing here and would cost every write the
+  index maintenance EP-49 measured. They stay dropped.
 
 - 2026-07-09, M0 (index premise falsified): the Context and Orientation section below says
   the partial live indexes "are, however, exactly right for the delete-by-filter `UPDATE`,

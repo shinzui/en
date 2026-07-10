@@ -24,12 +24,15 @@ import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Numeric (readDec)
 
 import En.Check (CheckDecision (..), check)
+import En.Conformance.Kikan (matchesRelationshipFilter)
 import En.Effect.ConsistencyStore (ConsistencyStore, TokenMetadata (..))
 import En.Effect.ConsistencyStore qualified as ConsistencyStore
 import En.Effect.TupleStore (
     PageState (..),
     Precondition (..),
+    RelationshipFilter (..),
     StoreCursor (..),
+    SubjectRelationFilter (..),
     TuplePage (..),
     TupleRow (..),
     TupleStore (..),
@@ -75,6 +78,8 @@ main = do
         runConsistencyFetchCountScenario connection
         resetSchema connection
         runReadAllTuplesScenario connection
+        resetSchema connection
+        runRelationshipFilterScenario connection
         resetSchema connection
         runMigrationDedupeScenario connection
         Connection.release connection
@@ -857,6 +862,193 @@ runReadAllTuplesScenario connection = do
     headRevision <- runPgOrFail connection config TupleStore.headRevision
     drainedAtHead <- drainFrom headRevision
     assertEqual "the latecomer is visible at a later revision" 1501 (length drainedAtHead)
+
+{- | The relationship fixture: two object types, every subject shape, and a caveat.
+
+Each row exists to be distinguished from the others by some filter below. Without the
+wildcard the @subjectId = "*"@ flattening goes untested; without the userset the
+@coalesce(subject_relation, '')@ comparison the subject index is built on goes untested;
+without the caveated grant the residual @caveat_name@ predicate goes untested.
+-}
+relationshipFixture :: [Tuple]
+relationshipFixture =
+    [ Tuple projectX (RelationName "owner") (SubjectId alice) Nothing
+    , Tuple projectX (RelationName "viewer") (SubjectWildcard (ObjectType "user")) Nothing
+    , Tuple projectX (RelationName "member") (SubjectSet acmeOrg (RelationName "member")) Nothing
+    , Tuple projectY (RelationName "owner") (SubjectId alice) Nothing
+    , Tuple readmeDoc (RelationName "viewer") (SubjectId alice) Nothing
+    , Tuple readmeDoc (RelationName "viewer") (SubjectId bob) Nothing
+    , Tuple delegation (RelationName "delegate") (SubjectId alice) (Just delegationCaveat)
+    ]
+  where
+    projectX = ObjectRef (ObjectType "space") "project-x"
+    projectY = ObjectRef (ObjectType "space") "project-y"
+    readmeDoc = ObjectRef (ObjectType "doc") "readme"
+    delegation = ObjectRef (ObjectType "intention") "42"
+    acmeOrg = ObjectRef (ObjectType "org") "acme"
+    alice = ObjectRef (ObjectType "user") "alice"
+    bob = ObjectRef (ObjectType "user") "bob"
+    delegationCaveat =
+        TupleCaveat
+            { name = CaveatName "within_autonomy"
+            , payload = CaveatPayload (Map.fromList [("autonomy", ValueEnum "act")])
+            }
+
+{- | A 'RelationshipFilter' built positionally, in field order.
+
+A constructor application rather than a record update over 'anyRelationshipFilter',
+because @objectType@ and friends name fields of several types in scope in this module.
+-}
+relationshipFilter ::
+    Maybe Text ->
+    Maybe Text ->
+    Maybe Text ->
+    Maybe Text ->
+    Maybe Text ->
+    SubjectRelationFilter ->
+    Maybe Text ->
+    RelationshipFilter
+relationshipFilter objectType objectId relation subjectType subjectId subjectRelation caveatName =
+    RelationshipFilter
+        { objectType = ObjectType <$> objectType
+        , objectId
+        , relation = RelationName <$> relation
+        , subjectType = ObjectType <$> subjectType
+        , subjectId
+        , subjectRelation
+        , caveatName = CaveatName <$> caveatName
+        }
+
+-- | Every filter shape the grammar admits that this fixture can distinguish.
+relationshipFilterCases :: [(String, RelationshipFilter)]
+relationshipFilterCases =
+    [ ("object type", relationshipFilter (Just "space") Nothing Nothing Nothing Nothing AnySubjectRelation Nothing)
+    , ("object type and id", relationshipFilter (Just "space") (Just "project-x") Nothing Nothing Nothing AnySubjectRelation Nothing)
+    , ("object type, id, and relation", relationshipFilter (Just "space") (Just "project-x") (Just "owner") Nothing Nothing AnySubjectRelation Nothing)
+    , ("object type and relation, residual", relationshipFilter (Just "space") Nothing (Just "owner") Nothing Nothing AnySubjectRelation Nothing)
+    , ("subject", relationshipFilter Nothing Nothing Nothing (Just "user") (Just "alice") AnySubjectRelation Nothing)
+    , ("wildcard subject", relationshipFilter Nothing Nothing Nothing (Just "user") (Just "*") AnySubjectRelation Nothing)
+    , ("userset subject", relationshipFilter Nothing Nothing Nothing (Just "org") (Just "acme") (ExactSubjectRelation (RelationName "member")) Nothing)
+    , ("subject carrying no relation", relationshipFilter Nothing Nothing Nothing (Just "user") (Just "alice") NoSubjectRelation Nothing)
+    , ("subject with a caveat residual", relationshipFilter Nothing Nothing Nothing (Just "user") (Just "alice") AnySubjectRelation (Just "within_autonomy"))
+    , ("object type with a caveat residual", relationshipFilter (Just "intention") Nothing Nothing Nothing Nothing AnySubjectRelation (Just "within_autonomy"))
+    , ("both anchors", relationshipFilter (Just "doc") Nothing Nothing (Just "user") (Just "alice") AnySubjectRelation Nothing)
+    ]
+
+{- | Filter shapes this fixture deliberately leaves empty.
+
+Asserted separately from 'relationshipFilterCases', which requires every case to match
+something: a read that silently returned nothing would satisfy an expected-empty
+assertion and a vacuous agreement assertion alike, so the two properties cannot be
+checked by one list.
+-}
+emptyRelationshipFilterCases :: [(String, RelationshipFilter)]
+emptyRelationshipFilterCases =
+    [ ("an uncaveated object type under a caveat constraint", relationshipFilter (Just "space") Nothing Nothing Nothing Nothing AnySubjectRelation (Just "within_autonomy"))
+    , ("a userset constraint on a concrete subject", relationshipFilter Nothing Nothing Nothing (Just "user") (Just "alice") (ExactSubjectRelation (RelationName "member")) Nothing)
+    , ("a subject that holds nothing", relationshipFilter Nothing Nothing Nothing (Just "user") (Just "nobody") AnySubjectRelation Nothing)
+    , ("a relation nobody holds on this type", relationshipFilter (Just "doc") Nothing (Just "owner") Nothing Nothing AnySubjectRelation Nothing)
+    ]
+
+{- | Filtered reads, counts, and delete-by-filter, against the real store.
+
+The read assertions are made against 'matchesRelationshipFilter' — the in-memory matcher
+the conformance store uses — rather than against hand-written expected sets. The two
+implementations are independent (one compiles SQL, one walks a list), so agreeing on
+every shape of the fixture is evidence that the filter means one thing, not two. A
+hand-written expectation would only prove the SQL matches what its author believed.
+-}
+runRelationshipFilterScenario :: Connection.Connection -> IO ()
+runRelationshipFilterScenario connection = do
+    config <- testConfig
+    writeToken <- runPgOrFail connection config (TupleStore.writeTuples relationshipFixture)
+    TokenMetadata{revision = seeded} <- either (fail . show) pure (tokenMetadataFromPayload writeToken)
+
+    let drain revision requested =
+            let step cursor seen = do
+                    TuplePage{rows, state} <-
+                        runPgOrFail connection config (TupleStore.readRelationships revision requested 100 cursor)
+                    let seenNow = seen <> ((.tuple) <$> rows)
+                    case state of
+                        Exhausted -> pure seenNow
+                        HasMore next -> step (Just next) seenNow
+                        Truncated next -> step (Just next) seenNow
+             in step Nothing []
+
+        expectedFor requested =
+            [tuple | tuple <- relationshipFixture, matchesRelationshipFilter requested tuple]
+
+    traverse_
+        ( \(label, requested) -> do
+            let expected = expectedFor requested
+            stored <- drain seeded requested
+            assertEqual
+                ("the store and the in-memory matcher agree on the " <> label <> " filter")
+                (sort expected)
+                (sort stored)
+            assertBool
+                ("the " <> label <> " filter matches something, so the agreement is not vacuous")
+                (not (null expected))
+            count <- runPgOrFail connection config (TupleStore.countRelationships seeded requested)
+            assertEqual
+                ("countRelationships equals the read cardinality for the " <> label <> " filter")
+                (fromIntegral (length expected) :: Int64)
+                count
+        )
+        relationshipFilterCases
+
+    traverse_
+        ( \(label, requested) -> do
+            assertEqual
+                ("the in-memory matcher agrees that " <> label <> " matches nothing")
+                []
+                (expectedFor requested)
+            stored <- drain seeded requested
+            assertEqual ("the store returns no row for " <> label) [] stored
+            count <- runPgOrFail connection config (TupleStore.countRelationships seeded requested)
+            assertEqual ("the store counts zero rows for " <> label) 0 count
+        )
+        emptyRelationshipFilterCases
+
+    -- Keyset pagination across the four grants naming alice.
+    let aliceFilter = relationshipFilter Nothing Nothing Nothing (Just "user") (Just "alice") AnySubjectRelation Nothing
+    firstPage <- runPgOrFail connection config (TupleStore.readRelationships seeded aliceFilter 2 Nothing)
+    assertEqual "the first page carries the requested limit" 2 (length firstPage.rows)
+    nextCursor <-
+        case firstPage.state of
+            HasMore cursor -> pure cursor
+            other -> fail ("expected the first page to have more, got " <> show other)
+    secondPage <- runPgOrFail connection config (TupleStore.readRelationships seeded aliceFilter 2 (Just nextCursor))
+    assertEqual "the second page carries the remaining rows" 2 (length secondPage.rows)
+    assertEqual "the second page is exhausted" Exhausted secondPage.state
+    assertEqual
+        "the two pages together are the whole match set, without repetition"
+        (sort (expectedFor aliceFilter))
+        (sort (((.tuple) <$> firstPage.rows) <> ((.tuple) <$> secondPage.rows)))
+
+    -- Offboard alice: the count and the token describe the same set of rows.
+    (deletedCount, deleteToken) <- runPgOrFail connection config (TupleStore.deleteRelationships aliceFilter)
+    assertEqual "delete-by-filter retires every live match" 4 deletedCount
+    TokenMetadata{revision = afterDelete} <- either (fail . show) pure (tokenMetadataFromPayload deleteToken)
+
+    afterRows <- drain afterDelete aliceFilter
+    assertEqual "a read at the delete's token no longer sees the retired grants" [] afterRows
+
+    beforeRows <- drain seeded aliceFilter
+    assertEqual
+        "a read at the pre-delete snapshot still sees them: the delete is soft"
+        (sort (expectedFor aliceFilter))
+        (sort beforeRows)
+
+    survivors <- runPgOrFail connection config (TupleStore.readAllTuples afterDelete 100 Nothing)
+    assertEqual
+        "the grants the filter did not name survive"
+        (sort [tuple | tuple <- relationshipFixture, not (matchesRelationshipFilter aliceFilter tuple)])
+        (sort ((.tuple) <$> survivors.rows))
+
+    -- Idempotent in effect: nothing is left live for the filter to retire.
+    (again, _) <- runPgOrFail connection config (TupleStore.deleteRelationships aliceFilter)
+    assertEqual "re-running the same delete retires nothing" 0 again
 
 {- | The batched touch protocol's retry ladder, which only a race can reach.
 

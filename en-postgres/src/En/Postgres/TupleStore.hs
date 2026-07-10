@@ -35,6 +35,7 @@ import Effectful.Error.Static (Error, throwError)
 import En.Effect.TupleStore (
     PageState (..),
     Precondition (..),
+    RelationshipFilter (..),
     StoreCursor (..),
     SubjectRelationFilter (..),
     TupleFilter (..),
@@ -130,6 +131,15 @@ interpretTupleStorePostgres config readOptimizedRevision =
             orThrow =<< runSession (readAllTuplesSession revision limit cursorId)
         ProbeTuples revision object relation subjects ->
             orThrow =<< runSession (probeTuplesSession revision object relation subjects)
+        ReadRelationships revision relationshipFilter limit cursor -> do
+            cursorId <- resolveCursor cursor
+            orThrow =<< runSession (readRelationshipsSession revision relationshipFilter limit cursorId)
+        CountRelationships revision relationshipFilter ->
+            orThrow =<< runSession (countRelationshipsSession revision relationshipFilter)
+        DeleteRelationships relationshipFilter -> do
+            (count, anchor) <- orThrow =<< runSession (deleteRelationshipsSession config relationshipFilter)
+            token <- mintToken config anchor
+            pure (count, token)
         ApplyTupleWrites request -> do
             outcome <- orThrow =<< runSession (applyTupleWritesSession config request)
             anchor <- either (throwError . WritePreconditionFailed) pure outcome
@@ -437,6 +447,206 @@ readAllTuplesSession revision limit cursorId = do
     let limitPlusOne = fromIntegral (max 0 limit + 1)
     rows <- Session.statement (allReadParams revision limitPlusOne cursorId) readAllTuplesStatement
     pure (pageFromRows cursorId limit rows)
+
+readRelationshipsSession :: Revision -> RelationshipFilter -> Int -> Int64 -> Session TuplePage
+readRelationshipsSession revision relationshipFilter limit cursorId = do
+    let limitPlusOne = fromIntegral (max 0 limit + 1)
+    rows <- Session.statement () (readRelationshipsStatement revision relationshipFilter limitPlusOne cursorId)
+    pure (pageFromRows cursorId limit rows)
+
+countRelationshipsSession :: Revision -> RelationshipFilter -> Session Int64
+countRelationshipsSession revision relationshipFilter =
+    Session.statement () (countRelationshipsStatement revision relationshipFilter)
+
+{- | Match and retire in one transaction, returning the count and the anchor.
+
+The count and the anchor's token therefore describe the same set of rows. Read the
+matches in one transaction and delete them in another and they need not: a grant
+committed between the two is counted and not deleted, or deleted and not counted, and
+the operator who ran a dry run is told a number that was never true.
+
+No @ROLLBACK@ path, unlike 'applyTupleWritesSession': there are no preconditions to fail.
+A SQL error aborts the session and the transaction with it.
+-}
+deleteRelationshipsSession :: ConsistencyConfig -> RelationshipFilter -> Session (Int64, Anchor)
+deleteRelationshipsSession config relationshipFilter = do
+    Session.script beginScript
+    anchor <- Session.statement schemaHashText anchorTransactionStatement
+    count <- Session.statement () (deleteRelationshipsStatement anchor.xid relationshipFilter)
+    Session.script commitScript
+    pure (count, anchor)
+  where
+    SchemaHash schemaHashText = config.schemaHash
+
+{- | The @WHERE@ fragments a filter contributes, numbered from @start@, paired with the
+encoder that binds their values.
+
+The values are baked into the encoder — every parameter is @const@ over the statement's
+@()@ input — so the /text/ this returns depends only on which fields are present, not on
+what they hold. hasql caches prepared statements by text, so the cache sees one entry per
+filter /shape/, and 'validateRelationshipFilter' bounds the shapes to those with an
+anchor.
+
+An absent field contributes nothing at all. It is emphatically not sent as a
+@($n::text IS NULL OR column = $n)@ guard, which is the obvious way to keep one fixed
+statement per operation and the reason this function exists. PostgreSQL can only see
+through such a guard while it is building a /custom/ plan, where the parameter is
+substituted as a constant and the disjunction folds away. hasql prepares its statements,
+so after five executions PostgreSQL is free to build a generic plan — and under a generic
+plan the guard is opaque, @object_type@ can no longer become an index condition, and
+@relation_tuple_object_hist_idx@ is abandoned for a sequential scan. The endpoint would
+degrade on its sixth call, in production, silently. Composing the predicate makes the
+anchored columns equality quals under every plan type.
+
+@subject_relation@ is always compared through @coalesce(subject_relation, '')@, matching
+the expression @relation_tuple_subject_hist_idx@ is built on; comparing the bare column
+would make the index unusable for the very filters it exists to serve.
+-}
+compileFilter :: Int -> RelationshipFilter -> ([Text], Encoders.Params ())
+compileFilter start relationshipFilter =
+    let (_, predicates, encoder) = foldl' step (start, [], mempty) clauses
+     in (reverse predicates, encoder)
+  where
+    step (index, predicates, encoder) (render, binding) =
+        case binding of
+            Nothing -> (index, render index : predicates, encoder)
+            Just value -> (index + 1, render index : predicates, encoder <> constTextParam value)
+
+    -- Each clause renders itself given the index its parameter will occupy, and says
+    -- what value (if any) to bind there. A clause binding 'Nothing' spends no index.
+    clauses :: [(Int -> Text, Maybe Text)]
+    clauses =
+        concat
+            [ column "object_type" (unObjectType <$> relationshipFilter.objectType)
+            , column "object_id" relationshipFilter.objectId
+            , column "relation" (unRelationName <$> relationshipFilter.relation)
+            , column "subject_type" (unObjectType <$> relationshipFilter.subjectType)
+            , column "subject_id" relationshipFilter.subjectId
+            , subjectRelationClause relationshipFilter.subjectRelation
+            , column "caveat_name" (unCaveatName <$> relationshipFilter.caveatName)
+            ]
+
+    column name =
+        foldMap (\value -> [(\index -> name <> " = " <> placeholder index, Just value)])
+
+    subjectRelationClause = \case
+        AnySubjectRelation -> []
+        NoSubjectRelation -> [(const "coalesce(subject_relation, '') = ''", Nothing)]
+        ExactSubjectRelation relationName ->
+            [
+                ( \index -> "coalesce(subject_relation, '') = " <> placeholder index
+                , Just (unRelationName relationName)
+                )
+            ]
+
+    placeholder index = "$" <> Text.pack (show index) <> "::text"
+
+-- | A parameter whose value is fixed when the statement is built. See 'compileFilter'.
+constTextParam :: Text -> Encoders.Params ()
+constTextParam value =
+    const value >$< Encoders.param (Encoders.nonNullable Encoders.text)
+
+constInt8Param :: Int64 -> Encoders.Params ()
+constInt8Param value =
+    const value >$< Encoders.param (Encoders.nonNullable Encoders.int8)
+
+{- | A page of filter-matching tuples live at the revision, keyset-paginated by row id.
+
+'readObjectRelationStatement' with the object and relation predicates replaced by the
+filter's, and the same @pg_visible_in_snapshot@ visibility pair every read uses — so a
+page taken long after the revision was resolved still excludes every row committed since.
+
+Which index serves it depends on the filter's anchor: @relation_tuple_object_hist_idx@
+for an @objectType@ anchor, @relation_tuple_subject_hist_idx@ for a @subjectType@ one.
+@relation@ and @caveat_name@ lead no index and are always residual predicates, applied to
+rows the anchor already narrowed. See docs/plans/50 for the measured plans.
+-}
+readRelationshipsStatement :: Revision -> RelationshipFilter -> Int64 -> Int64 -> Statement () [TupleRow]
+readRelationshipsStatement revision relationshipFilter limitPlusOne cursorId =
+    Statement.preparable sql encoder (Decoders.rowList tupleRowDecoder)
+  where
+    (predicates, filterEncoder) = compileFilter 4 relationshipFilter
+    sql =
+        Text.unlines $
+            [ "SELECT id, object_type, object_id, relation, subject_type, subject_id, subject_relation,"
+            , "       caveat_name, caveat_payload, created_xid::text, deleted_xid::text"
+            , "FROM relation_tuple"
+            , "WHERE id > $2"
+            , "  AND pg_visible_in_snapshot(created_xid, $1::pg_snapshot)"
+            , "  AND (deleted_xid IS NULL OR NOT pg_visible_in_snapshot(deleted_xid, $1::pg_snapshot))"
+            ]
+                <> fmap ("  AND " <>) predicates
+                <> [ "ORDER BY id ASC"
+                   , "LIMIT $3"
+                   ]
+    encoder =
+        constTextParam revision.revisionEncoding
+            <> constInt8Param cursorId
+            <> constInt8Param limitPlusOne
+            <> filterEncoder
+
+{- | How many tuples live at the revision match the filter.
+
+'readRelationshipsStatement' without the cursor, the limit, or the ordering. The count is
+deliberately unbounded by a page: it answers "how many grants would this delete revoke?",
+and a page-bounded answer to that question is a lie.
+-}
+countRelationshipsStatement :: Revision -> RelationshipFilter -> Statement () Int64
+countRelationshipsStatement revision relationshipFilter =
+    Statement.preparable
+        sql
+        encoder
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
+  where
+    (predicates, filterEncoder) = compileFilter 2 relationshipFilter
+    sql =
+        Text.unlines $
+            [ "SELECT count(*)"
+            , "FROM relation_tuple"
+            , "WHERE pg_visible_in_snapshot(created_xid, $1::pg_snapshot)"
+            , "  AND (deleted_xid IS NULL OR NOT pg_visible_in_snapshot(deleted_xid, $1::pg_snapshot))"
+            ]
+                <> fmap ("  AND " <>) predicates
+    encoder = constTextParam revision.revisionEncoding <> filterEncoder
+
+{- | Soft-delete every live row the filter matches, returning how many.
+
+The predicate is @deleted_xid IS NULL@ rather than a snapshot test: a delete acts on the
+live state, not on some caller's older view of it. That is also why this statement takes
+no revision.
+
+Two of the indexes that once served exactly this shape — the partial
+@relation_tuple_object_live_idx@ and @relation_tuple_subject_live_idx@ — were dropped by
+docs/plans/49 as dead, on an argument that considered only snapshot-visible /reads/. What
+remains is @relation_tuple_live_unique@, itself partial on @deleted_xid IS NULL@ and
+leading with @object_type@, which serves an object-anchored delete; a subject-anchored one
+rides @relation_tuple_subject_hist_idx@ and applies @deleted_xid IS NULL@ as a residual.
+See docs/plans/50 for the measured plans.
+
+@LIMIT@ cannot appear on an @UPDATE@, and none is wanted: a delete-by-filter that stopped
+early would report a count for a revocation it did not finish.
+-}
+deleteRelationshipsStatement :: Text -> RelationshipFilter -> Statement () Int64
+deleteRelationshipsStatement writeXid relationshipFilter =
+    Statement.preparable
+        sql
+        encoder
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int8)))
+  where
+    (predicates, filterEncoder) = compileFilter 2 relationshipFilter
+    sql =
+        Text.unlines $
+            [ "WITH deleted AS ("
+            , "  UPDATE relation_tuple"
+            , "  SET deleted_xid = $1::xid8"
+            , "  WHERE deleted_xid IS NULL"
+            ]
+                <> fmap ("    AND " <>) predicates
+                <> [ "  RETURNING id"
+                   , ")"
+                   , "SELECT count(*) FROM deleted"
+                   ]
+    encoder = constTextParam writeXid <> filterEncoder
 
 {- | Answer a point-membership question with one indexed read.
 
