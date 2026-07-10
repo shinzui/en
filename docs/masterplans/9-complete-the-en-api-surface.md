@@ -4,6 +4,7 @@ slug: complete-the-en-api-surface
 title: "Complete the en API surface"
 kind: master-plan
 created_at: 2026-07-07T15:24:21Z
+intention: intention_01kx4y4empedt9g83mprcrew89
 ---
 
 # Complete the en API surface
@@ -67,7 +68,7 @@ verifiable without the others.
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-50 | Expose relationship read and delete-by-filter endpoints | docs/plans/50-expose-relationship-read-and-delete-by-filter-endpoints.md | None | None | Not Started |
+| EP-50 | Expose relationship read and delete-by-filter endpoints | docs/plans/50-expose-relationship-read-and-delete-by-filter-endpoints.md | None | None | In Progress |
 | EP-51 | Return checked-at consistency tokens from read responses | docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md | None | None | Not Started |
 | EP-52 | Add a lookup-subjects API | docs/plans/52-add-a-lookup-subjects-api.md | None | None | Not Started |
 | EP-53 | Add a watch changelog API | docs/plans/53-add-a-watch-changelog-api.md | None | None | Not Started |
@@ -138,7 +139,57 @@ immutable argument and EP-54 rewires them.
 
 ## Surprises & Discoveries
 
-(None yet.)
+- 2026-07-09 (EP-50, affects EP-51/53/54): the external sequencing this plan recommended
+  has already happened. Master plans 6, 7, and 8 are all Complete, so
+  docs/plans/35 (versioned wire contract), docs/plans/40 and 42 (engine semantics), and
+  docs/plans/49 (index trim) all landed before any child here started. Every child must
+  therefore be written against the `/v1` path prefix, the `EnResponses`/`EnResult`
+  `MultiVerb` response list, and the `ErrorEnvelopeWire` error envelope defined in
+  `en-servant/src/En/Servant/API.hs` and `en-servant/src/En/Servant/Seam.hs`. The
+  JSON transcripts written into the child plans on 2026-07-07 predate that contract and
+  are stale wherever they show unversioned paths or `{"tag": ...}` sum encodings.
+
+- 2026-07-09 (EP-50, binds EP-53 and EP-54): the tree already has a live tuple filter.
+  `TupleFilter` in `en-core/src/En/Effect/TupleStore.hs`, added by docs/plans/46 for write
+  preconditions, carries exactly the fields EP-50's `RelationshipFilter` proposed, minus
+  `caveatName`, with `objectType` mandatory, and with a strictly better subject-relation
+  encoding: a three-valued `SubjectRelationFilter` (`Any`/`No`/`Exact`) rather than
+  `Maybe RelationName`. The `Maybe` spelling the child plan proposed is the exact
+  ambiguity `SubjectRelationFilter`'s Haddock says it exists to remove — under it, a
+  filter for `space:x#member@user:alice` also matches
+  `space:x#member@user:alice#admin`. EP-50 therefore defines `RelationshipFilter` as a
+  widening of `TupleFilter` (optional `objectType`, added `caveatName`, same
+  `SubjectRelationFilter`), and EP-53/EP-54 consume that shape, not the one their
+  Integration Points paragraph describes.
+
+- 2026-07-09 (EP-50, wire-surface conflict): `POST /v1/relationships/delete` already
+  exists — docs/plans/35 moved the exact-tuple delete there, off `DELETE /tuples`. EP-50's
+  proposed path for delete-by-filter collides with it. The two operations are genuinely
+  different (one names tuples, one names a filter), and renaming a frozen `v1` operation
+  is a breaking change outside this initiative's scope, so delete-by-filter lands at
+  `POST /v1/relationships/delete-by-filter`. Note this diverges from SpiceDB, where
+  `DeleteRelationships` *is* the filtered delete.
+
+- 2026-07-09 (EP-50, storage): the partial "live" indexes EP-50's Context section reserves
+  for the delete-by-filter `UPDATE` — "exactly right for the delete-by-filter `UPDATE`,
+  whose predicate *is* `deleted_xid IS NULL`" — no longer exist. docs/plans/49 dropped both
+  `relation_tuple_object_live_idx` and `relation_tuple_subject_live_idx` in
+  `en-migrations/db/migrations/20260709232320_drop-dead-live-indexes.sql`, after EP-50's
+  plan was written and on the strength of an argument that only counted *reads*. EP-50 does
+  not resurrect them: the surviving partial unique index `relation_tuple_live_unique`
+  (six identity columns, `WHERE deleted_xid IS NULL`) leads with `object_type` and serves
+  object-anchored deletes, and subject-anchored deletes ride
+  `relation_tuple_subject_hist_idx` with `deleted_xid IS NULL` as a residual. M2's `EXPLAIN`
+  evidence decides whether that residual is acceptable; if it is not, the reinstatement
+  belongs in a plan of its own, with the write-amplification cost EP-49 measured.
+  `relation_tuple_created_xid_idx`, which EP-53's watch query wants, was *not* dropped.
+
+- 2026-07-09 (EP-50, storage): there is no longer a `DeleteTuples` store operation to
+  mirror. docs/plans/46 collapsed writes and deletes into one `ApplyTupleWrites`
+  constructor interpreted by `applyTupleWritesSession`. EP-50's delete-by-filter session
+  follows that session's transaction shape (`BEGIN`, anchor insert, mutate, `COMMIT`,
+  `tokenFromAnchor`) rather than the `deleteTuplesSession` its plan names, which no
+  longer exists.
 
 
 ## Decision Log
@@ -152,6 +203,15 @@ immutable argument and EP-54 rewires them.
 - Decision: Build watch on the existing xid8 soft-delete tables rather than a new outbox/changelog table.
   Rationale: The review (E5) observes the changelog substantially exists in relation_tuple + en_transaction; a cursored "changes since revision" query is much cheaper than introducing and backfilling a new table. Revisit only if EP-53's implementation disproves this.
   Date: 2026-07-07
+- Decision: `RelationshipFilter` is a widening of the existing `TupleFilter`, and reuses its `SubjectRelationFilter` rather than the `Maybe RelationName` the child plans describe.
+  Rationale: See Surprises. Two filter dialects over one table would be strictly worse, and `Maybe RelationName` cannot distinguish "any subject shape" from "a subject carrying no relation". `TupleFilter` keeps its mandatory `objectType` because a precondition is evaluated inside a write transaction, where an unanchored filter is a sequential scan under a lock; `RelationshipFilter` relaxes it because a read endpoint anchored on `subjectType` alone is the "what does alice hold?" query this initiative exists to serve. EP-53 and EP-54 consume `RelationshipFilter` unchanged.
+  Date: 2026-07-09
+- Decision: Delete-by-filter is served at `POST /v1/relationships/delete-by-filter`, not `POST /v1/relationships/delete`.
+  Rationale: The latter path is already the exact-tuple delete under the frozen v1 contract. Recorded here because it changes the URL every child plan and the review's E2 description assume.
+  Date: 2026-07-09
+- Decision: EP-49's index trim is settled ahead of EP-53, not concurrently with it.
+  Rationale: The Integration Points paragraph asks EP-53 and EP-49 to reconcile before either lands. EP-49 is Complete: it dropped the two partial `*_live_idx` indexes and kept `relation_tuple_created_xid_idx`, which is the index EP-53's changelog query wants. There is nothing left to reconcile; EP-53 inherits a settled index set and must record that it did.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective

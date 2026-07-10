@@ -5,6 +5,7 @@ title: "Expose relationship read and delete-by-filter endpoints"
 kind: exec-plan
 created_at: 2026-07-07T15:25:10Z
 master_plan: "docs/masterplans/9-complete-the-en-api-surface.md"
+intention: intention_01kx4y4empedt9g83mprcrew89
 ---
 
 # Expose relationship read and delete-by-filter endpoints
@@ -61,7 +62,42 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- 2026-07-09, M0 (orientation): every plan this one asked to be sequenced behind has
+  landed. `docs/plans/35` (versioned wire contract), `40`/`42` (engine semantics), and
+  `49` (index trim) are all Complete, per the Exec-Plan Registries of master plans 6, 7,
+  and 8. Consequences, each of which contradicts a statement written into the sections
+  below on 2026-07-07:
+
+  1. The API is served under `/v1` and every operation answers with a `MultiVerb`
+     response list (`EnResponses`) mapped onto an `EnResult` sum, not a bare `Post '[JSON]`.
+     Handler faults travel as `ErrorEnvelopeWire` (`{"code","message","retryable"}`), not
+     `{"error": "..."}`. Every JSON transcript in this plan has been rewritten accordingly.
+
+  2. Sum types no longer encode as `{"tag": ..., "contents": ...}`. `En.Servant.API` now
+     hand-writes every aeson instance with a string discriminator — `kind` for subjects,
+     `mode` for consistency, `result` for decisions, `status` for page states. The
+     `SubjectIdWire`/`FullyConsistentWire` spellings in the original transcripts describe
+     bytes en no longer serves.
+
+  3. `POST /v1/relationships/delete` is taken: docs/plans/35 moved the exact-tuple delete
+     there. See the Decision Log for the path this plan uses instead.
+
+  4. `TupleFilter` already exists (docs/plans/46, write preconditions) and is nearly the
+     type this plan proposes to introduce. See the Decision Log.
+
+  5. `deleteTuplesSession` no longer exists. docs/plans/46 collapsed writes and deletes
+     into `ApplyTupleWrites`, interpreted by `applyTupleWritesSession`. That session is
+     the shape delete-by-filter mirrors.
+
+- 2026-07-09, M0 (index premise falsified): the Context and Orientation section below says
+  the partial live indexes "are, however, exactly right for the delete-by-filter `UPDATE`,
+  whose predicate *is* `deleted_xid IS NULL`". They were dropped by docs/plans/49 in
+  `en-migrations/db/migrations/20260709232320_drop-dead-live-indexes.sql`, whose argument
+  considered only reads. The delete `UPDATE` must therefore be served by
+  `relation_tuple_live_unique` (partial unique, `WHERE deleted_xid IS NULL`, leading with
+  `object_type`) for object-anchored filters and by `relation_tuple_subject_hist_idx` with
+  a residual `deleted_xid IS NULL` for subject-anchored ones. M2's `EXPLAIN` evidence
+  settles whether that residual is tolerable.
 
 
 ## Decision Log
@@ -74,6 +110,19 @@ Record every decision made while working on the plan.
 - Decision: Both endpoints are `POST` with a JSON body: `POST /relationships/query` and `POST /relationships/delete`. No `GET` with query parameters, and no `DELETE` with a body.
   Rationale: The request carries a structured consistency value (possibly a long opaque token) and a nested filter, which fight URL encoding; and the review (A5 in `docs/reviews/2026-07-07-architecture-performance-review.md`) already flags the existing `DELETE /tuples`-with-body as proxy-hostile, so the new delete surface deliberately avoids repeating that mistake.
   Date: 2026-07-07
+  Superseded 2026-07-09 in part: the `POST` decision and its rationale stand — indeed docs/plans/35 acted on the same A5 finding and already moved the exact-tuple delete from `DELETE /tuples` to `POST /v1/relationships/delete`. Only the *paths* change; see the next entry.
+- Decision: The two new endpoints are `POST /v1/relationships/query` and `POST /v1/relationships/delete-by-filter`.
+  Rationale: `POST /v1/relationships/delete` is already the exact-tuple delete under the frozen `v1` contract, so the path this plan reserved is taken by an operation with different semantics (it names tuples; this one names a filter). Renaming a shipped `v1` operation is a breaking change and belongs to a `v2`, not to this plan. `delete-by-filter` says what it does, at the cost of diverging from SpiceDB, where `DeleteRelationships` is itself the filtered delete. The alternative — overloading `/delete` on the presence of a `filter` key — was rejected: a request meaning "revoke these three grants" and a request meaning "revoke everything matching this pattern" must not differ by a typo.
+  Date: 2026-07-09
+- Decision: `RelationshipFilter` is defined as a widening of the existing `TupleFilter`, and reuses `SubjectRelationFilter` rather than the `Maybe RelationName` this plan's Milestone 1 sketch proposes.
+  Rationale: `en-core/src/En/Effect/TupleStore.hs` already carries `TupleFilter`, added by docs/plans/46 for write preconditions, with the same six constrainable fields. Its subject-relation constraint is a three-valued `SubjectRelationFilter` (`AnySubjectRelation`/`NoSubjectRelation`/`ExactSubjectRelation`) whose Haddock records precisely why `Maybe RelationName` is wrong: under `Nothing`-means-any, the exact filter for `space:x#member@user:alice` also matches the userset grant `space:x#member@user:alice#admin`, which can be live at the same time. Introducing the weaker spelling for the new endpoint would put two contradictory filter dialects over one table. `RelationshipFilter` therefore differs from `TupleFilter` in exactly two ways: `objectType` becomes `Maybe` (a read anchored on `subjectType` alone is the "what does alice hold?" query this plan exists to serve), and `caveatName` is added. `TupleFilter` keeps its mandatory `objectType`, because a precondition is evaluated inside a write transaction where an unanchored filter is a sequential scan under a lock. Matching semantics are written once, against `RelationshipFilter`, and `TupleFilter`'s matcher is defined by widening into it, so the two cannot drift.
+  Date: 2026-07-09
+- Decision: The filter's SQL predicate is composed from the fields actually present, rather than sent as a fixed parameter list guarded by `($n::text IS NULL OR column = $n)`.
+  Rationale: Milestone 2 anticipated the question and asked for `EXPLAIN` evidence before choosing. The null-guard form is index-friendly only under a *custom* plan, where PostgreSQL substitutes the parameter and folds `NULL IS NULL OR …` away. hasql issues `Statement.preparable` statements, so PostgreSQL may switch to a generic plan after five executions — at which point the guard is opaque, the qual cannot become an index condition, and every filtered read degrades to a sequential scan on a hot endpoint, silently and only in production. Composing the predicate makes the anchored columns real equality quals under every plan type. The shape space is bounded (seven optional fields, and validation forbids the unanchored ones), so the prepared-statement cache sees a handful of texts. Both forms are measured in M2 and the plans recorded in Surprises & Discoveries.
+  Date: 2026-07-09
+- Decision: The new wire types get hand-written aeson and `ToSchema` instances, not derived ones.
+  Rationale: `En.Servant.API`'s section comment requires the wire shape to be "a reviewed artifact rather than a side effect of generic derivation", and `En.Servant.OpenApi`'s header notes that generic derivation "would resurrect exactly the constructor-tagged shapes those instances exist to remove". The Milestone 3 sketch below says `deriving Generic, FromJSON/ToJSON`; that instruction predates docs/plans/35 and is not followed. The new sum type `RelationshipsStateWire` reuses the `status` discriminator and the `exhausted`/`hasMore`/`truncated` vocabulary that `LookupStateWire` and `ExpandStateWire` already share.
+  Date: 2026-07-09
 - Decision: `dryRun` is a mandatory (not defaulted) field of the delete request.
   Rationale: Delete-by-filter is the most destructive operation in the API. Aeson's generic decoding rejects a missing field, so a caller must always state intent explicitly; a typo'd or omitted flag cannot silently destroy grants.
   Date: 2026-07-07
