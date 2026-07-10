@@ -41,6 +41,13 @@ module En.Servant.API (
     preconditionFromWire,
     WriteTuplesResponseWire (..),
     DeleteTuplesRequestWire (..),
+    RelationshipFilterWire (..),
+    ReadRelationshipsRequestWire (..),
+    RelationshipsStateWire (..),
+    ReadRelationshipsResponseWire (..),
+    DeleteRelationshipsRequestWire (..),
+    DeleteRelationshipsResponseWire (..),
+    relationshipFilterFromWire,
     objectRefToWire,
     objectRefFromWire,
     subjectToWire,
@@ -66,6 +73,7 @@ import Data.Aeson (
  )
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Types (Parser)
+import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe)
 import Data.SOP (I (..), NS (..))
@@ -95,14 +103,23 @@ import Servant.API.MultiVerb (AsUnion (..), MultiVerb, Respond)
 import Servant.Server (ErrorFormatter, ErrorFormatters (..), defaultErrorFormatters)
 
 import En.Check (BatchPair (..), CaveatObligation (..), CheckDecision (..), checkMany)
-import En.Effect.ConsistencyStore (ConsistencyStore)
+import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), resolveConsistency)
 import En.Effect.TupleStore (
+    PageState (..),
     Precondition (..),
+    RelationshipFilter (..),
+    StoreCursor (..),
     SubjectRelationFilter (..),
     TupleFilter (..),
+    TuplePage (..),
+    TupleRow (..),
     TupleStore,
     TupleWriteRequest (..),
     applyTupleWrites,
+    countRelationships,
+    deleteRelationships,
+    readRelationships,
+    validateRelationshipFilter,
  )
 import En.Error (EnError)
 import En.Expand qualified as Expand
@@ -210,6 +227,13 @@ change ships as @\/v2@ served alongside it, rather than mutating these operation
 
 Deletion is a @POST@ to @\/v1\/relationships\/delete@, not a @DELETE@ carrying a
 request body: HTTP intermediaries are permitted to drop a @DELETE@ body.
+
+@\/v1\/relationships\/delete@ retires the tuples a request /names/;
+@\/v1\/relationships\/delete-by-filter@ retires every tuple a request /describes/. They
+are separate operations rather than one that branches on the body, because "revoke these
+three grants" and "revoke everything matching this pattern" must not differ by a typo.
+The spelling diverges from SpiceDB, whose @DeleteRelationships@ is the filtered one; the
+unfiltered path was here first and @v1@ is frozen.
 -}
 type EnAPI =
     "v1"
@@ -220,6 +244,14 @@ type EnAPI =
                     :> "delete"
                     :> ReqBody '[JSON] DeleteTuplesRequestWire
                     :> MultiVerb 'POST '[JSON] (EnResponses "Consistency token for the deletion" WriteTuplesResponseWire) (EnResult WriteTuplesResponseWire)
+                :<|> "relationships"
+                    :> "query"
+                    :> ReqBody '[JSON] ReadRelationshipsRequestWire
+                    :> MultiVerb 'POST '[JSON] (EnResponses "A page of stored relationships" ReadRelationshipsResponseWire) (EnResult ReadRelationshipsResponseWire)
+                :<|> "relationships"
+                    :> "delete-by-filter"
+                    :> ReqBody '[JSON] DeleteRelationshipsRequestWire
+                    :> MultiVerb 'POST '[JSON] (EnResponses "How many relationships the filter matched" DeleteRelationshipsResponseWire) (EnResult DeleteRelationshipsResponseWire)
                 :<|> "check"
                     :> ReqBody '[JSON] CheckRequestWire
                     :> MultiVerb 'POST '[JSON] (EnResponses "The authorization decision" CheckResponseWire) (EnResult CheckResponseWire)
@@ -241,6 +273,8 @@ server :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error E
 server env =
     writeTuplesHandler env
         :<|> deleteTuplesHandler env
+        :<|> readRelationshipsHandler env
+        :<|> deleteRelationshipsHandler env
         :<|> checkHandler env
         :<|> batchCheckHandler env
         :<|> lookupHandler env
@@ -1060,6 +1094,177 @@ instance FromJSON DeleteTuplesRequestWire where
     parseJSON = withObject "DeleteTuplesRequestWire" \o ->
         DeleteTuplesRequestWire <$> o .: "tuples" <*> o .:? "preconditions"
 
+{- | A filter over stored relationships, for reading and for delete-by-filter.
+
+Every field is optional, but not every combination is legal: the filter must constrain
+@objectType@ or @subjectType@, @objectId@ requires @objectType@, and @subjectId@ and a
+@subjectRelation@ other than @any@ require @subjectType@. An illegal filter is a @400@.
+The rule is not taste — a filter anchored on neither end matches no index and scans the
+whole table, so accepting one would let any caller hold the store open.
+
+This is 'TupleFilterWire' with @objectType@ relaxed to optional (so "every grant naming
+@user:alice@" is expressible) and @caveatName@ added. The two are separate types because
+a precondition's filter is evaluated inside a write transaction, where an unanchored
+scan is a lock held over the whole relation, so @objectType@ there is mandatory.
+-}
+data RelationshipFilterWire = RelationshipFilterWire
+    { objectType :: !(Maybe Text)
+    , objectId :: !(Maybe Text)
+    , relation :: !(Maybe Text)
+    , subjectType :: !(Maybe Text)
+    , subjectId :: !(Maybe Text)
+    , subjectRelation :: !(Maybe SubjectRelationFilterWire)
+    , caveatName :: !(Maybe Text)
+    }
+    deriving stock (Eq, Show)
+
+-- | An absent constraint is an absent key, not a @null@ one. See 'TupleFilterWire'.
+instance ToJSON RelationshipFilterWire where
+    toJSON wire =
+        Aeson.object $
+            foldMap (\value -> ["objectType" .= value]) wire.objectType
+                <> foldMap (\value -> ["objectId" .= value]) wire.objectId
+                <> foldMap (\value -> ["relation" .= value]) wire.relation
+                <> foldMap (\value -> ["subjectType" .= value]) wire.subjectType
+                <> foldMap (\value -> ["subjectId" .= value]) wire.subjectId
+                <> foldMap (\value -> ["subjectRelation" .= value]) wire.subjectRelation
+                <> foldMap (\value -> ["caveatName" .= value]) wire.caveatName
+    toEncoding wire =
+        pairs $
+            foldMap ("objectType" .=) wire.objectType
+                <> foldMap ("objectId" .=) wire.objectId
+                <> foldMap ("relation" .=) wire.relation
+                <> foldMap ("subjectType" .=) wire.subjectType
+                <> foldMap ("subjectId" .=) wire.subjectId
+                <> foldMap ("subjectRelation" .=) wire.subjectRelation
+                <> foldMap ("caveatName" .=) wire.caveatName
+
+instance FromJSON RelationshipFilterWire where
+    parseJSON = withObject "RelationshipFilterWire" \o ->
+        RelationshipFilterWire
+            <$> o .:? "objectType"
+            <*> o .:? "objectId"
+            <*> o .:? "relation"
+            <*> o .:? "subjectType"
+            <*> o .:? "subjectId"
+            <*> o .:? "subjectRelation"
+            <*> o .:? "caveatName"
+
+data ReadRelationshipsRequestWire = ReadRelationshipsRequestWire
+    { consistency :: !ConsistencyWire
+    , filter :: !RelationshipFilterWire
+    , limit :: !Int
+    , cursor :: !(Maybe Text)
+    }
+    deriving stock (Eq, Show)
+
+instance ToJSON ReadRelationshipsRequestWire where
+    toJSON wire =
+        Aeson.object
+            [ "consistency" .= wire.consistency
+            , "filter" .= wire.filter
+            , "limit" .= wire.limit
+            , "cursor" .= wire.cursor
+            ]
+    toEncoding wire =
+        pairs
+            ( "consistency" .= wire.consistency
+                <> "filter" .= wire.filter
+                <> "limit" .= wire.limit
+                <> "cursor" .= wire.cursor
+            )
+
+instance FromJSON ReadRelationshipsRequestWire where
+    parseJSON = withObject "ReadRelationshipsRequestWire" \o ->
+        ReadRelationshipsRequestWire
+            <$> o .: "consistency"
+            <*> o .: "filter"
+            <*> o .: "limit"
+            <*> o .:? "cursor"
+
+{- | Whether a page of relationships is the last one.
+
+Two statuses, not the three 'LookupStateWire' and 'ExpandStateWire' carry: @truncated@
+means an evaluation budget ran out mid-page, and a stored-tuple read spends no budget —
+it walks an index. A store that somehow reported truncation is reported as @hasMore@,
+which resumes from the same cursor and is therefore correct either way.
+-}
+data RelationshipsStateWire
+    = RelationshipsExhaustedWire
+    | RelationshipsHasMoreWire !Text
+    deriving stock (Eq, Show)
+
+instance ToJSON RelationshipsStateWire where
+    toJSON = \case
+        RelationshipsExhaustedWire -> Aeson.object ["status" .= ("exhausted" :: Text)]
+        RelationshipsHasMoreWire cursor -> Aeson.object ["status" .= ("hasMore" :: Text), "cursor" .= cursor]
+    toEncoding = \case
+        RelationshipsExhaustedWire -> pairs ("status" .= ("exhausted" :: Text))
+        RelationshipsHasMoreWire cursor -> pairs ("status" .= ("hasMore" :: Text) <> "cursor" .= cursor)
+
+instance FromJSON RelationshipsStateWire where
+    parseJSON = withObject "RelationshipsStateWire" \o ->
+        o .: "status" >>= \case
+            "exhausted" -> pure RelationshipsExhaustedWire
+            "hasMore" -> RelationshipsHasMoreWire <$> o .: "cursor"
+            other -> unknownVariant "relationships status" other ["exhausted", "hasMore"]
+
+data ReadRelationshipsResponseWire = ReadRelationshipsResponseWire
+    { relationships :: ![TupleWire]
+    , state :: !RelationshipsStateWire
+    }
+    deriving stock (Eq, Show)
+
+instance ToJSON ReadRelationshipsResponseWire where
+    toJSON wire = Aeson.object ["relationships" .= wire.relationships, "state" .= wire.state]
+    toEncoding wire = pairs ("relationships" .= wire.relationships <> "state" .= wire.state)
+
+instance FromJSON ReadRelationshipsResponseWire where
+    parseJSON = withObject "ReadRelationshipsResponseWire" \o ->
+        ReadRelationshipsResponseWire <$> o .: "relationships" <*> o .: "state"
+
+{- | A delete-by-filter request. @dryRun@ is mandatory and has no default.
+
+This is the most destructive operation in the API, and a defaulted flag is one a caller
+can omit by accident. Requiring it means intent is always stated: a body missing @dryRun@
+is a @400@, not a deletion.
+-}
+data DeleteRelationshipsRequestWire = DeleteRelationshipsRequestWire
+    { filter :: !RelationshipFilterWire
+    , dryRun :: !Bool
+    }
+    deriving stock (Eq, Show)
+
+instance ToJSON DeleteRelationshipsRequestWire where
+    toJSON wire = Aeson.object ["filter" .= wire.filter, "dryRun" .= wire.dryRun]
+    toEncoding wire = pairs ("filter" .= wire.filter <> "dryRun" .= wire.dryRun)
+
+instance FromJSON DeleteRelationshipsRequestWire where
+    parseJSON = withObject "DeleteRelationshipsRequestWire" \o ->
+        DeleteRelationshipsRequestWire <$> o .: "filter" <*> o .: "dryRun"
+
+{- | @count@ is how many grants a real deletion retired, or — for a dry run — how many it
+would have. @token@ is present exactly when @dryRun@ was false: a dry run writes nothing,
+so it has no revision to name. A caller that deleted can pass the token straight back as
+@atLeastAsFresh@ and observe the revocation.
+-}
+data DeleteRelationshipsResponseWire = DeleteRelationshipsResponseWire
+    { dryRun :: !Bool
+    , count :: !Int64
+    , token :: !(Maybe Text)
+    }
+    deriving stock (Eq, Show)
+
+instance ToJSON DeleteRelationshipsResponseWire where
+    toJSON wire =
+        Aeson.object ["dryRun" .= wire.dryRun, "count" .= wire.count, "token" .= wire.token]
+    toEncoding wire =
+        pairs ("dryRun" .= wire.dryRun <> "count" .= wire.count <> "token" .= wire.token)
+
+instance FromJSON DeleteRelationshipsResponseWire where
+    parseJSON = withObject "DeleteRelationshipsResponseWire" \o ->
+        DeleteRelationshipsResponseWire <$> o .: "dryRun" <*> o .: "count" <*> o .:? "token"
+
 newtype WriteTuplesResponseWire = WriteTuplesResponseWire
     { token :: Text
     }
@@ -1096,6 +1301,47 @@ deleteTuplesHandler env request = enHandler do
     preconditions <- traverseOrInvalid preconditionFromWire (fromMaybe [] request.preconditions)
     token <- engine env (applyTupleWrites TupleWriteRequest{preconditions, writes = [], deletes})
     pure (tokenToWire token)
+
+readRelationshipsHandler ::
+    (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) =>
+    Env es ->
+    ReadRelationshipsRequestWire ->
+    Handler (EnResult ReadRelationshipsResponseWire)
+readRelationshipsHandler env request = enHandler do
+    consistency <- orInvalid (consistencyFromWire request.consistency)
+    relationshipFilter <- orInvalid (relationshipFilterFromWire request.filter)
+    limit <- orInvalid (positiveLimit request.limit)
+    page <-
+        engine env do
+            ResolvedConsistency{revision} <- resolveConsistency consistency
+            readRelationships revision relationshipFilter limit (StoreCursor <$> request.cursor)
+    pure (relationshipsPageToWire page)
+
+{- | Dry-run and deletion are one endpoint because they must ask the store the same
+question. Splitting them into @\/count@ and @\/delete@ would invite a caller to count
+against a snapshot and delete against a later one, and be surprised by the difference.
+
+The dry run resolves 'FullyConsistent' rather than the caller's consistency: a count read
+from a stale replica is not a preview of what a delete — which always acts on live state —
+is about to do.
+-}
+deleteRelationshipsHandler ::
+    (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) =>
+    Env es ->
+    DeleteRelationshipsRequestWire ->
+    Handler (EnResult DeleteRelationshipsResponseWire)
+deleteRelationshipsHandler env request = enHandler do
+    relationshipFilter <- orInvalid (relationshipFilterFromWire request.filter)
+    if request.dryRun
+        then do
+            count <-
+                engine env do
+                    ResolvedConsistency{revision} <- resolveConsistency FullyConsistent
+                    countRelationships revision relationshipFilter
+            pure DeleteRelationshipsResponseWire{dryRun = True, count, token = Nothing}
+        else do
+            (count, ConsistencyToken token) <- engine env (deleteRelationships relationshipFilter)
+            pure DeleteRelationshipsResponseWire{dryRun = False, count, token = Just token}
 
 checkHandler :: Env es -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
 checkHandler env request = enHandler do
@@ -1285,6 +1531,55 @@ tupleFilterFromWire tupleFilter
     nonEmpty label value
         | Text.null value = Left (label <> " must not be empty")
         | otherwise = Right value
+
+{- | Convert and then validate: a filter that decodes but does not anchor is still a
+client fault, and 'validateRelationshipFilter' owns the grammar. The two steps are one
+function so no handler can perform the first and forget the second.
+
+As in 'tupleFilterFromWire', an empty string is rejected rather than read as an absent
+constraint: @objectId: ""@ matches nothing, and silently widening it to "any object" would
+turn a narrow read into a table scan, or a narrow delete into a mass revocation.
+-}
+relationshipFilterFromWire :: RelationshipFilterWire -> Either Text RelationshipFilter
+relationshipFilterFromWire wire = do
+    converted <-
+        RelationshipFilter
+            <$> traverse (fmap ObjectType . nonEmpty "filter objectType") wire.objectType
+            <*> traverse (nonEmpty "filter objectId") wire.objectId
+            <*> traverse (fmap RelationName . nonEmpty "filter relation") wire.relation
+            <*> traverse (fmap ObjectType . nonEmpty "filter subjectType") wire.subjectType
+            <*> traverse (nonEmpty "filter subjectId") wire.subjectId
+            <*> subjectRelationFromWire (fromMaybe AnySubjectRelationWire wire.subjectRelation)
+            <*> traverse (fmap CaveatName . nonEmpty "filter caveatName") wire.caveatName
+    validateRelationshipFilter converted
+  where
+    nonEmpty label value
+        | Text.null value = Left (label <> " must not be empty")
+        | otherwise = Right value
+
+{- | A page limit must be positive. Zero would return an empty page whose cursor equals
+the caller's own, so a drain loop over it never terminates and never advances.
+-}
+positiveLimit :: Int -> Either Text Int
+positiveLimit limit
+    | limit <= 0 = Left "limit must be positive"
+    | otherwise = Right limit
+
+relationshipsPageToWire :: TuplePage -> ReadRelationshipsResponseWire
+relationshipsPageToWire TuplePage{rows, state} =
+    ReadRelationshipsResponseWire
+        { relationships = tupleToWire . (.tuple) <$> rows
+        , state = relationshipsStateToWire state
+        }
+
+relationshipsStateToWire :: PageState -> RelationshipsStateWire
+relationshipsStateToWire =
+    \case
+        Exhausted -> RelationshipsExhaustedWire
+        HasMore (StoreCursor cursor) -> RelationshipsHasMoreWire cursor
+        -- See 'RelationshipsStateWire': a stored-tuple read spends no budget, so it
+        -- cannot truncate. Resuming from the cursor is right regardless.
+        Truncated (StoreCursor cursor) -> RelationshipsHasMoreWire cursor
 
 subjectRelationFromWire :: SubjectRelationFilterWire -> Either Text SubjectRelationFilter
 subjectRelationFromWire = \case

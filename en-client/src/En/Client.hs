@@ -38,17 +38,25 @@ import En.Servant.API
 data EnClient = EnClient
     { writeTuples :: WriteTuplesRequestWire -> ClientM (EnResult WriteTuplesResponseWire)
     , deleteTuples :: DeleteTuplesRequestWire -> ClientM (EnResult WriteTuplesResponseWire)
+    , readRelationships :: ReadRelationshipsRequestWire -> ClientM (EnResult ReadRelationshipsResponseWire)
+    , deleteRelationships :: DeleteRelationshipsRequestWire -> ClientM (EnResult DeleteRelationshipsResponseWire)
     , check :: CheckRequestWire -> ClientM (EnResult CheckResponseWire)
     , batchCheck :: BatchCheckRequestWire -> ClientM (EnResult BatchCheckResponseWire)
     , lookup :: LookupRequestWire -> ClientM (EnResult LookupPageWire)
     , expand :: ExpandRequestWire -> ClientM (EnResult ExpandTreeWire)
     }
 
+{- | The pattern match below is positional: its order must be the order of the operations
+in 'En.Servant.API.EnAPI'. Adding a route anywhere but the end silently re-binds every
+field after it, and the types will not catch it when the neighbours' shapes agree.
+-}
 enClient :: EnClient
 enClient =
     EnClient
         { writeTuples
         , deleteTuples
+        , readRelationships
+        , deleteRelationships
         , check
         , batchCheck
         , lookup
@@ -57,6 +65,8 @@ enClient =
   where
     writeTuples
         :<|> deleteTuples
+        :<|> readRelationships
+        :<|> deleteRelationships
         :<|> check
         :<|> batchCheck
         :<|> lookup

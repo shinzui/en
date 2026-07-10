@@ -7,6 +7,7 @@ import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy (ByteString)
+import Data.Foldable qualified as Foldable
 import Data.Functor ((<&>))
 import Data.List qualified as List
 import Data.Map.Strict qualified as Map
@@ -46,6 +47,8 @@ import En.Servant.API (
     CheckRequestWire (..),
     CheckResponseWire (..),
     ConsistencyWire (..),
+    DeleteRelationshipsRequestWire (..),
+    DeleteRelationshipsResponseWire (..),
     DeleteTuplesRequestWire (..),
     EnResult (..),
     Env (..),
@@ -59,6 +62,10 @@ import En.Servant.API (
     LookupStateWire (..),
     ObjectRefWire (..),
     PreconditionWire (..),
+    ReadRelationshipsRequestWire (..),
+    ReadRelationshipsResponseWire (..),
+    RelationshipFilterWire (..),
+    RelationshipsStateWire (..),
     SubjectRelationFilterWire (..),
     SubjectWire (..),
     TupleCaveatWire (..),
@@ -345,6 +352,8 @@ writePreconditionTests env = do
                     , preconditions = Just [TupleMustExistWire (ownerFilter "alice"){objectType = ""}]
                     }
             )
+
+    relationshipEndpointTests env
   where
     bobOwnerTuple =
         TupleWire
@@ -375,13 +384,7 @@ openApiDocumentTests = do
 
     assertEqual
         "openapi document lists exactly the served operations"
-        [ "/v1/batch-check"
-        , "/v1/check"
-        , "/v1/expand"
-        , "/v1/lookup"
-        , "/v1/relationships"
-        , "/v1/relationships/delete"
-        ]
+        servedPaths
         (List.sort (objectKeys (document `at` "paths")))
 
     mapM_
@@ -391,18 +394,62 @@ openApiDocumentTests = do
                 ["200", "400", "412", "422", "503"]
                 (List.sort (objectKeys (document `at` "paths" `at` Key.fromText path `at` "post" `at` "responses")))
         )
+        servedPaths
+
+    assertBool
+        "openapi document defines the error envelope"
+        ("ErrorEnvelopeWire" `elem` objectKeys (document `at` "components" `at` "schemas"))
+
+    mapM_
+        ( \name ->
+            assertBool
+                ("openapi document defines " <> Text.unpack name)
+                (name `elem` objectKeys (document `at` "components" `at` "schemas"))
+        )
+        [ "RelationshipFilterWire"
+        , "ReadRelationshipsRequestWire"
+        , "ReadRelationshipsResponseWire"
+        , "RelationshipsStateWire"
+        , "DeleteRelationshipsRequestWire"
+        , "DeleteRelationshipsResponseWire"
+        ]
+
+    -- The filter's anchoring grammar cannot be expressed in `required`, so it must reach
+    -- the reader through the description. Losing it makes the 400 look arbitrary.
+    assertBool
+        "the relationship filter schema documents its anchoring rule"
+        ( "objectType"
+            `Text.isInfixOf` asText (document `at` "components" `at` "schemas" `at` "RelationshipFilterWire" `at` "description")
+        )
+
+    -- dryRun is required. A schema that made it optional would tell a code generator to
+    -- emit a field a caller can leave out of the most destructive call in the API.
+    assertEqual
+        "delete-by-filter requires both filter and dryRun"
+        ["dryRun", "filter"]
+        ( List.sort
+            (asTextList (document `at` "components" `at` "schemas" `at` "DeleteRelationshipsRequestWire" `at` "required"))
+        )
+  where
+    servedPaths =
         [ "/v1/batch-check"
         , "/v1/check"
         , "/v1/expand"
         , "/v1/lookup"
         , "/v1/relationships"
         , "/v1/relationships/delete"
+        , "/v1/relationships/delete-by-filter"
+        , "/v1/relationships/query"
         ]
 
-    assertBool
-        "openapi document defines the error envelope"
-        ("ErrorEnvelopeWire" `elem` objectKeys (document `at` "components" `at` "schemas"))
-  where
+    asText :: Aeson.Value -> Text
+    asText (Aeson.String text) = text
+    asText _ = ""
+
+    asTextList :: Aeson.Value -> [Text]
+    asTextList (Aeson.Array values) = asText <$> Foldable.toList values
+    asTextList _ = []
+
     at :: Aeson.Value -> Key.Key -> Aeson.Value
     at (Aeson.Object o) key = maybe Aeson.Null id (KeyMap.lookup key o)
     at _ _ = Aeson.Null
@@ -410,6 +457,153 @@ openApiDocumentTests = do
     objectKeys :: Aeson.Value -> [Text]
     objectKeys (Aeson.Object o) = Key.toText <$> KeyMap.keys o
     objectKeys _ = []
+
+{- | A 'RelationshipFilterWire' built positionally, in field order: object type, object
+id, relation, subject type, subject id, subject relation, caveat name.
+
+A constructor application rather than a record update over an empty filter, because
+'TupleFilterWire' declares five of the same field names and GHC cannot disambiguate an
+update whose every field is shared.
+-}
+relationshipFilterWire ::
+    Maybe Text ->
+    Maybe Text ->
+    Maybe Text ->
+    Maybe Text ->
+    Maybe Text ->
+    Maybe SubjectRelationFilterWire ->
+    Maybe Text ->
+    RelationshipFilterWire
+relationshipFilterWire objectType objectId relation subjectType subjectId subjectRelation caveatName =
+    RelationshipFilterWire
+        { objectType
+        , objectId
+        , relation
+        , subjectType
+        , subjectId
+        , subjectRelation
+        , caveatName
+        }
+
+emptyFilterWire :: RelationshipFilterWire
+emptyFilterWire =
+    relationshipFilterWire Nothing Nothing Nothing Nothing Nothing Nothing Nothing
+
+subjectFilterWire :: Text -> Text -> RelationshipFilterWire
+subjectFilterWire subjectType subjectId =
+    relationshipFilterWire Nothing Nothing Nothing (Just subjectType) (Just subjectId) Nothing Nothing
+
+{- | The relationship query and delete-by-filter endpoints, against the in-memory store.
+
+Each 'runPorts' call reinterprets 'runTupleStoreInMemory' over the fixture, so the store
+is fresh per handler call and a deletion is not observable by a later read. That the
+delete really retires rows — and that a pre-delete snapshot still sees them — is asserted
+against PostgreSQL, in @en-postgres/integration-test/Main.hs@; here the question is only
+whether the wire surface says the right things.
+-}
+relationshipEndpointTests :: Env TestEffects -> IO ()
+relationshipEndpointTests env = do
+    let query relationshipFilter limit cursor =
+            readRelationshipsHandler
+                env
+                ReadRelationshipsRequestWire
+                    { consistency = MinimizeLatencyWire
+                    , filter = relationshipFilter
+                    , limit
+                    , cursor
+                    }
+
+        -- The fixture's two grants naming alice: space:project-x#owner and
+        -- intention:42#delegate, in that row order.
+        aliceGrants =
+            [ ("space", "project-x", "owner")
+            , ("intention", "42", "delegate")
+            ]
+
+        identify response =
+            [ (wire.object.objectType, wire.object.objectId, wire.relation)
+            | wire <- response.relationships
+            ]
+
+        okQuery label relationshipFilter limit cursor =
+            runHandler (query relationshipFilter limit cursor) >>= \case
+                Right (EnOk response) -> pure response
+                other -> fail (label <> "\nexpected EnOk, got: " <> show other)
+
+    aliceAll <- okQuery "query alice" (subjectFilterWire "user" "alice") 100 Nothing
+    assertEqual "query returns every grant naming the subject" aliceGrants (identify aliceAll)
+    assertEqual "a complete page is exhausted" RelationshipsExhaustedWire aliceAll.state
+
+    -- Keyset pagination: the cursor resumes, it does not restart.
+    firstPage <- okQuery "query alice, page 1" (subjectFilterWire "user" "alice") 1 Nothing
+    assertEqual "the first page carries the requested limit" (take 1 aliceGrants) (identify firstPage)
+    cursor <-
+        case firstPage.state of
+            RelationshipsHasMoreWire next -> pure next
+            other -> fail ("expected the first page to have more, got " <> show other)
+    secondPage <- okQuery "query alice, page 2" (subjectFilterWire "user" "alice") 1 (Just cursor)
+    assertEqual "the second page resumes rather than restarts" (drop 1 aliceGrants) (identify secondPage)
+    assertEqual "the second page is exhausted" RelationshipsExhaustedWire secondPage.state
+
+    -- A caveat name is a residual predicate, and it is anchored by the subject.
+    caveated <-
+        okQuery
+            "query alice's caveated grants"
+            (relationshipFilterWire Nothing Nothing Nothing (Just "user") (Just "alice") Nothing (Just "within_autonomy"))
+            100
+            Nothing
+    assertEqual
+        "a caveat-name constraint selects only the caveated grant"
+        [("intention", "42", "delegate")]
+        (identify caveated)
+
+    -- The grammar, on the wire. Each of these is a 400, not an expensive answer.
+    assertEqual
+        "a filter anchored on neither end is a client error"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf (query emptyFilterWire 100 Nothing)
+    assertEqual
+        "a filter whose objectId names no objectType is a client error"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf
+            (query (relationshipFilterWire Nothing (Just "project-x") Nothing (Just "user") Nothing Nothing Nothing) 100 Nothing)
+    assertEqual
+        "a filter whose subjectId names no subjectType is a client error"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf
+            (query (relationshipFilterWire (Just "space") Nothing Nothing Nothing (Just "alice") Nothing Nothing) 100 Nothing)
+    assertEqual
+        "an empty-string constraint is a client error, not an absent one"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf
+            (query (relationshipFilterWire Nothing Nothing Nothing (Just "") Nothing Nothing Nothing) 100 Nothing)
+    -- A zero limit returns an empty page whose cursor is the caller's own, so a drain
+    -- loop over it would spin forever.
+    assertEqual
+        "a non-positive limit is a client error"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf (query (subjectFilterWire "user" "alice") 0 Nothing)
+
+    -- Delete-by-filter: a dry run counts and writes nothing; a real delete returns a token.
+    runHandler (deleteRelationshipsHandler env DeleteRelationshipsRequestWire{filter = subjectFilterWire "user" "alice", dryRun = True}) >>= \case
+        Right (EnOk response) ->
+            assertEqual
+                "a dry run reports the match count and mints no token"
+                DeleteRelationshipsResponseWire{dryRun = True, count = 2, token = Nothing}
+                response
+        other -> fail ("dry run\nexpected EnOk, got: " <> show other)
+
+    runHandler (deleteRelationshipsHandler env DeleteRelationshipsRequestWire{filter = subjectFilterWire "user" "alice", dryRun = False}) >>= \case
+        Right (EnOk response) -> do
+            assertEqual "a real delete reports the same count" 2 response.count
+            assertBool "a real delete mints a token" (response.token /= Nothing)
+            assertBool "a real delete says it was not a dry run" (not response.dryRun)
+        other -> fail ("delete\nexpected EnOk, got: " <> show other)
+
+    assertEqual
+        "delete-by-filter rejects an unanchored filter before deleting anything"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf (deleteRelationshipsHandler env DeleteRelationshipsRequestWire{filter = emptyFilterWire, dryRun = False})
 
 {- | Pin the engine-error mapping: status, stable code, and retryability.
 
@@ -688,6 +882,77 @@ wireContractTests = do
             , subjectId = Nothing
             , subjectRelation = Nothing
             }
+    -- The offboarding filter: anchored on the subject alone, every other field absent.
+    golden
+        "RelationshipFilterWire/subject"
+        "{\"subjectType\":\"user\",\"subjectId\":\"alice\"}"
+        (subjectFilterWire "user" "alice")
+    golden
+        "RelationshipFilterWire/full"
+        "{\"objectType\":\"space\",\"objectId\":\"project-x\",\"relation\":\"member\",\"subjectType\":\"user\",\"subjectId\":\"alice\",\"subjectRelation\":{\"match\":\"none\"},\"caveatName\":\"business_hours\"}"
+        ( relationshipFilterWire
+            (Just "space")
+            (Just "project-x")
+            (Just "member")
+            (Just "user")
+            (Just "alice")
+            (Just NoSubjectRelationWire)
+            (Just "business_hours")
+        )
+    -- The empty object decodes: it is a well-formed filter that the *grammar* rejects,
+    -- not a malformed body. The 400 comes from relationshipFilterFromWire, and says why.
+    assertEqual
+        "RelationshipFilterWire decodes an empty object as a wholly unconstrained filter"
+        (Just emptyFilterWire)
+        (decode "{}")
+
+    golden
+        "ReadRelationshipsRequestWire"
+        "{\"consistency\":{\"mode\":\"fullyConsistent\"},\"filter\":{\"subjectType\":\"user\",\"subjectId\":\"alice\"},\"limit\":100,\"cursor\":null}"
+        ReadRelationshipsRequestWire
+            { consistency = FullyConsistentWire
+            , filter = subjectFilterWire "user" "alice"
+            , limit = 100
+            , cursor = Nothing
+            }
+
+    golden "RelationshipsStateWire/exhausted" "{\"status\":\"exhausted\"}" RelationshipsExhaustedWire
+    golden
+        "RelationshipsStateWire/hasMore"
+        "{\"status\":\"hasMore\",\"cursor\":\"42\"}"
+        (RelationshipsHasMoreWire "42")
+    rejects
+        "RelationshipsStateWire"
+        (decode "{\"status\":\"truncated\",\"cursor\":\"42\"}" :: Maybe RelationshipsStateWire)
+
+    golden
+        "ReadRelationshipsResponseWire"
+        "{\"relationships\":[{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"relation\":\"viewer\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"caveat\":null}],\"state\":{\"status\":\"exhausted\"}}"
+        ReadRelationshipsResponseWire
+            { relationships = [viewerTuple]
+            , state = RelationshipsExhaustedWire
+            }
+
+    golden
+        "DeleteRelationshipsRequestWire"
+        "{\"filter\":{\"subjectType\":\"user\",\"subjectId\":\"alice\"},\"dryRun\":true}"
+        DeleteRelationshipsRequestWire{filter = subjectFilterWire "user" "alice", dryRun = True}
+    -- dryRun has no default: the most destructive call in the API states its intent or
+    -- does not decode.
+    assertEqual
+        "DeleteRelationshipsRequestWire refuses a body that omits dryRun"
+        Nothing
+        (decode "{\"filter\":{\"subjectType\":\"user\",\"subjectId\":\"alice\"}}" :: Maybe DeleteRelationshipsRequestWire)
+
+    golden
+        "DeleteRelationshipsResponseWire/dryRun"
+        "{\"dryRun\":true,\"count\":3,\"token\":null}"
+        DeleteRelationshipsResponseWire{dryRun = True, count = 3, token = Nothing}
+    golden
+        "DeleteRelationshipsResponseWire/deleted"
+        "{\"dryRun\":false,\"count\":3,\"token\":\"en1.abc\"}"
+        DeleteRelationshipsResponseWire{dryRun = False, count = 3, token = Just "en1.abc"}
+
     golden
         "PreconditionWire/mustExist"
         "{\"kind\":\"mustExist\",\"filter\":{\"objectType\":\"space\",\"objectId\":\"project-x\",\"relation\":\"member\",\"subjectType\":\"user\",\"subjectId\":\"alice\",\"subjectRelation\":{\"match\":\"none\"}}}"
@@ -763,71 +1028,72 @@ newCheckCacheEnv = do
     cache <- newCache CacheConfig{enabled = True, maxEntries = 100} :: IO (Cache SubproblemKey ResidualDecision)
     pure CheckCacheEnv{cacheDatastoreId = DatastoreId "test", cacheDecisions = cache}
 
-batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
-batchHandler env =
-    batch
+{- | The handlers 'server' returns, named.
+
+'server' answers with a positional @:\<|\>@ chain, so every consumer that wants one
+handler must spell out the whole shape. Written once per handler — as it was until
+docs/plans/50 added two routes in the middle of the chain — a new route silently rebinds
+each later name to its neighbour, and nothing catches it wherever the neighbours' types
+agree. @check@ and @batchCheck@ do not agree, but @writeTuples@ and @deleteTuples@ very
+nearly do. Destructuring once, here, means a route added anywhere breaks this one
+pattern loudly.
+-}
+data Handlers = Handlers
+    { writeTuples :: WriteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
+    , deleteTuples :: DeleteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
+    , readRelationships :: ReadRelationshipsRequestWire -> Handler (EnResult ReadRelationshipsResponseWire)
+    , deleteRelationships :: DeleteRelationshipsRequestWire -> Handler (EnResult DeleteRelationshipsResponseWire)
+    , check :: CheckRequestWire -> Handler (EnResult CheckResponseWire)
+    , batchCheck :: BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
+    , lookup :: LookupRequestWire -> Handler (EnResult LookupPageWire)
+    , expand :: ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
+    }
+
+handlers :: Env TestEffects -> Handlers
+handlers env =
+    Handlers
+        { writeTuples = writeTuplesEndpoint
+        , deleteTuples = deleteTuplesEndpoint
+        , readRelationships = readRelationshipsEndpoint
+        , deleteRelationships = deleteRelationshipsEndpoint
+        , check = checkEndpoint
+        , batchCheck = batchCheckEndpoint
+        , lookup = lookupEndpoint
+        , expand = expandEndpoint
+        }
   where
-    _write
-        :<|> _delete
-        :<|> _check
-        :<|> batch
-        :<|> _lookup
-        :<|> _expand = server env
+    writeTuplesEndpoint
+        :<|> deleteTuplesEndpoint
+        :<|> readRelationshipsEndpoint
+        :<|> deleteRelationshipsEndpoint
+        :<|> checkEndpoint
+        :<|> batchCheckEndpoint
+        :<|> lookupEndpoint
+        :<|> expandEndpoint = server env
+
+batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
+batchHandler env = (handlers env).batchCheck
 
 checkHandler :: Env TestEffects -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
-checkHandler env =
-    checkEndpoint
-  where
-    _write
-        :<|> _delete
-        :<|> checkEndpoint
-        :<|> _batch
-        :<|> _lookup
-        :<|> _expand = server env
+checkHandler env = (handlers env).check
 
 lookupHandler :: Env TestEffects -> LookupRequestWire -> Handler (EnResult LookupPageWire)
-lookupHandler env =
-    lookupEndpoint
-  where
-    _write
-        :<|> _delete
-        :<|> _check
-        :<|> _batch
-        :<|> lookupEndpoint
-        :<|> _expand = server env
+lookupHandler env = (handlers env).lookup
 
 writeTuplesHandler :: Env TestEffects -> WriteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
-writeTuplesHandler env =
-    writeEndpoint
-  where
-    writeEndpoint
-        :<|> _delete
-        :<|> _check
-        :<|> _batch
-        :<|> _lookup
-        :<|> _expand = server env
+writeTuplesHandler env = (handlers env).writeTuples
 
 deleteTuplesHandler :: Env TestEffects -> DeleteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
-deleteTuplesHandler env =
-    deleteEndpoint
-  where
-    _write
-        :<|> deleteEndpoint
-        :<|> _check
-        :<|> _batch
-        :<|> _lookup
-        :<|> _expand = server env
+deleteTuplesHandler env = (handlers env).deleteTuples
 
 expandHandler :: Env TestEffects -> ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
-expandHandler env =
-    expandEndpoint
-  where
-    _write
-        :<|> _delete
-        :<|> _check
-        :<|> _batch
-        :<|> _lookup
-        :<|> expandEndpoint = server env
+expandHandler env = (handlers env).expand
+
+readRelationshipsHandler :: Env TestEffects -> ReadRelationshipsRequestWire -> Handler (EnResult ReadRelationshipsResponseWire)
+readRelationshipsHandler env = (handlers env).readRelationships
+
+deleteRelationshipsHandler :: Env TestEffects -> DeleteRelationshipsRequestWire -> Handler (EnResult DeleteRelationshipsResponseWire)
+deleteRelationshipsHandler env = (handlers env).deleteRelationships
 
 -- | Did the engine stop early because its deadline had elapsed?
 isTruncated :: EnResult LookupPageWire -> Bool

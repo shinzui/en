@@ -86,6 +86,8 @@ import En.Servant.API (
     CheckRequestWire,
     CheckResponseWire,
     ConsistencyWire,
+    DeleteRelationshipsRequestWire,
+    DeleteRelationshipsResponseWire,
     DeleteTuplesRequestWire,
     EnAPI,
     Env,
@@ -99,6 +101,10 @@ import En.Servant.API (
     LookupStateWire,
     ObjectRefWire,
     PreconditionWire,
+    ReadRelationshipsRequestWire,
+    ReadRelationshipsResponseWire,
+    RelationshipFilterWire,
+    RelationshipsStateWire,
     SubjectRelationFilterWire,
     SubjectWire,
     TupleCaveatWire,
@@ -460,6 +466,81 @@ instance ToSchema TupleFilterWire where
                     , ("subjectId", textRef)
                     , ("subjectRelation", subjectRelation)
                     ]
+
+{- | Every field is optional, so the schema requires none. The anchoring grammar — at
+least one of @objectType@ or @subjectType@, and the two dependency rules — is a
+constraint OpenAPI cannot express, so it lives in the description instead of in
+@required@, and is enforced by 'En.Servant.API.relationshipFilterFromWire'.
+-}
+instance ToSchema RelationshipFilterWire where
+    declareNamedSchema _ = do
+        subjectRelation <- declareSchemaRef (Proxy @SubjectRelationFilterWire)
+        pure $
+            NamedSchema (Just "RelationshipFilterWire") $
+                partialObjectSchema
+                    []
+                    [ ("objectType", textRef)
+                    , ("objectId", textRef)
+                    , ("relation", textRef)
+                    , ("subjectType", textRef)
+                    , ("subjectId", textRef)
+                    , ("subjectRelation", subjectRelation)
+                    , ("caveatName", textRef)
+                    ]
+                    & description
+                        ?~ "Must constrain objectType or subjectType. objectId requires objectType; \
+                           \subjectId and a subjectRelation other than \"any\" require subjectType. \
+                           \A filter anchored on neither end would scan the whole store and is rejected \
+                           \with 400."
+
+instance ToSchema ReadRelationshipsRequestWire where
+    declareNamedSchema _ = do
+        consistency <- declareSchemaRef (Proxy @ConsistencyWire)
+        relationshipFilter <- declareSchemaRef (Proxy @RelationshipFilterWire)
+        pure $
+            NamedSchema (Just "ReadRelationshipsRequestWire") $
+                objectSchema
+                    [ ("consistency", consistency)
+                    , ("filter", relationshipFilter)
+                    , ("limit", primitive OpenApiInteger)
+                    , ("cursor", nullable textRef)
+                    ]
+
+instance ToSchema RelationshipsStateWire where
+    declareNamedSchema _ =
+        pure $
+            sumSchema
+                "RelationshipsStateWire"
+                [ objectSchema [("status", literal "exhausted")]
+                , objectSchema [("status", literal "hasMore"), ("cursor", textRef)]
+                ]
+
+instance ToSchema ReadRelationshipsResponseWire where
+    declareNamedSchema _ = do
+        tuple <- declareSchemaRef (Proxy @TupleWire)
+        state <- declareSchemaRef (Proxy @RelationshipsStateWire)
+        pure $
+            NamedSchema (Just "ReadRelationshipsResponseWire") $
+                objectSchema [("relationships", arrayOf tuple), ("state", state)]
+
+instance ToSchema DeleteRelationshipsRequestWire where
+    declareNamedSchema _ = do
+        relationshipFilter <- declareSchemaRef (Proxy @RelationshipFilterWire)
+        pure $
+            NamedSchema (Just "DeleteRelationshipsRequestWire") $
+                objectSchema [("filter", relationshipFilter), ("dryRun", primitive OpenApiBoolean)]
+                    & description
+                        ?~ "dryRun has no default. A dry run reports how many relationships the filter \
+                           \matches and deletes nothing; dryRun=false retires every match and returns a \
+                           \consistency token that sees the revocation."
+
+instance ToSchema DeleteRelationshipsResponseWire where
+    declareNamedSchema _ =
+        pure $
+            NamedSchema (Just "DeleteRelationshipsResponseWire") $
+                partialObjectSchema
+                    [("dryRun", primitive OpenApiBoolean), ("count", primitive OpenApiInteger)]
+                    [("token", nullable textRef)]
 
 instance ToSchema PreconditionWire where
     declareNamedSchema _ = do

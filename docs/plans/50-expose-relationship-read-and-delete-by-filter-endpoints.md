@@ -53,8 +53,11 @@ This section must always reflect the actual current state of the work.
 - [x] M2 (2026-07-09): implemented `readRelationshipsSession`, `countRelationshipsSession`, and `deleteRelationshipsSession` in `en-postgres/src/En/Postgres/TupleStore.hs`, with `compileFilter` composing each statement's predicate and encoder from the fields actually present.
 - [x] M2 (2026-07-09): extended `en-postgres/integration-test/Main.hs` with `runRelationshipFilterScenario` — eleven non-empty filter shapes and four deliberately-empty ones, each cross-checked against `matchesRelationshipFilter`; keyset pagination; delete-by-filter with the pre-delete snapshot still seeing the retired grants and the returned token not; and delete idempotence. `cabal test en-postgres-integration-tests` passes.
 - [x] M2 (2026-07-09): captured `EXPLAIN (ANALYZE, BUFFERS)` for the composed and null-guard forms and for the delete `UPDATE`; recorded in Surprises & Discoveries. The null-guard form under a generic plan costs 3527 buffers and 40.6 ms against the composed form's 4 buffers and 0.033 ms.
-- [ ] M3: Add wire DTOs, the two routes, and handlers in `en-servant/src/En/Servant/API.hs`; extend `en-servant/test/Main.hs`.
-- [ ] M3: Add `readRelationships` and `deleteRelationships` to `EnClient` in `en-client/src/En/Client.hs`.
+- [x] M3 (2026-07-09): added `RelationshipFilterWire`, `ReadRelationshipsRequestWire`, `RelationshipsStateWire`, `ReadRelationshipsResponseWire`, `DeleteRelationshipsRequestWire`, and `DeleteRelationshipsResponseWire` with hand-written aeson instances; added the routes `POST /v1/relationships/query` and `POST /v1/relationships/delete-by-filter` and their handlers to `en-servant/src/En/Servant/API.hs`.
+- [x] M3 (2026-07-09): added hand-written `ToSchema` instances for all six new wire types in `en-servant/src/En/Servant/OpenApi.hs`, which the API type made a compile error rather than an omission.
+- [x] M3 (2026-07-09): added `readRelationships` and `deleteRelationships` to `EnClient` in `en-client/src/En/Client.hs`.
+- [x] M3 (2026-07-09): extended `en-servant/test/Main.hs` with golden encodings for the six wire types, `relationshipEndpointTests` (query, pagination, caveat residual, five grammar rejections, dry run, real delete), and OpenAPI assertions for the two new paths, the six new schemas, and `dryRun` being required. `cabal test all` passes across all seven suites.
+- [x] M3 (2026-07-09): replaced six positional `server env` destructurings in `en-servant/test/Main.hs` with one `Handlers` record — see Surprises & Discoveries.
 - [ ] M4: Run the end-to-end curl transcripts ("list grants for alice", "offboard alice") against a locally running `en-server` and paste the observed output into Validation and Acceptance.
 
 
@@ -155,6 +158,25 @@ implementation. Provide concise evidence.
   to the rows the anchor already selected rather than to the table. Reinstating the partial
   live indexes docs/plans/49 dropped would buy nothing here and would cost every write the
   index maintenance EP-49 measured. They stay dropped.
+
+- 2026-07-09, M3 (a latent trap in the test suite, now closed): `server` returns its
+  handlers as a positional `:<|>` chain, and `en-servant/test/Main.hs` destructured that
+  chain separately in each of six helpers, naming the one handler it wanted and prefixing
+  the rest with an underscore. Inserting two routes in the middle of the chain — as this
+  plan does — rebinds every name after the insertion point to its neighbour. The type
+  checker catches this only where the neighbours' request types differ. `writeTuples` and
+  `deleteTuples` both answer `EnResult WriteTuplesResponseWire`, so a shift between those
+  two is silent, and the suite would have gone on testing the write handler while claiming
+  to test the delete handler. Replaced with a single `Handlers` record destructured once,
+  so a route added anywhere breaks exactly one pattern, loudly. The same hazard exists in
+  `en-client/src/En/Client.hs`, where the chain is also destructured once; a comment there
+  now says why the order is load-bearing.
+
+- 2026-07-09, M3 (the OpenAPI document is compile-enforced): adding the routes to `EnAPI`
+  broke `en-servant/src/En/Servant/OpenApi.hs` with `No instance for ToSchema
+  ReadRelationshipsRequestWire` before any test ran. The document cannot silently fall
+  behind the API. Worth recording because it is the opposite of what a hand-written
+  description usually gives you.
 
 - 2026-07-09, M0 (index premise falsified): the Context and Orientation section below says
   the partial live indexes "are, however, exactly right for the delete-by-filter `UPDATE`,
