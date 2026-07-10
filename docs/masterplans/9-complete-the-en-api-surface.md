@@ -69,7 +69,7 @@ verifiable without the others.
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | EP-50 | Expose relationship read and delete-by-filter endpoints | docs/plans/50-expose-relationship-read-and-delete-by-filter-endpoints.md | None | None | Complete |
-| EP-51 | Return checked-at consistency tokens from read responses | docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md | None | None | In Progress |
+| EP-51 | Return checked-at consistency tokens from read responses | docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md | None | None | Complete |
 | EP-52 | Add a lookup-subjects API | docs/plans/52-add-a-lookup-subjects-api.md | None | None | Not Started |
 | EP-53 | Add a watch changelog API | docs/plans/53-add-a-watch-changelog-api.md | None | None | Not Started |
 | EP-54 | Manage the schema lifecycle at runtime | docs/plans/54-manage-the-schema-lifecycle-at-runtime.md | None | EP-50 | Not Started |
@@ -117,6 +117,16 @@ EP-52 and EP-53 must include the same field in their new response DTOs from day 
 (they consume EP-51's convention; if they land first, they add the field following the
 review's E3 description and EP-51 reconciles).
 
+**Landed 2026-07-09.** The convention is: wire field `checkedAt :: !Text`, last in the
+response object; core field `checkedAt :: !ConsistencyToken` on the result record; minted
+by `mintToken` (the `ConsistencyStore` effect operation, a pure encode) from the revision
+the read *resolved to*, never echoed from the request. `check`/`checkCached` return
+`CheckOutcome`, `checkMany` returns `BatchOutcome`, and `LookupPage`/`ExpandTree` carry the
+field. `ReadRelationshipsResponseWire` (EP-50's) gained it here. The cursored-read rule is
+load-bearing and is spelled out in Surprises & Discoveries: on resume, take the token from
+the cursor's validated token and do not re-resolve the request's `consistency`. EP-52 and
+EP-53 are both cursored.
+
 The watch changelog storage query (EP-53) reads `relation_tuple.created_xid`/
 `deleted_xid` ordered by transaction visibility, likely via
 `relation_tuple_created_xid_idx` — the index that
@@ -148,7 +158,7 @@ immutable argument and EP-54 rewires them.
 
 - [x] EP-50 (2026-07-09): `POST /v1/relationships/query` lists relationships by filter with keyset pagination
 - [x] EP-50 (2026-07-09): `POST /v1/relationships/delete-by-filter` with a mandatory dry-run flag; offboarding a user is one call
-- [ ] EP-51: every read response carries the token it was evaluated at; write-then-read-at-token round-trips
+- [x] EP-51 (2026-07-09): every read response carries the token it was evaluated at; write-then-read-at-token round-trips
 - [ ] EP-52: lookup-subjects returns a flat, cursored subject set with correct caveat and operator handling
 - [ ] EP-53: watch feed streams tuple changes since a revision; expired cursors rejected with a typed error
 - [ ] EP-54: schema read endpoint and explicit reload without restart; old-schema requests drain safely
@@ -251,6 +261,54 @@ immutable argument and EP-54 rewires them.
   older `en-server` binary. The second bind fails, but `GET /healthz` still answers `200`
   from the stale process, so an acceptance run against 8080 silently exercises the wrong
   build. Use `EN_PORT=<free> EN_AUTH_DISABLED=true cabal run en-server` instead.
+  **EP-51 confirms and widens this**: on the same machine 8080 was held by an unrelated
+  `ssh` tunnel, not an `en-server` at all. Anything listening there will answer. Check with
+  `lsof -nP -iTCP:8080 -sTCP:LISTEN` before assuming what you are talking to.
+
+- 2026-07-09 (EP-51 complete; **cancels EP-51's Milestone 1 and rewrites what EP-53 may
+  assume**): the token-minting primitive EP-51 was to introduce already existed.
+  `docs/plans/42` (master plan 7) added `MintToken` to the `ConsistencyStore` effect in
+  commit `b2ab2c5`, because closing the forgeable-lookup-cursor hole required the datastore
+  to mint a token a cursor could carry. It landed with the exact encoding EP-51 specified
+  and a Haddock naming `checked_at` as a future consumer. Every interpreter implements it:
+  `en-postgres/src/En/Postgres/Revision.hs`, both in-memory stores in
+  `en-core/src/En/Conformance/Kikan.hs`, and both stores in
+  `en-example/src/En/Example/Host.hs`. `MintToken` is a *pure encode* in all of them —
+  `pure (encodeToken …)`, never a database session — so a read response can carry a token
+  at no round-trip cost. EP-53's watch feed should mint its cursor and its `checkedAt` the
+  same way rather than inventing a revision encoding.
+
+- 2026-07-09 (EP-51 complete; **binds EP-52 and EP-53**): the `checkedAt` convention is now
+  fixed and must be copied. On the wire it is `checkedAt :: !Text`, placed **last** in the
+  response object (the hand-written `toEncoding` fixes field order, and the golden tests in
+  `en-servant/test/Main.hs` assert exact bytes). In core it is
+  `checkedAt :: !ConsistencyToken` on the result record. It is minted from the revision the
+  read *resolved to*, never echoed from the request: a check at `AtLeastAsFresh` a token
+  whose revision was `27796:27797:` was observed reporting `27797:27797:`, because
+  "no older than" resolved something fresher. For a **cursored** read — which both EP-52 and
+  EP-53 are — the resume path must take the token from the cursor's *validated* token and
+  must **not** re-resolve the request's `consistency`. EP-51 observed a lookup page-two
+  request asking for `minimizeLatency` and correctly receiving page one's snapshot. A
+  cursored read that re-resolves silently spans two snapshots and produces a page with gaps.
+
+- 2026-07-09 (EP-51 complete; affects `docs/plans/57`, master plan 10): EP-51's hard
+  dependency for Biscuit minting is discharged — `CheckResponseWire.checkedAt` exists — but
+  EP-51 deliberately did **not** rewire `mintCheckedObjectGrant` in
+  `en-biscuit/src/En/Biscuit/Mint.hs`. That function still stamps the minted `EnGrant` with
+  the *caller-supplied* `grant.consistencyToken` rather than `outcome.checkedAt`, the
+  snapshot its decision was actually made at. It is now a one-line fix and it belongs to
+  EP-57, which owns grant semantics; re-stamping an authorization token's snapshot from
+  inside a plan scoped to "what reads return" would be the wrong place to decide it. A
+  comment at the call site records this. EP-57 must not assume it was already done.
+
+- 2026-07-09 (EP-51 complete; corrects this master plan's Integration Points below):
+  `checkMany` returns `BatchOutcome { decisions :: ![Either EnError CheckDecision],
+  checkedAt :: !ConsistencyToken }` — the `Either` because master plan 7's engine hardening
+  already made batch checks preserve per-pair failures. `check` and `checkCached` return
+  `CheckOutcome { decision, checkedAt }`. `checkAtRevision` and `checkCachedAtRevision`
+  return a bare decision and mint nothing: they take an already-resolved revision, and
+  minting inside them would emit one identical, discarded token per confirmed lookup
+  candidate.
 
 
 ## Decision Log
@@ -272,6 +330,15 @@ immutable argument and EP-54 rewires them.
   Date: 2026-07-09
 - Decision: EP-49's index trim is settled ahead of EP-53, not concurrently with it.
   Rationale: The Integration Points paragraph asks EP-53 and EP-49 to reconcile before either lands. EP-49 is Complete: it dropped the two partial `*_live_idx` indexes and kept `relation_tuple_created_xid_idx`, which is the index EP-53's changelog query wants. There is nothing left to reconcile; EP-53 inherits a settled index set and must record that it did.
+  Date: 2026-07-09
+- Decision: EP-51's Milestone 1 is marked complete as pre-landed rather than reimplemented, and EP-51's fourth Decision Log entry is recorded as moot.
+  Rationale: `docs/plans/42` (master plan 7) already added `MintToken` with the exact encoding EP-51 specified, and already replaced the forgeable raw revision in lookup cursors with a validated token. Reimplementing either would have been a no-op at best and a fork of the token format at worst. Recorded here because it is the second time a child of this master plan has found its groundwork already laid by a master plan that ran first — see the first Surprises entry.
+  Date: 2026-07-09
+- Decision: `checkedAt` is the snapshot the read resolved to, not the token the request supplied.
+  Rationale: Observed live: a check at `AtLeastAsFresh` a write token pinning `27796:27797:` reported `27797:27797:`. "No older than" permits a fresher snapshot, and reporting the request's token back would misstate what was read — the precise defect the field exists to fix. Every child adding a read endpoint must mint from the resolved revision.
+  Date: 2026-07-09
+- Decision: EP-51 does not fix `mintCheckedObjectGrant`'s use of the caller-supplied `consistencyToken`; `docs/plans/57` does.
+  Rationale: The function mints an `EnGrant` stamped with a token the caller chose rather than the one its decision was made at — exactly the E3 defect, in the one place it is a security property rather than an ergonomic one. EP-51's scope is what reads return. Changing an authorization token's recorded snapshot is a semantic change to en-biscuit, and EP-57 hard-depends on EP-51 for the express purpose of making it. Left as a one-line fix with a comment at the call site.
   Date: 2026-07-09
 
 

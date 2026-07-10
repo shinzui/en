@@ -55,7 +55,7 @@ This section must always reflect the actual current state of the work.
 - [x] M3 (2026-07-09): `Env.checkOperation` in `en-servant/src/En/Servant/Seam.hs` returns `Eff es CheckOutcome`. `Authorize.requirePermission` and `En.Example.Host.resolveWithGate` project `.decision`. `en-server/app/Main.hs` needed no change, as predicted.
 - [x] M3 (2026-07-09): `checkedAt` added to `CheckResponseWire`, `BatchCheckResponseWire`, `LookupPageWire`, `ExpandTreeWire`, and `ReadRelationshipsResponseWire`; handlers, `ToSchema` instances, and `en-servant/test/Main.hs` updated. `CheckResponseWire` and `BatchCheckResponseWire` stopped being newtypes.
 - [x] M3 (2026-07-09): `en-client/src/En/Client.hs` needed only recompilation; `chainFrom` added and exported.
-- [ ] M4: Run the write → check → lookup chaining transcript against a live server and paste the observed output into Validation and Acceptance.
+- [x] M4 (2026-07-09): Ran the write → check → lookup chain against a live `en-server` on PostgreSQL. Observed output pasted into Validation and Acceptance, along with batch-check's single token, expand, `relationships/query`, the tampered-token negative control, and a cursor-resume demonstration. The repository's own smoke test (`just test-server`) still passes.
 
 
 ## Surprises & Discoveries
@@ -121,6 +121,49 @@ implementation. Provide concise evidence.
   costs one `mintToken` call and no extra store round trip (`MintToken` is a pure encode in
   every interpreter — `pure (encodeToken …)`, no database session).
 
+- 2026-07-09 (M4): **`checkedAt` is not an echo of the request's token, and the live
+  transcript shows it.** A check at `AtLeastAsFresh` a write token whose revision was
+  `27796:27797:` reported `checkedAt` with revision `27797:27797:`. `AtLeastAsFresh` means
+  "no older than", so the datastore resolved a strictly fresher snapshot than the one
+  requested and the response names the snapshot actually read. A caller that chained on its
+  own write token instead of on `checkedAt` would be pinning a snapshot the read did not
+  use — which is the bug this field exists to prevent, visible in three lines of curl.
+
+- 2026-07-09 (M4): **The cursor-resume property is stronger than "page two equals page
+  one".** Paging a lookup at `limit: 1` and then resuming *while asking for
+  `minimizeLatency`* — a mode that resolves to whatever is freshest — still returned page
+  one's token:
+
+  ```text
+  page 1: {"objects":["project-x"],"status":"hasMore",  "checkedAt":"en1.…27798%3a27798%3a."}
+  page 2: {"objects":["project-y"],"status":"exhausted","checkedAt":"en1.…27798%3a27798%3a."}
+  ```
+
+  The request's `consistency` is ignored entirely on a cursor-resume path, because
+  `lookupWithDeadlineWithChecker` takes the revision from the cursor's validated token. One
+  lookup reads one snapshot however many pages it takes and whatever each page asks for.
+
+- 2026-07-09 (M4): **This plan's HTTP transcripts were wrong in three ways**, all from
+  predating `docs/plans/35`. The write path is `POST /v1/relationships`, not `/tuples`.
+  Sum types encode with string discriminators (`{"mode": "atLeastAsFresh", "token": …}`,
+  `{"kind": "id", …}`, `{"result": "allowed"}`), not `{"tag": …, "contents": …}`. And the
+  tampered-token negative control returns a typed `400` with a stable `code`, not the `500`
+  the plan predicted under "today's collapsed error model":
+
+  ```text
+  400 {"code":"invalid_consistency_token","message":"TokenBadSnapshot \"xmin must be <= xmax\"","retryable":false}
+  ```
+
+  The MasterPlan's first Surprises entry warned that every child's 2026-07-07 transcripts
+  were stale for exactly this reason. It was right. Validation and Acceptance now holds the
+  observed output.
+
+- 2026-07-09 (M4, affects any plan running the server by hand): **the port-8080 hazard the
+  MasterPlan records is real, and not only from a stale `en-server`.** On this machine 8080
+  was held by an unrelated `ssh` tunnel. Anything listening there will answer, and an
+  acceptance run against it proves nothing. `EN_PORT=8099 EN_AUTH_DISABLED=true cabal run
+  en-server` avoids it; check with `lsof -nP -iTCP:8080 -sTCP:LISTEN` first.
+
 
 ## Decision Log
 
@@ -166,7 +209,42 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+**Complete, 2026-07-09.** The purpose stated that only writes returned tokens, that this
+broke token chaining, and that it hard-blocked HTTP Biscuit minting. All five read
+endpoints now return `checkedAt` — `/v1/check`, `/v1/batch-check`, `/v1/lookup`,
+`/v1/expand`, and `/v1/relationships/query` — and the write → check → lookup chain was
+observed round-tripping against a live server on PostgreSQL, with a tampered token refused
+by a typed `400`. Embedded consumers get the same thing through `CheckOutcome`,
+`BatchOutcome`, `LookupPage.checkedAt`, and `ExpandTree.checkedAt`. The token is minted
+through one code path, the datastore's own `MintToken`, so hosted, embedded, and test
+consumers cannot disagree about the encoding.
+
+Two things the plan asked for turned out to be already true, both because
+`docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md` needed
+them first. All of Milestone 1's code existed, with the exact encoding this plan specified.
+And the lookup cursor-resume hazard the plan's fourth Decision Log entry warned about — a
+forged cursor yielding a token for a forged revision — was already closed: cursors carry a
+token, not a revision, and it is validated before use. The lesson is not "read the tree
+before writing the plan", which this plan's author did; it is that a plan written against a
+tree three master plans ago should expect its Milestone 1 to have been someone else's
+Milestone 3, and should check before implementing rather than after.
+
+Two divergences from the written plan, both recorded in the Decision Log.
+`BatchOutcome.decisions` carries `[Either EnError CheckDecision]` because master plan 7
+already made `checkMany` preserve per-pair failures. And `checkAtRevision` mints nothing,
+because minting per confirmed lookup candidate would produce a pile of identical discarded
+tokens.
+
+What remains. `mintCheckedObjectGrant` in `en-biscuit/src/En/Biscuit/Mint.hs` still stamps
+an `EnGrant` with the caller-supplied `grant.consistencyToken` rather than
+`outcome.checkedAt`, the snapshot its decision was actually made at. That is now a
+one-line fix, and it is deliberately left to
+`docs/plans/57-mint-biscuit-grants-over-http.md`, which hard-depends on this plan and owns
+the grant's semantics; a comment at the call site says so. Sibling plans
+`docs/plans/52` (lookup-subjects) and `docs/plans/53` (watch) must include `checkedAt` in
+their new read-response DTOs, following the convention this plan establishes: a `Text`
+field last in the object, minted from the read's resolved revision, and — for anything
+cursored — taken from the cursor's validated token on resume rather than re-resolved.
 
 
 ## Context and Orientation
@@ -452,44 +530,74 @@ The acceptance scenario is token chaining across a write, a check, and a lookup,
 using the built-in demo schema (`user`, `space#viewer`, permission `view`; served when
 `EN_SCHEMA_PATH` is unset — see `en-server/app/Main.hs`).
 
+Everything below was run on 2026-07-09 and the output is the observed output, not a
+sketch. Note three corrections to what this plan originally predicted: the write path is
+`POST /v1/relationships` (not `/tuples`); the wire encodings use the `/v1` contract's
+string discriminators (`{"mode": "atLeastAsFresh", "token": …}`, `{"kind": "id", …}`,
+`{"result": "allowed"}`) rather than the `{"tag": …, "contents": …}` forms this plan was
+written against; and the negative control now returns a typed `400`, not the `500` the
+plan predicted, because `docs/plans/35`'s error envelope has since landed.
+
+Bring up the database and a server. Do **not** use `just start-server`: it binds port
+8080, which something else may already be serving, and a stale listener would answer
+`/healthz` while silently exercising the wrong build.
+
+```bash
+just process-up
+just run-migrations
+EN_PORT=8099 EN_AUTH_DISABLED=true cabal run en-server
+```
+
 Step 1 — write a grant and capture the write token:
 
 ```bash
-WRITE_TOKEN=$(curl -sS -X POST localhost:8080/tuples -H 'content-type: application/json' -d '{
+WRITE_TOKEN=$(curl -sS -X POST localhost:8099/v1/relationships -H 'content-type: application/json' -d '{
   "tuples": [{
     "object": {"objectType": "space", "objectId": "project-x"},
     "relation": "viewer",
-    "subject": {"tag": "SubjectIdWire", "contents": {"objectType": "user", "objectId": "alice"}},
+    "subject": {"kind": "id", "objectType": "user", "objectId": "alice"},
     "caveat": null
   }]
 }' | jq -r '.token')
 ```
 
+Observed:
+
+```json
+{"token":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a88633b46c783909e.27796%3a27797%3a."}
+```
+
 Step 2 — check at least as fresh as the write; capture `checkedAt`:
 
 ```bash
-curl -sS -X POST localhost:8080/check -H 'content-type: application/json' -d "{
-  \"consistency\": {\"tag\": \"AtLeastAsFreshWire\", \"contents\": \"$WRITE_TOKEN\"},
+CHECK=$(curl -sS -X POST localhost:8099/v1/check -H 'content-type: application/json' -d "{
+  \"consistency\": {\"mode\": \"atLeastAsFresh\", \"token\": \"$WRITE_TOKEN\"},
   \"context\": {\"values\": {}},
-  \"subject\": {\"tag\": \"SubjectIdWire\", \"contents\": {\"objectType\": \"user\", \"objectId\": \"alice\"}},
+  \"subject\": {\"kind\": \"id\", \"objectType\": \"user\", \"objectId\": \"alice\"},
   \"permission\": \"view\",
   \"object\": {\"objectType\": \"space\", \"objectId\": \"project-x\"}
-}"
+}")
+CHECKED_AT=$(echo "$CHECK" | jq -r '.checkedAt')
 ```
 
-Expected shape:
+Observed:
 
 ```json
-{"decision": {"tag": "AllowedWire"}, "checkedAt": "en1.…"}
+{"decision":{"result":"allowed"},"checkedAt":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a88633b46c783909e.27797%3a27797%3a."}
 ```
+
+The returned token is worth reading closely. Its revision field is `27797:27797:`, while
+the write token's was `27796:27797:`. `AtLeastAsFresh` means "no older than", not "exactly
+this", so the check resolved to a snapshot strictly fresher than the write it was asked to
+cover, and `checkedAt` reports the snapshot actually used rather than echoing the request.
+That is the whole point of the field.
 
 Step 3 — lookup at least as fresh as the check's token; the chain round-trips:
 
 ```bash
-CHECKED_AT=<the checkedAt value from step 2>
-curl -sS -X POST localhost:8080/lookup -H 'content-type: application/json' -d "{
-  \"consistency\": {\"tag\": \"AtLeastAsFreshWire\", \"contents\": \"$CHECKED_AT\"},
-  \"subject\": {\"tag\": \"SubjectIdWire\", \"contents\": {\"objectType\": \"user\", \"objectId\": \"alice\"}},
+curl -sS -X POST localhost:8099/v1/lookup -H 'content-type: application/json' -d "{
+  \"consistency\": {\"mode\": \"atLeastAsFresh\", \"token\": \"$CHECKED_AT\"},
+  \"subject\": {\"kind\": \"id\", \"objectType\": \"user\", \"objectId\": \"alice\"},
   \"permission\": \"view\",
   \"objectType\": \"space\",
   \"context\": {\"values\": {}},
@@ -499,19 +607,77 @@ curl -sS -X POST localhost:8080/lookup -H 'content-type: application/json' -d "{
 }"
 ```
 
-Expected: HTTP 200 with `space:project-x` in `objects`, a `state` of
-`LookupExhaustedWire`, and the page's own `checkedAt` present. A negative control:
-tamper with one character of `CHECKED_AT` inside the revision field and the lookup
-must fail with the invalid-token error (HTTP 500 under today's collapsed error model —
-review A3; a typed 4xx once `docs/plans/35` lands).
+Observed — HTTP 200, `project-x` present, `exhausted`, and the page's own `checkedAt`:
 
-Batch semantics: `POST /batch-check` with two pairs returns
-`{"decisions": [...], "checkedAt": "en1.…"}` — one token, per the Decision Log.
+```json
+{"objects":[{"object":{"objectType":"space","objectId":"project-x"},"decision":{"result":"allowed"}}],"state":{"status":"exhausted"},"checkedAt":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a88633b46c783909e.27797%3a27797%3a."}
+```
 
-Test-level validation: the M1 mint/validate round-trip test, the M2 core assertions
-(single batch token; cursor-resume page reuses the first page's token), and the M3
-handler tests all pass under `cabal test en-core`, `cabal test en-servant`,
-`cabal test en-postgres-revision-tests`.
+Batch semantics — two pairs, one token, per the Decision Log:
+
+```json
+{"decisions":[{"result":"allowed"},{"result":"denied"}],"checkedAt":"en1.0c9c482f-…-.27797%3a27797%3a."}
+```
+
+`POST /v1/expand` and `POST /v1/relationships/query` carry it too, the latter being the
+endpoint `docs/plans/50` shipped without it:
+
+```json
+{"root":{"objectType":"space","objectId":"project-x"},"permission":"view","children":[{"kind":"userset","object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","children":[{"kind":"subject","subject":{"kind":"id","objectType":"user","objectId":"alice"}}]}],"state":{"status":"exhausted"},"checkedAt":"en1.0c9c482f-…-.27797%3a27797%3a."}
+{"relationships":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}],"state":{"status":"exhausted"},"checkedAt":"en1.0c9c482f-…-.27797%3a27797%3a."}
+```
+
+Negative control — flip one character inside the token's revision field (`27797` becomes
+`97797`, leaving the prefix, datastore id, and schema hash intact) and present it as a
+lookup's freshness bound. The token is refused, with a typed code a client can branch on:
+
+```text
+400 {"code":"invalid_consistency_token","message":"TokenBadSnapshot \"xmin must be <= xmax\"","retryable":false}
+```
+
+Cursor resume — the strongest statement the field makes. Write a second grant, page a
+lookup at `limit: 1`, then resume from the cursor while *asking for `minimizeLatency`*, a
+consistency mode that would resolve to a different, fresher snapshot if the cursor did not
+pin one. Page two reports page one's token regardless, because a continuation reads at the
+revision named by its cursor's validated token:
+
+```text
+page 1: {"objects":["project-x"],"status":"hasMore",  "checkedAt":"en1.…27798%3a27798%3a."}
+page 2: {"objects":["project-y"],"status":"exhausted","checkedAt":"en1.…27798%3a27798%3a."}
+```
+
+Finally, the repository's pre-existing smoke test still passes — it asserts on
+`.decision.result`, which this plan preserves:
+
+```bash
+$ EN_PORT=8099 just test-server
+server smoke test passed: allowed
+```
+
+Afterwards: `just process-down`.
+
+Test-level validation, all observed passing:
+
+```bash
+$ cabal test en-core en-servant en-postgres:en-postgres-revision-tests
+Test suite en-core-conformance: PASS
+Test suite en-core-interface-tests: PASS
+Test suite en-postgres-revision-tests: PASS
+Test suite en-servant-tests: PASS
+
+$ cabal test en-postgres-integration-tests
+Test suite en-postgres-integration-tests: PASS
+
+$ cabal test en-biscuit en-example
+Test suite en-example-tests: PASS
+Test suite en-biscuit-tests: PASS
+```
+
+The integration suite is where M1's mint/validate round-trip lives, and where the chain is
+proven against a real PostgreSQL rather than a test double: it resolves `FullyConsistent`,
+mints, decodes and validates the result back to the same revision; then checks at a write
+token, spends the resulting `checkedAt` as a later read's bound, and asserts a resumed
+lookup page reports the first page's token.
 
 
 ## Idempotence and Recovery
