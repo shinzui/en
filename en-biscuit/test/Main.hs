@@ -13,11 +13,17 @@
      closed on 'Denied'/'Conditional'/engine errors, stamps @now + defaultTtl@
      expiry, propagates consistency token and schema hash, and bounds scoped
      grants.
+  4. Attenuation-scoping tests pinning the @biscuit-haskell@ semantics the whole
+     layer rests on: facts added by a holder-appended block are invisible to
+     un-annotated queries, to 'En.Biscuit.Verify.verifyGrant', and to plain
+     authorizer policies, so a holder can never widen a grant.
 -}
 module Main (main) where
 
 import Control.Monad (unless, when)
+import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
@@ -27,7 +33,11 @@ import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import System.Exit (exitFailure)
 
 import Auth.Biscuit (
+    Biscuit,
+    Block,
+    OpenOrSealed,
     SecretKey,
+    Verified,
     addBlock,
     authorizeBiscuit,
     authorizer,
@@ -36,9 +46,13 @@ import Auth.Biscuit (
     newSecret,
     parseB64,
     parseSecretKeyHex,
+    query,
+    queryRawBiscuitFacts,
     serializeB64,
     toPublic,
  )
+import Auth.Biscuit.Datalog.AST (Query)
+import Auth.Biscuit.Datalog.Executor (Bindings)
 import Effectful (Eff, IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 
@@ -98,6 +112,13 @@ main = do
     verifyScopedTests
     attenuationTests
     shomeiFlowTest
+    attenuationForgedRightTest
+    attenuationForgedExpiryTest
+    attenuationForgedRevocationTest
+    attenuationForgedScopeTest
+    attenuationForgedSubjectTest
+    authorizerScopingTest
+    narrowingDirectionTest
     putStrLn "en-biscuit tests PASS"
 
 -- | Wiring check for the biscuit-haskell dependency.
@@ -649,6 +670,293 @@ shomeiFlowTest = do
     -- established by the downstream does not match the token's subject).
     impostor <- verifyGrant public token (requestFor "mallory")
     assertVerifyError "shomei flow: different caller" WrongSubject impostor
+
+{- | Attenuation scoping, forged @en_right@. A holder appends a block asserting a
+right over a resource the authority never granted, and a broader permission on
+the granted resource. Neither reaches the verifier: un-annotated queries — what
+'En.Biscuit.Verify.verifyGrant' uses — read authority facts only.
+
+This test doubles as the syntax spike for @trusting previous@ in the @query@
+quasiquoter; if it stops parsing, every positive control below is vacuous.
+-}
+attenuationForgedRightTest :: IO ()
+attenuationForgedRightTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+
+    -- Forged object: a right over document:secret, never granted.
+    (forgedObject, parsedObject) <-
+        forgedToken secret (ObjectGrant forgeableObjectGrant) [block|en_right("document", "secret", "view");|]
+
+    control <- queryOrDie "forged en_right" parsedObject [query|en_right("document", "secret", $p) trusting previous|]
+    assertBool "forged en_right: the forged fact must be present in the token" (not (Set.null control))
+    scoped <- queryOrDie "forged en_right" parsedObject [query|en_right("document", "secret", $p)|]
+    assertBool "forged en_right: an un-annotated query must not see the holder block" (Set.null scoped)
+
+    assertVerifyError "forged en_right: widened resource" ResourceNotInScope
+        =<< verifyGrant public forgedObject (roadmapRequest{resource = ObjectRef (ObjectType "document") "secret"})
+    -- The genuine request must still succeed: had the forged fact been visible,
+    -- two `en_right` rows would make extraction ambiguous and surface
+    -- MalformedGrant rather than a verified grant.
+    assertVerified "forged en_right: the genuine request still verifies"
+        =<< verifyGrant public forgedObject roadmapRequest
+
+    -- Forged permission: admin on the granted resource.
+    (forgedPerm, parsedPerm) <-
+        forgedToken secret (ObjectGrant forgeableObjectGrant) [block|en_right("document", "roadmap", "admin");|]
+
+    permControl <- queryOrDie "forged permission" parsedPerm [query|en_right("document", "roadmap", "admin") trusting previous|]
+    assertBool "forged permission: the forged fact must be present in the token" (not (Set.null permControl))
+
+    assertVerifyError "forged permission: widened operation" OperationNotAuthorized
+        =<< verifyGrant public forgedPerm (objectRequest (RelationName "admin") roadmapRef verifyNow)
+    assertVerified "forged permission: the genuine operation still verifies"
+        =<< verifyGrant public forgedPerm roadmapRequest
+
+{- | Attenuation scoping, forged @en_expires_at@. A holder cannot extend the life
+of a token by asserting a later expiry.
+-}
+attenuationForgedExpiryTest :: IO ()
+attenuationForgedExpiryTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+
+    (token, parsed) <-
+        forgedToken secret (ObjectGrant forgeableObjectGrant) [block|en_expires_at(2027-01-01T00:00:00Z);|]
+
+    control <- queryOrDie "forged expiry" parsed [query|en_expires_at($e) trusting previous|]
+    assertEqual "forged expiry: the token carries both the real and the forged expiry" 2 (Set.size control)
+    scoped <- queryOrDie "forged expiry" parsed [query|en_expires_at($e)|]
+    assertEqual "forged expiry: an un-annotated query sees only the authority expiry" 1 (Set.size scoped)
+
+    -- afterExpiry (02:00Z) is past the real expiry (01:00Z) and far short of the
+    -- forged one (2027). The verifier must read the real one.
+    assertVerifyError "forged expiry: past the real expiry" Expired
+        =<< verifyGrant public token (objectRequest (RelationName "view") roadmapRef afterExpiry)
+    assertVerified "forged expiry: before the real expiry" =<< verifyGrant public token roadmapRequest
+
+{- | Attenuation scoping, forged @en_revocation_id@, in both directions: a holder
+can neither shadow a real revocation id to escape revocation, nor plant one in a
+token that has none.
+-}
+attenuationForgedRevocationTest :: IO ()
+attenuationForgedRevocationTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+
+    -- Shadowing: the authority names rev-1; the holder adds rev-clean, hoping
+    -- the verifier reads theirs (or reads neither, because two rows are
+    -- ambiguous, and so skips the revocation check entirely).
+    (shadowed, _) <-
+        forgedToken
+            secret
+            (ObjectGrant (forgeableObjectGrantWith (Just (RevocationId "rev-1"))))
+            [block|en_revocation_id("rev-clean");|]
+    let revokesRev1 r = pure (r == RevocationId "rev-1")
+    assertVerifyError "forged revocation: shadowing does not evade revocation" Revoked
+        =<< verifyGrant public shadowed roadmapRequest{revoked = revokesRev1}
+
+    -- Planting: the authority names no revocation id, so the verifier must never
+    -- consult the caller's revocation check at all.
+    (planted, parsedPlanted) <-
+        forgedToken secret (ObjectGrant forgeableObjectGrant) [block|en_revocation_id("rev-x");|]
+    control <- queryOrDie "planted revocation" parsedPlanted [query|en_revocation_id("rev-x") trusting previous|]
+    assertBool "planted revocation: the forged id must be present in the token" (not (Set.null control))
+
+    asked <- newIORef []
+    let recordAsk r = modifyIORef' asked (r :) >> pure False
+    assertVerified "planted revocation: the token still verifies"
+        =<< verifyGrant public planted roadmapRequest{revoked = recordAsk}
+    consulted <- readIORef asked
+    assertEqual "planted revocation: the forged id never reached the revocation check" [] consulted
+
+{- | Attenuation scoping, forged @en_container_scope@. A scoped grant lists its
+containers as separate facts, so a holder-added container is the most natural
+widening attack: 'En.Biscuit.Verify.resolveScope' collects /every/ matching row.
+-}
+attenuationForgedScopeTest :: IO ()
+attenuationForgedScopeTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+
+    (token, parsed) <-
+        forgedToken secret (ScopedGrant forgeableScopedGrant) [block|en_container_scope("folder", "f9");|]
+
+    control <- queryOrDie "forged scope" parsed [query|en_container_scope($t, $i) trusting previous|]
+    assertEqual "forged scope: the token carries three containers" 3 (Set.size control)
+    scoped <- queryOrDie "forged scope" parsed [query|en_container_scope($t, $i)|]
+    assertEqual "forged scope: an un-annotated query sees only the authority's two" 2 (Set.size scoped)
+
+    assertVerifyError "forged scope: the added container is out of scope" ResourceNotInScope
+        =<< verifyGrant public token (scopedRequest (ObjectRef (ObjectType "folder") "f9"))
+    assertVerified "forged scope: a genuine container still verifies"
+        =<< verifyGrant public token (scopedRequest (ObjectRef (ObjectType "folder") "f1"))
+
+{- | Attenuation scoping, forged @en_subject@. A holder cannot re-point a grant at
+another principal.
+-}
+attenuationForgedSubjectTest :: IO ()
+attenuationForgedSubjectTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+
+    (token, parsed) <-
+        forgedToken secret (ObjectGrant forgeableObjectGrant) [block|en_subject("user", "mallory");|]
+
+    control <- queryOrDie "forged subject" parsed [query|en_subject("user", "mallory") trusting previous|]
+    assertBool "forged subject: the forged fact must be present in the token" (not (Set.null control))
+    scoped <- queryOrDie "forged subject" parsed [query|en_subject($t, $i)|]
+    assertEqual "forged subject: an un-annotated query sees only the authority subject" 1 (Set.size scoped)
+
+    let mallory = SubjectId (ObjectRef (ObjectType "user") "mallory")
+    assertVerifyError "forged subject: mallory cannot use alice's grant" WrongSubject
+        =<< verifyGrant public token roadmapRequest{expectedSubject = mallory}
+    assertVerified "forged subject: alice's own request still verifies"
+        =<< verifyGrant public token roadmapRequest
+
+{- | The same guarantee for consumers that never touch en's verifier: a plain
+@allow if@ policy is scoped to the authority block too, so a forged fact cannot
+satisfy it. This is what @docs/user/biscuit-decision-tokens.md@ promises services
+in other stacks.
+-}
+authorizerScopingTest :: IO ()
+authorizerScopingTest = do
+    secret <- loadSecret
+    (_, parsed) <-
+        forgedToken secret (ObjectGrant forgeableObjectGrant) [block|en_right("document", "secret", "view");|]
+
+    forged <- authorizeBiscuit parsed [authorizer|allow if en_right("document", "secret", "view");|]
+    case forged of
+        Left _ -> pure ()
+        Right _ -> die "authorizer scoping: a forged holder fact satisfied an allow policy — breakout!"
+
+    genuine <- authorizeBiscuit parsed [authorizer|allow if en_right("document", "roadmap", "view");|]
+    case genuine of
+        Right _ -> pure ()
+        Left err -> die ("authorizer scoping: the authority fact should satisfy the policy: " <> show err)
+
+{- | Attenuation is one-way. 'attenuationTests' already pins the legal direction
+(a narrowed token fails requests its parent passed). This pins the illegal one,
+with the strongest block an attacker can write: a forged widening fact /plus/ a
+check that matches it, since a block's own checks may read its own facts.
+-}
+narrowingDirectionTest :: IO ()
+narrowingDirectionTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+        f1 = ObjectRef (ObjectType "folder") "f1"
+        f9 = ObjectRef (ObjectType "folder") "f9"
+
+    grantBlk <- either (die . show) pure (grantBlock (ScopedGrant forgeableScopedGrant))
+    parent <- serializeB64 <$> mkBiscuit secret grantBlk
+
+    (attacked, _) <-
+        forgedToken
+            secret
+            (ScopedGrant forgeableScopedGrant)
+            [block|
+              en_container_scope("folder", "f9");
+              check if resource($t, $i), $t == "folder", $i == "f9";
+            |]
+
+    -- The parent passes f1 and fails f9. The attack block cannot flip f9.
+    assertVerified "narrowing: the parent token authorizes a genuine container"
+        =<< verifyGrant public parent (scopedRequest f1)
+    assertVerifyError "narrowing: the parent token rejects a container it never held" ResourceNotInScope
+        =<< verifyGrant public parent (scopedRequest f9)
+    assertVerifyError "narrowing: a forged fact plus a matching check cannot widen the scope" ResourceNotInScope
+        =<< verifyGrant public attacked (scopedRequest f9)
+
+    -- And the block's own check can only narrow: it now rejects f1, which the
+    -- parent allowed.
+    assertRestrictionFailed "narrowing: the attacker's own check narrows their token"
+        =<< verifyGrant public attacked (scopedRequest f1)
+
+{- | Mint an authority block for @grant@, then let a holder append @forged@. The
+result is exactly what a malicious bearer can produce from a genuine token.
+-}
+forgedToken :: SecretKey -> EnBiscuitGrant -> Block -> IO (ByteString, Biscuit OpenOrSealed Verified)
+forgedToken secret grant forged = do
+    grantBlk <- either (die . show) pure (grantBlock grant)
+    authority <- mkBiscuit secret grantBlk
+    tampered <- addBlock forged authority
+    let bytes = serializeB64 tampered
+    parsed <- either (die . show) pure (parseB64 (toPublic secret) bytes)
+    pure (bytes, parsed)
+
+queryOrDie :: String -> Biscuit OpenOrSealed Verified -> Query -> IO (Set Bindings)
+queryOrDie label biscuit q =
+    either (\err -> die (label <> ": query failed: " <> err)) pure (queryRawBiscuitFacts biscuit q)
+
+assertVerified :: String -> Either EnBiscuitVerifyError VerifiedGrant -> IO ()
+assertVerified label result =
+    case result of
+        Right _ -> pure ()
+        Left err -> die (label <> ": expected success, got " <> show err)
+
+{- | An object grant for alice over @document:roadmap@, expiring at 01:00Z so
+'verifyNow' (00:30Z) is inside it and 'afterExpiry' (02:00Z) is outside.
+-}
+forgeableObjectGrant :: EnGrant
+forgeableObjectGrant = forgeableObjectGrantWith Nothing
+
+-- | 'forgeableObjectGrant', optionally carrying an application revocation id.
+forgeableObjectGrantWith :: Maybe RevocationId -> EnGrant
+forgeableObjectGrantWith mRevocationId =
+    EnGrant
+        { subject = aliceSubject
+        , permission = RelationName "view"
+        , object = roadmapRef
+        , consistencyToken = ConsistencyToken "zk-123"
+        , schemaHash = SchemaHash "sha-abc"
+        , expiresAt = laterExpiry
+        , audience = Audience "billing-service"
+        , requestId = Nothing
+        , revocationId = mRevocationId
+        }
+
+roadmapRef :: ObjectRef
+roadmapRef = ObjectRef (ObjectType "document") "roadmap"
+
+-- | A scoped grant for alice over @folder:f1@ and @folder:f2@, expiring at 01:00Z.
+forgeableScopedGrant :: EnScopedGrant
+forgeableScopedGrant =
+    EnScopedGrant
+        { subject = aliceSubject
+        , permission = RelationName "view"
+        , objectType = ObjectType "document"
+        , containers =
+            [ ObjectRef (ObjectType "folder") "f1"
+            , ObjectRef (ObjectType "folder") "f2"
+            ]
+        , consistencyToken = ConsistencyToken "zk-456"
+        , schemaHash = SchemaHash "sha-abc"
+        , expiresAt = laterExpiry
+        , audience = Audience "billing-service"
+        , requestId = Nothing
+        , revocationId = Nothing
+        }
+
+-- | The request 'forgeableObjectGrant' authorizes, at a clock before its expiry.
+roadmapRequest :: VerifyRequest IO
+roadmapRequest = objectRequest (RelationName "view") roadmapRef verifyNow
+
+-- | An alice/billing-service request for a given operation, resource, and clock.
+objectRequest :: RelationName -> ObjectRef -> UTCTime -> VerifyRequest IO
+objectRequest op resourceRef nowT =
+    mkVerifyRequest
+        aliceSubject
+        (Audience "billing-service")
+        op
+        resourceRef
+        (Audience "billing-service")
+        acceptedSchemas
+        nowT
+        (const (pure False))
+
+-- | The request 'forgeableScopedGrant' authorizes for a given container.
+scopedRequest :: ObjectRef -> VerifyRequest IO
+scopedRequest container = objectRequest (RelationName "view") container verifyNow
 
 verifyNow :: UTCTime
 verifyNow = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 1800)

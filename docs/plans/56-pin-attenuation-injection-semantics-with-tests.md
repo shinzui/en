@@ -5,6 +5,7 @@ title: "Pin attenuation-injection semantics with tests"
 kind: exec-plan
 created_at: 2026-07-07T15:25:10Z
 master_plan: "docs/masterplans/10-harden-the-biscuit-decision-token-layer.md"
+intention: intention_01kx6ajfcjefhtvc4fhwk7fjq7
 ---
 
 # Pin attenuation-injection semantics with tests
@@ -48,15 +49,15 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Confirm the `trusting previous` query syntax works through `queryRawBiscuitFacts` with a two-block token (spike assertion inside the first new test).
-- [ ] M1: Forged `en_right` test — object grant, holder block adds a broader `en_right`; verifier rejects the widened request, accepts the original; positive controls prove the forged fact is physically present.
-- [ ] M1: Forged `en_expires_at` test — holder block adds a later expiry; verification after the real expiry returns `Expired`.
-- [ ] M1: Forged `en_revocation_id` tests — shadowing a real id does not evade `Revoked`; adding an id to an id-less token does not reach the revocation callback.
-- [ ] M1: Forged `en_container_scope` and `en_subject` tests — scoped grant cannot gain a container; subject cannot be re-pointed.
-- [ ] M2: Authorizer-policy scoping test — `authorizeBiscuit` with a non-`trusting` `allow if` over the forged fact denies.
-- [ ] M2: Narrowing-direction tests — attenuation makes previously passing requests fail (correct), and no forged-fact-plus-check combination makes a previously failing request pass.
-- [ ] Final: `cabal test en-biscuit` passes; the library-promise summary below is confirmed against observed behavior; Outcomes & Retrospective written.
-- [ ] Contingency (only if an M1/M2 assertion fails): record evidence in Surprises & Discoveries, halt, escalate to the master plan, then execute M3.
+- [x] M1: Confirm the `trusting previous` query syntax works through `queryRawBiscuitFacts` with a two-block token (spike assertion inside the first new test).
+- [x] M1: Forged `en_right` test — object grant, holder block adds a broader `en_right`; verifier rejects the widened request, accepts the original; positive controls prove the forged fact is physically present.
+- [x] M1: Forged `en_expires_at` test — holder block adds a later expiry; verification after the real expiry returns `Expired`.
+- [x] M1: Forged `en_revocation_id` tests — shadowing a real id does not evade `Revoked`; adding an id to an id-less token does not reach the revocation callback.
+- [x] M1: Forged `en_container_scope` and `en_subject` tests — scoped grant cannot gain a container; subject cannot be re-pointed.
+- [x] M2: Authorizer-policy scoping test — `authorizeBiscuit` with a non-`trusting` `allow if` over the forged fact denies.
+- [x] M2: Narrowing-direction tests — attenuation makes previously passing requests fail (correct), and no forged-fact-plus-check combination makes a previously failing request pass.
+- [x] Final: `cabal test en-biscuit` passes; the library-promise summary below is confirmed against observed behavior; Outcomes & Retrospective written.
+- [x] Contingency (only if an M1/M2 assertion fails): not triggered — every assertion held on the first run. M3 was not executed and no production module changed.
 
 
 ## Surprises & Discoveries
@@ -64,7 +65,53 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- The scoping assumption **holds**. Every M1/M2 assertion passed on the first
+  run against the pinned `biscuit-haskell`; the contingency milestone M3 was
+  never entered and no production module was touched.
+
+- `trusting previous` parses in the `query` quasiquoter but is *rejected* in the
+  `authorizer` quasiquoter, so the M1 fallback ("prove presence via an
+  `authorizeBiscuit` policy annotated `trusting previous`") could never have
+  worked. `Auth/Biscuit/Datalog/Parser.hs:430` errors with `PreviousInAuthorizer`
+  when `inAuthorizer` is set, and `authorizer` is built from `authorizerParser`
+  (which sets it) while `query` is built from `queryParser False`. This does not
+  matter — the primary path works — but the plan's stated fallback was not
+  viable. Anyone reaching for it should instead query the parsed biscuit
+  directly with `queryRawBiscuitFacts`.
+
+- The tests were verified to be non-vacuous by mutation, not just by inspection.
+  Adding `trusting previous` to the `en_container_scope` query in
+  `resolveScope` (`en-biscuit/src/En/Biscuit/Verify.hs:279`) — i.e. simulating
+  exactly the regression this plan guards against — turns the suite red with the
+  intended message, and the source was then restored:
+
+    ```text
+    en-biscuit test FAILED: verify forged scope: the added container is out of scope: expected Left ResourceNotInScope, got Right <verified grant>
+    Test suite en-biscuit-tests: FAIL
+    ```
+
+- Not all forged facts are equally dangerous, and the tests now record the
+  distinction. `en_container_scope` is the one genuinely exploitable shape:
+  `resolveScope` gathers *every* matching row via `containerRefs`, so a visible
+  holder fact would directly widen the scope (as the mutation above proves).
+  The single-valued facts (`en_subject`, `en_expires_at`, `en_right`,
+  `en_revocation_id`) are read through `getSingleVariableValue`, which returns
+  `Nothing` on two rows — a visible forged fact would therefore surface
+  `MalformedGrant` (fail-closed) rather than a widened grant. `en_revocation_id`
+  is the exception worth naming: it is *optional*, so `Nothing` means "not
+  revocable" rather than "malformed", and a visible shadowing fact would silently
+  skip the revocation check. That is why `attenuationForgedRevocationTest`
+  asserts `Revoked` rather than merely "not `Right`". This asymmetry is also why
+  each forged-fact test asserts the genuine request still returns `Right`: a
+  bare "the widened request fails" assertion would pass vacuously under
+  `MalformedGrant`.
+
+- `en-biscuit/test/Main.hs` compiles with `-Wambiguous-fields` active, and
+  `EnGrant`/`EnScopedGrant`/`VerifyRequest`/`MintConfig` share field names
+  (`revocationId`, `operation`, `now`). Record *update* syntax on those fields
+  warns; record *construction* does not. The new helpers
+  (`forgeableObjectGrantWith`, `objectRequest`) take the varying field as a
+  parameter for this reason rather than updating a shared literal.
 
 
 ## Decision Log
@@ -107,6 +154,34 @@ Record every decision made while working on the plan.
   a security finding for the whole layer (and for EP-55/EP-57, which must not
   build on a broken verifier) and needs a human decision before code changes.
   Date: 2026-07-07
+- Decision: Prove the tests are a real tripwire by mutating `resolveScope` to
+  trust holder blocks, observing the failure, and restoring the source — rather
+  than trusting that the assertions would catch a regression.
+  Rationale: A test that pins a dependency assumption is worthless if it passes
+  for the wrong reason. The plan's positive controls prove the forged fact is
+  *present*; the mutation proves the exploit assertions are *load-bearing*.
+  `en_container_scope` was chosen as the mutation site because it is the only
+  fact whose extraction path (`containerRefs`, which keeps every row) would
+  widen a grant rather than fail closed.
+  Date: 2026-07-10
+- Decision: Assert the exact error constructor *and* that the genuine request
+  still returns `Right`, in every forged-fact test.
+  Rationale: Four of the five forged facts are read with
+  `getSingleVariableValue`, which returns `Nothing` when the holder's row is
+  visible alongside the authority's. A test asserting only "the widened request
+  fails" would pass under `MalformedGrant` — i.e. it would stay green while
+  extraction was actually broken. The success assertion is what distinguishes
+  "the forged fact was ignored" from "the forged fact broke the token".
+  Date: 2026-07-10
+- Decision: In `narrowingDirectionTest`, pin `ResourceNotInScope` for the
+  `folder:f9` request rather than accepting either that or `RestrictionFailed`.
+  Rationale: The plan allowed either, because the attacker's own `check if`
+  could in principle trip first. It does not: `extractAndCheck` runs the scope
+  test before `runRestrictions`, so `f9` is rejected as out-of-scope and never
+  reaches the authorizer. Pinning the observed constructor makes a future
+  reordering of those two steps visible. The `folder:f1` request, which does
+  reach the authorizer, is separately pinned to `RestrictionFailed`.
+  Date: 2026-07-10
 
 
 ## Outcomes & Retrospective
@@ -114,7 +189,46 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+The plan's purpose was to convert an untested assumption into a tripwire. That is
+done, and the assumption survived. `cabal test en-biscuit` now runs seven new
+tests — `attenuationForgedRightTest`, `attenuationForgedExpiryTest`,
+`attenuationForgedRevocationTest`, `attenuationForgedScopeTest`,
+`attenuationForgedSubjectTest`, `authorizerScopingTest`, and
+`narrowingDirectionTest` — covering all five `en_*` grant facts a holder might
+forge, at all three layers the Decision Log named: the raw fact query that
+`extractAndCheck` depends on, the full `verifyGrant` verifier, and plain
+`authorizeBiscuit` policies for downstream services that never touch en's
+verifier. Finding D2 of
+`docs/reviews/2026-07-07-architecture-performance-review.md` is closed. Only
+`en-biscuit/test/Main.hs` changed; contingency milestone M3 was not triggered.
+
+What the suite now guarantees, and would fail loudly on: a holder-appended block
+containing forged `en_right` (either a new object or a broader permission),
+`en_expires_at`, `en_revocation_id` (shadowing a real id, or planted into an
+id-less token), `en_container_scope`, or `en_subject` changes no `verifyGrant`
+outcome and satisfies no un-annotated `allow if` policy — while a
+`trusting previous` control proves in each case that the forged fact really is in
+the token, so no test can pass because the attack failed to build.
+
+Two things exceed the plan as written. First, the tests were validated by
+mutation rather than by inspection: temporarily making `resolveScope` trust
+holder blocks turns the suite red with the expected message (transcript in
+Surprises & Discoveries), which is the evidence that these assertions are
+load-bearing rather than incidentally green. Second, the plan under-specified the
+planted-revocation case; the `IORef` assertion proves not just that the token
+verifies but that the forged id never reached the caller's revocation callback,
+which is the property that actually matters.
+
+One gap is worth naming for the sibling plans: this plan pins *fact* scoping, not
+*key* scoping. Every test signs with a single deterministic issuer key. When
+EP-55
+(`docs/plans/55-support-key-rotation-and-unconditional-revocation-in-biscuit-grants.md`)
+introduces a keyset and `rootKeyId` selection, the analogous question — can a
+holder influence which key a verifier selects? — is new ground and is not covered
+here. The seven tests will need their `verifyGrant` call sites updated
+mechanically (`singleKey` plus a `const (pure False)` block check, per the
+Interfaces and Dependencies section below), but every assertion in them remains
+correct as written, because none of them depend on the key material.
 
 
 ## Context and Orientation

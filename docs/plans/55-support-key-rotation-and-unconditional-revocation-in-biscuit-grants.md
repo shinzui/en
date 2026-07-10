@@ -53,6 +53,7 @@ This section must always reflect the actual current state of the work.
 - [ ] M2: Define `IssuerKeySet` in a new module `en-biscuit/src/En/Biscuit/Keys.hs` and expose it from `En.Biscuit`.
 - [ ] M2: Change `verifyGrant` to accept `IssuerKeySet` and parse via `Auth.Biscuit.parseWith`.
 - [ ] M2: Add the rotation test: keys A and B, one keyset, both tokens verify; keyset without A rejects only the key-A token.
+- [ ] M2: Add a key-selection attack test (raised by EP-56, see Surprises & Discoveries): a token minted under key A, with its `rootKeyId` rewritten to name key B, must be rejected — a holder must not be able to steer which key the verifier reaches for.
 - [ ] M3: Add `revokedBlockIds` to `VerifyRequest` and wire it into `ParserConfig.isRevoked` so every verify consults built-in revocation ids.
 - [ ] M3: Map the `RevokedBiscuit` parse error to the existing `Revoked` verify error; keep the application-level `revoked` check as an optional extra.
 - [ ] M3: Add tests: token without application `revocationId` is revocable by block id; application-level revocation still works.
@@ -66,7 +67,46 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+Carried in from EP-56 (`docs/plans/56-pin-attenuation-injection-semantics-with-tests.md`),
+which landed first and pinned the fact-scoping semantics this plan builds on:
+
+- The fact-scoping assumption **holds** against the pinned biscuit-haskell, so
+  this plan builds on today's `extractAndCheck` / `resolveScope` in
+  `en-biscuit/src/En/Biscuit/Verify.hs` unchanged. EP-56's contingency rewrite
+  (its milestone M3) was never triggered and is retired.
+
+- EP-56's seven new tests in `en-biscuit/test/Main.hs`
+  (`attenuationForgedRightTest`, `attenuationForgedExpiryTest`,
+  `attenuationForgedRevocationTest`, `attenuationForgedScopeTest`,
+  `attenuationForgedSubjectTest`, `authorizerScopingTest`,
+  `narrowingDirectionTest`) call `verifyGrant` with the single-`PublicKey`
+  signature. M2 of this plan must update those call sites mechanically to
+  `singleKey`/`IssuerKeySet` plus a `const (pure False)` `revokedBlockIds`
+  check. None of their assertions depend on key material, so none of them should
+  be weakened or deleted to make the new signature compile — if one starts
+  failing, that is a security regression in this plan's changes, not test rot.
+
+- The soft spot this plan's M3 closes, made precise: forged single-valued facts
+  fail closed today because `getSingleVariableValue` returns `Nothing` on two
+  rows and `extractAndCheck` reports `MalformedGrant`. `en_revocation_id` is the
+  exception — its `Nothing` means "not revocable", not "malformed", so a holder
+  who could shadow it would silently skip the revocation check. Fact scoping is
+  what prevents that today. Built-in block revocation ids are signature bytes in
+  the token envelope rather than Datalog facts, so after M3 that soft spot is
+  gone by construction, not merely by scoping.
+
+- `trusting previous` parses in the `query` quasiquoter but is rejected in the
+  `authorizer` quasiquoter (`Auth/Biscuit/Datalog/Parser.hs:430` raises
+  `PreviousInAuthorizer`). Inspect holder-block facts with
+  `queryRawBiscuitFacts`, not with an authorizer policy.
+
+- `en-biscuit/test/Main.hs` compiles with `-Wambiguous-fields`, and
+  `EnGrant`/`EnScopedGrant`/`VerifyRequest`/`MintConfig` share the field names
+  `revocationId`, `operation`, and `now`. Record *update* syntax on those fields
+  warns; record *construction* does not. Adding `revokedBlockIds` to
+  `VerifyRequest` in M3 keeps this trap alive — prefer parameterized helpers
+  (the file already has `forgeableObjectGrantWith` and `objectRequest`) over
+  updating a shared record literal.
 
 
 ## Decision Log
@@ -121,6 +161,15 @@ Record every decision made while working on the plan.
   the repository's own tests already use hex key literals
   (`en-biscuit/test/Main.hs`, `loadSecret`).
   Date: 2026-07-07
+- Decision: Test that a holder cannot steer issuer-key selection.
+  Rationale: EP-56 pinned fact scoping under a single key, leaving key selection
+  untested. `rootKeyId` is attacker-visible metadata in the Biscuit envelope, and
+  once `verifyGrant` picks a key from a keyset by that id, "which key does the
+  verifier reach for" becomes a new attack surface introduced by *this* plan. A
+  token minted under key A whose `rootKeyId` is rewritten to name key B must fail
+  signature verification, and the test must say so explicitly rather than relying
+  on it falling out of the crypto.
+  Date: 2026-07-10
 - Decision: A revocation *distribution* mechanism (shared store or feed) stays
   out of scope; this plan only guarantees every token is revocable in
   principle, via a caller-supplied membership check.

@@ -4,6 +4,7 @@ slug: harden-the-biscuit-decision-token-layer
 title: "Harden the Biscuit decision-token layer"
 kind: master-plan
 created_at: 2026-07-07T15:24:21Z
+intention: intention_01kx6ajfcjefhtvc4fhwk7fjq7
 ---
 
 # Harden the Biscuit decision-token layer
@@ -66,7 +67,7 @@ needlessly serialize the key-rotation fix.
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | EP-55 | Support key rotation and unconditional revocation in Biscuit grants | docs/plans/55-support-key-rotation-and-unconditional-revocation-in-biscuit-grants.md | None | None | Not Started |
-| EP-56 | Pin attenuation-injection semantics with tests | docs/plans/56-pin-attenuation-injection-semantics-with-tests.md | None | None | Not Started |
+| EP-56 | Pin attenuation-injection semantics with tests | docs/plans/56-pin-attenuation-injection-semantics-with-tests.md | None | None | Complete |
 | EP-57 | Mint Biscuit grants over HTTP | docs/plans/57-mint-biscuit-grants-over-http.md | None | EP-55 | Not Started |
 
 
@@ -117,14 +118,46 @@ config.
 
 - [ ] EP-55: tokens carry a key id; verifiers accept a keyset; rotation demonstrated without redeploying verifiers
 - [ ] EP-55: every token revocable via built-in block revocation ids; application revocationId remains optional
-- [ ] EP-56: holder-attenuated blocks injecting en_right/en_expires_at facts proven ignored or rejected
+- [x] EP-56: holder-attenuated blocks injecting en_right/en_expires_at facts proven ignored or rejected
 - [ ] EP-57: authenticated HTTP endpoint mints a grant from a fresh check at a checked-at token
 - [ ] EP-57: minted-over-HTTP token verifies and attenuates locally end-to-end
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- EP-56: the fact-scoping assumption **holds** against the pinned
+  biscuit-haskell. No rewrite of `extractAndCheck` is needed, so EP-55 builds on
+  today's `Verify.hs` shape unchanged — the conditional dependency the
+  Decomposition Strategy warned about never materialized. EP-55 is unblocked
+  exactly as registered.
+
+- EP-56: the forged facts are not uniformly dangerous, which sharpens what EP-55
+  must preserve. Only `en_container_scope` is genuinely exploitable if scoping
+  ever breaks, because `resolveScope`'s `containerRefs` keeps *every* matching
+  row; the single-valued facts go through `getSingleVariableValue`, which returns
+  `Nothing` on two rows and so fails closed with `MalformedGrant`. The exception
+  is `en_revocation_id`, whose `Nothing` means "not revocable" rather than
+  "malformed" — a visible forged row would silently skip the revocation check
+  rather than fail. **EP-55 must keep this in mind**: its unconditional
+  block-revocation-id check is precisely what removes that soft spot, since
+  built-in revocation ids are signature bytes in the token envelope and cannot be
+  shadowed by a Datalog fact at all.
+
+- EP-56: `trusting previous` parses in the `query` quasiquoter but is rejected in
+  the `authorizer` quasiquoter (`Auth/Biscuit/Datalog/Parser.hs:430`,
+  `PreviousInAuthorizer`). Any plan reaching for an authorizer policy to inspect
+  holder-block facts must use `queryRawBiscuitFacts` instead.
+
+- EP-56: the new tests were validated by mutation — making `resolveScope` trust
+  holder blocks turns the suite red — so they are a genuine tripwire for a future
+  `cabal.project` re-pin of biscuit-haskell, not merely green assertions.
+
+- EP-56 pins *fact* scoping only. Whether a holder can influence which issuer key
+  a verifier selects is untested ground that arrives with EP-55's `rootKeyId`
+  keyset selection; EP-55 should carry that test itself. EP-56's seven tests need
+  only a mechanical `verifyGrant` call-site update when EP-55 lands (`singleKey`
+  plus a `const (pure False)` block check); none of their assertions depend on
+  key material.
 
 
 ## Decision Log
@@ -138,6 +171,12 @@ config.
 - Decision: Defer a revocation distribution mechanism.
   Rationale: Storing/serving revocation lists is a service concern; the watch API (docs/plans/53) is the natural carrier once it exists. This plan only guarantees every token is revocable in principle.
   Date: 2026-07-07
+- Decision: EP-55 proceeds against the existing `Verify.hs` shape; the M3 contingency in EP-56 is retired.
+  Rationale: EP-56 landed green, so the fact-scoping assumption `extractAndCheck` rests on is confirmed against the pinned biscuit-haskell and no authority-scoped rewrite is required. The soft ordering EP-56-before-EP-55 has paid off exactly as intended: EP-55 now knows which verifier it is building on.
+  Date: 2026-07-10
+- Decision: EP-55 must additionally test whether a holder can influence issuer-key selection.
+  Rationale: EP-56 pins fact scoping under a single key. Key-id selection (`rootKeyId`) is attacker-visible metadata in the token envelope, and "which key does the verifier reach for" is a new attack surface that arrives only with EP-55's keyset. It belongs in the plan that introduces it, not in a retrofit of EP-56.
+  Date: 2026-07-10
 
 
 ## Outcomes & Retrospective
