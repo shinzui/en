@@ -66,7 +66,7 @@ needlessly serialize the key-rotation fix.
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-55 | Support key rotation and unconditional revocation in Biscuit grants | docs/plans/55-support-key-rotation-and-unconditional-revocation-in-biscuit-grants.md | None | None | In Progress |
+| EP-55 | Support key rotation and unconditional revocation in Biscuit grants | docs/plans/55-support-key-rotation-and-unconditional-revocation-in-biscuit-grants.md | None | None | Complete |
 | EP-56 | Pin attenuation-injection semantics with tests | docs/plans/56-pin-attenuation-injection-semantics-with-tests.md | None | None | Complete |
 | EP-57 | Mint Biscuit grants over HTTP | docs/plans/57-mint-biscuit-grants-over-http.md | None | EP-55 | Not Started |
 
@@ -116,8 +116,8 @@ config.
 
 ## Progress
 
-- [ ] EP-55: tokens carry a key id; verifiers accept a keyset; rotation demonstrated without redeploying verifiers
-- [ ] EP-55: every token revocable via built-in block revocation ids; application revocationId remains optional
+- [x] EP-55 (2026-07-10): tokens carry a key id; verifiers accept a keyset; rotation demonstrated without redeploying verifiers (`keyRotationTest`, `legacyTokenTest`, `keySelectionAttackTest`)
+- [x] EP-55 (2026-07-10): every token revocable via built-in block revocation ids; application revocationId remains optional (`blockRevocationTest`)
 - [x] EP-56: holder-attenuated blocks injecting en_right/en_expires_at facts proven ignored or rejected
 - [ ] EP-57: authenticated HTTP endpoint mints a grant from a fresh check at a checked-at token
 - [ ] EP-57: minted-over-HTTP token verifies and attenuates locally end-to-end
@@ -158,6 +158,32 @@ config.
   only a mechanical `verifyGrant` call-site update when EP-55 lands (`singleKey`
   plus a `const (pure False)` block check); none of their assertions depend on
   key material.
+
+- EP-55 landed (2026-07-10) and confirmed both predictions above. EP-56's seven
+  fact-scoping tests took exactly the mechanical call-site update through a shared
+  `keySetFor` helper — no assertion changed. The key-selection surface EP-56
+  flagged is now closed by `keySelectionAttackTest`: an A-signed token claiming
+  key id 2 fails `SignatureInvalid` against a keyset mapping id 2 → key B, because
+  `selectIssuerKey` routes by the attacker-visible id but the crypto rejects the
+  mismatch.
+
+- **Interface change EP-57 must consume** (`docs/plans/57-mint-biscuit-grants-over-http.md`):
+  the token-format contract is now broken exactly once, as intended. `verifyGrant`
+  takes an `En.Biscuit.Keys.IssuerKeySet` (not a single `PublicKey`);
+  `VerifyRequest` now *requires* a `revokedBlockIds :: Set ByteString -> m Bool`
+  field; and every mint function returns `En.Biscuit.Mint.MintedGrant` (`token`,
+  `expiresAt`, `revocationIds`) instead of bare `ByteString`. `MintConfig` gained
+  `issuerKeyId :: IssuerKeyId`. EP-57 loads issuer key material via
+  `parseSigningKeyText` / `parseIssuerKeySetText` from `En.Biscuit.Keys` and
+  returns the `MintedGrant` fields in its HTTP response body. The
+  `EN_BISCUIT_SIGNING_KEY` / `EN_BISCUIT_ISSUER_KEYS` text formats are documented
+  in `docs/user/biscuit-decision-tokens.md` (Key rotation and revocation).
+
+- Deviation from EP-55's sketch, recorded for EP-57's benefit: the entire
+  `En.Biscuit.Keys` module (identity, keyset, and text codecs) was created in the
+  M1 commit rather than accreted across milestones — the plan explicitly permitted
+  one home for `IssuerKeyId`. So all of `En.Biscuit.Keys` is available as of the
+  first EP-55 commit, not staged by milestone.
 
 
 ## Decision Log
