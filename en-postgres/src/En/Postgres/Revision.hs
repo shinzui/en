@@ -30,6 +30,7 @@ module En.Postgres.Revision (
     comparePostgresRevision,
     encodeToken,
     decodeToken,
+    renderTokenDecodeError,
     tokenMetadataFromPayload,
     validateTokenMetadata,
     resolveConsistencyRequest,
@@ -130,12 +131,32 @@ data CachedValue a = CachedValue
 -- | The 'Revision' instantiation of 'TtlCache', the only one in the tree.
 type OptimizedRevisionCache = TtlCache Revision
 
+{- | Why a token failed to decode. Internal to this module; its 'Show' is for the
+operator's logs. A client is shown 'renderTokenDecodeError' instead, because the two
+audiences want different text and a constructor name must never reach the wire.
+-}
 data TokenDecodeError
     = TokenBadPrefix
     | TokenBadFieldCount
     | TokenBadEscape Text
     | TokenBadSnapshot Text
+    | TokenBadExpiry Text
     deriving stock (Eq, Show)
+
+{- | A token-decode failure, rendered for the client that sent the token.
+
+Deliberately not the 'Show' instance: 'Show' names the constructor for an operator
+reading a log, and this names the fault for a caller reading an HTTP body. The
+offending token is not echoed back — a caller that sent it already has it, and an
+operator does not need it twice.
+-}
+renderTokenDecodeError :: TokenDecodeError -> Text
+renderTokenDecodeError = \case
+    TokenBadPrefix -> "not an en consistency token"
+    TokenBadFieldCount -> "consistency token is truncated or has extra fields"
+    TokenBadEscape _ -> "consistency token contains an invalid escape sequence"
+    TokenBadSnapshot _ -> "consistency token does not carry a PostgreSQL snapshot"
+    TokenBadExpiry _ -> "consistency token has an unparseable expiry"
 
 parsePgSnapshot :: Text -> Either Text PgSnapshot
 parsePgSnapshot input =
@@ -346,7 +367,7 @@ decodeToken (ConsistencyToken tokenText) =
 tokenMetadataFromPayload :: ConsistencyToken -> Either EnError TokenMetadata
 tokenMetadataFromPayload token =
     case decodeToken token of
-        Left err -> Left (InvalidConsistencyToken (Text.pack (show err)))
+        Left err -> Left (MalformedConsistencyToken (renderTokenDecodeError err))
         Right payload ->
             Right
                 TokenMetadata
@@ -364,15 +385,15 @@ validateTokenMetadata config now oldestRetainedXid metadata
     | metadata.schemaHash /= config.schemaHash =
         Left (InvalidConsistencyToken "token schema hash does not match the active schema")
     | maybe False (<= now) metadata.expiresAt =
-        Left (InvalidConsistencyToken "token is expired")
+        Left (ConsistencyTokenExpired "token is expired")
     | otherwise = do
         snapshot <-
             mapLeft
-                (InvalidConsistencyToken . ("token revision is not a PostgreSQL snapshot: " <>))
+                (MalformedConsistencyToken . ("token revision is not a PostgreSQL snapshot: " <>))
                 (revisionToPgSnapshot metadata.revision)
         if retainedHistoryVisible oldestRetainedXid snapshot
             then Right ()
-            else Left (InvalidConsistencyToken "token is older than the garbage-collection window")
+            else Left (ConsistencyTokenExpired "token is older than the garbage-collection window")
 
 {- | The four things a consistency mode might need, each fetched on demand.
 
@@ -528,7 +549,7 @@ parseExpiry :: Text -> Either TokenDecodeError UTCTime
 parseExpiry text =
     case iso8601ParseM (Text.unpack text) of
         Just value -> Right value
-        Nothing -> Left (TokenBadEscape text)
+        Nothing -> Left (TokenBadExpiry text)
 
 parseWord :: Text -> Text -> Either Text Word64
 parseWord fieldName textValue

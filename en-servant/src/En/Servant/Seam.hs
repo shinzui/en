@@ -204,6 +204,10 @@ enErrorToFault = \case
     MissingCaveatContext names ->
         BadRequestFault
             (envelope "missing_caveat_context" ("missing caveat context: " <> Text.intercalate ", " names))
+    MalformedConsistencyToken detail ->
+        BadRequestFault (envelope "malformed_consistency_token" detail)
+    ConsistencyTokenExpired detail ->
+        BadRequestFault (envelope "consistency_token_expired" detail)
     InvalidConsistencyToken detail ->
         BadRequestFault (envelope "invalid_consistency_token" detail)
     InvalidCursor cursor ->

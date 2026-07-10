@@ -142,8 +142,11 @@ Cursor-resumable at a pinned snapshot, not streamed. A lookup-subjects resolves
 consistency /once/ and every page of it — including the forward checks that confirm
 intersection and exclusion candidates — reads the same snapshot. The cursor carries a
 'ConsistencyToken' pinning it, validated on resume exactly as any token presented on a
-read: datastore identity, schema hash, garbage-collection window. A tampered, foreign, or
-expired cursor is refused with @InvalidConsistencyToken "lookup-subjects cursor"@, and is
+read: datastore identity, schema hash, garbage-collection window. A structurally malformed
+cursor is refused with 'En.Error.InvalidCursor' (a pagination artifact, not a token, just as
+a malformed watch cursor is); a well-formed cursor whose embedded token is foreign, expired,
+or tampered is refused by that token's own validation ('InvalidConsistencyToken',
+'En.Error.ConsistencyTokenExpired', or 'En.Error.MalformedConsistencyToken'). Either is
 recovered from by restarting without one.
 
 Results are ordered by subject and the cursor records the last one emitted, which is what
@@ -761,7 +764,7 @@ engine go through 'resolveLookupSubjectsCursor'.
 -}
 decodeLookupSubjectsCursor :: LookupSubjectsCursor -> Either EnError LookupSubjectsCursorState
 decodeLookupSubjectsCursor (LookupSubjectsCursor cursorText) =
-    maybe (Left invalidCursor) Right do
+    maybe (Left (InvalidCursor cursorText)) Right do
         body <- Text.stripPrefix "lookupsubjects-v1" cursorText
         ([tokenText, kind, objectTypeText, objectId, relation], rest) <- parseFieldsPrefix 5 body
         if Text.null rest then Just () else Nothing
@@ -806,10 +809,6 @@ resolveLookupSubjectsCursor cursor =
             metadata <- decodeToken cursorState.token
             validateToken metadata
             pure (Right (metadata.revision, cursorState))
-
-invalidCursor :: EnError
-invalidCursor =
-    InvalidConsistencyToken "lookup-subjects cursor"
 
 encodeField :: Text -> Text
 encodeField value =

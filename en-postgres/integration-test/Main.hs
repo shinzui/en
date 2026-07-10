@@ -228,19 +228,20 @@ runTupleStoreScenario connection = do
         =<< runPg connection config (check graph (AtLeastAsFresh firstPageToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX)
     {- Cursor validation against the real PostgreSQL validator, not a test double.
     Flipping one character inside the cursor's token field preserves the field's
-    length prefix, so the cursor still parses -- and is then refused by `decodeToken`,
-    which is the only thing standing between a client and a read at a revision of its
-    choosing. A retired v1 cursor is refused at the parse step, before any token is
-    consulted, because its revision field was exactly that. -}
+    length prefix, so the cursor still parses -- and its embedded token is then refused
+    by `decodeToken` as 'MalformedConsistencyToken', with client prose rather than the
+    internal @TokenBadPrefix@ constructor name that used to leak to the wire (docs/plans/60,
+    M2). A retired v1 cursor is a different thing: it is malformed as a /cursor/, refused at
+    the parse step as 'InvalidCursor' before any token is consulted. -}
     let LookupCursor projectXCursorText = projectXCursor
         corruptedTokenCursor = LookupCursor (Text.replace ":en1." ":xn1." projectXCursorText)
     assertEqual
-        "postgres-backed lookup rejects a cursor whose token was tampered with"
-        (Left (InvalidConsistencyToken "TokenBadPrefix"))
+        "postgres-backed lookup rejects a cursor whose token was tampered with, with prose not a constructor name"
+        (Left (MalformedConsistencyToken "not an en consistency token"))
         =<< runPg connection config (Lookup.lookup graph (AtLeastAsFresh writeToken) (lookupRequest (Just corruptedTokenCursor)))
     assertEqual
-        "postgres-backed lookup rejects a retired v1 cursor"
-        (Left (InvalidConsistencyToken "lookup cursor"))
+        "postgres-backed lookup rejects a retired v1 cursor as a malformed cursor"
+        (Left (InvalidCursor "lookup-v1|13:test-revision|0:|0:"))
         =<< runPg connection config (Lookup.lookup graph (AtLeastAsFresh writeToken) (lookupRequest (Just (LookupCursor "lookup-v1|13:test-revision|0:|0:"))))
     deleteToken <- runPgOrFail connection config (TupleStore.deleteTuples [tuple, tuple2])
     TokenMetadata{revision = deleteRevision} <- either (fail . show) pure (tokenMetadataFromPayload deleteToken)
@@ -258,7 +259,7 @@ runTupleStoreScenario connection = do
     staleResult <- runPg connection staleConfig (ConsistencyStore.resolveConsistency (AtExactSnapshot writeToken))
     assertEqual
         "stale snapshot token is rejected after GC horizon advances"
-        (Left (InvalidConsistencyToken "token is older than the garbage-collection window"))
+        (Left (ConsistencyTokenExpired "token is older than the garbage-collection window"))
         staleResult
     {- The reported bug (docs/plans/60), end to end. On a store whose garbage-collection
     window holds no anchor row -- here forced by @gcWindow = "0 seconds"@ -- 'oldestRetainedXid'
@@ -1456,7 +1457,7 @@ runWatchFeedScenario connection = do
     let expired = Watch.encodeWatchCursor config.datastoreId (Watch.WatchAt (Revision "1:1:"))
     assertEqual
         "a cursor whose window predates the garbage-collection horizon is refused"
-        (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
+        (Left (ConsistencyTokenExpired "watch cursor is older than the garbage-collection window"))
         =<< runPg connection config (Watch.watch config (StartFromCursor expired) Nothing 100)
 
     let foreign' = Watch.encodeWatchCursor (DatastoreId "not-this-datastore") (Watch.WatchAt (Revision "1:1:"))

@@ -49,6 +49,7 @@ import En.Effect.TupleStore (ChangePage (..), RelationshipFilter, TupleStore, he
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
+import En.Postgres.Revision (tokenMetadataFromPayload)
 import En.Reachability (ReachabilityGraph (..))
 import En.Revision (ConsistencyToken (..), DatastoreId (..), SchemaHash (..))
 import En.Schema (ObjectType (..), RelationName (..))
@@ -317,16 +318,17 @@ main = do
 
     {- The wire carries a cursor as opaque text and hands it to the engine unread, so
     the engine's cursor validation is what protects the endpoint. A retired v1 cursor
-    -- whose revision field a client could choose freely -- and an unparsable one both
-    surface as a 400 rather than a 500, because `enErrorToFault` maps
-    `InvalidConsistencyToken` to a client fault. -}
+    -- whose revision field a client could choose freely -- and an unparsable one are
+    both malformed /cursors/, so they surface as a 400 under `invalid_cursor`, the same
+    code a malformed watch cursor gets (docs/plans/60, M2). `enErrorToFault` maps
+    `InvalidCursor` to a client fault. -}
     assertEqual
         "a retired v1 lookup cursor is a client error"
-        (Just "invalid_consistency_token")
+        (Just "invalid_cursor")
         =<< clientErrorCodeOf (lookupEndpoint lookupRequest{cursor = Just "lookup-v1|13:test-revision|0:|0:"})
     assertEqual
         "an unparsable lookup cursor is a client error"
-        (Just "invalid_consistency_token")
+        (Just "invalid_cursor")
         =<< clientErrorCodeOf (lookupEndpoint lookupRequest{cursor = Just "not-a-cursor"})
 
     -- The server owns the lookup budget, not the caller. A `deadlineMaxMillis` of zero
@@ -402,10 +404,11 @@ lookupSubjectsTests env = do
         (Just "invalid_request")
         =<< clientErrorCodeOf (lookupSubjectsHandler env groupNesting{limit = 0})
     -- The wire hands the cursor to the engine unread, so the engine's validation is what
-    -- protects the endpoint. `enErrorToFault` maps `InvalidConsistencyToken` to a 400.
+    -- protects the endpoint. A malformed cursor is `InvalidCursor`, which `enErrorToFault`
+    -- maps to a 400 under `invalid_cursor` (docs/plans/60, M2).
     assertEqual
         "an unparsable lookup-subjects cursor is a client error"
-        (Just "invalid_consistency_token")
+        (Just "invalid_cursor")
         =<< clientErrorCodeOf (lookupSubjectsHandler env groupNesting{cursor = Just "not-a-cursor"})
 
     -- `audit = owner & member` is an intersection, so every candidate costs a confirming
@@ -1221,7 +1224,10 @@ errorModelTests = do
     mapsTo "UnknownRelation" (UnknownRelation "audit") (400, "unknown_relation", False)
     mapsTo "SchemaViolation" (SchemaViolation "subject type not permitted") (400, "schema_violation", False)
     mapsTo "MissingCaveatContext" (MissingCaveatContext ["now"]) (400, "missing_caveat_context", False)
+    mapsTo "MalformedConsistencyToken" (MalformedConsistencyToken "not an en consistency token") (400, "malformed_consistency_token", False)
+    mapsTo "ConsistencyTokenExpired" (ConsistencyTokenExpired "token is older than the garbage-collection window") (400, "consistency_token_expired", False)
     mapsTo "InvalidConsistencyToken" (InvalidConsistencyToken "bad token") (400, "invalid_consistency_token", False)
+    mapsTo "InvalidCursor" (InvalidCursor "not-a-cursor") (400, "invalid_cursor", False)
     mapsTo "ResolutionLimitExceeded" ResolutionLimitExceeded (422, "resolution_limit_exceeded", False)
     mapsTo "CycleDetected" (CycleDetected "space:recursive#view") (422, "cycle_detected", False)
     mapsTo
@@ -1253,8 +1259,40 @@ errorModelTests = do
         "ErrorEnvelopeWire"
         "{\"code\":\"store_error\",\"message\":\"the tuple store failed; retry later\",\"retryable\":true}"
         (envelopeOf (enErrorToFault (StoreError secretDetail)))
+
+    {- The regression guard for docs/plans/60, M2: a malformed consistency token must reach
+    the wire as prose, never as the name of the internal 'En.Postgres.Revision.TokenDecodeError'
+    constructor that classified it. Each of these strings trips a different decode branch; every
+    resulting envelope must carry a stable code and a message free of any internal constructor
+    name. `TokenBad` alone catches every decode constructor; the `EnError` token names catch a
+    `show`-the-error regression at the mapping layer. -}
+    Foldable.traverse_
+        assertNoConstructorLeak
+        [ "xn1.a.b.c.d" -- TokenBadPrefix
+        , "en1.a.b.c" -- TokenBadFieldCount
+        , "en1.%zz.schema.10:20:." -- TokenBadEscape
+        , "en1.primary.schema.not-a-snapshot." -- TokenBadSnapshot
+        , "en1.primary.schema.10:20:.not-a-date" -- TokenBadExpiry
+        ]
   where
     secretDetail = "SELECT * FROM relation_tuple WHERE object_id = $1 -- 'alice'"
+
+    assertNoConstructorLeak tokenText =
+        case tokenMetadataFromPayload (ConsistencyToken tokenText) of
+            Right _ -> assertBool ("expected " <> Text.unpack tokenText <> " to be rejected as malformed") False
+            Left err -> do
+                let envelope = envelopeOf (enErrorToFault err)
+                assertEqual
+                    ("a malformed token is a stable malformed_consistency_token: " <> Text.unpack tokenText)
+                    "malformed_consistency_token"
+                    envelope.code
+                Foldable.traverse_
+                    ( \forbidden ->
+                        assertBool
+                            ("response body for " <> Text.unpack tokenText <> " must not leak the internal name " <> Text.unpack forbidden <> "; got: " <> Text.unpack envelope.message)
+                            (not (forbidden `Text.isInfixOf` envelope.message))
+                    )
+                    ["TokenBad", "MalformedConsistencyToken", "ConsistencyTokenExpired", "InvalidConsistencyToken"]
 
     mapsTo :: String -> EnError -> (Int, Text, Bool) -> IO ()
     mapsTo label err expected =

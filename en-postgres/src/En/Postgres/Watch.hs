@@ -169,12 +169,12 @@ validateWatchCursor config oldestRetainedXid datastoreId cursorState
     | otherwise =
         case revisionToPgSnapshot (windowStart cursorState) of
             Left err ->
-                Left (InvalidConsistencyToken ("watch cursor revision is not a PostgreSQL snapshot: " <> err))
+                Left (MalformedConsistencyToken ("watch cursor revision is not a PostgreSQL snapshot: " <> err))
             Right snapshot
                 | retainedHistoryVisible oldestRetainedXid snapshot ->
                     Right cursorState
                 | otherwise ->
-                    Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window")
+                    Left (ConsistencyTokenExpired "watch cursor is older than the garbage-collection window")
 
 windowStart :: WatchCursorState -> Revision
 windowStart = \case

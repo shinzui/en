@@ -144,7 +144,7 @@ lookupSubjectsTests = do
 
     assertEqual
         "a malformed cursor is refused"
-        (Left (InvalidConsistencyToken "lookup-subjects cursor"))
+        (Left (InvalidCursor "not-a-cursor"))
         ( fmap
             (.subjects)
             (fixtureLookupSubjects requestContext exclusionSpace member userType 1 (Just (LookupSubjectsCursor "not-a-cursor")))

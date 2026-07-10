@@ -420,8 +420,10 @@ token minted by a different datastore. This is what a cursor-validation test nee
 the permissive interpreter above accepts a forged cursor and would certify the very
 hole it is meant to prove closed.
 
-Both rejections raise 'InvalidConsistencyToken' through the ambient @Error EnError@,
-which is how 'En.Postgres.Revision.runConsistencyStorePostgres' surfaces them too.
+A token it did not mint raises 'MalformedConsistencyToken' (it is not a token this
+store recognises); a token minted by a different datastore raises
+'InvalidConsistencyToken'. Both surface through the ambient @Error EnError@, exactly
+as 'En.Postgres.Revision.runConsistencyStorePostgres' surfaces the same two faults.
 -}
 runConsistencyStoreInMemoryStrict ::
     (Error EnError :> es) =>
@@ -433,7 +435,7 @@ runConsistencyStoreInMemoryStrict datastoreId =
         DecodeToken token ->
             case parseInMemoryToken token of
                 Nothing ->
-                    throwError (InvalidConsistencyToken "token is not an in-memory token")
+                    throwError (MalformedConsistencyToken "token is not an in-memory token")
                 Just (tokenDatastore, revision) ->
                     pure
                         TokenMetadata

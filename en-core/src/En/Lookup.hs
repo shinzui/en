@@ -163,12 +163,17 @@ A lookup resolves consistency /once/ and every page of it, including the forward
 checks that confirm intersection and exclusion candidates, reads the same snapshot.
 The cursor carries a 'En.Revision.ConsistencyToken' pinning that snapshot, and a
 continuation is validated exactly as any token presented on a read -- datastore
-identity, schema hash, garbage-collection window. A tampered, foreign, or expired
-cursor is refused with @InvalidConsistencyToken "lookup cursor"@. Cursors from the
-retired @lookup-v1@ format are refused for the same reason: they carried a raw
-revision that a client could choose. A refused cursor is recoverable by restarting
-the lookup without one, and cursors expire with the GC window, so a client that
-sits on one for a day should expect to.
+identity, schema hash, garbage-collection window. A structurally malformed cursor --
+including one in the retired @lookup-v1@ format, whose raw client-chosen revision is
+exactly what v2 removed -- is refused with 'En.Error.InvalidCursor', the same fault a
+malformed watch cursor raises: a cursor is a pagination artifact, not a token, and
+restarting the scan in its place would silently redeliver rows. A well-formed cursor
+whose embedded token is foreign, has expired, or was tampered with is refused by the
+token validation it carries -- 'En.Error.InvalidConsistencyToken',
+'En.Error.ConsistencyTokenExpired', or 'En.Error.MalformedConsistencyToken'
+respectively -- exactly as that token would be on a direct read. A refused cursor is
+recoverable by restarting the lookup without one, and cursors expire with the GC
+window, so a client that sits on one for a day should expect to.
 
 Results are ordered by object key and a cursor records the last one emitted, which
 is what keeps pages free of duplicates and gaps. Continuation pages do /not/ resume
@@ -976,7 +981,7 @@ no cursor, which is the same recovery path as any invalid cursor.
 -}
 decodeLookupCursor :: LookupCursor -> Either EnError LookupCursorState
 decodeLookupCursor (LookupCursor cursorText) =
-    maybe (Left (InvalidConsistencyToken "lookup cursor")) Right do
+    maybe (Left (InvalidCursor cursorText)) Right do
         body <- Text.stripPrefix "lookup-v2" cursorText
         ([tokenText, objectTypeText, objectId, countText], afterFixed) <- parseFieldsPrefix 4 body
         branchCount <- readMaybe (Text.unpack countText)
@@ -1024,11 +1029,11 @@ datastore identity, same schema hash, same garbage-collection horizon -- and the
 revision the continuation reads at comes from the /validated/ token metadata,
 never from the cursor's own bytes.
 
-A malformed cursor is 'Left' here. A well-formed cursor carrying a token the
-datastore rejects raises through the ambient error effect, exactly as
-'resolveConsistency' does for a bad 'En.Revision.AtExactSnapshot' token; the two
-failures are the same kind of failure and both reach the caller as
-'InvalidConsistencyToken'.
+A malformed cursor is 'Left' here as 'En.Error.InvalidCursor'. A well-formed cursor
+carrying a token the datastore rejects raises through the ambient error effect,
+exactly as 'resolveConsistency' does for a bad 'En.Revision.AtExactSnapshot' token:
+the token's own fault reaches the caller unchanged ('InvalidConsistencyToken',
+'En.Error.ConsistencyTokenExpired', or 'En.Error.MalformedConsistencyToken').
 -}
 resolveCursor ::
     (ConsistencyStore :> es) =>

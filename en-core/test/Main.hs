@@ -550,10 +550,10 @@ main = do
 
     let strictLookupWithCursor cursor =
             lookupEngine noDeadline strictConsistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 10) (Just cursor))
-    assertEqual "a forged v1 lookup cursor is rejected, not obeyed" (Left (InvalidConsistencyToken "lookup cursor")) =<< strictLookupWithCursor forgedLookupCursor
-    assertEqual "a malformed v2 lookup cursor is rejected" (Left (InvalidConsistencyToken "lookup cursor")) =<< strictLookupWithCursor garbageLookupCursor
+    assertEqual "a forged v1 lookup cursor is rejected, not obeyed" (Left (InvalidCursor "lookup-v1|13:test-revision|0:|0:")) =<< strictLookupWithCursor forgedLookupCursor
+    assertEqual "a malformed v2 lookup cursor is rejected" (Left (InvalidCursor "lookup-v2|4:oops")) =<< strictLookupWithCursor garbageLookupCursor
     assertEqual "a lookup cursor minted by another datastore is rejected" (Left (InvalidConsistencyToken "token datastore does not match this en datastore")) =<< strictLookupWithCursor foreignLookupCursor
-    assertEqual "a lookup cursor carrying an unmintable token is rejected" (Left (InvalidConsistencyToken "token is not an in-memory token")) =<< strictLookupWithCursor tamperedTokenLookupCursor
+    assertEqual "a lookup cursor carrying an unmintable token is rejected" (Left (MalformedConsistencyToken "token is not an in-memory token")) =<< strictLookupWithCursor tamperedTokenLookupCursor
     -- The happy path still pages: a cursor this datastore minted is obeyed.
     assertEqual "a validly minted lookup cursor is obeyed" (Right (lookupPage [allowed space] LookupExhausted)) =<< strictLookupWithCursor (encodeLookupCursor LookupCursorState{version = 2, token = testToken, lastObject = Just childSpace, frontier = []})
     validPublic <- either (fail . show) pure (validateSchema publicSchema)

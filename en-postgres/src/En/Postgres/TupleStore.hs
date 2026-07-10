@@ -486,7 +486,7 @@ from a watch cursor or a consistency token the caller supplied.
 windowStartXmin :: Revision -> Either EnError Word64
 windowStartXmin revision =
     case revisionToPgSnapshot revision of
-        Left err -> Left (InvalidConsistencyToken ("watch window start is not a PostgreSQL snapshot: " <> err))
+        Left err -> Left (MalformedConsistencyToken ("watch window start is not a PostgreSQL snapshot: " <> err))
         Right snapshot -> Right snapshot.xmin
 
 {- | Match and retire in one transaction, returning the count and the anchor.

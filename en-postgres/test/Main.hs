@@ -22,6 +22,7 @@ import En.Postgres.Revision (
     newOptimizedRevisionReader,
     parsePgSnapshot,
     renderPgSnapshot,
+    renderTokenDecodeError,
     resolveConsistencyRequest,
     retainedHistoryVisible,
     revisionFromPgSnapshot,
@@ -155,11 +156,11 @@ main = do
         (validateTokenMetadata config now 0 metadataWithWrongSchema)
     assertEqual
         "expired token is rejected"
-        (Left (InvalidConsistencyToken "token is expired"))
+        (Left (ConsistencyTokenExpired "token is expired"))
         (validateTokenMetadata config now 0 expiredMetadata)
     assertEqual
         "token older than GC horizon is rejected"
-        (Left (InvalidConsistencyToken "token is older than the garbage-collection window"))
+        (Left (ConsistencyTokenExpired "token is older than the garbage-collection window"))
         (validateTokenMetadata config now 20 metadata)
     {- The reported bug: a token minted from a head revision on an idle store has
     @xmax == horizon@ and no in-flight transaction below the horizon, so every
@@ -175,7 +176,7 @@ main = do
     horizon. -}
     assertEqual
         "a token with an in-flight transaction below the horizon is still rejected"
-        (Left (InvalidConsistencyToken "token is older than the garbage-collection window"))
+        (Left (ConsistencyTokenExpired "token is older than the garbage-collection window"))
         (validateTokenMetadata config now 850 (metadataAtRevision (Revision "849:851:849")))
 
     -- 'retainedHistoryVisible' boundaries, stated directly.
@@ -256,7 +257,7 @@ main = do
                         , schemaHash = tokenPayload.schemaHash
                         , expiresAt = tokenPayload.expiresAt
                         }
-            Left err -> Left (InvalidConsistencyToken (showText err))
+            Left err -> Left (MalformedConsistencyToken (renderTokenDecodeError err))
 
     -- \| A 'ResolveEnv' over 'IO' that appends each getter's name as it runs.
     --
@@ -363,11 +364,11 @@ testWatchCursorCodec = do
     how far back the feed must be able to see. -}
     assertEqual
         "a cursor whose window opens behind the garbage-collection horizon is refused"
-        (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
+        (Left (ConsistencyTokenExpired "watch cursor is older than the garbage-collection window"))
         (validateWatchCursor config 120 datastore atStart)
     assertEqual
         "a mid-drain cursor is judged on its window start, not its end"
-        (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
+        (Left (ConsistencyTokenExpired "watch cursor is older than the garbage-collection window"))
         (validateWatchCursor config 120 datastore draining)
 
     {- A watch cursor is now judged by the identical predicate a consistency token is —
@@ -396,7 +397,7 @@ testWatchCursorCodec = do
         (validateWatchCursor config 110 datastore atStart)
     assertEqual
         "a horizon just past the in-flight transaction is refused"
-        (Left (InvalidConsistencyToken "watch cursor is older than the garbage-collection window"))
+        (Left (ConsistencyTokenExpired "watch cursor is older than the garbage-collection window"))
         (validateWatchCursor config 111 datastore atStart)
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -413,10 +414,6 @@ assertEqual label expected actual
 parseUtc :: String -> UTCTime
 parseUtc =
     parseTimeOrError True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
-
-showText :: (Show a) => a -> Text.Text
-showText =
-    Text.pack . show
 
 testOptimizedRevisionReader :: IO ()
 testOptimizedRevisionReader = do

@@ -15,7 +15,28 @@ data EnError
       SchemaViolation Text
     | -- | A caveat could not be evaluated because required context was missing.
       MissingCaveatContext [Text]
-    | -- | The supplied consistency token is invalid or outside the GC window.
+    | {- | The supplied consistency token is not an en consistency token at all:
+      a bad prefix, the wrong field count, an invalid escape sequence, an
+      unparseable snapshot, or an unparseable expiry. Carries a human-readable
+      rendering — never the @Show@ output of the internal decode error.
+
+      Distinct from 'ConsistencyTokenExpired' (the token was well-formed; its
+      history is gone) and from 'InvalidConsistencyToken' (the token is for a
+      different datastore or schema). The three are three different things for a
+      client to do — fix the bug, re-read and retry, reconfigure — so they carry
+      three different wire codes. See "En.Servant.Seam".
+      -}
+      MalformedConsistencyToken Text
+    | {- | A well-formed consistency token whose history the garbage collector has
+      already reaped, or whose wall-clock @expiresAt@ has passed. The token was
+      valid once; time moved. The client's recovery is to re-read and retry with
+      the fresh token that read returns.
+      -}
+      ConsistencyTokenExpired Text
+    | {- | The supplied consistency token is well-formed and current, but belongs
+      to a different datastore or was minted under a different schema hash. The
+      recovery is to reconfigure, not to retry.
+      -}
       InvalidConsistencyToken Text
     | {- | A pagination cursor was malformed or does not belong to this store.
       Carries the cursor's rendering.

@@ -99,6 +99,7 @@ test-suite en-servant-tests
     , effectful-core
     , en-biscuit
     , en-core
+    , en-postgres
     , en-servant
     , http-types
     , openapi-hs
