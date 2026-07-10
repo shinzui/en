@@ -67,7 +67,6 @@ import En.Servant.API (
     DeleteRelationshipsRequestWire (..),
     DeleteRelationshipsResponseWire (..),
     DeleteTuplesRequestWire (..),
-    EnApi (..),
     EnResult (..),
     Env (..),
     ExpandNodeWire (..),
@@ -102,7 +101,18 @@ import En.Servant.API (
     WriteTuplesRequestWire (..),
     WriteTuplesResponseWire (..),
     app,
-    server,
+    batchCheckHandler,
+    checkHandler,
+    deleteRelationshipsHandler,
+    deleteTuplesHandler,
+    expandHandler,
+    lookupHandler,
+    lookupSubjectsHandler,
+    mintGrantHandler,
+    readRelationshipsHandler,
+    schemaHandler,
+    watchHandler,
+    writeTuplesHandler,
  )
 import En.Servant.OpenApi (enOpenApi)
 import En.Servant.Seam (
@@ -140,7 +150,7 @@ main = do
                 , deadlineMaxMillis = 30000
                 , mint = Nothing
                 }
-        batch = batchHandler env
+        batch = batchCheckHandler env
         request =
             BatchCheckRequestWire
                 { consistency = MinimizeLatencyWire
@@ -179,7 +189,7 @@ main = do
     assertEqual
         "oversized batch returns a typed batch_too_large"
         (Just "batch_too_large")
-        =<< clientErrorCodeOf (batchHandler smallEnv oversized)
+        =<< clientErrorCodeOf (batchCheckHandler smallEnv oversized)
 
     assertEqual
         "an unknown permission returns a typed unknown_relation"
@@ -873,7 +883,7 @@ schemaEndpointTests env = do
                 , loadedAt = testActiveSchema.loadedAt
                 }
         )
-        =<< runHandler (handlers env).readSchema
+        =<< runHandler (schemaHandler env)
 
 {- | The watch endpoint's wire surface, over 'stubWatch'.
 
@@ -1577,86 +1587,13 @@ newCheckCacheEnv = do
     cache <- newCache CacheConfig{enabled = True, maxEntries = 100} :: IO (Cache SubproblemKey ResidualDecision)
     pure CheckCacheEnv{cacheDatastoreId = DatastoreId "test", cacheDecisions = cache}
 
-{- | The handlers 'server' returns, named.
-
-'server' answers with a positional @:\<|\>@ chain, so every consumer that wants one
-handler must spell out the whole shape. Written once per handler — as it was until
-docs/plans/50 added two routes in the middle of the chain — a new route silently rebinds
-each later name to its neighbour, and nothing catches it wherever the neighbours' types
-agree. @check@ and @batchCheck@ do not agree, but @writeTuples@ and @deleteTuples@ very
-nearly do. Destructuring once, here, means a route added anywhere breaks this one
-pattern loudly.
+{- | The handlers are imported directly from their vertical slices ('En.Tuple.Api',
+'En.Check.Api', 'En.Lookup.Api', 'En.Expand.Api', 'En.Schema.Api'), re-exported through
+'En.Servant.API'. Before the slice split this suite destructured @server env@ into a
+'Handlers' record to name each one; now each handler is a top-level export, so a test calls
+it by name. @batchCheck@ is the one whose slice name differs from the old wrapper name
+(@batchHandler@); tests call 'batchCheckHandler' directly.
 -}
-data Handlers = Handlers
-    { writeTuples :: WriteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
-    , deleteTuples :: DeleteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
-    , readRelationships :: ReadRelationshipsRequestWire -> Handler (EnResult ReadRelationshipsResponseWire)
-    , deleteRelationships :: DeleteRelationshipsRequestWire -> Handler (EnResult DeleteRelationshipsResponseWire)
-    , check :: CheckRequestWire -> Handler (EnResult CheckResponseWire)
-    , batchCheck :: BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
-    , lookup :: LookupRequestWire -> Handler (EnResult LookupPageWire)
-    , lookupSubjects :: LookupSubjectsRequestWire -> Handler (EnResult LookupSubjectsPageWire)
-    , expand :: ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
-    , watch :: WatchRequestWire -> Handler (EnResult WatchResponseWire)
-    , mintGrant :: MintGrantRequestWire -> Handler MintGrantResponseWire
-    , readSchema :: Handler SchemaInfoWire
-    }
-
-handlers :: Env TestEffects -> Handlers
-handlers env =
-    Handlers
-        { writeTuples = writeTuplesEndpoint
-        , deleteTuples = deleteTuplesEndpoint
-        , readRelationships = readRelationshipsEndpoint
-        , deleteRelationships = deleteRelationshipsEndpoint
-        , check = checkEndpoint
-        , batchCheck = batchCheckEndpoint
-        , lookup = lookupEndpoint
-        , lookupSubjects = lookupSubjectsEndpoint
-        , expand = expandEndpoint
-        , watch = watchEndpoint
-        , mintGrant = mintGrantEndpoint
-        , readSchema = readSchemaEndpoint
-        }
-  where
-    EnApi
-        { writeTuples = writeTuplesEndpoint
-        , deleteTuples = deleteTuplesEndpoint
-        , readRelationships = readRelationshipsEndpoint
-        , deleteRelationships = deleteRelationshipsEndpoint
-        , check = checkEndpoint
-        , batchCheck = batchCheckEndpoint
-        , lookup = lookupEndpoint
-        , lookupSubjects = lookupSubjectsEndpoint
-        , expand = expandEndpoint
-        , watch = watchEndpoint
-        , mintGrant = mintGrantEndpoint
-        , readSchema = readSchemaEndpoint
-        } = server env
-
-batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
-batchHandler env = (handlers env).batchCheck
-
-checkHandler :: Env TestEffects -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
-checkHandler env = (handlers env).check
-
-lookupHandler :: Env TestEffects -> LookupRequestWire -> Handler (EnResult LookupPageWire)
-lookupHandler env = (handlers env).lookup
-
-lookupSubjectsHandler :: Env TestEffects -> LookupSubjectsRequestWire -> Handler (EnResult LookupSubjectsPageWire)
-lookupSubjectsHandler env = (handlers env).lookupSubjects
-
-writeTuplesHandler :: Env TestEffects -> WriteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
-writeTuplesHandler env = (handlers env).writeTuples
-
-deleteTuplesHandler :: Env TestEffects -> DeleteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
-deleteTuplesHandler env = (handlers env).deleteTuples
-
-expandHandler :: Env TestEffects -> ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
-expandHandler env = (handlers env).expand
-
-watchHandler :: Env TestEffects -> WatchRequestWire -> Handler (EnResult WatchResponseWire)
-watchHandler env = (handlers env).watch
 
 {- | A watch feed over the in-memory store, standing in for 'En.Postgres.Watch.watch'.
 
@@ -1695,12 +1632,6 @@ stubWatch _start relationshipFilter limit = do
     checkedAt <- mintToken revision
     page <- readChanges revision revision relationshipFilter limit Nothing
     pure WatchBatch{changes = page.changes, cursor = "enwatch1.test.at.test-revision..", checkedAt}
-
-readRelationshipsHandler :: Env TestEffects -> ReadRelationshipsRequestWire -> Handler (EnResult ReadRelationshipsResponseWire)
-readRelationshipsHandler env = (handlers env).readRelationships
-
-deleteRelationshipsHandler :: Env TestEffects -> DeleteRelationshipsRequestWire -> Handler (EnResult DeleteRelationshipsResponseWire)
-deleteRelationshipsHandler env = (handlers env).deleteRelationships
 
 -- | Did the engine stop early because its deadline had elapsed?
 isTruncated :: EnResult LookupPageWire -> Bool
@@ -1823,7 +1754,7 @@ mintGrantTests baseEnv = do
                             , maxTtl = 3600
                             }
                 }
-        grantsFor e = (handlers e).mintGrant
+        grantsFor e = mintGrantHandler e
         request =
             MintGrantRequestWire
                 { consistency = MinimizeLatencyWire

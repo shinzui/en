@@ -62,6 +62,11 @@ the 'En.Servant.API.EnApi' record. Association is by field name, so adding a rou
 record cannot silently rebind the others — the fragility the positional @:\<|\>@
 destructuring this replaced was subject to. The @:: EnApi (AsClientT ClientM)@ annotation
 fixes the client monad to 'ClientM'.
+
+'EnApi' mounts one sub-record per concept slice, so the derived client is nested: the
+umbrella yields the five slice clients, and each slice client yields its operations. This
+flat 'EnClient' is projected from them, one field at a time, so callers keep the flat
+@client.check@ surface.
 -}
 enClient :: EnClient
 enClient =
@@ -80,20 +85,12 @@ enClient =
         , readSchema
         }
   where
-    EnApi
-        { writeTuples
-        , deleteTuples
-        , readRelationships
-        , deleteRelationships
-        , check
-        , batchCheck
-        , lookup
-        , lookupSubjects
-        , expand
-        , watch
-        , mintGrant
-        , readSchema
-        } = genericClient :: EnApi (AsClientT ClientM)
+    EnApi{relationships, checks, lookups, expands, schema} = genericClient :: EnApi (AsClientT ClientM)
+    TupleRoutes{writeTuples, deleteTuples, readRelationships, deleteRelationships, watch} = relationships
+    CheckRoutes{check, batchCheck, mintGrant} = checks
+    LookupRoutes{lookup, lookupSubjects} = lookups
+    ExpandRoutes{expand} = expands
+    SchemaRoutes{readSchema} = schema
 
 {- | Ask for a read at least as fresh as a previous response's @checkedAt@.
 

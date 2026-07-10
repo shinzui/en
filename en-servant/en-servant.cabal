@@ -37,10 +37,17 @@ library
   import:          warnings, shared
   hs-source-dirs:  src
   exposed-modules:
+    En.Check.Api
+    En.Expand.Api
+    En.Lookup.Api
+    En.Schema.Api
     En.Servant.API
     En.Servant.Authorize
     En.Servant.OpenApi
+    En.Servant.Response
     En.Servant.Seam
+    En.Servant.Wire
+    En.Tuple.Api
 
   build-depends:
     , aeson

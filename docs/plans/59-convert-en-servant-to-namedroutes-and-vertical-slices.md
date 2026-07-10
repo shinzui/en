@@ -115,11 +115,23 @@ trailing it.
       passes. Deliberate-break check: renaming the `check` field path to `checkx` fails the
       suite (the `openApiDocumentTests` path-set assertion fires first, before `routingTests`,
       which would independently 404 on `/v1/check`); reverted.
-- [ ] Milestone 3: split `En.Servant.API` into vertical slices — `En.Servant.Wire` (shared
-      wire vocabulary), `En.Servant.Response` (the `MultiVerb` machinery), and
-      `En.Tuple.Api` / `En.Check.Api` / `En.Lookup.Api` / `En.Expand.Api` (routes + DTOs +
-      handlers). Keep `En.Servant.API` as a thin re-export umbrella so its public interface
-      is byte-for-byte identical and no downstream import breaks.
+- [x] Milestone 3 (done 2026-07-10): split `En.Servant.API` (2,548 lines) into vertical slices.
+      Created `En.Servant.Wire` (shared vocabulary + conversions), `En.Servant.Response` (the
+      `MultiVerb` machinery + handler plumbing, logic unchanged), and five concept slices —
+      `En.Tuple.Api` (write/delete/query/delete-by-filter/watch, `TupleRoutes`), `En.Check.Api`
+      (check/batch-check/grants, `CheckRoutes`), `En.Lookup.Api` (lookup/lookup-subjects,
+      `LookupRoutes`), `En.Expand.Api` (expand, `ExpandRoutes`), and `En.Schema.Api` (schema
+      `GET`, `SchemaRoutes`). `En.Servant.API` is now a 143-line umbrella: a five-field `EnApi`
+      record mounting the slice sub-records at `"v1"`, `server`/`app`/`apiProxy`/
+      `envelopeFormatters`, and a re-export list (`module` re-exports of Wire + the five slices,
+      plus `EnResponses`/`EnResult (..)` from Response and `Env`/`ActiveSchema`/`EnServer` from
+      Seam) that is a superset of today's, so `OpenApi.hs`, the test, and `En.Client` compile
+      with their existing `En.Servant.API` imports unchanged. `En.Client` now destructures the
+      nested `genericClient` (umbrella → slice sub-records → operations) into its flat
+      `EnClient`; the test imports the twelve handlers directly from the re-export and dropped
+      the `Handlers`/`server env` extraction. `cabal build all` and `cabal test all` pass with no
+      warnings; `grep ':<|>' API.hs` is empty; slices are concept-as-directory. Downstream by
+      import review (both blocked from local build, as recorded).
 - [ ] Milestone 4: amend the document of record,
       `docs/plans/35-version-the-wire-contract-and-type-the-error-model.md`, whose code
       blocks specify the `:<|>` chain and positional server this plan replaces.
