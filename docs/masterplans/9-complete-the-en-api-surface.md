@@ -71,7 +71,7 @@ verifiable without the others.
 | EP-50 | Expose relationship read and delete-by-filter endpoints | docs/plans/50-expose-relationship-read-and-delete-by-filter-endpoints.md | None | None | Complete |
 | EP-51 | Return checked-at consistency tokens from read responses | docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md | None | None | Complete |
 | EP-52 | Add a lookup-subjects API | docs/plans/52-add-a-lookup-subjects-api.md | None | None | Complete |
-| EP-53 | Add a watch changelog API | docs/plans/53-add-a-watch-changelog-api.md | None | None | In Progress |
+| EP-53 | Add a watch changelog API | docs/plans/53-add-a-watch-changelog-api.md | None | None | Complete |
 | EP-54 | Manage the schema lifecycle at runtime | docs/plans/54-manage-the-schema-lifecycle-at-runtime.md | None | EP-50 | Not Started |
 
 
@@ -118,6 +118,12 @@ the anchoring grammar: at least one of `objectType`/`subjectType`; `objectId` re
 `objectType`; `subjectId` and a non-`Any` `subjectRelation` require `subjectType`. See
 Surprises & Discoveries for why, and for the SQL-composition rule that comes with it.
 
+**EP-53 consumed it unchanged on 2026-07-09.** `ReadChanges` takes `Maybe RelationshipFilter`
+and compiles it through the same `compileFilter`; the wire request carries
+`filter :: Maybe RelationshipFilterWire`, validated by the same `relationshipFilterFromWire`,
+so an unanchored subscription filter is the same `400` an unanchored read filter is. Only
+EP-54's per-type enumeration remains.
+
 Checked-at token plumbing is defined by EP-51: `check`/`lookup`/`expand` results in
 `en-core` gain the resolved revision, and every read response DTO gains a token field.
 EP-52 and EP-53 must include the same field in their new response DTOs from day one
@@ -140,6 +146,14 @@ with `checkedAt`, minted from the resolved revision. A page-two request that ask
 (`27802:27802:`). EP-53 must do the same. Only EP-54's schema-read endpoint remains, and it
 is not a tuple read: whether it carries `checkedAt` at all is EP-54's to decide and record.
 
+**EP-53 consumed it on 2026-07-09 and confirmed it live too.** `WatchResponseWire` ends with
+`checkedAt`, minted from the window's *end* revision. A drain's page two reported
+`27807:27807:` — the end its cursor carried — while the head had already advanced past it.
+But see Surprises: a `checkedAt` token minted from a head revision stops validating the moment
+one write lands, because `validateTokenMetadata` rejects on `xmax <= horizon` and a head
+snapshot's `xmax` is the next unassigned xid. EP-53 sidestepped this for cursors by deriving a
+different rule; the token convention itself is untouched and unexercised at that boundary.
+
 The watch changelog storage query (EP-53) reads `relation_tuple.created_xid`/
 `deleted_xid` ordered by transaction visibility, likely via
 `relation_tuple_created_xid_idx` — the index that
@@ -160,11 +174,32 @@ docs/plans/37-schedule-background-maintenance-for-reaping-and-transaction-prunin
 older than the horizon must return a typed "cursor expired" error, exactly like a stale
 consistency token.
 
+**Landed 2026-07-09, and the index is now load-bearing.** EP-53's `ReadChanges` bounds both
+xid arms by the window-start snapshot's `xmin`, and `EXPLAIN` against a 250,000-row table
+shows a `BitmapOr` over `relation_tuple_created_xid_idx` and `relation_tuple_deleted_xid_idx`
+with that bound as each arm's `Index Cond`. The `UNION ALL` fallback EP-53's plan reserved was
+not needed. Nothing further is owed in either Decision Log. Two corrections to the paragraph
+above, both recorded in Surprises: the cursor-expired check is **not** "exactly like a stale
+consistency token" — it is `horizon <= start.xmin`, and the token rule would both expire a
+one-poll-old subscription and admit a window that loses a deletion; and the error it raises is
+`InvalidConsistencyToken` only for expiry, while a cursor this store never issued raises
+`InvalidCursor` (wire code `invalid_cursor`). EP-37 must record the mirror entry when it
+lands, and must record the `xmin` rule, not the `xmax` one.
+
 Schema state in `en-server` (currently a `ValidSchema` loaded once from
 `EN_SCHEMA_PATH` in `en-server/app/Main.hs`) becomes mutable state under EP-54 (reload
 swaps it atomically; in-flight requests keep the old schema). Every other endpoint reads
 the schema through whatever handle EP-54 introduces; until then, plans use the existing
 immutable argument and EP-54 rewires them.
+
+**Two notes for EP-54, as of 2026-07-09.** `POST /v1/watch` reads no schema at all — tuple
+change events are schema-independent data — and EP-53 deliberately omitted the schema-hash
+check from watch-cursor validation for exactly that reason: expiring every watch consumer on
+a reload would sever the revocation feed at the moment an operator changes the model. EP-54
+must not "fix" that omission. Separately, `Env` now carries `watchOperation`, so EP-54's
+schema handle is the second field added to it in this initiative; keep its type out of
+`en-postgres`, because `en-example` and `en-servant`'s test suite build an `Env` and neither
+depends on that package.
 
 
 ## Progress
@@ -173,7 +208,7 @@ immutable argument and EP-54 rewires them.
 - [x] EP-50 (2026-07-09): `POST /v1/relationships/delete-by-filter` with a mandatory dry-run flag; offboarding a user is one call
 - [x] EP-51 (2026-07-09): every read response carries the token it was evaluated at; write-then-read-at-token round-trips
 - [x] EP-52 (2026-07-09): `POST /v1/lookup-subjects` returns a flat, cursored subject set with correct caveat, operator, and wildcard handling
-- [ ] EP-53: watch feed streams tuple changes since a revision; expired cursors rejected with a typed error
+- [x] EP-53 (2026-07-09): `POST /v1/watch` streams tuple changes since a revision, cursor, or token, optionally filtered; expired cursors rejected with a typed error
 - [ ] EP-54: schema read endpoint and explicit reload without restart; old-schema requests drain safely
 - [ ] EP-54: stored-tuple validation against a candidate schema; compatible-change taxonomy documented
 
@@ -364,6 +399,64 @@ immutable argument and EP-54 rewires them.
   EP-53 should reach for the same posture wherever its changelog feed needs a decision.
 
 
+- 2026-07-09 (EP-53 complete; **binds EP-54, and corrects this master plan's own guidance to
+  EP-53**): the garbage-collection check `validateTokenMetadata` performs — reject when
+  `snapshot.xmax <= oldestRetainedXid` — is not reusable for a cursor minted from a head
+  revision, and EP-53's plan told it to copy that check anyway. A `headRevision` snapshot's
+  `xmax` is the next *unassigned* xid; the first write afterwards is assigned exactly that
+  xid, inserts its `en_transaction` anchor, and the horizon rises to meet it. A watch
+  subscription therefore expired one poll after birth, which the integration test caught on
+  its first run. The rule a revision window actually needs is `horizon <= start.xmin`: the
+  reaper removes rows whose `deleted_xid < horizon`, and if the horizon is at or below the
+  window's `xmin` then every such row is visible at the window's start, hence not live there,
+  hence owed no event. The token rule is also *unsound* here — a snapshot `849:851:849` passes
+  it against a horizon of `850` while a row deleted at `849` is both live at the start and
+  reapable. **The same sharp edge exists for `checkedAt` tokens minted from a head revision
+  (EP-51's convention): mint at `fullyConsistent`, let one write land, and the token no longer
+  validates.** Nothing in the tree exercises it, and no open plan owns it. EP-54 must not
+  assume a head-derived token or revision keeps validating across a write.
+
+- 2026-07-09 (EP-53 complete; **binds EP-54**): the shared filter EP-50 defined is now
+  consumed by a second caller, unchanged, and the composition rule held. `ReadChanges` takes
+  `Maybe RelationshipFilter` and compiles it through the same `compileFilter` in
+  `en-postgres/src/En/Postgres/TupleStore.hs`, so its predicates are composed rather than sent
+  as `($n IS NULL OR column = $n)` guards. EP-54's per-type tuple enumeration is the third
+  caller and must do the same. Note the storage operation grew a filter argument at birth
+  rather than acquiring one later: EP-50 had landed, so deferring it would have meant
+  revisiting the effect, the interpreter, the in-memory stub, and the endpoint.
+
+- 2026-07-09 (EP-53 complete; **binds EP-54**): `En.Servant.Seam.Env` now has a
+  `watchOperation` field, so EP-52's warning about `Env`'s three construction sites
+  (`en-server/app/Main.hs`, `en-example/src/En/Example/Host.hs`, `en-servant/test/Main.hs`)
+  has now been paid twice. EP-53 kept the cost from growing: `WatchStart` and `WatchBatch`
+  live in a new en-core module `En.Watch`, not in `En.Postgres.Watch`, because `en-example`
+  and `en-servant`'s test suite build an `Env` and neither depends on `en-postgres`. EP-54's
+  schema handle is state rather than an operation and will touch all three sites regardless —
+  but it should keep any type it puts in `Env` out of `en-postgres` for the same reason.
+
+- 2026-07-09 (EP-53 complete; **settles what the Integration Points paragraph left open, and
+  frees EP-49's index question forever**): the changelog query does use
+  `relation_tuple_created_xid_idx`, and `EXPLAIN` proves it. Both xid arms are bounded by the
+  window-start snapshot's `xmin`, and the planner answers with a `BitmapOr` over
+  `relation_tuple_created_xid_idx` and `relation_tuple_deleted_xid_idx`, each with the `xmin`
+  bound as its `Index Cond`. The `UNION ALL` fallback EP-53's plan reserved was never needed.
+  The index EP-49 kept on this plan's promise is now load-bearing; nothing further is owed in
+  either Decision Log. A cost was found and recorded rather than fixed: neither index carries
+  `id`, so the `ORDER BY id` is a sort and the keyset predicate a filter, making a drain of a
+  wide window re-scan it once per page. See EP-53's Surprises for the remedy and why it is out
+  of scope.
+
+- 2026-07-09 (EP-53 complete; **EP-54 is now the only plan left, and its `checkedAt` question
+  is answered by precedent, not by rule**): every tuple-read response in the API now ends with
+  `checkedAt` — `check`, `batch-check`, `lookup`, `lookup-subjects`, `expand`,
+  `relationships/query`, and now `watch`. `POST /v1/watch` mints it from the window's *end*
+  revision, and a resuming poll takes that end from its cursor and re-resolves nothing, which
+  EP-51's rule demanded and the live transcript confirmed (page two of a drain reported
+  `27807:27807:` while the head had already moved past it). EP-54's schema-read endpoint is
+  not a tuple read, so as the Integration Points below say, whether it carries `checkedAt` at
+  all remains EP-54's to decide and record.
+
+
 ## Decision Log
 
 - Decision: Prefer landing the versioned wire contract (docs/plans/35, master plan 6) before these endpoints.
@@ -401,6 +494,18 @@ immutable argument and EP-54 rewires them.
   Date: 2026-07-09
 - Decision: The `TokenBadFieldCount` leak in `en-postgres/src/En/Postgres/Revision.hs` is recorded, not fixed, by EP-52.
   Rationale: It predates this initiative, affects every token-bearing endpoint rather than the one EP-52 added, and fixing it means designing stable codes for the token-decode failure modes — a wire-contract question that belongs beside `docs/plans/35`'s error model, not inside a plan scoped to one new read. EP-53 inherits it and should not assume it was handled.
+  Date: 2026-07-09
+- Decision: EP-53 confirmed the leak still exists and still did not fix it. A tampered `startToken` on `POST /v1/watch` surfaces a `TokenDecodeError` constructor name; the watch cursor's own failures do not.
+  Rationale: Unchanged from the entry above. The fix is a wire-contract design task, and EP-53 is scoped to one new read. EP-54 inherits it in turn.
+  Date: 2026-07-09
+- Decision: The watch cursor's garbage-collection check is `horizon <= start.xmin`, diverging from `validateTokenMetadata`'s `horizon < revision.xmax`, and EP-53's own Decision Log entry saying it "checks the GC horizon exactly as `validateTokenMetadata` does" is superseded.
+  Rationale: See Surprises. The token rule is unusable for a head-derived cursor and unsound for a revision window, in opposite directions. The window's condition is derivable from what the reaper removes, so it was derived rather than copied. Recorded at master-plan level because it also identifies a latent defect in EP-51's `checkedAt` convention that no open plan owns.
+  Date: 2026-07-09
+- Decision: `WatchStart` and `WatchBatch` live in en-core (`En.Watch`), not in `En.Postgres.Watch` as EP-53's plan specified. Only the cursor codec, its validation, and the `watch` orchestration are datastore-specific.
+  Rationale: `Env.watchOperation`'s type names both, and two of `Env`'s three construction sites (`en-example`, `en-servant`'s test suite) do not depend on `en-postgres`. Forcing that dependency to name a type whose constructors carry `Text` would buy nothing. The types are genuinely neutral: the cursor is opaque `Text` at this layer and `checkedAt` is a `ConsistencyToken`.
+  Date: 2026-07-09
+- Decision: The watch feed is a pull API and stays one. EP-53 shipped no NDJSON, no SSE, and no long-poll.
+  Rationale: Unchanged from EP-53's own 2026-07-07 entry, restated here because the endpoint now exists and the temptation to add streaming to it will arrive. Every streaming design still needs the cursor semantics EP-53 built, and wire streaming for large results is separately tracked as review gap E13.
   Date: 2026-07-09
 
 

@@ -52,9 +52,9 @@ This section must always reflect the actual current state of the work.
 - [x] M2 (2026-07-09): The `watch` orchestration function (window selection, draining state machine, resumption cursor, `checkedAt` token) in `En.Postgres.Watch`, integration-tested by `runWatchFeedScenario` in `en-postgres/integration-test/Main.hs`. `mintToken` is used, not `encodeToken`: `docs/plans/42` had already added the `MintToken` operation, and it is a pure encode in every interpreter.
 - [x] M3 (2026-07-09): `POST /v1/watch` route, wire DTOs, `Env.watchOperation`, server wiring, `EnClient.watch`, hand-written `ToSchema` instances; servant handler tests, golden byte-exact wire tests, and the OpenAPI path/schema assertions. The cursor-expired path is asserted in `en-postgres`, against the real validator, rather than through a stubbed handler that could not produce it.
 - [x] M3 (2026-07-09): `docs/plans/50`'s `RelationshipFilter` had landed, so the optional `filter` field is present from day one — on the wire as `RelationshipFilterWire`, in the store as composed `WHERE` predicates through `compileFilter`. No deferral.
-- [ ] M4: Run the end-to-end transcript (start from now → write → poll shows touch → delete → poll shows delete) against a live server and paste the output into Validation and Acceptance.
-- [x] Record the index-retention coordination entry with `docs/plans/49` in both Decision Logs — done 2026-07-09 when EP-49 landed: `relation_tuple_created_xid_idx` is KEPT and reserved for this plan.
-- [ ] Record the pruning coordination entry in the Decision Log of `docs/plans/37` when that plan lands (see Decision Log here).
+- [x] M4 (2026-07-09): Ran the end-to-end transcript against a live server (start from now → write → poll shows touch → delete → poll shows delete → poll is caught up), plus the drain, the `startToken` start, the subscription filter, and all four `400` paths. Pasted into Validation and Acceptance.
+- [x] Record the index-retention coordination entry with `docs/plans/49` in both Decision Logs — done 2026-07-09 when EP-49 landed: `relation_tuple_created_xid_idx` is KEPT and reserved for this plan. M1's `EXPLAIN` confirms it is now load-bearing.
+- [ ] Record the pruning coordination entry in the Decision Log of `docs/plans/37` when that plan lands (see Decision Log here). **Still open** — EP-37 has not landed. When it does, it must also learn that this plan's horizon rule is `horizon <= start.xmin`, not the token rule, so shortening `EN_GC_WINDOW` bounds watch recovery by the window start's `xmin` rather than its `xmax`.
 
 
 ## Surprises & Discoveries
@@ -139,6 +139,36 @@ implementation. Provide concise evidence.
   `runWatchWindowScenario` is the assertion that catches getting this backwards: it places a
   skipped row between two reported ones.
 
+- 2026-07-09 (M3, confirming what `docs/plans/52` recorded): adding `watchOperation` to
+  `En.Servant.Seam.Env` broke all three construction sites, as EP-52 warned it would. The
+  cost was avoidable in one respect and not in another. Naming `En.Postgres.Watch`'s types
+  in the field would additionally have forced `en-example` and `en-servant`'s own test suite
+  to depend on `en-postgres` — neither does today — purely to spell a type whose constructors
+  carry `Text`. Putting `WatchStart` and `WatchBatch` in en-core avoids that. The field itself
+  is unavoidable: unlike EP-50's relationship read, watch is not a store effect a handler can
+  `send` for itself, because the cursor codec is the datastore's.
+
+- 2026-07-09 (M3, the OpenAPI document is a real test): adding the route without a `ToSchema`
+  instance fails to compile, as `docs/plans/50` recorded — but the *path list* assertion in
+  `en-servant/test/Main.hs` also fired, and it is the one that would have caught a route
+  added to `EnAPI` and forgotten in `server`. Both guards earned their keep on this plan.
+
+- 2026-07-09 (M4, confirming `docs/plans/50` and `docs/plans/51`): port 8080 was held by an
+  `ssh` tunnel, and `GET /healthz` answered `200` from it. `lsof -nP -iTCP:8080 -sTCP:LISTEN`
+  before assuming what you are talking to. Also confirmed live: page two of a drain reported
+  `checkedAt` of `27807:27807:`, its window's end carried in the cursor, while the head had
+  already moved past it — EP-51's cursored-read rule holding in a second endpoint.
+
+- 2026-07-09 (M4, inherited and unfixed, as `docs/plans/52` predicted): the watch cursor's own
+  failures produce clean envelopes — `invalid_consistency_token` with "watch cursor is older
+  than the garbage-collection window", `invalid_cursor` with "malformed pagination cursor:
+  not-a-cursor". But a tampered `startToken` still routes through
+  `tokenMetadataFromPayload`, whose message is `Text.pack (show err)` over the internal
+  `TokenDecodeError` sum, so it surfaces a Haskell constructor name. EP-52 recorded this and
+  did not fix it; neither does this plan, for the same reason — the fix is designing stable
+  codes for the token-decode failure modes, which is a wire-contract question beside
+  `docs/plans/35`'s error model.
+
 
 ## Decision Log
 
@@ -193,7 +223,47 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+**Complete, 2026-07-09.** `POST /v1/watch` is a cursored polling feed over the changelog that
+en's soft-delete design already recorded. A consumer subscribes from now, from a watch
+cursor, or from an ordinary consistency token; receives the batch of touch and delete events
+that became visible between its position and the store's head, optionally scoped by
+`RelationshipFilter`; and gets back a cursor and a `checkedAt` token. Cursors older than the
+garbage-collection horizon are refused with a typed error. Gap E5 of the architecture review
+is closed, and the three consumers the review named — downstream cache invalidation,
+search-index ACL sync, and `en-biscuit`'s revocation feed — can each be built on it without
+reading the database.
+
+The master plan's Decision Log bet that the changelog "substantially exists in
+`relation_tuple` + `en_transaction`" and that no outbox table was needed. That bet paid: no
+migration was written, and the two `*_xid_idx` indexes `docs/plans/49` had preserved on this
+plan's promise turned out to serve the window query under a `BitmapOr` on the first attempt,
+with the `xmin` bound as their index condition. The `UNION ALL` fallback this plan reserved
+was never needed.
+
+Three things this plan got wrong and the work corrected. **The horizon rule.** The plan said
+to copy `validateTokenMetadata`'s GC check; doing so expires a subscription one poll after
+it is created, and is separately unsound for a window. The right condition —
+`horizon <= start.xmin` — is derivable from what the reaper removes, and the derivation is now
+in `validateWatchCursor`'s Haddock. This was caught by an integration test on its first run,
+not by review. **The paging key.** A row created and retired inside one window emits no event
+but still consumes a page, so a resumption cursor names the last row *fetched*, not the last
+event *emitted*; the plan's sketch of reusing `pageFromRows` would have silently dropped the
+row after each skipped one. **The module boundary.** `WatchStart` and `WatchBatch` are the
+handler's vocabulary, not the datastore's, and putting them in `En.Postgres.Watch` as the
+plan specified would have forced `en-example` and `en-servant`'s test suite to take a
+dependency on `en-postgres` to name them.
+
+Known cost, recorded rather than fixed: neither xid index carries `id`, so the window query's
+`ORDER BY id` is a sort and the keyset predicate is a filter rather than a seek. Draining a
+window of `W` changes at page size `L` therefore re-scans and re-sorts `W` rows on each of
+its `W/L` pages. The window is bounded by the GC horizon, so this is bounded — but a consumer
+that has been offline for most of `EN_GC_WINDOW` pays it. The remedy is a `UNION` rewrite
+with per-arm keyset seeks, and it belongs to a plan that can price it.
+
+Deferred, as scoped from the start: NDJSON/SSE streaming and long-poll (this is a pull API;
+review gap E13 tracks wire streaming), and the `EmitWindow`-style optimizations that
+`docs/plans/42` owns for lookup. Left open: the mirror coordination entry in
+`docs/plans/37`'s Decision Log, which cannot be written until that plan lands.
 
 
 ## Context and Orientation
@@ -492,60 +562,135 @@ just start-server
 
 ## Validation and Acceptance
 
-Live transcript, demo schema (`space#viewer`, served when `EN_SCHEMA_PATH` is unset).
-
-Step 1 — subscribe from now (no cursor):
+Recorded 2026-07-09 against a live `en-server` on the dev database, demo schema
+(`space#viewer`, served when `EN_SCHEMA_PATH` is unset). Not port 8080: `lsof -nP
+-iTCP:8080 -sTCP:LISTEN` showed an unrelated `ssh` tunnel holding it, and `GET /healthz`
+would have answered `200` from that. Run the built binary on a free port instead:
 
 ```bash
-curl -sS -X POST localhost:8080/watch -H 'content-type: application/json' \
-  -d '{"cursor": null, "startToken": null, "limit": 100}'
+just process-up && just run-migrations
+EN_PORT=8099 EN_AUTH_DISABLED=true "$(cabal list-bin en-server)"
+```
+
+Step 1 — subscribe from now. No cursor, no token: an empty batch and the cursor to poll
+with.
+
+```bash
+curl -sS -X POST localhost:8099/v1/watch -H 'content-type: application/json' -d '{"limit": 100}'
 ```
 
 ```json
-{"changes": [], "cursor": "enwatch1.…", "checkedAt": "en1.…"}
+{"changes":[],"cursor":"enwatch1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.at.27802%3a27802%3a..","checkedAt":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a88633b46c783909e.27802%3a27802%3a."}
 ```
 
-Step 2 — write a grant, then poll with the cursor from step 1:
+Step 2 — write a grant. The write is assigned xid `27802`, so its token pins `27802:27803:`.
 
 ```bash
-curl -sS -X POST localhost:8080/tuples -H 'content-type: application/json' -d '{
-  "tuples": [{"object": {"objectType": "space", "objectId": "project-x"}, "relation": "viewer",
-              "subject": {"tag": "SubjectIdWire", "contents": {"objectType": "user", "objectId": "alice"}},
-              "caveat": null}]}' > /dev/null
-
-curl -sS -X POST localhost:8080/watch -H 'content-type: application/json' \
-  -d '{"cursor": "<cursor from step 1>", "startToken": null, "limit": 100}'
+curl -sS -X POST localhost:8099/v1/relationships -H 'content-type: application/json' -d '{
+  "tuples": [{"object": {"objectType": "space", "objectId": "watch-demo"}, "relation": "viewer",
+              "subject": {"kind": "id", "objectType": "user", "objectId": "alice"},
+              "caveat": null}]}'
 ```
 
 ```json
-{
-  "changes": [
-    {"kind": {"tag": "TouchWire"},
-     "tuple": {"object": {"objectType": "space", "objectId": "project-x"},
-               "relation": "viewer",
-               "subject": {"tag": "SubjectIdWire", "contents": {"objectType": "user", "objectId": "alice"}},
-               "caveat": null}}
-  ],
-  "cursor": "enwatch1.…",
-  "checkedAt": "en1.…"
-}
+{"token":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a88633b46c783909e.27802%3a27803%3a."}
 ```
 
-Step 3 — delete the grant, poll with the newest cursor: the response contains the
-same tuple with `"kind": {"tag": "DeleteWire"}` and a further-advanced cursor. A
-fourth poll returns `"changes": []` (feed is caught up; the cursor may stay equal).
+Step 3 — poll with the cursor from step 1. **This is the assertion the M2 bug would have
+failed**: the cursor's window opens at `27802:27802:`, and the write above took xid `27802`,
+so `oldestRetainedXid` is now `27802`. Under `validateTokenMetadata`'s
+`xmax <= horizon` rule the subscription would be expired one poll after birth. Under the
+window's own `horizon <= xmin` rule it is exact, and reports the touch:
 
-Error path: a cursor whose start snapshot lies behind the GC horizon returns the
-stale-cursor error (`{"error": "InvalidConsistencyToken \"watch cursor is older than
-the garbage-collection window\""}`-shaped under today's collapsed error model, review
-A3; a typed code once `docs/plans/35` lands). This path is asserted in the M2 tests
-with a forged low-xmax cursor rather than by waiting out a real GC window.
+```bash
+curl -sS -X POST localhost:8099/v1/watch -H 'content-type: application/json' \
+  -d '{"cursor": "enwatch1.0c9c…-c4c65a3ae6e5.at.27802%3a27802%3a..", "limit": 100}'
+```
 
-Test-level validation: M1's visibility-algebra assertions (touch, delete,
-net-no-op skip, pagination completeness), M2's codec/validation/orchestration tests,
-and M3's handler tests — under the commands in Concrete Steps. The recorded `EXPLAIN`
-must show index usage on the xid arms (or the Surprises entry explains the fallback
-taken).
+```json
+{"changes":[{"kind":"touch","tuple":{"object":{"objectType":"space","objectId":"watch-demo"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}}],"cursor":"enwatch1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.at.27803%3a27803%3a..","checkedAt":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a88633b46c783909e.27803%3a27803%3a."}
+```
+
+Step 4 — delete the grant (`POST /v1/relationships/delete`), poll with the newest cursor:
+
+```json
+{"changes":[{"kind":"delete","tuple":{"object":{"objectType":"space","objectId":"watch-demo"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}}],"cursor":"enwatch1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.at.27804%3a27804%3a..","checkedAt":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a88633b46c783909e.27804%3a27804%3a."}
+```
+
+Step 5 — a fourth poll. The feed is caught up: no changes, and the cursor is unchanged at
+`27804:27804:`.
+
+```json
+{"changes":[],"cursor":"enwatch1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.at.27804%3a27804%3a..","checkedAt":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a88633b46c783909e.27804%3a27804%3a."}
+```
+
+Draining a two-change window at `limit: 1`. Page one hands back a `drain` cursor pinning
+both window edges and the row id it stopped at:
+
+```text
+page 1: [('touch', 'alice')]
+cursor: enwatch1.0c9c…-c4c65a3ae6e5.drain.27806%3a27806%3a.27807%3a27807%3a.1005074
+```
+
+Page two reports `checkedAt` of `27807:27807:` — the window's end, carried in the cursor —
+even though the head had advanced past it by then. That is `docs/plans/51`'s cursored-read
+rule holding: a resuming poll re-resolves nothing. Its cursor returns to `at.27807:27807:`,
+and the window is closed:
+
+```json
+{"changes":[{"kind":"touch","tuple":{"object":{"objectType":"space","objectId":"scoped"},"relation":"owner","subject":{"kind":"id","objectType":"user","objectId":"bob"},"caveat":null}}],"cursor":"enwatch1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.at.27807%3a27807%3a..","checkedAt":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a88633b46c783909e.27807%3a27807%3a."}
+```
+
+Re-presenting that same page-one drain cursor replays page two identically, which is the
+at-least-once delivery the feed promises.
+
+A `startToken` starts the feed at the snapshot a write token pins. Two grants written, the
+first minting the token: only the second is reported.
+
+```text
+[('touch', 'after-token', 'bob')]
+```
+
+A subscription filter scopes the feed. Two grants land in one window, one naming `alice` and
+one naming `bob`:
+
+```text
+unfiltered:               [('touch', 'viewer', 'alice'), ('touch', 'owner', 'bob')]
+filter subjectId=alice:   [('touch', 'viewer', 'alice')]
+filter subjectId=bob:     [('touch', 'owner', 'bob')]
+```
+
+Error paths, all `400`, each with a stable code and a message a client can read:
+
+```text
+cursor behind the GC horizon
+  {"code":"invalid_consistency_token","message":"watch cursor is older than the garbage-collection window","retryable":false}
+cursor and startToken together
+  {"code":"invalid_request","message":"watch takes cursor or startToken, not both","retryable":false}
+a cursor this store never issued
+  {"code":"invalid_cursor","message":"malformed pagination cursor: not-a-cursor","retryable":false}
+an unanchored subscription filter
+  {"code":"invalid_request","message":"filter must constrain objectType or subjectType","retryable":false}
+```
+
+The served OpenAPI document lists the operation and its full status set:
+
+```bash
+curl -sS localhost:8099/v1/openapi.json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(sorted(d["paths"])); print(sorted(d["paths"]["/v1/watch"]["post"]["responses"]))'
+```
+
+```text
+['/v1/batch-check', '/v1/check', '/v1/expand', '/v1/lookup', '/v1/lookup-subjects', '/v1/relationships', '/v1/relationships/delete', '/v1/relationships/delete-by-filter', '/v1/relationships/query', '/v1/watch']
+['200', '400', '412', '422', '503']
+```
+
+Test-level validation, all passing under the commands in Concrete Steps: M1's
+visibility-algebra assertions (touch, delete, net-no-op skip, pagination completeness across
+rows that emit no event, filter narrowing) and its `EXPLAIN`, which shows the `BitmapOr` over
+both xid indexes recorded in Surprises & Discoveries; M2's codec, validation, and
+orchestration tests, including the forged low-xmin cursor that stands in for a real GC
+window; M3's handler tests, golden byte-exact wire tests, and the OpenAPI path and schema
+assertions. `cabal test all` is green across every suite in the tree.
 
 
 ## Idempotence and Recovery
