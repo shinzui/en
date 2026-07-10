@@ -24,6 +24,7 @@ import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
@@ -43,6 +44,8 @@ import Auth.Biscuit (
     authorizeBiscuit,
     authorizer,
     block,
+    fromRevocationList,
+    getRevocationIds,
     mkBiscuit,
     mkBiscuitWith,
     newSecret,
@@ -118,6 +121,7 @@ main = do
     keyRotationTest
     keySelectionAttackTest
     legacyTokenTest
+    blockRevocationTest
     attenuationTests
     shomeiFlowTest
     attenuationForgedRightTest
@@ -641,6 +645,46 @@ legacyTokenTest = do
     assertSignatureInvalid "legacy: the same token fails against a keyset without the legacy key"
         =<< verifyGrant withoutLegacy token roadmapRequest
 
+{- | Unconditional revocation. A token minted with NO application-level
+@en_revocation_id@ is still revocable by its built-in block revocation ids: it
+verifies with an empty revocation set and is rejected 'Revoked' once one of the
+ids the mint reported is in 'revokedBlockIds'. And attenuation is revocable
+per-block: revoking only the id of an attenuation block kills the child token
+while the parent stays valid.
+-}
+blockRevocationTest :: IO ()
+blockRevocationTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+        config = MintConfig{issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
+
+    -- A token carrying no application revocation id.
+    minted <- either (die . show) pure =<< mintObjectGrant config Allowed (forgeableObjectGrantWith Nothing)
+    let token = minted.token
+
+    assertVerified "block revocation: token with no en_revocation_id verifies with an empty revocation set"
+        =<< verifyGrant (keySetFor public) token roadmapRequest
+    assertVerifyError "block revocation: the same token is revocable by a built-in block id" Revoked
+        =<< verifyGrant
+            (keySetFor public)
+            token
+            roadmapRequest{revokedBlockIds = fromRevocationList minted.revocationIds}
+
+    -- Attenuation appends a block, so the child has one more revocation id than
+    -- the parent. Revoking only that added id must kill the child, not the parent.
+    grantBlk <- either (die . show) pure (grantBlock (ObjectGrant (forgeableObjectGrantWith Nothing)))
+    parentBiscuit <- mkBiscuitWith (Just 1) secret grantBlk
+    childBiscuit <- attenuateGrant noAttenuation{narrowedService = Just (Audience "billing-service")} parentBiscuit
+    let parentToken = serializeB64 parentBiscuit
+        childToken = serializeB64 childBiscuit
+        addedBlockId = NE.last (getRevocationIds childBiscuit)
+        revokeAdded = fromRevocationList [addedBlockId]
+
+    assertVerifyError "block revocation: revoking the attenuation block kills the child" Revoked
+        =<< verifyGrant (keySetFor public) childToken roadmapRequest{revokedBlockIds = revokeAdded}
+    assertVerified "block revocation: revoking only the child's added block leaves the parent valid"
+        =<< verifyGrant (keySetFor public) parentToken roadmapRequest{revokedBlockIds = revokeAdded}
+
 {- | Attenuate a scoped token to one resource and one service; the narrowed
 request still verifies, but the original broader requests do not.
 -}
@@ -1105,6 +1149,7 @@ mkVerifyRequest subj aud op res svc schemas nowT rev =
         , acceptedSchemaHashes = schemas
         , now = nowT
         , revoked = rev
+        , revokedBlockIds = const (pure False)
         }
 
 assertVerifyError :: String -> EnBiscuitVerifyError -> Either EnBiscuitVerifyError VerifiedGrant -> IO ()

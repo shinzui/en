@@ -24,7 +24,10 @@ decision was already made upstream and is carried in the signed token.
   6. the requested operation and resource are within the grant (an object grant
      names one resource; a scoped grant lists its containers and the resource
      must be one of them);
-  7. the token is not revoked (the caller supplies the check);
+  7. the token is not revoked — its built-in block revocation ids are checked
+     against the caller's revocation set on every parse ('revokedBlockIds', which
+     applies to every token), and any application-level @en_revocation_id@ is
+     checked too ('revoked', an optional convenience);
   8. any attenuation restrictions added by intermediate holders still allow this
      exact request.
 
@@ -75,6 +78,7 @@ import Auth.Biscuit (
     FromValue (..),
     Open,
     OpenOrSealed,
+    ParseError (..),
     ParserConfig (..),
     Verified,
     addBlock,
@@ -127,7 +131,20 @@ data VerifyRequest m = VerifyRequest
     expiry.
     -}
     , revoked :: RevocationId -> m Bool
-    -- ^ Whether the token's @en_revocation_id@ (if any) is revoked.
+    {- ^ Whether the token's application-level @en_revocation_id@ (if any) is
+    revoked. An optional convenience layer: it fires only for tokens that carry
+    an @en_revocation_id@ fact. For unconditional revocation use
+    'revokedBlockIds', which applies to every token.
+    -}
+    , revokedBlockIds :: Set ByteString -> m Bool
+    {- ^ Whether ANY of the token's built-in block revocation ids is revoked.
+    Consulted on every verification, before blocks are decoded, so it applies to
+    every token regardless of whether it carries an application-level
+    @en_revocation_id@. The argument is the set of the token's block revocation
+    ids (signature bytes, one per block, including any attenuation blocks). Build
+    it with 'Auth.Biscuit.fromRevocationList' from a static revocation list, or
+    pass @const (pure False)@ if you do not maintain a revocation set.
+    -}
     }
 
 -- | The scope a verified grant authorizes.
@@ -200,13 +217,18 @@ verifyGrant keySet token request = do
         parseWith
             ParserConfig
                 { encoding = UrlBase64
-                , -- Built-in block-revocation-id checking is wired in M3; until
-                  -- then no token is revoked by its block ids.
-                  isRevoked = const (pure False)
+                , -- Unconditional revocation: the parser hands us the set of the
+                  -- token's built-in block revocation ids before any block is
+                  -- decoded, so every token is revocable regardless of whether it
+                  -- carries an application-level en_revocation_id.
+                  isRevoked = request.revokedBlockIds
                 , getPublicKey = selectIssuerKey keySet
                 }
             token
     case parsed of
+        -- A built-in block revocation id was in the caller's set; distinct from a
+        -- bad signature so the caller can tell revocation from forgery.
+        Left RevokedBiscuit -> pure (Left Revoked)
         Left parseErr -> pure (Left (SignatureInvalid (tshow parseErr)))
         Right biscuit ->
             case extractAndCheck biscuit request of
