@@ -164,6 +164,118 @@ Notes:
   The portable `MonadIO` `mintObjectGrant` above (precomputed decision) stays the
   reusable deliverable so `en-core` never gains a token or `MonadIO`-only surface.
 
+## Minting over HTTP (`POST /v1/grants`)
+
+Embedded callers mint with `En.Biscuit.Mint` (Step 2). A pure HTTP consumer of
+`en-server` mints the same tokens over the wire, so a gateway written in any
+language never has to link the Haskell library.
+
+`en-server` exposes `POST /v1/grants` when it is configured with an issuer key.
+The caller supplies the check inputs; the server runs its *own* `check` and mints
+only on `Allowed` — it never trusts a caller-asserted decision. The minted token
+is bound to the consistency token that check evaluated at and to the active schema
+hash the check ran against.
+
+### Enabling it
+
+Minting is off unless an issuer key is configured, and `en-server` **refuses to
+start** a minting endpoint on an unauthenticated server — a mint endpoint hands
+out signed bearer tokens. Configure both:
+
+```bash
+# The issuer signing key, in the "<key-id>:<64 hex>" format of En.Biscuit.Keys.
+export EN_BISCUIT_ISSUER_SECRET_KEY="1:<64 hex chars>"
+# Optional TTL bounds (defaults shown). The maximum must not be below the default.
+export EN_BISCUIT_DEFAULT_TTL_SECONDS=300
+export EN_BISCUIT_MAX_TTL_SECONDS=3600
+# Caller authentication MUST be enabled; otherwise startup is refused.
+export EN_API_KEYS_READ_WRITE="gateway:<secret at least 16 bytes>"
+```
+
+With no `EN_BISCUIT_ISSUER_SECRET_KEY`, `POST /v1/grants` returns `404` and every
+other endpoint works normally. On startup the server logs
+`Biscuit grant minting: enabled (key id N, …)` or `disabled` — never the key
+material itself.
+
+### Request and response
+
+```bash
+curl -sS -X POST "$EN/v1/grants" \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $API_KEY" \
+  -d '{
+    "consistency": {"mode": "fullyConsistent"},
+    "context":     {"values": {}},
+    "subject":     {"kind": "id", "objectType": "user", "objectId": "alice"},
+    "permission":  "view",
+    "object":      {"objectType": "space", "objectId": "project-x"},
+    "audience":    "document-service",
+    "ttlSeconds":  300,
+    "requestId":   "demo-1"
+  }'
+```
+
+```json
+{
+  "token": "CAES4wMK-AIK…",
+  "expiresAt": "2026-07-10T16:59:07Z",
+  "revocationIds": ["28dc09b7…"],
+  "checkedAt": "en1.<datastore>.<schema-hash>.<rev>."
+}
+```
+
+- `token` — the URL-safe base64 Biscuit. Forward it downstream in the
+  `X-En-Biscuit` header (see [Transport](#transport-two-tokens-two-headers)).
+- `expiresAt` — the absolute expiry stamped into the token.
+- `revocationIds` — the token's built-in per-block revocation ids, hex-encoded.
+  Record them if you might revoke the token before it expires.
+- `checkedAt` — the consistency token the mint's check evaluated at, also signed
+  into the grant as `en_consistency_token`. Send it back as `atLeastAsFresh` on a
+  later read to chain freshness.
+
+### Fields and failures
+
+- `consistency` / `context` — as for `POST /v1/check`.
+- `subject` — must be a concrete `id` subject; a userset or wildcard is `400`.
+- `audience` — the downstream service the grant targets; a verifier rejects a
+  token whose audience is not its own.
+- `ttlSeconds` — optional; positive and no greater than
+  `EN_BISCUIT_MAX_TTL_SECONDS` (a larger value is **rejected with `400`**, never
+  silently clamped). Omitted, the configured default applies.
+- `requestId` — optional correlation id echoed into the token's `en_request_id`.
+
+| Outcome | Status | Body `code` |
+| --- | --- | --- |
+| `Allowed` | `200` | — (the response above) |
+| `Denied` or `Conditional` | `403` | `decision_not_allowed` |
+| Non-concrete subject, `ttlSeconds` over the max, malformed body | `400` | `invalid_request` |
+| Minting not configured | `404` | `not_found` |
+| Missing or invalid API key | `401` | `unauthenticated` (auth layer) |
+
+### Verifying a minted token
+
+Any service verifies and attenuates the token locally with `En.Biscuit.Verify`
+(Step 3), against the issuer public keyset — no further `en-server` call. The
+`en-verify-grant` binary (built from `en-biscuit`) does this from the shell: it
+reads the token on stdin and the keyset from `EN_BISCUIT_ISSUER_PUBLIC_KEYS`.
+
+```bash
+jq -r '.token' grant.json | \
+  EN_BISCUIT_ISSUER_PUBLIC_KEYS="1:<issuer public key hex>" \
+  en-verify-grant \
+    --subject user:alice --operation view --resource space:project-x \
+    --audience document-service --schema-hash "<the hash en-server logged>" \
+    --attenuate-service thumbnail-service
+# verified: subject=user:alice operation=view resource=space:project-x expires=… requestId=demo-1
+# attenuated: narrowed to service thumbnail-service; that service verifies, a different service is REJECTED (RestrictionFailed)
+```
+
+The `--attenuate-service` demonstration narrows the *service* dimension rather
+than the resource because the endpoint mints single-object grants: the grant
+already fixes its subject, operation, and one resource, so narrowing any of those
+and requesting a different value is refused by the grant itself, whereas the
+service is a purely ambient fact the appended attenuation block alone constrains.
+
 ## Step 3 — verify locally (downstream side)
 
 Verification lives in `En.Biscuit.Verify`. It parses and checks the issuer
@@ -337,7 +449,10 @@ Authorization: Bearer <shomei-jwt>
 X-En-Biscuit:   <base64-biscuit>
 ```
 
-Do not overload a single `Authorization` header with two token types.
+`X-En-Biscuit` is **the** standard header for presenting an `en` decision proof
+to a downstream service — it carries the `token` from `POST /v1/grants` (or from
+an embedded mint) verbatim. Do not overload a single `Authorization` header with
+two token types.
 
 ## Security checklist
 
@@ -368,5 +483,7 @@ Do not overload a single `Authorization` header with two token types.
 | `En.Biscuit.Mint` | `MintConfig` (with `issuerKeyId`), `MintedGrant`, `mintObjectGrant`/`mintScopedGrant` (+ `…WithExpiry`), `mintCheckedObjectGrant`, `EnBiscuitMintError` |
 | `En.Biscuit.Verify` | `VerifyRequest` (with `revokedBlockIds`), `verifyGrant` (takes an `IssuerKeySet`), `VerifiedGrant`, `EnBiscuitVerifyError`, `attenuateGrant`, `Attenuation`/`noAttenuation` |
 | `En.Biscuit` | Re-exports all of the above |
+| `en-server` `POST /v1/grants` | Mint a decision token over HTTP — the server runs the check and mints only on `Allowed`; see [Minting over HTTP](#minting-over-http-post-v1grants) |
+| `en-verify-grant` (binary) | Shell verifier/attenuator: token on stdin, keyset in `EN_BISCUIT_ISSUER_PUBLIC_KEYS` |
 
 See `docs/ideas/biscuit-integration.md` for the original design rationale.

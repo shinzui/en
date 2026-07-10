@@ -68,7 +68,7 @@ needlessly serialize the key-rotation fix.
 |---|-------|------|-----------|-----------|--------|
 | EP-55 | Support key rotation and unconditional revocation in Biscuit grants | docs/plans/55-support-key-rotation-and-unconditional-revocation-in-biscuit-grants.md | None | None | Complete |
 | EP-56 | Pin attenuation-injection semantics with tests | docs/plans/56-pin-attenuation-injection-semantics-with-tests.md | None | None | Complete |
-| EP-57 | Mint Biscuit grants over HTTP | docs/plans/57-mint-biscuit-grants-over-http.md | None | EP-55 | In Progress |
+| EP-57 | Mint Biscuit grants over HTTP | docs/plans/57-mint-biscuit-grants-over-http.md | None | EP-55 | Complete |
 
 
 ## Dependency Graph
@@ -119,8 +119,8 @@ config.
 - [x] EP-55 (2026-07-10): tokens carry a key id; verifiers accept a keyset; rotation demonstrated without redeploying verifiers (`keyRotationTest`, `legacyTokenTest`, `keySelectionAttackTest`)
 - [x] EP-55 (2026-07-10): every token revocable via built-in block revocation ids; application revocationId remains optional (`blockRevocationTest`)
 - [x] EP-56: holder-attenuated blocks injecting en_right/en_expires_at facts proven ignored or rejected
-- [ ] EP-57: authenticated HTTP endpoint mints a grant from a fresh check at a checked-at token
-- [ ] EP-57: minted-over-HTTP token verifies and attenuates locally end-to-end
+- [x] EP-57 (2026-07-10): authenticated `POST /v1/grants` mints a grant from a fresh check at the check's `checkedAt` token; fail-closed on Denied/Conditional (403), non-concrete subject / over-max TTL (400), disabled (404); startup refuses minting without caller auth
+- [x] EP-57 (2026-07-10): minted-over-HTTP token verifies and attenuates locally end-to-end (`en-verify-grant` against a live `en-server` on PostgreSQL, no server contact for the verify)
 
 
 ## Surprises & Discoveries
@@ -185,6 +185,27 @@ config.
   one home for `IssuerKeyId`. So all of `En.Biscuit.Keys` is available as of the
   first EP-55 commit, not staged by milestone.
 
+- EP-57 landed (2026-07-10) and consumed the EP-55 interface change exactly as
+  registered: `parseSigningKeyText` for `EN_BISCUIT_ISSUER_SECRET_KEY`,
+  `MintedGrant`'s `token`/`expiresAt`/`revocationIds` for the response body, and
+  `verifyGrant` over an `IssuerKeySet` in the `en-verify-grant` binary. Two
+  discoveries worth carrying forward: (1) the mint endpoint's 403/404 status set is
+  disjoint from EP-35's shared `EnResponses` (412/422), so it is a plain `Post`
+  that throws `ServerError`s carrying `ErrorEnvelopeWire` rather than a `MultiVerb`
+  union — the `permissionDenied`/`notFound` precedent in `En.Servant.Seam` already
+  anticipated this shape. (2) The grant's `en_schema_hash` is read from the
+  request-time `ActiveSchema` snapshot, not captured into config, so a `SIGHUP`
+  reload cannot mint under a hash the check did not evaluate under — the
+  Integration Points note that "EP-55 defines the key-material representation,
+  EP-57 wires it into server config" holds, but the schema hash deliberately stays
+  out of that config.
+
+- EP-57 note for any future scoped-HTTP-minting work: the endpoint mints object
+  grants only, so `en-verify-grant`'s attenuation demo narrows the *service*
+  dimension (the one an object grant does not itself constrain) rather than the
+  resource. The resource-narrowing path is already written and returns for free
+  when scoped grants get an HTTP surface.
+
 
 ## Decision Log
 
@@ -207,7 +228,53 @@ config.
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+All three children are Complete (2026-07-10), and the three weaknesses the review
+(Theme D) found are closed:
+
+- **Single-key management → keyed rotation (EP-55).** Tokens carry a `rootKeyId`
+  and verifiers accept an `IssuerKeySet`, so rotating the issuer key is a config
+  rollout, not a synchronized fleet redeploy (`keyRotationTest`,
+  `legacyTokenTest`). A holder cannot steer key selection to a key that would
+  accept a forgery (`keySelectionAttackTest`).
+- **Opt-in revocation → unconditional revocation (EP-55).** Every token is
+  revocable by its built-in per-block revocation ids regardless of whether the
+  minter supplied an application-level `revocationId` (`blockRevocationTest`).
+- **Untested attenuation safety → pinned semantics (EP-56).** Holder-added blocks
+  injecting forged `en_right`/`en_expires_at` facts are proven ignored or
+  rejected, validated by mutation so the tests are a genuine tripwire for a
+  biscuit-haskell re-pin.
+- **Embedded-only minting → HTTP minting (EP-57).** `en-server` mints decision
+  tokens over `POST /v1/grants`, fed by plan 51's checked-at consistency tokens,
+  fail-closed and gated behind caller authentication; downstream services verify
+  and attenuate locally with `En.Biscuit.Verify` or the new `en-verify-grant`
+  binary.
+
+**Decomposition, in hindsight.** The three-way split held. EP-56 running first as
+a cheap, test-only tripwire paid off exactly as the Decision Log predicted: it
+confirmed the fact-scoping assumption `extractAndCheck` rests on, so EP-55 built on
+today's `Verify.hs` with no rewrite, and EP-56's seven tests took only a mechanical
+call-site update when EP-55 changed the `verifyGrant` signature. Bundling key ids +
+multi-key verification + unconditional revocation into EP-55 broke the mint/verify
+contract exactly once, as intended. EP-57's dependencies (plan 51 hard, plan 33 for
+deployment, EP-55 soft) were all satisfied by the time it ran, so it never blocked.
+
+**Integration points, as delivered.** The token format was extended by EP-55
+(envelope `rootKeyId` + block revocation ids; the `en_*` Datalog vocabulary
+untouched, as the 2026-07-07 revision note corrected) and consumed unchanged by
+EP-56's tests and EP-57's endpoint. Issuer secret-key material moved from an
+in-memory `MintConfig.issuerSecretKey` to `EN_BISCUIT_ISSUER_SECRET_KEY`
+configuration (EP-55 defined the codec, EP-57 wired it in). One deliberate
+refinement over the plan: the active schema hash a grant embeds is *not* part of
+that config — EP-57 reads it from the request-time schema snapshot so a `SIGHUP`
+reload cannot mint under a hash the check did not evaluate under.
+
+**Out of scope, still out of scope.** Sealed tokens and third-party blocks remain
+future work. A revocation *distribution* mechanism (a shared store or feed) is
+deferred to the watch API (docs/plans/53) as its natural carrier; this initiative
+guarantees only that every token is revocable in principle, and EP-57's response
+returns the revocation ids that make it so. Scoped grants over HTTP are deferred
+(EP-57 Decision Log), with the verifier's resource-narrowing path already written
+for when they land.
 
 
 ---

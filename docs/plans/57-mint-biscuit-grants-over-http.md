@@ -84,10 +84,10 @@ This section must always reflect the actual current state of the work.
 - [x] M1 (2026-07-10): Implemented `mintGrantHandler`: decode + concrete-subject check + TTL bound (reject, not clamp) → 404-if-disabled / 400 / 403-on-non-Allowed / mint on Allowed at `checkedAt` with `schemaHash = active.graph.hash`, response hex-encodes revocation ids.
 - [x] M1 (2026-07-10): `mintGrantTests` in `en-servant/test/Main.hs` proves Allowed mints a locally-verifiable token whose recovered consistency token equals `checkedAt`; Denied→403, ttl-over-max→400, non-concrete subject→400, `mint=Nothing`→404. OpenAPI path/schema assertions updated. `cabal test en-servant` passes.
 - [x] M2 (2026-07-10): Server config in `en-server/app/Config.hs` + `Main.hs`: `EN_BISCUIT_ISSUER_SECRET_KEY` (EP-55 `parseSigningKeyText` format), `EN_BISCUIT_DEFAULT_TTL_SECONDS` (300), `EN_BISCUIT_MAX_TTL_SECONDS` (3600, ≥ default), startup refusal when minting is on but `auth == AuthDisabled`, and a `Biscuit grant minting: enabled/disabled` startup line that never logs key material. Gate + malformed-key + TTL-ordering refusals verified against the built binary.
-- [ ] M3: Downstream verifier executable `en-verify-grant` added to `en-biscuit/en-biscuit.cabal` and `en-biscuit/app/VerifyGrant.hs`.
-- [ ] M3: End-to-end acceptance transcript captured: curl mints; `en-verify-grant` verifies and attenuates locally.
-- [ ] M3: `docs/user/biscuit-decision-tokens.md` updated: HTTP minting section and the standard `X-En-Biscuit` header convention.
-- [ ] Final: `cabal build all` and package test suites pass; Outcomes & Retrospective written.
+- [x] M3 (2026-07-10): Downstream verifier executable `en-verify-grant` added to `en-biscuit/en-biscuit.cabal` and `en-biscuit/app/VerifyGrant.hs`: token on stdin, keyset in `EN_BISCUIT_ISSUER_PUBLIC_KEYS`, `--attenuate-service` for the offline-narrowing demo.
+- [x] M3 (2026-07-10): End-to-end acceptance captured live against `en-server` on PostgreSQL (see Validation and Acceptance): curl seeded a tuple and minted; `en-verify-grant` verified and attenuated locally; the 403/400/400/404/401 negatives and the startup gate all reproduced.
+- [x] M3 (2026-07-10): `docs/user/biscuit-decision-tokens.md` updated with a "Minting over HTTP (`POST /v1/grants`)" section, the formalized `X-En-Biscuit` header convention, and API-summary rows for the endpoint and the `en-verify-grant` binary.
+- [x] Final (2026-07-10): `cabal build all` green; `cabal test en-servant en-biscuit en-core` all PASS; Outcomes & Retrospective written.
 
 
 ## Surprises & Discoveries
@@ -95,7 +95,39 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- The `mint` field on `Env` had to be strict (`!(Maybe MintEnv)`) to match the
+  record's style, and GHC then *errors* (not warns) on every `Env{…}` site that
+  omits it. That turned "add a field" into a small cross-package sweep:
+  `en-example`'s host and `en-server`'s `serverEnv` both had to set `mint`, and
+  the `en-servant` test env too. Useful discipline — a strict field means no
+  construction site can silently default to `Nothing`.
+
+- EP-35 landed before this plan, so the wire style is the versioned `/v1`
+  `MultiVerb`/`EnResult`/`EnFault` machinery, not the legacy `jsonError`/`ErrorWire`
+  the plan's Decision Log hedged against. But the mint endpoint's status set
+  (403/404) is disjoint from the shared `EnResponses` (412/422), so it does not
+  fit that machinery. It became a plain `Post` that throws `ServerError`s carrying
+  EP-35's `ErrorEnvelopeWire` — the same envelope, minus the typed union — reusing
+  the `permissionDenied`/`notFound` precedent already in `Seam`. `servant-openapi`
+  still derives a `200`+`400` for it (the `400` from the JSON `ReqBody`), which the
+  OpenAPI document test now pins.
+
+- The grant's `en_schema_hash` must come from the *request-time* `ActiveSchema`
+  snapshot (`active.graph.hash`), not a value captured into `MintEnv` at startup.
+  `en-server` swaps the snapshot on `SIGHUP`, and the check evaluates against that
+  snapshot's graph; a captured startup hash would let a post-reload mint sign a
+  hash the check did not evaluate under. So `MintEnv` carries only key material and
+  TTL bounds — a simplification the plan's sketch (which listed `schemaHash` in
+  `MintEnv`) did not anticipate.
+
+- The plan's `--attenuate-resource` demo does not work for object grants: an
+  object grant authorizes exactly one resource, so there is no second in-scope
+  resource for an attenuation block to reject with `RestrictionFailed` (a
+  different resource fails at the grant with `ResourceNotInScope` instead). The
+  verifier narrows the *service* dimension instead — the one dimension a grant
+  does not itself constrain — which produces the intended `RestrictionFailed`.
+  Recorded in the Decision Log; the resource demo returns for free when scoped
+  HTTP minting lands.
 
 
 ## Decision Log
@@ -191,6 +223,20 @@ Record every decision made while working on the plan.
   endpoint is "a caller is authenticated at all", which the startup gate
   enforces; a read-write tier is not required.
   Date: 2026-07-10
+- Decision: `en-verify-grant`'s attenuation demo narrows the *service* dimension
+  (`--attenuate-service`), not the resource (`--attenuate-resource` as the
+  original sketch named it).
+  Rationale: the endpoint mints single-object grants. An object grant fixes its
+  subject, operation, and one resource, so attenuating any of those and then
+  requesting a different value is refused by the *grant* (`OperationNotAuthorized`
+  / `ResourceNotInScope`), not by the appended block — which cannot demonstrate a
+  `RestrictionFailed`. The service is the one dimension the grant does not itself
+  constrain (it is a purely ambient authorizer fact), so narrowing it and
+  requesting a different service yields the intended `RestrictionFailed`. The
+  plan's Validation already anticipated this ("narrowing to the resource *or a
+  service*"). Resource/service narrowing share one `attenuateGrant` code path, so
+  the scoped-grant resource demo remains available when scoped HTTP minting lands.
+  Date: 2026-07-10
 
 
 ## Outcomes & Retrospective
@@ -198,7 +244,46 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+**Delivered, against the Purpose.** A pure HTTP consumer of `en-server` can now
+obtain decision tokens: an authenticated caller `POST`s a subject/permission/object
+to `/v1/grants`, the server runs its own check and, only on `Allowed`, mints a
+short-lived Biscuit grant bound to the consistency token the check evaluated at and
+to the request-time schema hash. The response carries the serialized token, its
+expiry, its hex-encoded block revocation ids, and the `checkedAt` token. Downstream,
+`en-verify-grant` (or any `En.Biscuit.Verify` caller) verifies and attenuates it
+locally with no `en-server` call. The end-to-end acceptance in Validation was met:
+`curl` minted from a running server and `en-verify-grant` verified and attenuated
+the token offline.
+
+**Safety properties, all in place.** Fail-closed non-mints (403 on
+`Denied`/`Conditional`; 400 on non-concrete subject or over-max TTL; 404 when
+disabled) hold, and `mintObjectGrantWithExpiry` re-enforces the `Allowed`-only rule
+independently of the handler. The deployment gate is a hard startup refusal, not a
+warning: an issuer key without caller authentication aborts before the port binds.
+The freshness invariant is intact — the `consistencyToken` signed into every grant
+is the token its own check evaluated at (`CheckOutcome.checkedAt`), never a fabricated
+value.
+
+**What went to plan.** Both external prerequisites were already Complete (plan 51's
+`checkedAt`-returning `checkOperation`, plan 33's `AuthConfig`), and EP-55's keyed
+mint/verify contract dropped in cleanly — `parseSigningKeyText` for config,
+`MintedGrant` for the response, `verifyGrant` over an `IssuerKeySet` for the binary.
+The soft dependency on EP-55 paid off: the endpoint mints in the final keyed format,
+so no follow-up migration is owed.
+
+**Deviations from the sketch** (all recorded in the Decision Log / Surprises): the
+wire contract is EP-35's throw-based `ServerError`+`ErrorEnvelopeWire` rather than a
+`MultiVerb` union (disjoint status set); `MintEnv` omits `schemaHash` (read from the
+request snapshot instead, for reload safety); and the attenuation demo narrows the
+*service*, not the resource (object grants have a single resource).
+
+**Gaps / future work.** (1) Scoped grants over HTTP remain deferred (Decision Log) —
+`en-verify-grant`'s resource-narrowing path is already written for when they land.
+(2) The endpoint is reachable by any authenticated key; if a deployment wants minting
+gated to a stronger tier, add `v1/grants` to `Middleware.isWriteRequest`. (3) A
+revocation *distribution* mechanism is out of scope for master plan 10 (the watch API,
+docs/plans/53, is its natural carrier) — this plan only guarantees every minted token
+is revocable in principle via its block revocation ids, which the response returns.
 
 
 ## Context and Orientation
@@ -525,6 +610,57 @@ Acceptance is end-to-end observable behavior:
 
 Success in tests looks like the suites' PASS lines; the live transcript in
 Concrete Steps is the human-verifiable proof.
+
+### Live acceptance transcript (2026-07-10)
+
+Captured against `en-server` on PostgreSQL (built-in demo schema, hash
+`fnv1a64:88633b46c783909e`), with `EN_BISCUIT_ISSUER_SECRET_KEY="1:a2c4…eecc"`,
+`EN_API_KEYS_READ_WRITE="deployer:S3cret-value-at-least-16"`, on port 8899. The
+issuer public key for id 1 is `24afd8171d2c0107ec6d5656aa36f8409184c2567649e0a7f66e629cc3dbfd70`.
+
+Startup logged the enabled line without key material:
+
+```text
+Biscuit grant minting: enabled (key id 1, defaultTtl=300s, maxTtl=3600s)
+```
+
+Seed → mint → verify+attenuate (no server contact for the verify):
+
+```text
+$ curl -sS -X POST :8899/v1/relationships -H "$AUTH" -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}]}'
+{"token":"en1.0c9c482f-….27829:27830:."}
+
+$ curl -sS -X POST :8899/v1/grants -H "$AUTH" -d '{"consistency":{"mode":"fullyConsistent"},…,"subject":{"kind":"id","objectType":"user","objectId":"alice"},"permission":"view","object":{"objectType":"space","objectId":"project-x"},"audience":"document-service","ttlSeconds":300,"requestId":"demo-1"}'
+{"token":"CAES4wMK-AIK…","expiresAt":"2026-07-10T16:59:07.400896Z","revocationIds":["28dc09b7…"],"checkedAt":"en1.0c9c482f-….27830:27830:."}
+
+$ jq -r '.token' grant.json | EN_BISCUIT_ISSUER_PUBLIC_KEYS="1:24afd8…fd70" en-verify-grant \
+    --subject user:alice --operation view --resource space:project-x \
+    --audience document-service --schema-hash fnv1a64:88633b46c783909e \
+    --attenuate-service thumbnail-service
+verified: subject=user:alice operation=view resource=space:project-x expires=2026-07-10 16:59:07 UTC requestId=demo-1
+attenuated: narrowed to service thumbnail-service; that service verifies, a different service is REJECTED (RestrictionFailed)
+```
+
+Negatives, each the documented status and code:
+
+```text
+Denied (bob has no tuple)            -> HTTP 403  {"code":"decision_not_allowed",…}
+ttlSeconds=99999 (> max 3600)        -> HTTP 400  {"code":"invalid_request","message":"ttlSeconds exceeds the configured maximum of 3600 seconds",…}
+subject kind "wildcard"              -> HTTP 400  {"code":"invalid_request","message":"grants require a concrete subject (kind \"id\")",…}
+no Authorization header              -> HTTP 401  {"code":"unauthenticated",…}
+/v1/grants on a no-issuer server     -> HTTP 404  {"code":"not_found","message":"grant minting is not enabled",…}  (/v1/check on it still 200)
+```
+
+Startup gate (config-time, no database needed to reach it):
+
+```text
+$ EN_BISCUIT_ISSUER_SECRET_KEY="1:a2c4…eecc" EN_AUTH_DISABLED=true en-server
+en-server: EN_BISCUIT_ISSUER_SECRET_KEY is set but caller authentication is not enabled.
+A grant-minting endpoint on an unauthenticated server would hand bearer
+tokens to anyone. Enable authentication (docs/plans/33) or unset the key.
+$ echo $?
+1
+```
 
 
 ## Idempotence and Recovery

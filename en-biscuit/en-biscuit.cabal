@@ -50,6 +50,20 @@ library
     , text
     , time
 
+executable en-verify-grant
+  import:         warnings, shared
+  hs-source-dirs: app
+  main-is:        VerifyGrant.hs
+  build-depends:
+    , base             >=4.19 && <5
+    , biscuit-haskell
+    , bytestring
+    , containers
+    , en-biscuit
+    , en-core
+    , text
+    , time
+
 test-suite en-biscuit-tests
   import:         warnings, shared
   type:           exitcode-stdio-1.0
