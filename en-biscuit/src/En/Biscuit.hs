@@ -8,6 +8,8 @@ into scope:
 
   * "En.Biscuit.Grant" — the typed grant model and the stable Biscuit Datalog
     predicate vocabulary.
+  * "En.Biscuit.Keys" — issuer key identity, verifier keysets, and key-material
+    text codecs for issuer-key rotation.
   * "En.Biscuit.Mint" — minting helpers that turn successful en decisions into
     signed Biscuit tokens.
   * "En.Biscuit.Verify" — local, fail-closed verification and attenuation of
@@ -15,10 +17,12 @@ into scope:
 -}
 module En.Biscuit (
     module En.Biscuit.Grant,
+    module En.Biscuit.Keys,
     module En.Biscuit.Mint,
     module En.Biscuit.Verify,
 ) where
 
 import En.Biscuit.Grant
+import En.Biscuit.Keys
 import En.Biscuit.Mint
 import En.Biscuit.Verify

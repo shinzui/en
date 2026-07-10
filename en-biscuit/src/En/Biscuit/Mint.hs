@@ -38,6 +38,9 @@ module En.Biscuit.Mint (
     -- * Configuration
     MintConfig (..),
 
+    -- * Result
+    MintedGrant (..),
+
     -- * Errors
     EnBiscuitMintError (..),
 
@@ -56,11 +59,14 @@ module En.Biscuit.Mint (
 
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString)
+import Data.List.NonEmpty (NonEmpty)
 import Data.Time (NominalDiffTime, UTCTime, addUTCTime)
 
-import Auth.Biscuit (SecretKey, mkBiscuit, serializeB64)
+import Auth.Biscuit (SecretKey, getRevocationIds, mkBiscuitWith, serializeB64)
 import Effectful (Eff, IOE, (:>))
 import Effectful.Error.Static (runErrorNoCallStack)
+
+import En.Biscuit.Keys (IssuerKeyId (..))
 
 import En.Check (CheckOutcome (..), check)
 import En.Decision (CaveatObligation, CheckDecision (..))
@@ -88,6 +94,12 @@ data MintConfig m = MintConfig
     {- ^ The Biscuit issuer's private key; downstream services verify with the
     matching public key.
     -}
+    , issuerKeyId :: IssuerKeyId
+    {- ^ The identifier of 'issuerSecretKey', stamped into every minted token's
+    Biscuit envelope so verifiers can select the matching public key from a
+    keyset. Rotating the signing key means minting under a new id while
+    verifiers trust both; see "En.Biscuit.Keys".
+    -}
     , defaultTtl :: NominalDiffTime
     {- ^ Token lifetime for the non-explicit mint functions: expiry is
     @now + defaultTtl@.
@@ -97,6 +109,26 @@ data MintConfig m = MintConfig
     tests.
     -}
     }
+
+{- | A freshly minted token and the metadata an issuer needs to track it. All
+mint functions return this so a caller can record what it just handed out — in
+particular the built-in block revocation ids, which are the only way to revoke a
+token that carries no application-level @en_revocation_id@.
+-}
+data MintedGrant = MintedGrant
+    { token :: ByteString
+    -- ^ The URL-safe base64 serialized Biscuit ('Auth.Biscuit.serializeB64').
+    , expiresAt :: UTCTime
+    -- ^ The expiry actually stamped into the token.
+    , revocationIds :: NonEmpty ByteString
+    {- ^ Raw built-in revocation ids of every block ('getRevocationIds'), in
+    block order (authority block first). Record these at mint time if you ever
+    want to revoke the token before it expires: adding any of them to a
+    verifier's revocation set kills the token regardless of whether it carries
+    an application-level revocation id.
+    -}
+    }
+    deriving stock (Eq, Show)
 
 -- | Why a grant did not produce a token. Every constructor is a non-mint.
 data EnBiscuitMintError
@@ -132,7 +164,7 @@ mintObjectGrant ::
     MintConfig m ->
     CheckDecision ->
     EnGrant ->
-    m (Either EnBiscuitMintError ByteString)
+    m (Either EnBiscuitMintError MintedGrant)
 mintObjectGrant config decision grant = do
     expiry <- resolveExpiry config
     mintObjectGrantWithExpiry config expiry decision grant
@@ -144,12 +176,12 @@ mintObjectGrantWithExpiry ::
     UTCTime ->
     CheckDecision ->
     EnGrant ->
-    m (Either EnBiscuitMintError ByteString)
+    m (Either EnBiscuitMintError MintedGrant)
 mintObjectGrantWithExpiry config expiry decision grant =
     case decision of
         Denied -> pure (Left DecisionDenied)
         Conditional obligations -> pure (Left (DecisionConditional obligations))
-        Allowed -> signGrant config.issuerSecretKey (ObjectGrant (withObjectExpiry expiry grant))
+        Allowed -> signGrant config expiry (ObjectGrant (withObjectExpiry expiry grant))
 
 {- | Mint a container-scoped grant from a bounded list of containers the caller
 already derived (e.g. from @en.lookup@). Expiry is stamped as @now + defaultTtl@.
@@ -165,7 +197,7 @@ mintScopedGrant ::
     MintConfig m ->
     Int ->
     EnScopedGrant ->
-    m (Either EnBiscuitMintError ByteString)
+    m (Either EnBiscuitMintError MintedGrant)
 mintScopedGrant config maxContainers grant = do
     expiry <- resolveExpiry config
     mintScopedGrantWithExpiry config expiry maxContainers grant
@@ -177,11 +209,11 @@ mintScopedGrantWithExpiry ::
     UTCTime ->
     Int ->
     EnScopedGrant ->
-    m (Either EnBiscuitMintError ByteString)
+    m (Either EnBiscuitMintError MintedGrant)
 mintScopedGrantWithExpiry config expiry maxContainers grant
     | n == 0 = pure (Left EmptyLookupScope)
     | n > maxContainers = pure (Left (LookupScopeTooLarge maxContainers n))
-    | otherwise = signGrant config.issuerSecretKey (ScopedGrant (withScopedExpiry expiry grant))
+    | otherwise = signGrant config expiry (ScopedGrant (withScopedExpiry expiry grant))
   where
     n = length grant.containers
 
@@ -206,7 +238,7 @@ mintCheckedObjectGrant ::
     Consistency ->
     CaveatContext ->
     EnGrant ->
-    Eff es (Either EnBiscuitMintError ByteString)
+    Eff es (Either EnBiscuitMintError MintedGrant)
 mintCheckedObjectGrant config graph consistency context grant = do
     outcome <-
         runErrorNoCallStack @EnError
@@ -252,17 +284,29 @@ withScopedExpiry expiry g =
         , revocationId = g.revocationId
         }
 
-{- | Encode a grant to facts and sign them into a serialized Biscuit. The only
-place @mkBiscuit@ is called.
+{- | Encode a grant to facts and sign them into a serialized Biscuit under the
+config's issuer key id. The only place @mkBiscuitWith@ is called. Reports the
+stamped @expiry@ and the freshly minted token's built-in block revocation ids in
+the 'MintedGrant'.
 -}
 signGrant ::
     (MonadIO m) =>
-    SecretKey ->
+    MintConfig m ->
+    UTCTime ->
     EnBiscuitGrant ->
-    m (Either EnBiscuitMintError ByteString)
-signGrant secret grant =
+    m (Either EnBiscuitMintError MintedGrant)
+signGrant config expiry grant =
     case grantBlock grant of
         Left err -> pure (Left (GrantEncodingError err))
         Right blk -> do
-            biscuit <- liftIO (mkBiscuit secret blk)
-            pure (Right (serializeB64 biscuit))
+            biscuit <- liftIO (mkBiscuitWith (Just keyId) config.issuerSecretKey blk)
+            pure
+                ( Right
+                    MintedGrant
+                        { token = serializeB64 biscuit
+                        , expiresAt = expiry
+                        , revocationIds = getRevocationIds biscuit
+                        }
+                )
+  where
+    IssuerKeyId keyId = config.issuerKeyId

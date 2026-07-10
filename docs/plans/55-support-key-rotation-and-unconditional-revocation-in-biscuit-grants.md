@@ -5,6 +5,7 @@ title: "Support key rotation and unconditional revocation in Biscuit grants"
 kind: exec-plan
 created_at: 2026-07-07T15:25:10Z
 master_plan: "docs/masterplans/10-harden-the-biscuit-decision-token-layer.md"
+intention: intention_01kx6ajfcjefhtvc4fhwk7fjq7
 ---
 
 # Support key rotation and unconditional revocation in Biscuit grants
@@ -46,10 +47,10 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Add `IssuerKeyId` and thread it through minting via `mkBiscuitWith`.
-- [ ] M1: Introduce the `MintedGrant` result (token bytes, stamped expiry, block revocation ids) and change all mint functions to return it.
-- [ ] M1: Update `en-biscuit/test/Main.hs` for the new mint result type; all existing tests pass.
-- [ ] M1: Add a test asserting a minted token round-trips its key id (verifies only with the matching keyset entry).
+- [x] M1 (2026-07-10): Add `IssuerKeyId` and thread it through minting via `mkBiscuitWith`. Placed `IssuerKeyId` in the new `En.Biscuit.Keys` module (its M4 home) from the start; `signGrant` now calls `mkBiscuitWith (Just keyId)`.
+- [x] M1 (2026-07-10): Introduce the `MintedGrant` result (token bytes, stamped expiry, block revocation ids) and change all mint functions to return it.
+- [x] M1 (2026-07-10): Update `en-biscuit/test/Main.hs` for the new mint result type; all existing tests pass.
+- [x] M1 (2026-07-10): Add a test asserting a minted token round-trips its key id (`keyIdRoundTripTest`: mint under `IssuerKeyId 7`, `parseB64` with the matching public key succeeds; the M2 rotation test completes the keyset-selection proof).
 - [ ] M2: Define `IssuerKeySet` in a new module `en-biscuit/src/En/Biscuit/Keys.hs` and expose it from `En.Biscuit`.
 - [ ] M2: Change `verifyGrant` to accept `IssuerKeySet` and parse via `Auth.Biscuit.parseWith`.
 - [ ] M2: Add the rotation test: keys A and B, one keyset, both tokens verify; keyset without A rejects only the key-A token.

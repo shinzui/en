@@ -35,6 +35,7 @@ library
   exposed-modules:
     En.Biscuit
     En.Biscuit.Grant
+    En.Biscuit.Keys
     En.Biscuit.Mint
     En.Biscuit.Verify
 

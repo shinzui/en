@@ -67,9 +67,11 @@ import En.Biscuit.Grant (
     grantBlock,
     grantFactsText,
  )
+import En.Biscuit.Keys (IssuerKeyId (..))
 import En.Biscuit.Mint (
     EnBiscuitMintError (..),
     MintConfig (..),
+    MintedGrant (..),
     mintCheckedObjectGrant,
     mintObjectGrant,
     mintScopedGrant,
@@ -108,6 +110,7 @@ main = do
     mintFailClosedTest
     mintScopedTest
     mintCheckedTest
+    keyIdRoundTripTest
     verifyObjectTests
     verifyScopedTests
     attenuationTests
@@ -291,10 +294,10 @@ mintAllowedTest :: IO ()
 mintAllowedTest = do
     secret <- loadSecret
     let public = toPublic secret
-        config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+        config = MintConfig{issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
     result <- mintObjectGrant config Allowed sampleObjectGrant
     bytes <- case result of
-        Right b -> pure b
+        Right b -> pure b.token
         Left e -> die ("mint allowed: expected a token, got " <> show e)
     biscuit <- either (die . show) pure (parseB64 public bytes)
     -- One authorization proves en_right + consistency token + schema hash are
@@ -317,7 +320,7 @@ mintAllowedTest = do
 mintFailClosedTest :: IO ()
 mintFailClosedTest = do
     secret <- loadSecret
-    let config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+    let config = MintConfig{issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
     denied <- mintObjectGrant config Denied sampleObjectGrant
     assertEqual "mint denied fails closed" (Left DecisionDenied) denied
     let obligations = [CaveatObligation{caveat = CaveatName "within_hours", missingContext = ["now"]}]
@@ -329,7 +332,7 @@ mintScopedTest :: IO ()
 mintScopedTest = do
     secret <- loadSecret
     let public = toPublic secret
-        config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+        config = MintConfig{issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
         grant =
             EnScopedGrant
                 { subject = SubjectId (ObjectRef (ObjectType "user") "bob")
@@ -348,7 +351,7 @@ mintScopedTest = do
                 }
     ok <- mintScopedGrant config 5 grant
     bytes <- case ok of
-        Right b -> pure b
+        Right b -> pure b.token
         Left e -> die ("mint scoped: expected a token, got " <> show e)
     biscuit <- either (die . show) pure (parseB64 public bytes)
     auth <-
@@ -392,13 +395,13 @@ mintCheckedTest = do
     allowed <-
         runMintEff $
             mintCheckedObjectGrant
-                MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+                MintConfig{issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
                 kikanGraph
                 MinimizeLatency
                 emptyCtx
                 allowedGrant
     bytes <- case allowed of
-        Right b -> pure b
+        Right b -> pure b.token
         Left e -> die ("mint checked allowed: expected a token, got " <> show e)
     biscuit <- either (die . show) pure (parseB64 public bytes)
     auth <- authorizeBiscuit biscuit [authorizer|allow if en_right("space", "project-x", "view");|]
@@ -409,7 +412,7 @@ mintCheckedTest = do
     engineErr <-
         runMintEff $
             mintCheckedObjectGrant
-                MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+                MintConfig{issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
                 kikanGraph
                 MinimizeLatency
                 emptyCtx
@@ -418,6 +421,22 @@ mintCheckedTest = do
         Left (EngineError _) -> pure ()
         other -> die ("mint checked: engine error should surface, got " <> showMintResult other)
 
+{- | A token minted under a specific issuer key id carries a signature the
+matching public key verifies. The key id changes which key a keyset verifier
+selects (the rotation story, pinned in 'keyRotationTest'), not the signature
+itself, so 'parseB64' with the right public key still succeeds.
+-}
+keyIdRoundTripTest :: IO ()
+keyIdRoundTripTest = do
+    secret <- loadSecret
+    let public = toPublic secret
+        config = MintConfig{issuerSecretKey = secret, issuerKeyId = IssuerKeyId 7, defaultTtl = 3600, now = pure sampleExpiry}
+    minted <- either (die . show) pure =<< mintObjectGrant config Allowed sampleObjectGrant
+    case parseB64 public minted.token of
+        Right _ -> pure ()
+        Left e ->
+            die ("key id round-trip: token minted under key id 7 must verify with the matching public key, got " <> show e)
+
 {- | Verify an object token: accept the in-scope request; reject wrong audience,
 expired, wrong subject, wrong resource, unaccepted schema, and revoked.
 -}
@@ -425,7 +444,7 @@ verifyObjectTests :: IO ()
 verifyObjectTests = do
     secret <- loadSecret
     let public = toPublic secret
-        config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+        config = MintConfig{issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
         grant =
             EnGrant
                 { subject = aliceSubject
@@ -438,7 +457,8 @@ verifyObjectTests = do
                 , requestId = Just (RequestId "req-1")
                 , revocationId = Just (RevocationId "rev-1")
                 }
-    token <- either (die . show) pure =<< mintObjectGrant config Allowed grant
+    minted <- either (die . show) pure =<< mintObjectGrant config Allowed grant
+    let token = minted.token
 
     let ok =
             mkVerifyRequest
@@ -489,7 +509,7 @@ verifyScopedTests :: IO ()
 verifyScopedTests = do
     secret <- loadSecret
     let public = toPublic secret
-        config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+        config = MintConfig{issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
         grant =
             EnScopedGrant
                 { subject = aliceSubject
@@ -506,7 +526,8 @@ verifyScopedTests = do
                 , requestId = Nothing
                 , revocationId = Nothing
                 }
-    token <- either (die . show) pure =<< mintScopedGrant config 5 grant
+    minted <- either (die . show) pure =<< mintScopedGrant config 5 grant
+    let token = minted.token
 
     inScope <-
         verifyGrant public token $
@@ -630,7 +651,7 @@ shomeiFlowTest :: IO ()
 shomeiFlowTest = do
     secret <- loadSecret
     let public = toPublic secret
-        config = MintConfig{issuerSecretKey = secret, defaultTtl = 3600, now = pure sampleExpiry}
+        config = MintConfig{issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
 
     -- Gateway: verified Shomei identity -> en subject -> mint.
     let AuthenticatedUser{authUserId = gatewayUserId} = AuthenticatedUser{authUserId = "alice"}
@@ -647,7 +668,8 @@ shomeiFlowTest = do
                 , requestId = Nothing
                 , revocationId = Nothing
                 }
-    token <- either (die . show) pure =<< mintObjectGrant config Allowed grant
+    minted <- either (die . show) pure =<< mintObjectGrant config Allowed grant
+    let token = minted.token
 
     let requestFor authenticated =
             mkVerifyRequest
