@@ -45,9 +45,12 @@ library
   build-depends:
     , aeson
     , base                       >=4.19 && <5
+    , biscuit-haskell
+    , bytestring
     , containers
     , effectful
     , effectful-core
+    , en-biscuit
     , en-core
     , en-postgres
     , insert-ordered-containers
@@ -69,10 +72,12 @@ test-suite en-servant-tests
   build-depends:
     , aeson
     , base
+    , biscuit-haskell
     , bytestring
     , containers
     , effectful
     , effectful-core
+    , en-biscuit
     , en-core
     , en-servant
     , servant

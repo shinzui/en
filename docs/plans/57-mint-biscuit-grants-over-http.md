@@ -5,6 +5,7 @@ title: "Mint Biscuit grants over HTTP"
 kind: exec-plan
 created_at: 2026-07-07T15:25:10Z
 master_plan: "docs/masterplans/10-harden-the-biscuit-decision-token-layer.md"
+intention: intention_01kx6ajfcjefhtvc4fhwk7fjq7
 ---
 
 # Mint Biscuit grants over HTTP
@@ -75,14 +76,14 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M0: Verified prerequisite 1 — plan 51 Complete; located the checked-at-returning check surface it produced and recorded its exact shape here.
-- [ ] M0: Verified prerequisite 2 — plan 33's auth mechanism exists; recorded how "auth is active" is detectable at startup.
-- [ ] M0: Checked whether EP-55 and EP-35 have landed; recorded which key format and wire conventions apply.
-- [ ] M1: Added `MintGrantRequestWire`/`MintGrantResponseWire` and the `POST /grants` route to `EnAPI` in `en-servant/src/En/Servant/API.hs`.
-- [ ] M1: Added `MintEnv` and the optional `mint` field to `Env` in `en-servant/src/En/Servant/Seam.hs`; `en-servant` gains the `en-biscuit` dependency.
-- [ ] M1: Implemented `mintGrantHandler`: decode, concrete-subject check, checked check at a token, fail-closed non-mint responses, TTL clamping, mint, respond.
-- [ ] M1: Handler tests (or en-example round-trip) proving Allowed mints and Denied/Conditional/disabled do not.
-- [ ] M2: Server config in `en-server/app/Main.hs`: issuer key env vars (EP-55 format), TTL bounds, startup refusal when minting is on but auth is off.
+- [x] M0 (2026-07-10): Verified prerequisite 1 — plan 51 Complete. Checked-at surface: `Env.checkOperation :: ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckOutcome` (`en-servant/src/En/Servant/Seam.hs:88`); `CheckOutcome` (from `En.Check`) carries `.decision :: CheckDecision` and `.checkedAt :: ConsistencyToken`. The handler runs `checkOperation` and stamps the grant with `outcome.checkedAt`.
+- [x] M0 (2026-07-10): Verified prerequisite 2 — plan 33 Complete. Auth mechanism: `Config.ServerConfig.auth :: Middleware.AuthConfig` where `AuthConfig = AuthDisabled | AuthKeys ![ApiKey]` (`en-server/app/Middleware.hs:51`). "Auth active" ⇔ not `AuthDisabled`. The startup gate refuses when the issuer key is set but `auth == AuthDisabled`.
+- [x] M0 (2026-07-10): EP-55 landed (keyed format) and EP-35 landed (versioned `/v1`, typed `ErrorEnvelopeWire`/`EnFault`, `MultiVerb`/`EnResult`). Key material via `En.Biscuit.Keys.parseSigningKeyText` (`"<id>:<64hex>" -> (IssuerKeyId, SecretKey)`); mint via `mintObjectGrantWithExpiry` returning `MintedGrant{token, expiresAt, revocationIds}`; verify via `verifyGrant :: IssuerKeySet -> ByteString -> VerifyRequest m -> …`. Route is `POST /v1/grants`.
+- [x] M1 (2026-07-10): Added `MintGrantRequestWire`/`MintGrantResponseWire` and the `POST /v1/grants` route to `EnAPI` in `en-servant/src/En/Servant/API.hs`, with `ToSchema` instances in `OpenApi.hs` and the `mintGrant` field on `en-client`'s `EnClient`.
+- [x] M1 (2026-07-10): Added `MintEnv` and the strict `mint :: !(Maybe MintEnv)` field to `Env` in `en-servant/src/En/Servant/Seam.hs`; `en-servant` gained the `en-biscuit`/`biscuit-haskell` dependencies. `en-example`'s host sets `mint = Nothing`.
+- [x] M1 (2026-07-10): Implemented `mintGrantHandler`: decode + concrete-subject check + TTL bound (reject, not clamp) → 404-if-disabled / 400 / 403-on-non-Allowed / mint on Allowed at `checkedAt` with `schemaHash = active.graph.hash`, response hex-encodes revocation ids.
+- [x] M1 (2026-07-10): `mintGrantTests` in `en-servant/test/Main.hs` proves Allowed mints a locally-verifiable token whose recovered consistency token equals `checkedAt`; Denied→403, ttl-over-max→400, non-concrete subject→400, `mint=Nothing`→404. OpenAPI path/schema assertions updated. `cabal test en-servant` passes.
+- [x] M2 (2026-07-10): Server config in `en-server/app/Config.hs` + `Main.hs`: `EN_BISCUIT_ISSUER_SECRET_KEY` (EP-55 `parseSigningKeyText` format), `EN_BISCUIT_DEFAULT_TTL_SECONDS` (300), `EN_BISCUIT_MAX_TTL_SECONDS` (3600, ≥ default), startup refusal when minting is on but `auth == AuthDisabled`, and a `Biscuit grant minting: enabled/disabled` startup line that never logs key material. Gate + malformed-key + TTL-ordering refusals verified against the built binary.
 - [ ] M3: Downstream verifier executable `en-verify-grant` added to `en-biscuit/en-biscuit.cabal` and `en-biscuit/app/VerifyGrant.hs`.
 - [ ] M3: End-to-end acceptance transcript captured: curl mints; `en-verify-grant` verifies and attenuates locally.
 - [ ] M3: `docs/user/biscuit-decision-tokens.md` updated: HTTP minting section and the standard `X-En-Biscuit` header convention.
@@ -160,6 +161,36 @@ Record every decision made while working on the plan.
   subject, permission, object); the server derives the decision and the
   checked-at token itself.
   Date: 2026-07-07
+- Decision: The grant's `schemaHash` is read from the request-time active
+  schema snapshot (`active.graph.hash`), not stored as a static `MintEnv`
+  field. So `MintEnv` holds only issuer key material and TTL bounds.
+  Rationale: `checkHandler` evaluates against `active.graph`, and a SIGHUP
+  schema reload swaps that snapshot between requests. Stamping a captured
+  startup hash would let the server mint a grant claiming a schema hash the
+  check did not evaluate under. Taking the hash from the same snapshot the
+  check ran against is the invariant `En.Servant.Seam.engine` documents.
+  Date: 2026-07-10
+- Decision: `POST /v1/grants` is a plain `Post '[JSON] MintGrantResponseWire`
+  whose handler throws `Servant.ServerError` (carrying EP-35's
+  `ErrorEnvelopeWire`) for its non-200 outcomes — 404 (disabled), 400 (bad
+  input), 403 (Denied/Conditional) — and reuses `faultToServerError` for the
+  engine-fault family (400/422/503). It is NOT wired through the shared
+  `EnResponses`/`EnResult` `MultiVerb` union.
+  Rationale: the mint route's status set (403/404) diverges from every other
+  `EnAPI` operation's (412/422), so a parallel typed union would be pure
+  boilerplate. `En.Servant.Seam` already establishes the throw-based precedent
+  for exactly these statuses (`permissionDenied` → 403, `notFound` → 404). The
+  error bodies still speak EP-35's envelope with stable codes
+  (`decision_not_allowed`, `not_found`, `invalid_request`).
+  Date: 2026-07-10
+- Decision: `/v1/grants` is reachable by any authenticated key, read-only or
+  read-write; it is not added to `Middleware.isWriteRequest`.
+  Rationale: minting runs a check the same caller could already run via
+  `/v1/check`; the grant only repackages an `Allowed` decision it can already
+  observe as a forwardable proof. The safety property plan 33 gives this
+  endpoint is "a caller is authenticated at all", which the startup gate
+  enforces; a read-write tier is not required.
+  Date: 2026-07-10
 
 
 ## Outcomes & Retrospective

@@ -26,7 +26,8 @@ import System.IO (BufferMode (BlockBuffering, LineBuffering), hSetBuffering, std
 import System.Posix.Signals (Handler (Catch), installHandler, sigHUP, sigINT, sigTERM)
 import Text.Read (readMaybe)
 
-import Config (PoolConfig (..), ServerConfig (..), StoreConfig (..), TlsConfig (..), loadServerConfig, loadStoreConfig, validateGcWindow)
+import Config (BiscuitConfig (..), PoolConfig (..), ServerConfig (..), StoreConfig (..), TlsConfig (..), loadServerConfig, loadStoreConfig, validateGcWindow)
+import En.Biscuit.Keys (IssuerKeyId (..))
 import En.Cache (Cache, CacheConfig (..), SubproblemKey, TupleReadKey, cacheStats, newCache)
 import En.Check (CheckCacheEnv (..), checkCachedWithBudget, checkWithBudget)
 import En.Decision (ResidualDecision)
@@ -52,7 +53,7 @@ import En.Schema.Parse (parseSchema)
 import En.SchemaCheck (OrphanReport (..), renderTupleOrphan, validateTuplesAgainstSchema)
 import En.Servant.API (tupleFromWire, tupleToWire)
 import En.Servant.OpenApi (appWithOpenApi)
-import En.Servant.Seam (ActiveSchema (..), AppEffects, Env (..))
+import En.Servant.Seam (ActiveSchema (..), AppEffects, Env (..), MintEnv (..))
 import En.Tuple (Tuple)
 import Hasql.Connection.Settings qualified as Settings
 import Hasql.Errors qualified as Hasql
@@ -347,6 +348,10 @@ runServe serverConfig loadedSchema pool config = do
                 , maxBatchSize = serverConfig.maxBatchSize
                 , deadlineDefaultMillis = serverConfig.deadlineDefaultMillis
                 , deadlineMaxMillis = serverConfig.deadlineMaxMillis
+                , -- The active schema hash a grant embeds is not captured here: the handler
+                  -- reads it from the request's `ActiveSchema` snapshot, so a SIGHUP reload
+                  -- cannot mint a grant under a hash its check did not evaluate under.
+                  mint = mintEnvFromConfig <$> serverConfig.biscuit
                 }
         ping :: IO Bool
         ping = do
@@ -380,6 +385,7 @@ runServe serverConfig loadedSchema pool config = do
     Text.putStrLn ("Tuple-read cache: " <> describeEntryCache tupleReadMaxEntries)
     Text.putStrLn ("Decision cache: " <> describeEntryCache decisionMaxEntries)
     Text.putStrLn ("Rate limit: " <> describeRateLimit serverConfig.rateLimit)
+    Text.putStrLn ("Biscuit grant minting: " <> describeMinting serverConfig.biscuit)
     Text.putStrLn ("Background maintenance: " <> describeMaintenance serverConfig.maintenance)
     Text.putStrLn
         ( "Lookup deadline: defaultMs="
@@ -430,6 +436,38 @@ runServe serverConfig loadedSchema pool config = do
     -- loses only the batch in flight; the next start resumes from what was committed.
     withAsync (runMaintenanceLoop serverConfig.maintenance runAppNow) \_maintenance ->
         serve serverConfig.tls serverConfig.port wrappedApp
+
+{- | Build the servant seam's 'MintEnv' from the parsed issuer configuration.
+
+Only key material and TTL bounds cross over; the schema hash a grant embeds is the
+request-time snapshot's, read in the handler.
+-}
+mintEnvFromConfig :: BiscuitConfig -> MintEnv
+mintEnvFromConfig cfg =
+    MintEnv
+        { issuerSecretKey = cfg.issuerSecretKey
+        , issuerKeyId = cfg.issuerKeyId
+        , defaultTtl = fromIntegral cfg.defaultTtlSeconds
+        , maxTtl = fromIntegral cfg.maxTtlSeconds
+        }
+
+{- | The @Biscuit grant minting:@ startup line.
+
+Logs the key id and TTL bounds so an operator can confirm which issuer is active,
+but never the secret key material.
+-}
+describeMinting :: Maybe BiscuitConfig -> Text.Text
+describeMinting = \case
+    Nothing -> "disabled"
+    Just cfg ->
+        let IssuerKeyId keyId = cfg.issuerKeyId
+         in "enabled (key id "
+                <> showText keyId
+                <> ", defaultTtl="
+                <> showText cfg.defaultTtlSeconds
+                <> "s, maxTtl="
+                <> showText cfg.maxTtlSeconds
+                <> "s)"
 
 describeReloadSource :: Maybe FilePath -> Bool -> Text.Text
 describeReloadSource schemaPath force =

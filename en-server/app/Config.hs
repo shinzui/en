@@ -20,6 +20,7 @@ module Config (
     StoreConfig (..),
     PoolConfig (..),
     TlsConfig (..),
+    BiscuitConfig (..),
     loadServerConfig,
     loadStoreConfig,
     validateGcWindow,
@@ -47,6 +48,8 @@ import Hasql.Statement qualified as Statement
 import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
 
+import Auth.Biscuit (SecretKey)
+import En.Biscuit.Keys (IssuerKeyId, parseSigningKeyText)
 import Maintenance (MaintenanceConfig (..))
 import Middleware (ApiKey (..), AuthConfig (..), KeyRole (..), RateLimitConfig (..))
 
@@ -61,6 +64,23 @@ data PoolConfig = PoolConfig
 data TlsConfig = TlsConfig
     { certFile :: !FilePath
     , keyFile :: !FilePath
+    }
+
+{- | Issuer configuration for @POST \/v1\/grants@, present only when
+@EN_BISCUIT_ISSUER_SECRET_KEY@ is set.
+
+The key material is parsed once, at startup: a malformed key aborts before the
+port binds rather than surfacing on the first mint. The active schema hash the
+grants are stamped with is /not/ here — the handler reads it from the request-time
+schema snapshot, so a @SIGHUP@ reload cannot mint under a hash the check did not
+evaluate under.
+-}
+data BiscuitConfig = BiscuitConfig
+    { issuerKeyId :: !IssuerKeyId
+    , issuerSecretKey :: !SecretKey
+    -- ^ Never logged.
+    , defaultTtlSeconds :: !Int
+    , maxTtlSeconds :: !Int
     }
 
 {- | What it takes to open the store and speak to it correctly.
@@ -95,6 +115,13 @@ data ServerConfig = ServerConfig
     buys a slow lookup no more time.
     -}
     , auth :: !AuthConfig
+    , biscuit :: !(Maybe BiscuitConfig)
+    {- ^ Issuer configuration for @POST \/v1\/grants@. 'Nothing' when
+    @EN_BISCUIT_ISSUER_SECRET_KEY@ is unset, which disables the endpoint. When it
+    is set, caller authentication must be active or startup is refused — a
+    minting endpoint on an unauthenticated server would hand bearer tokens to
+    anyone.
+    -}
     , rateLimit :: !RateLimitConfig
     , maintenance :: !MaintenanceConfig
     , tls :: !(Maybe TlsConfig)
@@ -115,6 +142,9 @@ knownVariables =
     [ "EN_API_KEYS_READ_ONLY"
     , "EN_API_KEYS_READ_WRITE"
     , "EN_AUTH_DISABLED"
+    , "EN_BISCUIT_DEFAULT_TTL_SECONDS"
+    , "EN_BISCUIT_ISSUER_SECRET_KEY"
+    , "EN_BISCUIT_MAX_TTL_SECONDS"
     , "EN_DATABASE_URL"
     , "EN_DECISION_CACHE_MAX_ENTRIES"
     , "EN_GC_WINDOW"
@@ -218,6 +248,8 @@ parseServerConfig environment = do
     maintenance <- parseMaintenance environment
     schemaReloadForce <- withDefault "EN_SCHEMA_RELOAD_FORCE" False boolean
     (auth, authWarnings) <- parseAuth environment
+    biscuit <- parseBiscuit environment
+    checkMintingAuthGate auth biscuit
     pure
         ( ServerConfig
             { store
@@ -230,6 +262,7 @@ parseServerConfig environment = do
             , deadlineMaxMillis
             , budget
             , auth
+            , biscuit
             , rateLimit
             , maintenance
             , tls
@@ -355,6 +388,71 @@ parseAuth environment = do
                     traverse
                         (parseKeyEntry name role)
                         (map Text.strip (Text.splitOn "," (Text.pack raw)))
+
+{- | Parse the issuer configuration for @POST \/v1\/grants@.
+
+Absent @EN_BISCUIT_ISSUER_SECRET_KEY@ — or an empty one, treated as absent as the
+key lists are — disables minting ('Nothing'). A present but malformed key aborts
+startup: a half-configured issuer must never serve. The TTL bounds default to
+300s and 3600s and the maximum must not sit below the default.
+-}
+parseBiscuit :: Map String String -> Either Text (Maybe BiscuitConfig)
+parseBiscuit environment =
+    case Map.lookup "EN_BISCUIT_ISSUER_SECRET_KEY" environment of
+        Nothing -> Right Nothing
+        Just raw
+            | Text.null (Text.strip (Text.pack raw)) -> Right Nothing
+            | otherwise -> do
+                (issuerKeyId, issuerSecretKey) <-
+                    first
+                        (\reason -> "Invalid EN_BISCUIT_ISSUER_SECRET_KEY: " <> reason)
+                        (parseSigningKeyText (Text.pack raw))
+                defaultTtlSeconds <- withDefault "EN_BISCUIT_DEFAULT_TTL_SECONDS" 300 positive
+                maxTtlSeconds <- withDefault "EN_BISCUIT_MAX_TTL_SECONDS" 3600 positive
+                if maxTtlSeconds < defaultTtlSeconds
+                    then Left (ttlOrderingError defaultTtlSeconds maxTtlSeconds)
+                    else
+                        Right
+                            ( Just
+                                BiscuitConfig
+                                    { issuerKeyId
+                                    , issuerSecretKey
+                                    , defaultTtlSeconds
+                                    , maxTtlSeconds
+                                    }
+                            )
+  where
+    withDefault :: forall a. String -> a -> Parser a -> Either Text a
+    withDefault = withDefaultIn environment
+
+ttlOrderingError :: Int -> Int -> Text
+ttlOrderingError defaultTtl maxTtl =
+    "Invalid EN_BISCUIT_MAX_TTL_SECONDS="
+        <> Text.pack (show maxTtl)
+        <> ": it is below EN_BISCUIT_DEFAULT_TTL_SECONDS="
+        <> Text.pack (show defaultTtl)
+        <> ". A default token lifetime above its own maximum is a contradiction."
+
+{- | Refuse to start a server that mints grants but authenticates no caller.
+
+A grant-minting endpoint on an unauthenticated server would hand signed bearer
+tokens to anyone with network reach, so this is a hard startup failure, never a
+warning (docs/plans/33, docs/plans/57).
+-}
+checkMintingAuthGate :: AuthConfig -> Maybe BiscuitConfig -> Either Text ()
+checkMintingAuthGate auth = \case
+    Nothing -> Right ()
+    Just _ -> case auth of
+        AuthKeys _ -> Right ()
+        AuthDisabled -> Left mintingWithoutAuthError
+
+mintingWithoutAuthError :: Text
+mintingWithoutAuthError =
+    Text.unlines
+        [ "EN_BISCUIT_ISSUER_SECRET_KEY is set but caller authentication is not enabled."
+        , "A grant-minting endpoint on an unauthenticated server would hand bearer"
+        , "tokens to anyone. Enable authentication (docs/plans/33) or unset the key."
+        ]
 
 authDisabledWarning :: Text
 authDisabledWarning =

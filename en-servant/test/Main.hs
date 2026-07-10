@@ -11,12 +11,19 @@ import Data.Foldable qualified as Foldable
 import Data.Functor ((<&>))
 import Data.List qualified as List
 import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
+import Data.Text.Encoding (encodeUtf8)
+import Data.Time (UTCTime (..), fromGregorian, getCurrentTime, secondsToDiffTime)
 import Effectful (Eff, IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Servant (Handler, ServerError (..), runHandler, type (:<|>) (..))
+
+import Auth.Biscuit (toPublic)
+import En.Biscuit.Grant (Audience (..))
+import En.Biscuit.Keys (parseSigningKeyText, singleKey)
+import En.Biscuit.Verify (VerifiedGrant (..), VerifyRequest (..), verifyGrant)
 
 import En.Budget (defaultEvaluationBudget)
 import En.Cache (Cache, CacheConfig (..), CacheStats (..), SubproblemKey, cacheStats, newCache)
@@ -38,7 +45,7 @@ import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
 import En.Reachability (ReachabilityGraph (..))
 import En.Revision (ConsistencyToken (..), DatastoreId (..), SchemaHash (..))
-import En.Schema (ObjectType (..))
+import En.Schema (ObjectType (..), RelationName (..))
 import En.Servant.API (
     BatchCheckPairWire (..),
     BatchCheckRequestWire (..),
@@ -69,6 +76,8 @@ import En.Servant.API (
     LookupSubjectsPageWire (..),
     LookupSubjectsRequestWire (..),
     LookupSubjectsStateWire (..),
+    MintGrantRequestWire (..),
+    MintGrantResponseWire (..),
     ObjectRefWire (..),
     PreconditionWire (..),
     ReadRelationshipsRequestWire (..),
@@ -93,10 +102,11 @@ import En.Servant.Seam (
     ActiveSchema (..),
     EnFault (..),
     ErrorEnvelopeWire (..),
+    MintEnv (..),
     enErrorToFault,
     faultToServerError,
  )
-import En.Tuple (ObjectRef (..))
+import En.Tuple (ObjectRef (..), Subject (..))
 import En.Watch (WatchBatch (..), WatchStart (..))
 
 main :: IO ()
@@ -121,6 +131,7 @@ main = do
                 , maxBatchSize = 10
                 , deadlineDefaultMillis = 3000
                 , deadlineMaxMillis = 30000
+                , mint = Nothing
                 }
         batch = batchHandler env
         request =
@@ -333,6 +344,7 @@ main = do
 
     lookupSubjectsTests env
     writePreconditionTests env
+    mintGrantTests env
 
 {- | @\/v1\/lookup-subjects@ over the wire, against the in-memory store.
 
@@ -553,7 +565,7 @@ openApiDocumentTests = do
 
     assertEqual
         "openapi document lists exactly the served operations"
-        (List.sort ("/v1/schema" : postPaths))
+        (List.sort ("/v1/schema" : "/v1/grants" : postPaths))
         (List.sort (objectKeys (document `at` "paths")))
 
     mapM_
@@ -571,6 +583,16 @@ openApiDocumentTests = do
         "the schema endpoint is a GET with only a 200"
         ["200"]
         (List.sort (objectKeys (document `at` "paths" `at` "/v1/schema" `at` "get" `at` "responses")))
+
+    -- POST /v1/grants throws its authorization outcomes (404 disabled, 403 not-allowed) and
+    -- its input faults as ServerErrors carrying the ErrorEnvelopeWire, rather than declaring
+    -- them as MultiVerb alternatives. The document therefore shows only the 200 and the 400
+    -- that servant-openapi derives from the JSON request body itself — not the 412/422/503
+    -- every EnResponses operation carries. See 'En.Servant.API.mintGrantHandler'.
+    assertEqual
+        "the grants endpoint is a POST with only a 200 and the body-parse 400"
+        ["200", "400"]
+        (List.sort (objectKeys (document `at` "paths" `at` "/v1/grants" `at` "post" `at` "responses")))
 
     assertBool
         "openapi document defines the error envelope"
@@ -593,6 +615,8 @@ openApiDocumentTests = do
         , "TupleChangeWire"
         , "WatchResponseWire"
         , "SchemaInfoWire"
+        , "MintGrantRequestWire"
+        , "MintGrantResponseWire"
         ]
 
     -- `limit` is the only required field of a watch request. A schema that also required
@@ -1435,6 +1459,7 @@ data Handlers = Handlers
     , lookupSubjects :: LookupSubjectsRequestWire -> Handler (EnResult LookupSubjectsPageWire)
     , expand :: ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
     , watch :: WatchRequestWire -> Handler (EnResult WatchResponseWire)
+    , mintGrant :: MintGrantRequestWire -> Handler MintGrantResponseWire
     , readSchema :: Handler SchemaInfoWire
     }
 
@@ -1451,6 +1476,7 @@ handlers env =
         , lookupSubjects = lookupSubjectsEndpoint
         , expand = expandEndpoint
         , watch = watchEndpoint
+        , mintGrant = mintGrantEndpoint
         , readSchema = readSchemaEndpoint
         }
   where
@@ -1464,6 +1490,7 @@ handlers env =
         :<|> lookupSubjectsEndpoint
         :<|> expandEndpoint
         :<|> watchEndpoint
+        :<|> mintGrantEndpoint
         :<|> readSchemaEndpoint = server env
 
 batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
@@ -1610,3 +1637,120 @@ assertOk label (Right fault) =
     fail (label <> "\nexpected EnOk, got: " <> show fault)
 assertOk label (Left err) =
     fail (label <> "\nexpected Right, got Left: " <> show err)
+
+{- | The deterministic issuer signing key from @en-biscuit/test/Main.hs@, in the
+EP-55 @"\<id\>:\<64 hex\>"@ format 'parseSigningKeyText' consumes. A fixed key so
+the test is reproducible; production uses a freshly generated one.
+-}
+testSigningKey :: Text
+testSigningKey = "1:a2c4ead323536b925f3488ee83e0888b79c2761405ca7c0c9a018c7c1905eecc"
+
+{- | The HTTP status and stable @code@ of a thrown 'ServerError', or 'Nothing' if
+the handler returned a value instead of throwing. @POST \/v1\/grants@ signals its
+non-200 outcomes by throwing rather than through an 'EnResult', so this is how the
+mint tests pin both the status and the code at once.
+-}
+thrownEnvelope :: Either ServerError a -> Maybe (Int, Text)
+thrownEnvelope = \case
+    Left err -> do
+        envelope <- decode err.errBody :: Maybe ErrorEnvelopeWire
+        pure (err.errHTTPCode, envelope.code)
+    Right _ -> Nothing
+
+{- | @POST \/v1\/grants@ over the wire, against the in-memory store.
+
+Pins the endpoint contract without a live server: an 'Allowed' request mints a
+token that 'verifyGrant' accepts for the same subject/operation/resource/audience
+and whose recovered consistency token equals the response's @checkedAt@; a
+'Denied' request throws 403 and no token; a @ttlSeconds@ above the maximum and a
+non-concrete subject are 400; and a server with no issuer configured
+(@mint = Nothing@) throws 404. Milestone 3 adds the live end-to-end proof.
+-}
+mintGrantTests :: Env TestEffects -> IO ()
+mintGrantTests baseEnv = do
+    (keyId, secret) <- either (fail . Text.unpack) pure (parseSigningKeyText testSigningKey)
+    let public = toPublic secret
+        keySet = singleKey keyId public
+        mintEnv =
+            baseEnv
+                { mint =
+                    Just
+                        MintEnv
+                            { issuerSecretKey = secret
+                            , issuerKeyId = keyId
+                            , defaultTtl = 300
+                            , maxTtl = 3600
+                            }
+                }
+        grantsFor e = (handlers e).mintGrant
+        request =
+            MintGrantRequestWire
+                { consistency = MinimizeLatencyWire
+                , context = CaveatContextWire Map.empty
+                , subject = SubjectIdWire ObjectRefWire{objectType = "user", objectId = "alice"}
+                , permission = "view"
+                , object = ObjectRefWire{objectType = "space", objectId = "project-x"}
+                , audience = "document-service"
+                , ttlSeconds = Just 120
+                , requestId = Just "req-mint-1"
+                }
+
+    -- Allowed -> 200 with a token that verifies locally.
+    response <-
+        runHandler (grantsFor mintEnv request) >>= \case
+            Right r -> pure r
+            Left err -> fail ("mint: expected 200, got a thrown error " <> show err)
+    assertEqual "mint: checkedAt is the snapshot the check evaluated at" testCheckedAt response.checkedAt
+    assertBool "mint: at least one revocation id" (not (null response.revocationIds))
+
+    now <- getCurrentTime
+    let verifyRequest =
+            VerifyRequest
+                { expectedSubject = SubjectId (ObjectRef (ObjectType "user") "alice")
+                , expectedAudience = Audience "document-service"
+                , operation = RelationName "view"
+                , resource = ObjectRef (ObjectType "space") "project-x"
+                , serviceName = Audience "document-service"
+                , acceptedSchemaHashes = Set.singleton testActiveSchema.graph.hash
+                , now = now
+                , revoked = const (pure False)
+                , revokedBlockIds = const (pure False)
+                }
+    verifyGrant keySet (encodeUtf8 response.token) verifyRequest >>= \case
+        Right grant -> do
+            let ConsistencyToken recovered = grant.consistencyToken
+            assertEqual
+                "mint: the token verifies and its consistency token is the response's checkedAt"
+                response.checkedAt
+                recovered
+        Left err -> fail ("mint: the minted token should verify locally, got " <> show err)
+
+    -- Denied -> 403, no token.
+    denied <-
+        runHandler
+            (grantsFor mintEnv request{subject = SubjectIdWire ObjectRefWire{objectType = "user", objectId = "bob"}})
+    assertEqual
+        "mint: a Denied decision is 403 decision_not_allowed"
+        (Just (403, "decision_not_allowed"))
+        (thrownEnvelope denied)
+
+    -- ttlSeconds above the configured maximum -> 400 (rejected, not clamped).
+    tooLong <- runHandler (grantsFor mintEnv request{ttlSeconds = Just 999999})
+    assertEqual
+        "mint: ttlSeconds above the maximum is 400 invalid_request"
+        (Just (400, "invalid_request"))
+        (thrownEnvelope tooLong)
+
+    -- A non-concrete subject -> 400.
+    nonConcrete <- runHandler (grantsFor mintEnv request{subject = SubjectWildcardWire "user"})
+    assertEqual
+        "mint: a non-concrete subject is 400 invalid_request"
+        (Just (400, "invalid_request"))
+        (thrownEnvelope nonConcrete)
+
+    -- mint = Nothing -> 404, and every other endpoint still works.
+    disabled <- runHandler (grantsFor baseEnv request)
+    assertEqual
+        "mint: a server with no issuer key answers 404 not_found"
+        (Just (404, "not_found"))
+        (thrownEnvelope disabled)

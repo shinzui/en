@@ -48,6 +48,11 @@ data EnClient = EnClient
     , lookupSubjects :: LookupSubjectsRequestWire -> ClientM (EnResult LookupSubjectsPageWire)
     , expand :: ExpandRequestWire -> ClientM (EnResult ExpandTreeWire)
     , watch :: WatchRequestWire -> ClientM (EnResult WatchResponseWire)
+    , mintGrant :: MintGrantRequestWire -> ClientM MintGrantResponseWire
+    {- ^ Not an 'EnResult': @POST \/v1\/grants@ throws its non-200 outcomes (404 when minting
+    is disabled, 403 when the decision is not Allowed, 400 on a bad request) as client
+    errors rather than returning them, so 'runClientM' surfaces them as 'Left'.
+    -}
     , readSchema :: ClientM SchemaInfoWire
     -- ^ Not an 'EnResult': @GET \/v1\/schema@ has no failure alternative to return into.
     }
@@ -69,6 +74,7 @@ enClient =
         , lookupSubjects
         , expand
         , watch
+        , mintGrant
         , readSchema
         }
   where
@@ -82,6 +88,7 @@ enClient =
         :<|> lookupSubjects
         :<|> expand
         :<|> watch
+        :<|> mintGrant
         :<|> readSchema = client apiProxy
 
 {- | Ask for a read at least as fresh as a previous response's @checkedAt@.

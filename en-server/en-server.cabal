@@ -42,17 +42,19 @@ executable en-server
   build-depends:
     , aeson
     , async
-    , base            >=4.19 && <5
+    , base             >=4.19 && <5
+    , biscuit-haskell
     , bytestring
     , containers
     , effectful
     , effectful-core
+    , en-biscuit
     , en-core
     , en-migrations
     , en-postgres
     , en-servant
     , hasql
-    , hasql-pool      ^>=1.4
+    , hasql-pool       ^>=1.4
     , http-types
     , ram
     , text

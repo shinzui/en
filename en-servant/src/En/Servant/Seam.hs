@@ -5,6 +5,7 @@ module En.Servant.Seam (
     AppEffects,
     ActiveSchema (..),
     Env (..),
+    MintEnv (..),
     EnServer,
     ErrorEnvelopeWire (..),
     EnFault (..),
@@ -28,11 +29,14 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO qualified as Text
-import Data.Time (UTCTime)
+import Data.Time (NominalDiffTime, UTCTime)
 import Effectful (Eff, IOE)
 import Effectful.Error.Static (Error)
 import Servant (Handler, ServerError (..), err400, err403, err404, err412, err422, err503, throwError)
 import System.IO (stderr)
+
+import Auth.Biscuit (SecretKey)
+import En.Biscuit.Keys (IssuerKeyId)
 
 import En.Budget (EvaluationBudget)
 import En.Check (CheckOutcome)
@@ -111,6 +115,35 @@ data Env es = Env
     {- ^ Ceiling the server imposes on a client-supplied @deadlineMillis@. A larger
     request is clamped, not rejected: asking for "as long as you'll give me" is
     reasonable, and the server -- not the caller -- decides how long that is.
+    -}
+    , mint :: !(Maybe MintEnv)
+    {- ^ Issuer configuration for @POST \/v1\/grants@. 'Nothing' disables the
+    endpoint: the handler answers 404, so a server that configures no issuer key
+    does not advertise a minting capability it cannot fulfil. A host that wants
+    HTTP grant minting supplies 'Just'; see @docs/plans/57-mint-biscuit-grants-over-http.md@.
+    -}
+    }
+
+{- | What @POST \/v1\/grants@ needs to mint a decision token: the issuer key
+material and the token-lifetime bounds. Deliberately /not/ the active schema
+hash — the handler reads that from the request-time 'ActiveSchema' snapshot
+(@active.graph.hash@), the same snapshot its check evaluated against, so a
+@SIGHUP@ schema reload can never mint a grant claiming a hash the check did not
+evaluate under.
+-}
+data MintEnv = MintEnv
+    { issuerSecretKey :: !SecretKey
+    -- ^ The Biscuit issuer's private signing key. Never logged.
+    , issuerKeyId :: !IssuerKeyId
+    {- ^ The id of 'issuerSecretKey', stamped into every minted token's envelope
+    so verifiers select the matching public key from their keyset (EP-55).
+    -}
+    , defaultTtl :: !NominalDiffTime
+    -- ^ Token lifetime when the request omits @ttlSeconds@.
+    , maxTtl :: !NominalDiffTime
+    {- ^ Upper bound on a caller-requested @ttlSeconds@. A request above it is
+    rejected with 400 rather than clamped, so a caller never caches a token with
+    a lifetime different from the one it asked for.
     -}
     }
 

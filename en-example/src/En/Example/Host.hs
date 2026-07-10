@@ -140,6 +140,9 @@ mkEnv cStore tStore =
         , maxBatchSize = 400
         , deadlineDefaultMillis = 3000
         , deadlineMaxMillis = 30000
+        , -- This host serves its own guarded routes, not `EnAPI`, so it exposes no
+          -- `POST /v1/grants`; grant minting is disabled.
+          mint = Nothing
         }
 
 server :: Env ExampleEffects -> Subject -> Server GuardedAPI

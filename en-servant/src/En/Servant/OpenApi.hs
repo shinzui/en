@@ -104,6 +104,8 @@ import En.Servant.API (
     LookupSubjectsPageWire,
     LookupSubjectsRequestWire,
     LookupSubjectsStateWire,
+    MintGrantRequestWire,
+    MintGrantResponseWire,
     ObjectRefWire,
     PreconditionWire,
     ReadRelationshipsRequestWire,
@@ -335,6 +337,49 @@ instance ToSchema CheckResponseWire where
     declareNamedSchema _ = do
         decision <- declareSchemaRef (Proxy @CheckDecisionWire)
         pure (NamedSchema (Just "CheckResponseWire") (objectSchema [("decision", decision), ("checkedAt", textRef)]))
+
+instance ToSchema MintGrantRequestWire where
+    declareNamedSchema _ = do
+        consistency <- declareSchemaRef (Proxy @ConsistencyWire)
+        context <- declareSchemaRef (Proxy @CaveatContextWire)
+        subject <- declareSchemaRef (Proxy @SubjectWire)
+        object <- declareSchemaRef (Proxy @ObjectRefWire)
+        pure $
+            NamedSchema (Just "MintGrantRequestWire") $
+                partialObjectSchema
+                    [ ("consistency", consistency)
+                    , ("context", context)
+                    , ("subject", subject)
+                    , ("permission", textRef)
+                    , ("object", object)
+                    , ("audience", textRef)
+                    ]
+                    [ ("ttlSeconds", primitive OpenApiInteger)
+                    , ("requestId", textRef)
+                    ]
+                    & description
+                        ?~ "Mints a Biscuit decision token if the server's own check for this \
+                           \subject/permission/object is Allowed. subject must be a concrete \"id\" \
+                           \subject. ttlSeconds, if given, must be positive and no greater than the \
+                           \server maximum (else 400). Returns 403 when the decision is not Allowed, \
+                           \and 404 when grant minting is not configured."
+
+instance ToSchema MintGrantResponseWire where
+    declareNamedSchema _ = do
+        timestamp <- declareSchemaRef (Proxy @UTCTime)
+        pure $
+            NamedSchema (Just "MintGrantResponseWire") $
+                objectSchema
+                    [ ("token", textRef)
+                    , ("expiresAt", timestamp)
+                    , ("revocationIds", arrayOf textRef)
+                    , ("checkedAt", textRef)
+                    ]
+                    & description
+                        ?~ "token is the URL-safe base64 Biscuit to forward downstream in the \
+                           \X-En-Biscuit header. revocationIds are the token's built-in block \
+                           \revocation ids, hex-encoded. checkedAt is the consistency token the \
+                           \mint's check evaluated at, also signed into the grant."
 
 instance ToSchema BatchCheckPairWire where
     declareNamedSchema _ = do
