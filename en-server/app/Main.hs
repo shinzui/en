@@ -20,7 +20,7 @@ import Network.Wai qualified as Wai
 import Network.Wai.Handler.Warp qualified as Warp
 import Network.Wai.Handler.WarpTLS qualified as WarpTLS
 import System.Environment (getArgs)
-import System.Exit (ExitCode (ExitFailure), exitFailure, exitWith)
+import System.Exit (ExitCode (ExitFailure), exitFailure, exitSuccess, exitWith)
 import System.IO (BufferMode (BlockBuffering, LineBuffering), hSetBuffering, stderr, stdout)
 import System.Posix.Signals (Handler (Catch), installHandler, sigINT, sigTERM)
 import Text.Read (readMaybe)
@@ -48,6 +48,7 @@ import En.Reachability (ReachabilityGraph (..), compile)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (Schema, ValidSchema, schemaHash, validateSchema)
 import En.Schema.Parse (parseSchema)
+import En.SchemaCheck (OrphanReport (..), renderTupleOrphan, validateTuplesAgainstSchema)
 import En.Servant.API (tupleFromWire, tupleToWire)
 import En.Servant.OpenApi (appWithOpenApi)
 import En.Servant.Seam (ActiveSchema (..), AppEffects, Env (..))
@@ -64,17 +65,21 @@ import Metrics (metricsMiddleware, metricsRoute, newMetrics)
 import Middleware (authMiddleware, describeRateLimit, rateLimitMiddleware)
 import Observability (newRequestLogger, requestIdMiddleware)
 
-{- | The three ways to run this binary.
+{- | The four ways to run this binary.
 
 Bulk import and export are subcommands rather than HTTP endpoints. The API is
 unauthenticated today, so a bulk-write endpoint would widen that exposure,
 whereas a subcommand runs with database credentials the operator already holds,
 needs no new wire contract, and composes with @gzip@, @pv@, and redirects.
+
+@check-schema@ is a subcommand for a different reason: it exists to be run before
+any process is touched, from CI or a deploy pipeline, against production data.
 -}
 data Command
     = Serve
     | Import FilePath Int
     | Export
+    | CheckSchema FilePath
 
 -- | Tuples per import transaction when @--batch-size@ is not given.
 defaultBatchSize :: Int
@@ -97,6 +102,12 @@ main = do
         -- token line -- so every diagnostic the shared prologue emits goes to stderr.
         Just (Import path batchSize) -> withSubcommandStore (runImport path batchSize)
         Just Export -> withSubcommandStore runExport
+        -- The candidate is read and validated before the store config is even loaded, so a
+        -- typo in a schema file costs no database round trip and no misleading "serving the
+        -- built-in demo schema" warning from a command that serves nothing.
+        Just (CheckSchema path) -> do
+            candidate <- loadCandidateSchema path >>= either candidateFailure pure
+            withSubcommandStore (runCheckSchema candidate)
 
 {- | A schema as it was read: the validated model, plus the text and origin
 @GET \/v1\/schema@ reports.
@@ -126,6 +137,7 @@ parseCommand :: [String] -> Maybe Command
 parseCommand = \case
     [] -> Just Serve
     ["export"] -> Just Export
+    ["check-schema", path] -> Just (CheckSchema path)
     ("import" : rest) -> parseImport Nothing defaultBatchSize rest
     _ -> Nothing
   where
@@ -146,8 +158,11 @@ usage = do
         , "  en-server                                     serve the HTTP API"
         , "  en-server import --file PATH [--batch-size N] import newline-delimited-JSON tuples"
         , "  en-server export                              write every live tuple as newline-delimited JSON"
+        , "  en-server check-schema PATH                   report which live tuples PATH would strand"
         , ""
-        , "All three read EN_DATABASE_URL and the optional EN_SCHEMA_PATH."
+        , "All four read EN_DATABASE_URL and the optional EN_SCHEMA_PATH."
+        , "check-schema exits 0 when the candidate strands nothing, 1 when it strands grants,"
+        , "and 2 when the candidate itself cannot be read, parsed, or validated."
         ]
     exitWith (ExitFailure 2)
 
@@ -497,6 +512,75 @@ runExport _loadedSchema pool config = do
             Truncated next -> drainFrom revision (Just next) exportedNow
 
     exportPageSize = 5000
+
+{- | Report which live tuples a candidate schema would strand, and exit accordingly.
+
+Read-only: it touches no process and writes no row. The point is to be run from CI or a
+deploy pipeline against production data, /before/ the schema is put anywhere near a server.
+
+Exit codes: 0 when the candidate strands nothing, 1 when it strands grants, 2 when the
+candidate itself cannot be read, parsed, or validated (raised by 'loadCandidateSchema',
+before this runs). The 2 is shared with 'usage', which is the honest grouping: both mean the
+operator gave this command something it cannot act on, and neither says anything about the
+state of the store.
+
+The active schema this process loaded (from @EN_SCHEMA_PATH@, or the demo model) is
+deliberately ignored. The question is what the /candidate/ makes of the stored data, and a
+pipeline vetting a schema change should not have to arrange for the outgoing one to be
+present.
+-}
+runCheckSchema :: ValidSchema -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
+runCheckSchema candidate _activeSchema pool config = do
+    let candidateHash = renderSchemaHash (schemaHash candidate)
+    outcome <- runStoreIO pool config do
+        revision <- TupleStore.headRevision
+        liftIO (toStderr ("checking at revision " <> revision.revisionEncoding))
+        validateTuplesAgainstSchema candidate revision
+    report <- either (storeFailure "check-schema") pure outcome
+    traverse_ (Text.putStrLn . renderTupleOrphan) report.orphans
+    let orphanCount = length report.orphans
+        summary =
+            showText orphanCount
+                <> " orphan(s) across "
+                <> showText report.scanned
+                <> " live tuple(s); candidate schema "
+                <> candidateHash
+    if orphanCount == 0
+        then do
+            Text.putStrLn (summary <> " fits them all.")
+            exitSuccess
+        else do
+            Text.putStrLn (summary <> " would strand them.")
+            exitWith (ExitFailure 1)
+
+{- | Read, parse, and validate a candidate schema without exiting.
+
+'loadSchema' cannot be reused: every one of its failure paths calls 'configFailure', which
+exits 1 -- the code 'runCheckSchema' reserves for "the candidate strands live grants". A
+pipeline that cannot tell a typo in a schema file from a schema that would destroy data is
+worse than no pipeline.
+-}
+loadCandidateSchema :: FilePath -> IO (Either Text.Text ValidSchema)
+loadCandidateSchema path = do
+    readResult <- try (Text.readFile path) :: IO (Either IOException Text.Text)
+    pure do
+        contents <-
+            case readResult of
+                Right value -> Right value
+                Left err -> Left ("could not read " <> Text.pack path <> ": " <> Text.pack (show err))
+        parsed <-
+            case parseSchema contents of
+                Right value -> Right value
+                Left err -> Left ("could not parse " <> Text.pack path <> ": " <> Text.pack (show err))
+        case validateSchema parsed of
+            Right valid -> Right valid
+            Left err -> Left ("invalid schema in " <> Text.pack path <> ": " <> Text.pack (show err))
+
+-- | The candidate is unusable. Distinct from 'configFailure', which exits 1.
+candidateFailure :: Text.Text -> IO a
+candidateFailure message = do
+    Text.hPutStrLn stderr ("en-server: " <> message)
+    exitWith (ExitFailure 2)
 
 storeFailure :: Text.Text -> EnError -> IO a
 storeFailure command err =

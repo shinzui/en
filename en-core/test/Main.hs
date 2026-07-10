@@ -124,6 +124,7 @@ import En.Schema.Render (renderMarkdown, renderMermaid, renderReachabilityMermai
 import En.Schema.TH (mkValidSchema, schema)
 import En.SchemaCheck (
     OrphanReason (..),
+    OrphanReport (..),
     TupleOrphan (..),
     checkTupleAgainstSchema,
     renderTupleOrphan,
@@ -1434,25 +1435,30 @@ testValidateTuplesAgainstSchema = do
         legal = schemaCheckTuple "author" aliceUser Nothing
         orphanRelation = schemaCheckTuple "editor" aliceUser Nothing
         orphanSubject = schemaCheckTuple "author" (SubjectId ObjectRef{objectType = ObjectType "service", objectId = "bot"}) Nothing
-        run :: [Tuple] -> Either EnError [TupleOrphan]
+        run :: [Tuple] -> Either EnError OrphanReport
         run tuples =
             runPureEff (runErrorNoCallStack (runTupleStoreInMemory tuples (validateTuplesAgainstSchema valid testRevision)))
 
     assertEqual
         "a store whose every tuple fits the schema yields no orphans"
-        (Right [])
+        (Right OrphanReport{scanned = 1, orphans = []})
         (run [legal])
     assertEqual
-        "the pass reports each orphan once, and leaves legal tuples alone"
+        "the pass reports each orphan once, counts every live tuple, and leaves legal tuples alone"
         ( Right
-            [ TupleOrphan{tuple = orphanRelation, reason = OrphanUnknownRelation (ObjectType "post") (RelationName "editor")}
-            , TupleOrphan{tuple = orphanSubject, reason = OrphanUnknownSubjectType (ObjectType "service")}
-            ]
+            OrphanReport
+                { scanned = 3
+                , orphans =
+                    [ TupleOrphan{tuple = orphanRelation, reason = OrphanUnknownRelation (ObjectType "post") (RelationName "editor")}
+                    , TupleOrphan{tuple = orphanSubject, reason = OrphanUnknownSubjectType (ObjectType "service")}
+                    ]
+                }
         )
         (run [legal, orphanRelation, orphanSubject])
+    -- "0 orphans" over an empty store and over a million grants are different reports.
     assertEqual
-        "an empty store yields no orphans"
-        (Right [])
+        "an empty store yields no orphans and scans nothing"
+        (Right OrphanReport{scanned = 0, orphans = []})
         (run [])
 
 testRelationshipFilterMatching :: IO ()

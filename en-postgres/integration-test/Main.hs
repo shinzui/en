@@ -12,7 +12,7 @@ import Data.Foldable (traverse_)
 import Data.Functor.Contravariant ((>$<))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
-import Data.List (nub, sort)
+import Data.List (nub, sort, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -53,8 +53,10 @@ import En.Postgres.TupleStore (pruneTransactionsBatchSession, reapDeletedTuplesB
 import En.Postgres.Watch qualified as Watch
 import En.Reachability (ReachabilityGraph, compile)
 import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), RevisionOrder (..))
-import En.Schema (AllowedSubject (..), CaveatName (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..), Schema (..))
+import En.Schema (AllowedSubject (..), CaveatName (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..), Schema (..), ValidSchema, validateSchema)
 import En.Schema qualified as Schema
+import En.Schema.Parse (parseSchema)
+import En.SchemaCheck (OrphanReason (..), OrphanReport (..), TupleOrphan (..), renderTupleOrphan, validateTuplesAgainstSchema)
 import En.Tuple (CaveatContext (..), CaveatPayload (..), CaveatValue (..), ObjectRef (..), Subject (..), Tuple (..), TupleCaveat (..))
 import En.Watch (WatchBatch (..), WatchStart (..))
 import EphemeralPg qualified as Pg
@@ -83,6 +85,8 @@ main = do
         runConsistencyFetchCountScenario connection
         resetSchema connection
         runReadAllTuplesScenario connection
+        resetSchema connection
+        runSchemaValidationScenario connection
         resetSchema connection
         runRelationshipFilterScenario connection
         resetSchema connection
@@ -862,6 +866,117 @@ page fetched afterwards, so an export that takes minutes still describes the
 graph as it stood when it began, rather than smearing concurrent writers across
 its pages.
 -}
+
+{- | The stored-tuple validation pass, end to end against PostgreSQL.
+
+Two things are under test that the en-core unit tests cannot reach: that the pass drains
+every page of a real @ReadAllTuples@ rather than stopping at the first (the fixture is
+larger than the pass's 1000-row page), and that it sees exactly the /live/ set — a retired
+grant is owed no orphan, however badly it fits the candidate.
+-}
+runSchemaValidationScenario :: Connection.Connection -> IO ()
+runSchemaValidationScenario connection = do
+    config <- testConfig
+    candidate <- parseValidSchema candidateSchemaText
+    superset <- parseValidSchema supersetSchemaText
+
+    let alice = SubjectId (ObjectRef (ObjectType "user") "alice")
+        viewer = RelationName "viewer"
+        -- More than one page of the pass's internal drain (1000 rows), so a pass that
+        -- stopped at the first page would miss the orphans seeded after it.
+        bulk =
+            [ Tuple
+                { object = ObjectRef{objectType = ObjectType "space", objectId = "bulk-" <> showText index}
+                , relation = viewer
+                , subject = alice
+                , caveat = Nothing
+                }
+            | index <- [1 :: Int .. 1200]
+            ]
+        unknownType =
+            Tuple
+                { object = ObjectRef{objectType = ObjectType "comment", objectId = "1"}
+                , relation = RelationName "author"
+                , subject = alice
+                , caveat = Nothing
+                }
+        unknownRelation =
+            Tuple
+                { object = ObjectRef{objectType = ObjectType "space", objectId = "x"}
+                , relation = RelationName "editor"
+                , subject = alice
+                , caveat = Nothing
+                }
+        disallowedWildcard =
+            Tuple
+                { object = ObjectRef{objectType = ObjectType "space", objectId = "x"}
+                , relation = viewer
+                , subject = SubjectWildcard (ObjectType "user")
+                , caveat = Nothing
+                }
+        seeded = bulk <> [unknownType, unknownRelation, disallowedWildcard]
+
+    writeToken <- runPgOrFail connection config (TupleStore.writeTuples seeded)
+    TokenMetadata{revision} <- either (fail . show) pure (tokenMetadataFromPayload writeToken)
+
+    supersetReport <- runPgOrFail connection config (validateTuplesAgainstSchema superset revision)
+    assertEqual "a superset schema strands nothing" [] supersetReport.orphans
+    assertEqual "the pass scans every live tuple" 1203 supersetReport.scanned
+
+    candidateReport <- runPgOrFail connection config (validateTuplesAgainstSchema candidate revision)
+    assertEqual "the pass scans every live tuple under the candidate too" 1203 candidateReport.scanned
+    assertEqual
+        "the candidate strands exactly the three unfitting grants"
+        ( sortOn
+            renderTupleOrphan
+            [ TupleOrphan{tuple = unknownType, reason = OrphanUnknownObjectType (ObjectType "comment")}
+            , TupleOrphan{tuple = unknownRelation, reason = OrphanUnknownRelation (ObjectType "space") (RelationName "editor")}
+            , TupleOrphan{tuple = disallowedWildcard, reason = OrphanDisallowedSubject (SubjectWildcard (ObjectType "user"))}
+            ]
+        )
+        (sortOn renderTupleOrphan candidateReport.orphans)
+
+    -- A grant retired before the pass runs is not stranded by anything: it is already gone.
+    deleteToken <- runPgOrFail connection config (TupleStore.deleteTuples [unknownType])
+    TokenMetadata{revision = afterDelete} <- either (fail . show) pure (tokenMetadataFromPayload deleteToken)
+    afterReport <- runPgOrFail connection config (validateTuplesAgainstSchema candidate afterDelete)
+    assertEqual "a retired grant is owed no orphan" 1202 afterReport.scanned
+    assertEqual
+        "the retired grant's orphan is gone, the others remain"
+        ( sortOn
+            renderTupleOrphan
+            [ TupleOrphan{tuple = unknownRelation, reason = OrphanUnknownRelation (ObjectType "space") (RelationName "editor")}
+            , TupleOrphan{tuple = disallowedWildcard, reason = OrphanDisallowedSubject (SubjectWildcard (ObjectType "user"))}
+            ]
+        )
+        (sortOn renderTupleOrphan afterReport.orphans)
+  where
+    candidateSchemaText =
+        "object user {}\n\
+        \\n\
+        \object space {\n\
+        \  relation viewer: user\n\
+        \  permission view = viewer\n\
+        \}\n"
+
+    supersetSchemaText =
+        "object user {}\n\
+        \\n\
+        \object comment {\n\
+        \  relation author: user\n\
+        \}\n\
+        \\n\
+        \object space {\n\
+        \  relation viewer: user, user:*\n\
+        \  relation editor: user\n\
+        \  permission view = viewer | editor\n\
+        \}\n"
+
+parseValidSchema :: Text -> IO ValidSchema
+parseValidSchema text = do
+    parsed <- either (fail . show) pure (parseSchema text)
+    either (fail . show) pure (validateSchema parsed)
+
 runReadAllTuplesScenario :: Connection.Connection -> IO ()
 runReadAllTuplesScenario connection = do
     config <- testConfig

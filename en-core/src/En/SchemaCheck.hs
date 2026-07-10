@@ -23,6 +23,7 @@ a type that does not exist can name them.
 module En.SchemaCheck (
     TupleOrphan (..),
     OrphanReason (..),
+    OrphanReport (..),
     checkTupleAgainstSchema,
     validateTuplesAgainstSchema,
     renderTupleOrphan,
@@ -218,6 +219,19 @@ renderValueType = \case
     ValueTimestamp _ -> "timestamp"
     ValueEnum stored -> "enum value " <> stored
 
+{- | What a scan found: the orphans, and how many live tuples were examined to find them.
+
+@scanned@ is carried because "0 orphans" means two very different things over an empty store
+and over a million grants, and an operator reading a report before a destructive schema
+change needs to know which one they are looking at. It costs nothing — the scan visits every
+row regardless.
+-}
+data OrphanReport = OrphanReport
+    { scanned :: !Int
+    , orphans :: ![TupleOrphan]
+    }
+    deriving stock (Eq, Show)
+
 {- | Every live tuple at @revision@ that the candidate schema cannot interpret.
 
 Anchored to one caller-held 'Revision', so writers may proceed throughout and the report
@@ -229,22 +243,25 @@ validateTuplesAgainstSchema ::
     (TupleStore :> es) =>
     ValidSchema ->
     Revision ->
-    Eff es [TupleOrphan]
+    Eff es OrphanReport
 validateTuplesAgainstSchema validSchema revision =
-    drainFrom Nothing []
+    drainFrom Nothing OrphanReport{scanned = 0, orphans = []}
   where
-    drainFrom :: (TupleStore :> es) => Maybe StoreCursor -> [TupleOrphan] -> Eff es [TupleOrphan]
-    drainFrom cursor found = do
+    drainFrom :: (TupleStore :> es) => Maybe StoreCursor -> OrphanReport -> Eff es OrphanReport
+    drainFrom cursor report = do
         TuplePage{rows, state} <- readAllTuples revision scanPageSize cursor
-        let orphans = mapMaybe (checkTupleAgainstSchema validSchema . (.tuple)) rows
-            foundNow = found <> orphans
+        let found =
+                OrphanReport
+                    { scanned = report.scanned + length rows
+                    , orphans = report.orphans <> mapMaybe (checkTupleAgainstSchema validSchema . (.tuple)) rows
+                    }
         case state of
-            Exhausted -> pure foundNow
+            Exhausted -> pure found
             -- `Truncated` means the store stopped short of the limit, not that the scan is
             -- over. A validation pass that treated it as the end would pass a schema that
             -- strands everything past the first short page.
-            HasMore next -> drainFrom (Just next) foundNow
-            Truncated next -> drainFrom (Just next) foundNow
+            HasMore next -> drainFrom (Just next) found
+            Truncated next -> drainFrom (Just next) found
 
     scanPageSize = 1000
 
