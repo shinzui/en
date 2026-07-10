@@ -70,7 +70,7 @@ verifiable without the others.
 |---|-------|------|-----------|-----------|--------|
 | EP-50 | Expose relationship read and delete-by-filter endpoints | docs/plans/50-expose-relationship-read-and-delete-by-filter-endpoints.md | None | None | Complete |
 | EP-51 | Return checked-at consistency tokens from read responses | docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md | None | None | Complete |
-| EP-52 | Add a lookup-subjects API | docs/plans/52-add-a-lookup-subjects-api.md | None | None | In Progress |
+| EP-52 | Add a lookup-subjects API | docs/plans/52-add-a-lookup-subjects-api.md | None | None | Complete |
 | EP-53 | Add a watch changelog API | docs/plans/53-add-a-watch-changelog-api.md | None | None | Not Started |
 | EP-54 | Manage the schema lifecycle at runtime | docs/plans/54-manage-the-schema-lifecycle-at-runtime.md | None | EP-50 | Not Started |
 
@@ -91,6 +91,13 @@ master plan 7; it benefits from the cycle semantics of docs/plans/40 and the cur
 discipline of docs/plans/42, and implementing it before those means inheriting the
 engine's current defects in a brand-new API. Third,
 docs/plans/57-mint-biscuit-grants-over-http.md (master plan 10) hard-depends on EP-51.
+
+**All three external constraints are settled as of 2026-07-09.** Master plans 6, 7, and 8
+completed before any child here started, so EP-50, EP-51, and EP-52 were all written
+against the `/v1` contract and the hardened engine — none of them shipped under the
+unversioned contract, and none of them had to migrate. EP-53 and EP-54 inherit the same
+settled ground. EP-51 is Complete, so docs/plans/57's hard dependency is discharged (but
+see Surprises: EP-57 must still make the `mintCheckedObjectGrant` fix itself).
 
 
 ## Integration Points
@@ -127,6 +134,12 @@ load-bearing and is spelled out in Surprises & Discoveries: on resume, take the 
 the cursor's validated token and do not re-resolve the request's `consistency`. EP-52 and
 EP-53 are both cursored.
 
+**EP-52 consumed this on 2026-07-09 and confirmed it live.** `LookupSubjectsPageWire` ends
+with `checkedAt`, minted from the resolved revision. A page-two request that asked for
+`minimizeLatency` and carried a page-one cursor correctly reported page one's snapshot
+(`27802:27802:`). EP-53 must do the same. Only EP-54's schema-read endpoint remains, and it
+is not a tuple read: whether it carries `checkedAt` at all is EP-54's to decide and record.
+
 The watch changelog storage query (EP-53) reads `relation_tuple.created_xid`/
 `deleted_xid` ordered by transaction visibility, likely via
 `relation_tuple_created_xid_idx` — the index that
@@ -159,7 +172,7 @@ immutable argument and EP-54 rewires them.
 - [x] EP-50 (2026-07-09): `POST /v1/relationships/query` lists relationships by filter with keyset pagination
 - [x] EP-50 (2026-07-09): `POST /v1/relationships/delete-by-filter` with a mandatory dry-run flag; offboarding a user is one call
 - [x] EP-51 (2026-07-09): every read response carries the token it was evaluated at; write-then-read-at-token round-trips
-- [ ] EP-52: lookup-subjects returns a flat, cursored subject set with correct caveat and operator handling
+- [x] EP-52 (2026-07-09): `POST /v1/lookup-subjects` returns a flat, cursored subject set with correct caveat, operator, and wildcard handling
 - [ ] EP-53: watch feed streams tuple changes since a revision; expired cursors rejected with a typed error
 - [ ] EP-54: schema read endpoint and explicit reload without restart; old-schema requests drain safely
 - [ ] EP-54: stored-tuple validation against a candidate schema; compatible-change taxonomy documented
@@ -310,6 +323,46 @@ immutable argument and EP-54 rewires them.
   minting inside them would emit one identical, discarded token per confirmed lookup
   candidate.
 
+- 2026-07-09 (EP-52 complete; **binds EP-53 and EP-54**): adding a field to
+  `En.Servant.Seam.Env` breaks every construction site, and there are three, not one:
+  `en-server/app/Main.hs`, `en-example/src/En/Example/Host.hs`, and
+  `en-servant/test/Main.hs`. EP-52 added `lookupSubjectsWithDeadlineOperation`. A plan that
+  adds an engine operation reachable from a handler pays this cost; a plan that calls the
+  store effects directly from the handler (as EP-50's read/delete-by-filter does) does not.
+  EP-53's watch feed is a store read and should follow EP-50; EP-54's schema handle is
+  state, not an operation, and will have to touch all three regardless.
+
+- 2026-07-09 (EP-52 complete; **binds EP-53 and EP-54, and every plan adding a wire type**):
+  a new wire type can break an *existing, untouched* test. `LookupSubjectsRequestWire`
+  carries both `deadlineMillis` and `limit`, which until then named `LookupRequestWire`
+  uniquely, so a record update in `en-servant/test/Main.hs` that had compiled for months
+  became `[GHC-99339] Ambiguous record update`. GHC narrows a record update by its field
+  set, then by the field types, and only then falls back to the expected type — warning
+  `-Wambiguous-fields` that the fallback is going away. Three older updates in that file
+  already ride it. A plan adding a wire type whose field names overlap an existing one
+  should expect to fix call sites it did not write.
+
+- 2026-07-09 (EP-52 complete; **affects EP-53, and every endpoint that accepts a token**):
+  a tampered consistency token is refused with the right status and the right stable `code`,
+  but the envelope's `message` is a Haskell constructor name —
+  `{"code":"invalid_consistency_token","message":"TokenBadFieldCount","retryable":false}`.
+  `en-postgres/src/En/Postgres/Revision.hs:281` builds it as
+  `InvalidConsistencyToken (Text.pack (show err))` over the internal `TokenDecodeError` sum.
+  Nothing a client should depend on is broken, and EP-52 did not fix it — it predates the
+  plan and belongs to no plan currently open. EP-53's watch cursor validates through the
+  same function and inherits it. Whoever fixes it should note that the `v1` contract
+  (docs/plans/35) exists precisely to keep internal constructor names off the wire.
+
+- 2026-07-09 (EP-52 complete; **corrects the third Surprises entry above, in EP-52's
+  favour**): the "inherit the engine's current defects in a brand-new API" risk this master
+  plan's Dependency Graph raised for EP-52 never materialized, because docs/plans/40 and 42
+  landed first. `check` treats a revisited subproblem as the empty set, so lookup-subjects'
+  confirmation step could delegate to it without forking cycle semantics; and `MintToken`
+  plus validated cursors were already in place. Six conformance scenarios — group nesting,
+  caveat satisfied, caveat unsatisfied, exclusion, intersection, wildcard — passed on their
+  first run. That is what "reach-then-check delegating to the one evaluator" is for, and
+  EP-53 should reach for the same posture wherever its changelog feed needs a decision.
+
 
 ## Decision Log
 
@@ -339,6 +392,15 @@ immutable argument and EP-54 rewires them.
   Date: 2026-07-09
 - Decision: EP-51 does not fix `mintCheckedObjectGrant`'s use of the caller-supplied `consistencyToken`; `docs/plans/57` does.
   Rationale: The function mints an `EnGrant` stamped with a token the caller chose rather than the one its decision was made at — exactly the E3 defect, in the one place it is a security property rather than an ergonomic one. EP-51's scope is what reads return. Changing an authorization token's recorded snapshot is a semantic change to en-biscuit, and EP-57 hard-depends on EP-51 for the express purpose of making it. Left as a one-line fix with a comment at the call site.
+  Date: 2026-07-09
+- Decision: Lookup-subjects does not port `En.Lookup`'s `EmitWindow` (the watermark-and-confirm-budget optimization that bounds intersection/exclusion confirmation to the current page). It confirms every candidate.
+  Rationale: The window is sound only where a confirmation's output goes straight into the page, so it threads a `Maybe EmitWindow` through every rewrite node with per-constructor rules about when to pass it on. Copying that into a brand-new evaluator buys a constant factor and risks a page with gaps if one rule is copied wrong. `docs/plans/42` owns lookup's paging mechanics; EP-52's page vocabulary, cursor discipline, and traversal shape are identical to lookup's, so a future generalization transfers mechanically rather than needing invention. Recorded here because the same choice faces EP-53's cursored watch feed.
+  Date: 2026-07-09
+- Decision: The lookup-subjects engine operation reaches its handler through `En.Servant.Seam.Env`, adding a field, rather than being called directly from the handler as EP-50's store reads are.
+  Rationale: The server must be able to substitute the decision-cached variant, and only the host knows whether the cache is enabled. The cost is that all three `Env` construction sites change. EP-50 needed no such field because a filtered relationship read is a store effect the handler can `send` itself, and there is nothing to substitute. EP-53 should follow EP-50; EP-54 will touch all three sites regardless, because a reloadable schema is state rather than an operation.
+  Date: 2026-07-09
+- Decision: The `TokenBadFieldCount` leak in `en-postgres/src/En/Postgres/Revision.hs` is recorded, not fixed, by EP-52.
+  Rationale: It predates this initiative, affects every token-bearing endpoint rather than the one EP-52 added, and fixing it means designing stable codes for the token-decode failure modes — a wire-contract question that belongs beside `docs/plans/35`'s error model, not inside a plan scoped to one new read. EP-53 inherits it and should not assume it was handled.
   Date: 2026-07-09
 
 

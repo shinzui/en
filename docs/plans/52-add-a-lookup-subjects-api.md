@@ -49,7 +49,7 @@ This section must always reflect the actual current state of the work.
 - [x] M1 (2026-07-09): Conformance tests over the kikan fixtures: group nesting through `org#member`, caveated delegate (Allowed and Conditional), exclusion (`member_not_owner`), intersection (`audit`), pagination determinism; plus a local wildcard-schema test, a malformed-cursor test, and a foreign-token cursor test under the strict consistency store.
 - [x] M2 (2026-07-09): Wire DTOs, `POST /v1/lookup-subjects` route, handler, and `Env.lookupSubjectsWithDeadlineOperation` in `en-servant/src/En/Servant/API.hs` and `en-servant/src/En/Servant/Seam.hs`; hand-written `ToSchema` instances in `en-servant/src/En/Servant/OpenApi.hs`; cached/uncached variants wired in `en-server/app/Main.hs`; uncached in `en-example/src/En/Example/Host.hs`; golden and handler tests in `en-servant/test/Main.hs`.
 - [x] M2 (2026-07-09): Add the `lookupSubjects` field to `EnClient` in `en-client/src/En/Client.hs`.
-- [ ] M3: Run the end-to-end curl transcript against a live server and paste the observed output into Validation and Acceptance.
+- [x] M3 (2026-07-09): Run the end-to-end curl transcript against a live server on PostgreSQL and paste the observed output into Validation and Acceptance. Covered: group nesting, exclusion, intersection, wildcard, three-page cursor walk, a cursored resume that does not re-resolve consistency, `checkedAt` chaining from a `check`, five rejections, and the served OpenAPI document. The expand tree for the same exclusion is recorded beside it, showing `alice` under both `granted` and `subtracted` — the flattening bug this plan exists to make unnecessary.
 
 
 ## Surprises & Discoveries
@@ -116,6 +116,34 @@ implementation. Provide concise evidence.
   had to be added to `servedPaths` before the suite would pass. Both guards fired, which is
   what they are for.
 
+- 2026-07-09 (M3, out of scope but affects every token-bearing endpoint): a tampered
+  consistency token is refused with the right status and the right stable `code`, but the
+  envelope's `message` is a Haskell constructor name.
+
+  ```text
+  {"code":"invalid_consistency_token","message":"TokenBadFieldCount","retryable":false}
+  ```
+
+  `en-postgres/src/En/Postgres/Revision.hs:281` builds the error as
+  `InvalidConsistencyToken (Text.pack (show err))` over the internal `TokenDecodeError`
+  sum. `code` is the contract and it is correct, so nothing a client should depend on is
+  broken; but the `v1` contract's whole point (`docs/plans/35`) is that internal
+  constructor names do not cross the trust boundary. This predates this plan and is not
+  fixed here. `docs/plans/53`'s watch cursor validates tokens through the same function
+  and will inherit it.
+
+- 2026-07-09 (M3): the text schema language's exclusion operator is the two-word `but not`,
+  not `-`. `permission p = member - owner` parses without complaint as a permission whose
+  rewrite names a relation literally called `member - owner`, and the failure surfaces only
+  at schema compile time as `unknown relation: space#member - owner`. Relation subjects are
+  comma-separated, and `|` is union, so `relation member: user | org#member` fails with
+  `unknown allowed subject object type: user | org#member | user`. Both cost a server
+  restart to discover; recorded so the next hand-run acceptance does not.
+
+- 2026-07-09 (M3): the master plan's warning about port 8080 held for a third time and for
+  a third reason. `lsof -nP -iTCP:8080 -sTCP:LISTEN` showed an `ssh` tunnel, not an
+  `en-server`. The acceptance ran on `EN_PORT=8099`.
+
 
 ## Decision Log
 
@@ -164,7 +192,46 @@ Record every decision made while working on the plan.
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
 Compare the result against the original purpose.
 
-(To be filled during and after implementation.)
+**Complete, 2026-07-09.** The purpose was "who has access to this object?", flat and
+correct. `POST /v1/lookup-subjects` answers it. On a live server, asking who can view a
+space returns `alice`, `bob`, and `carol` as three users — even though `carol` holds no
+tuple on that space and is reached only through `org:acme#member`. Asking who is a member
+but not the owner correctly omits `alice`. Asking who satisfies `owner & member` returns
+only `alice`. A wildcard grant is its own entry. Every response names the snapshot it was
+evaluated at, and a cursor walk visits each subject exactly once.
+
+What made this cheap was refusing to reimplement anything. The traversal collects
+candidates; the two nodes it cannot answer by collecting — intersection and exclusion —
+hand each candidate to `En.Check.check` at the traversal's pinned revision. The decision
+algebra, the caveat evaluation, the residual cache, and the cycle semantics all come from
+the one evaluator that already had them. Six conformance scenarios passed on their first
+run, which is the property that arrangement buys: this API cannot silently disagree with
+`check`, because it *is* `check` wherever the answer is subtle.
+
+Three things fell out of the sequencing rather than the design. Master plans 6, 7, and 8
+had all landed first, so the endpoint was born inside the `/v1` contract, the
+`ErrorEnvelopeWire`, and the validated-cursor discipline; the plan's own worry about
+"inheriting check's cycle-as-error defect through the confirmation step" was moot before
+it started. EP-51's `checkedAt` convention was likewise in place, including the rule that
+a cursored read must *not* re-resolve its consistency — a rule this plan needed and did
+not have to discover.
+
+Gaps, deliberately left. Confirmation is not bounded to the page: `En.Lookup`'s
+`EmitWindow` was not ported, so a request for page five confirms every candidate below
+`alice` again. `docs/plans/42` owns lookup's paging mechanics, and the page vocabulary,
+cursor discipline, and traversal shape here are identical to lookup's, so the fix
+transfers rather than needing invention. Subject-relation filtering (asking for usersets
+like `org#member` as *results*) was out of scope and remains so. And the wildcard's
+interaction with concrete-subject branches inside an intersection is conservative: a
+wildcard survives only if every branch grants the wildcard itself. It fails closed, and
+the conformance tests pin the behavior so a later refinement is a visible change rather
+than a silent one.
+
+One defect was found and not fixed, because it is not this plan's: a tampered consistency
+token is refused with a `message` of `TokenBadFieldCount`, a Haskell constructor name
+crossing the trust boundary. It is recorded in Surprises & Discoveries and it affects
+every endpoint that accepts a token, including the watch cursor `docs/plans/53` is about
+to add.
 
 
 ## Context and Orientation
@@ -432,28 +499,71 @@ cabal test en-core
 cabal test en-servant
 ```
 
-Start the dev PostgreSQL and the server (Justfile: `process-up` starts PostgreSQL via
-process-compose and waits for readiness; `start-server` applies the migrations under
-`en-migrations/db/migrations/` with `psql`, then runs `cabal run en-server`):
+Start the dev PostgreSQL (the `process-up` recipe in the `Justfile` starts it via
+process-compose on a Unix socket under `db/` and waits for readiness), then apply the
+migrations under `en-migrations/db/migrations/`:
 
 ```bash
 just process-up
-just start-server
+just run-migrations
 ```
 
 Afterwards: `just process-down`.
 
-For the live demo, use the built-in demo schema (`user`; `space` with relation
-`viewer` and permission `view = viewer`; served when `EN_SCHEMA_PATH` is unset). Seed
-two viewers:
+Do **not** use `just start-server` for a hand-run acceptance. It binds port 8080, and on
+this machine 8080 was held by an unrelated `ssh` tunnel that answers requests. Check what
+is there before assuming, and pick a free port:
 
 ```bash
-curl -sS -X POST localhost:8080/tuples -H 'content-type: application/json' -d '{
+lsof -nP -iTCP:8080 -sTCP:LISTEN
+```
+
+The built-in demo schema (served when `EN_SCHEMA_PATH` is unset) has only
+`space#viewer` and `view = viewer`, which exercises none of the properties this plan
+exists for. Write a schema that has a group, a wildcard, an exclusion, and an
+intersection. Note the text schema language's spelling: subjects of a relation are
+comma-separated, union is `|`, intersection is `&`, and exclusion is the two-word
+operator `but not` — `-` is not an operator and `a - b` parses as a relation named
+`a - b`.
+
+```text
+object user {}
+object org {
+  relation member: user
+}
+object space {
+  relation owner: user
+  relation member: user, org#member, user:*
+  permission view = owner | member
+  permission member_not_owner = member but not owner
+  permission audit = owner & member
+}
+```
+
+Serve it on a free port with authentication off:
+
+```bash
+EN_PORT=8099 EN_AUTH_DISABLED=true EN_SCHEMA_PATH=/tmp/demo.schema \
+  EN_DATABASE_URL="$PG_CONNECTION_STRING" cabal run en-server
+```
+
+Seed a group membership, a userset grant, two direct members, and an owner. `alice` is
+both member and owner, `bob` is a member only, and `carol` is reachable *only* through
+`org:acme#member`:
+
+```bash
+curl -sS -X POST localhost:8099/v1/relationships -H 'content-type: application/json' -d '{
   "tuples": [
-    {"object": {"objectType": "space", "objectId": "project-x"}, "relation": "viewer",
-     "subject": {"tag": "SubjectIdWire", "contents": {"objectType": "user", "objectId": "alice"}}, "caveat": null},
-    {"object": {"objectType": "space", "objectId": "project-x"}, "relation": "viewer",
-     "subject": {"tag": "SubjectIdWire", "contents": {"objectType": "user", "objectId": "bob"}}, "caveat": null}
+    {"object": {"objectType": "org", "objectId": "acme"}, "relation": "member",
+     "subject": {"kind": "id", "objectType": "user", "objectId": "carol"}, "caveat": null},
+    {"object": {"objectType": "space", "objectId": "project-x"}, "relation": "member",
+     "subject": {"kind": "set", "objectType": "org", "objectId": "acme", "relation": "member"}, "caveat": null},
+    {"object": {"objectType": "space", "objectId": "project-x"}, "relation": "member",
+     "subject": {"kind": "id", "objectType": "user", "objectId": "alice"}, "caveat": null},
+    {"object": {"objectType": "space", "objectId": "project-x"}, "relation": "member",
+     "subject": {"kind": "id", "objectType": "user", "objectId": "bob"}, "caveat": null},
+    {"object": {"objectType": "space", "objectId": "project-x"}, "relation": "owner",
+     "subject": {"kind": "id", "objectType": "user", "objectId": "alice"}, "caveat": null}
   ]
 }'
 ```
@@ -461,11 +571,15 @@ curl -sS -X POST localhost:8080/tuples -H 'content-type: application/json' -d '{
 
 ## Validation and Acceptance
 
-Live acceptance — "who can view space project-x?":
+Everything below was observed against a live `en-server` on PostgreSQL 17 on 2026-07-09,
+seeded exactly as Concrete Steps describes. The token in `checkedAt` is a real one; it
+names the PostgreSQL snapshot each read resolved to.
+
+**"Who can view space:project-x?"** — the sharing-dialog query.
 
 ```bash
-curl -sS -X POST localhost:8080/lookup-subjects -H 'content-type: application/json' -d '{
-  "consistency": {"tag": "FullyConsistentWire"},
+curl -sS -X POST localhost:8099/v1/lookup-subjects -H 'content-type: application/json' -d '{
+  "consistency": {"mode": "fullyConsistent"},
   "object": {"objectType": "space", "objectId": "project-x"},
   "permission": "view",
   "subjectType": "user",
@@ -476,77 +590,177 @@ curl -sS -X POST localhost:8080/lookup-subjects -H 'content-type: application/js
 }'
 ```
 
-Expected response shape (subject order is deterministic; `checkedAt` present if the
-EP-51 convention is in — see Decision Log):
-
 ```json
-{
-  "subjects": [
-    {"subject": {"tag": "SubjectIdWire", "contents": {"objectType": "user", "objectId": "alice"}},
-     "decision": {"tag": "AllowedWire"}},
-    {"subject": {"tag": "SubjectIdWire", "contents": {"objectType": "user", "objectId": "bob"}},
-     "decision": {"tag": "AllowedWire"}}
-  ],
-  "state": {"tag": "SubjectsExhaustedWire"}
-}
+{"subjects":[{"subject":{"kind":"id","objectType":"user","objectId":"alice"},"decision":{"result":"allowed"}},{"subject":{"kind":"id","objectType":"user","objectId":"bob"},"decision":{"result":"allowed"}},{"subject":{"kind":"id","objectType":"user","objectId":"carol"},"decision":{"result":"allowed"}}],"state":{"status":"exhausted"},"checkedAt":"en1.0c9c482f-6b7f-49d4-b106-c4c65a3ae6e5.fnv1a64%3a8fe395465a73936d.27801%3a27801%3a."}
 ```
 
-With `"limit": 1` the same request returns one subject and
-`{"tag": "SubjectsHasMoreWire", "contents": "<cursor>"}`; re-issuing with that cursor
-returns the second subject and then exhaustion — no duplicates, no gaps.
+`carol` holds no tuple on `space:project-x` at all. She is reached through
+`space:project-x#member@org:acme#member` and appears flat, as a user — which is the
+answer a sharing dialog needs and the one `expand` cannot give.
 
-The operator/caveat/wildcard correctness — the substance of this plan — is validated
-by the M1 conformance tests (`cabal test en-core`), which encode: group nesting
-resolves to flat concrete members; a caveated grant is `Conditional` with the right
-obligation when context is missing and `Allowed` when supplied; an excluded subject is
-absent even though the base branch grants it; an intersection returns only subjects
-satisfying all branches; a wildcard grant appears as a distinct wildcard entry. These
-tests fail against a naive flatten-the-expand-tree implementation, which is the point.
+**The exclusion.** Same request with `"permission": "member_not_owner"`:
 
-If `docs/plans/35`'s versioned contract has landed, adjust the route prefix, tag
-names, and error envelope accordingly and note it in the Decision Log.
+```json
+{"subjects":[{"subject":{"kind":"id","objectType":"user","objectId":"bob"},"decision":{"result":"allowed"}},{"subject":{"kind":"id","objectType":"user","objectId":"carol"},"decision":{"result":"allowed"}}],"state":{"status":"exhausted"},"checkedAt":"…27801%3a27801%3a."}
+```
+
+`alice` is gone: she is a member, and the subtrahend `owner` grants her.
+
+**The intersection.** Same request with `"permission": "audit"` (`owner & member`):
+
+```json
+{"subjects":[{"subject":{"kind":"id","objectType":"user","objectId":"alice"},"decision":{"result":"allowed"}}],"state":{"status":"exhausted"},"checkedAt":"…27801%3a27801%3a."}
+```
+
+Only `alice` satisfies both conjuncts.
+
+**Why the expand tree cannot be flattened.** `POST /v1/expand` on the same
+`member_not_owner`, reformatted for reading:
+
+```json
+{"root":{"objectType":"space","objectId":"project-x"},"permission":"member_not_owner",
+ "children":[{"kind":"exclusion",
+   "granted":[{"kind":"userset","object":{"objectType":"space","objectId":"project-x"},"relation":"member",
+     "children":[{"kind":"userset","object":{"objectType":"org","objectId":"acme"},"relation":"member",
+                  "children":[{"kind":"subject","subject":{"kind":"id","objectType":"user","objectId":"carol"}}]},
+                 {"kind":"subject","subject":{"kind":"id","objectType":"user","objectId":"alice"}},
+                 {"kind":"subject","subject":{"kind":"id","objectType":"user","objectId":"bob"}}]}],
+   "subtracted":[{"kind":"userset","object":{"objectType":"space","objectId":"project-x"},"relation":"owner",
+     "children":[{"kind":"subject","subject":{"kind":"id","objectType":"user","objectId":"alice"}}]}]}],
+ "state":{"status":"exhausted"},"checkedAt":"…"}
+```
+
+`alice` appears as a leaf under `granted` *and* under `subtracted`. A client that
+collects the tree's subject leaves reports her as having `member_not_owner`, which she
+does not. Getting this right requires the decision algebra, which is why it lives in the
+engine. (The tree does at least carry the `exclusion` operator now, thanks to
+`docs/plans/40`; before that it did not, and the mistake was not even detectable.)
+
+**The wildcard.** Granting `space:public#member@user:*` and asking who can view
+`space:public` returns the wildcard as its own entry beside the concrete owner, never
+expanded and never confused with a user whose id happens to be `*`:
+
+```json
+{"subjects":[{"subject":{"kind":"id","objectType":"user","objectId":"dave"},"decision":{"result":"allowed"}},{"subject":{"kind":"wildcard","objectType":"user"},"decision":{"result":"allowed"}}],"state":{"status":"exhausted"},"checkedAt":"…27802%3a27802%3a."}
+```
+
+**Paging.** With `"limit": 1`, walking the cursor visits each subject exactly once, in
+ascending order, and ends exhausted — no duplicates, no gaps:
+
+```text
+page 1  subjects: [alice]  state: hasMore, cursor: lookupsubjects-v1|85:en1.0c9c…27802%3a.|2:id|4:user|5:alice|0:
+page 2  subjects: [bob]    state: hasMore, cursor: lookupsubjects-v1|85:en1.0c9c…27802%3a.|2:id|4:user|3:bob|0:
+page 3  subjects: [carol]  state: exhausted
+```
+
+Page two was deliberately requested with `"consistency": {"mode": "minimizeLatency"}` and
+still reported `checkedAt` of `27802:27802:` — page one's snapshot. A cursored read takes
+its revision from the cursor's validated token and does not re-resolve the request's
+`consistency`; had it re-resolved, the page would span two snapshots and could silently
+drop a subject.
+
+**Chaining.** A `check` returns `checkedAt`; feeding that token back as
+`{"mode": "atLeastAsFresh", "token": …}` on a lookup-subjects is served with `200`.
+
+**Rejections**, each a `400` carrying the `v1` error envelope:
+
+```text
+subjectType: ""       → {"code":"invalid_request","message":"subjectType must not be empty","retryable":false}
+limit: 0              → {"code":"invalid_request","message":"limit must be positive","retryable":false}
+cursor: "not-a-cursor"→ {"code":"invalid_consistency_token","message":"lookup-subjects cursor","retryable":false}
+permission: unknown   → {"code":"unknown_relation","message":"unknown relation or permission: space#nonexistent","retryable":false}
+tampered cursor token → {"code":"invalid_consistency_token","message":"TokenBadFieldCount","retryable":false}
+```
+
+The last one is a well-formed cursor whose embedded token was altered by one character.
+It is refused, which is the property that matters — a cursor carries the revision a
+continuation reads at, so an unvalidated one lets a client read at any snapshot it names.
+(Its `message` leaks a Haskell constructor name; see Surprises & Discoveries.)
+
+**The OpenAPI document** at `GET /v1/openapi.json` lists `/v1/lookup-subjects` among the
+served paths and defines `LookupSubjectsPageWire`. Both are also asserted by
+`en-servant/test/Main.hs`, and a route without a hand-written `ToSchema` instance does not
+compile.
+
+**Automated suites.** The operator, caveat, and wildcard correctness that no curl
+transcript can cover lives in `cabal test en-core`; the wire contract, the four
+rejections, the decision cache, and the deadline clamp live in `cabal test en-servant`.
+
+```text
+Test suite en-core-conformance: PASS
+Test suite en-core-interface-tests: PASS
+Test suite en-servant-tests: PASS
+```
 
 
 ## Idempotence and Recovery
 
 The algorithm is a pure function of the store at a fixed revision; requests are safe
 to repeat and pages are deterministic for a fixed snapshot (the cursor pins the
-revision, exactly like lookup). No migrations, no writes, no state. The main schedule
-risk is inheriting engine defects through the confirmation step (check's
-cycle-as-error B3 and exclusion/Conditional B4): if a conformance scenario hits them,
-do not fork check's semantics inside this module — record the failing case in
-Surprises & Discoveries, mark the test pending with a reference to `docs/plans/40`,
-and proceed; the scenario becomes the cross-check when EP-40 lands.
+revision, exactly like lookup). No migrations, no writes, no state.
+
+The plan anticipated one schedule risk: inheriting check's engine defects through the
+confirmation step (cycle-as-error B3, exclusion/Conditional B4). It did not materialize.
+`docs/plans/40` landed before this plan started, so `check` already treats a revisited
+subproblem as the empty set and already combines exclusions correctly. Had it not, the
+instruction stands for any future evaluator built this way: do not fork check's semantics
+inside the new module — record the failing case, mark the test pending with a reference to
+the plan that owns the fix, and proceed.
+
+A cursor is client-supplied text and pins the snapshot a continuation reads at. It is
+validated on every resume: a malformed one is `InvalidConsistencyToken "lookup-subjects
+cursor"`, and a well-formed one whose token the datastore rejects raises through the same
+path any bad token does. Both reach the caller as a `400`. Recovery is to restart the
+lookup with no cursor. Cursors expire with the garbage-collection window, so a client that
+holds one for a day should expect them to.
 
 
 ## Interfaces and Dependencies
 
-End-state interfaces, by full module path:
+End-state interfaces as landed, by full module path:
 
 - `En.LookupSubjects` (`en-core/src/En/LookupSubjects.hs`, new; listed in
   `en-core/en-core.cabal`): `LookupSubjectsRequest`, `LookupSubject`,
-  `LookupSubjectsState`, `LookupSubjectsPage`, `LookupSubjectsCursor`, and
+  `LookupSubjectsState`, `LookupSubjectsPage`, `LookupSubjectsCursor`,
+  `LookupSubjectsCursorState`, `encodeLookupSubjectsCursor`,
+  `decodeLookupSubjectsCursor`, `resolveLookupSubjectsCursor`, and
   `lookupSubjects :: (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es)
   => ReachabilityGraph -> Consistency -> LookupSubjectsRequest -> Eff es
-  LookupSubjectsPage`, plus `lookupSubjectsWithDeadline` (adds the
-  `Lookup.Deadline (Eff es)` parameter) and `lookupSubjectsWithDeadlineCached` (adds
-  `CheckCacheEnv` and `IOE :> es`). Uses only existing effects — no storage changes.
+  LookupSubjectsPage`, plus `lookupSubjectsCached`, `lookupSubjectsWithDeadline`
+  (adds a `En.Lookup.Deadline (Eff es)` parameter — the type is reused, not redefined),
+  `lookupSubjectsWithDeadlineCached` (adds `CheckCacheEnv` and `IOE :> es`), and the
+  two `…AndBudget` variants taking an `EvaluationBudget`. `LookupSubjectsPage` carries
+  `checkedAt :: ConsistencyToken`. Uses only existing effects — no storage changes.
 - `En.Servant.Seam` (`en-servant/src/En/Servant/Seam.hs`): `Env` gains
-  `lookupSubjectsOperation`.
+  `lookupSubjectsWithDeadlineOperation`, taking a `Lookup.Deadline` so one
+  `deadlineMillis` ceiling governs both traversals. **Adding this field breaks every
+  `Env` construction site**: `en-server/app/Main.hs`, `en-example/src/En/Example/Host.hs`,
+  and `en-servant/test/Main.hs`.
 - `En.Servant.API` (`en-servant/src/En/Servant/API.hs`): route
-  `POST /lookup-subjects`; wire types `LookupSubjectsRequestWire`,
-  `LookupSubjectWire`, `LookupSubjectsStateWire`, `LookupSubjectsPageWire`.
-- `en-server/app/Main.hs`: wires the cached/uncached operation into `Env`.
-- `En.Client` (`en-client/src/En/Client.hs`): `EnClient` gains `lookupSubjects`.
+  `POST /v1/lookup-subjects`, between `lookup` and `expand` in `EnAPI`; wire types
+  `LookupSubjectsRequestWire`, `LookupSubjectWire`, `LookupSubjectsStateWire`,
+  `LookupSubjectsPageWire`, all with hand-written aeson instances using the `v1`
+  contract's string discriminators (`kind`, `result`, `status`).
+- `En.Servant.OpenApi` (`en-servant/src/En/Servant/OpenApi.hs`): a hand-written
+  `ToSchema` instance per new wire type. This is compile-enforced — a route in `EnAPI`
+  without one does not build.
+- `en-server/app/Main.hs`: wires `lookupSubjectsWithDeadlineCachedAndBudget` when the
+  decision cache is enabled, else `lookupSubjectsWithDeadlineAndBudget`.
+- `en-example/src/En/Example/Host.hs`: wires the plain `lookupSubjectsWithDeadline`.
+- `En.Client` (`en-client/src/En/Client.hs`): `EnClient` gains `lookupSubjects`. The
+  `:<|>` destructuring is positional and must match `EnAPI`'s order.
 
-Dependencies and coordination, restated so this plan stands alone: no hard
-dependencies. Prefer landing after
+Dependencies and coordination, restated so this plan stands alone: no hard dependencies,
+and by the time it was implemented every soft one had landed.
 `docs/plans/35-version-the-wire-contract-and-type-the-error-model.md` (versioned wire
-contract). Soft ordering after `docs/plans/40-adopt-zanzibar-cycle-and-exclusion-semantics-in-check.md`
-and `docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md`
-(see Decision Log). The response DTO carries `checkedAt` per
-`docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md`, which
-owns that convention. The master plan
-(`docs/masterplans/9-complete-the-en-api-surface.md`) records why this plan lives in
-the API master plan rather than the engine one: it is a new capability, not a fix. No
-new package dependencies are required.
+contract and error envelope),
+`docs/plans/40-adopt-zanzibar-cycle-and-exclusion-semantics-in-check.md` (cycle-as-empty-set
+and exclusion fixes in check, which the confirmation step calls), and
+`docs/plans/42-stream-lookup-pages-with-validated-cursors-and-a-real-deadline.md`
+(`MintToken`, validated cursors, real deadline) are all Complete. The response DTO carries
+`checkedAt` per `docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md`,
+which owns that convention and whose rule — a cursored read resumes from its cursor's
+validated token and does not re-resolve `consistency` — this module obeys. The master plan
+(`docs/masterplans/9-complete-the-en-api-surface.md`) records why this plan lives in the API
+master plan rather than the engine one: it is a new capability, not a fix. No new package
+dependencies are required.
