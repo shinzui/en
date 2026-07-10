@@ -250,6 +250,95 @@ Note that the two databases have different datastore identities, so tokens minte
 are rejected by the other — see [Datastore identity](#datastore-identity). Relationship
 data transfers; consistency tokens do not.
 
+### Reading the schema a server is running
+
+`GET /v1/schema` returns the authorization model the server is serving right now: the
+verbatim source text it loaded, its hash, where it came from, and when it was loaded.
+
+```shell
+curl -sS localhost:8080/v1/schema
+```
+
+```json
+{
+  "source": "object user {}\n\nobject post {\n  relation author: user\n  …",
+  "hash": "fnv1a64:1061a4beb2d5506c",
+  "origin": "/etc/en/blog.en",
+  "loadedAt": "2026-07-10T14:45:36.14586Z"
+}
+```
+
+`origin` is the `EN_SCHEMA_PATH` the model was read from, or `builtin-demo` when that
+variable is unset. `hash` is the fingerprint stamped into every consistency token — the
+same value the startup log prints as `Schema hash:`. `source` is the operator's own text,
+not a rendering of the compiled model, so it is what a candidate schema should be diffed
+against.
+
+The response carries no `checkedAt`. Every other read on the API reports the tuple-store
+snapshot it was evaluated at; this one reads no tuples and names no revision. `loadedAt` is
+the freshness handle for this endpoint.
+
+### Changing the schema
+
+A schema edit does not touch the relationships already in the store. Dropping a relation
+leaves every grant written on it in the table — live, unevaluatable, invisible to every
+check. en calls such a grant an **orphan**, and `en-server check-schema` finds them before
+a schema is deployed anywhere.
+
+```shell
+EN_DATABASE_URL='postgresql://user@localhost:5432/en' \
+  en-server check-schema ./blog-v2.en
+```
+
+```text
+ORPHAN post:1#author@user:alice — relation post#author not in candidate schema
+1 orphan(s) across 200024 live tuple(s); candidate schema fnv1a64:9f… would strand them.
+```
+
+The command is read-only: it connects to the database, scans every live relationship at a
+single pinned revision, and writes nothing. It exits **0** when the candidate strands
+nothing, **1** when it strands grants, and **2** when the candidate itself cannot be read,
+parsed, or validated — so a deploy pipeline can tell a typo in a schema file from a schema
+that would destroy data. Run it from CI against production data before the schema reaches a
+server.
+
+Whether an edit is safe depends only on what the stored relationships happen to use, but the
+classification below is exhaustive: every edit falls into one of four groups.
+
+**Compatible — no orphan is possible.** Adding an object type. Adding a relation or a
+permission to an existing type. Widening a relation's allowed subjects: a new subject type,
+a new userset, or adding a `type:*` wildcard allowance. Adding a caveat definition. Adding a
+parameter to an existing caveat — stored payloads simply do not carry it, which is exactly
+why removing one is not compatible.
+
+**Behavioral — allowed, strands nothing, but changes decisions.** Editing a permission's
+rewrite expression: permissions are computed rather than stored, so no relationship can be
+orphaned by one, and no `check-schema` run will say a word. Every decision that involves the
+permission can nonetheless change. Editing a caveat's predicate without touching its
+parameters is the same shape of change. Neither is detectable by the validator, and both
+deserve the review a code change gets.
+
+**Blocked unless forced — strands live grants.** `check-schema` reports each of these, with
+the reason named:
+
+| Edit | Reported as |
+|---|---|
+| Remove an object type that live relationships name as their object | `object type X not in candidate schema` |
+| Remove an object type that live relationships name as their subject | `subject object type X not in candidate schema` |
+| Remove a relation that has live relationships, **including any rename** (a rename is a remove plus an add) | `relation X#r not in candidate schema` |
+| Remove a relation that live relationships use as a userset subject (`group:eng#member`) | `relation group#member not in candidate schema` |
+| Narrow a relation's allowed subjects below a shape live relationships use — including dropping a wildcard allowance | `subject S is not an allowed subject of this relation` |
+| Remove a caveat definition that live relationships are held under | `caveat C not in candidate schema` |
+| Remove a caveat parameter, change its type, or drop a member from its enum, while live payloads carry the old shape | `caveat C payload does not fit its parameters: …` |
+
+**Always true, for every change of any size.** The schema hash covers the entire model, so
+even a purely additive edit rotates it — and *every outstanding consistency token is
+rejected afterwards*, including the write tokens clients are holding for read-your-writes.
+The message is `token schema hash does not match the active schema`. Treat a schema change
+like a migration: clients must be prepared to fall back from `atLeastAsFresh` chaining to
+`fullyConsistent` and re-acquire their tokens. See
+[Datastore identity](#datastore-identity) for the other reason a token can be refused.
+
 ### Connection pooling
 
 `en-server` serves every request from a pool of PostgreSQL connections, so
