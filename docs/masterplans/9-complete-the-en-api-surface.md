@@ -72,7 +72,7 @@ verifiable without the others.
 | EP-51 | Return checked-at consistency tokens from read responses | docs/plans/51-return-checked-at-consistency-tokens-from-read-responses.md | None | None | Complete |
 | EP-52 | Add a lookup-subjects API | docs/plans/52-add-a-lookup-subjects-api.md | None | None | Complete |
 | EP-53 | Add a watch changelog API | docs/plans/53-add-a-watch-changelog-api.md | None | None | Complete |
-| EP-54 | Manage the schema lifecycle at runtime | docs/plans/54-manage-the-schema-lifecycle-at-runtime.md | None | EP-50 | In Progress |
+| EP-54 | Manage the schema lifecycle at runtime | docs/plans/54-manage-the-schema-lifecycle-at-runtime.md | None | EP-50 | Complete |
 
 
 ## Dependency Graph
@@ -123,6 +123,14 @@ and compiles it through the same `compileFilter`; the wire request carries
 `filter :: Maybe RelationshipFilterWire`, validated by the same `relationshipFilterFromWire`,
 so an unanchored subscription filter is the same `400` an unanchored read filter is. Only
 EP-54's per-type enumeration remains.
+
+**Closed 2026-07-10: EP-54 does not use the filter at all, and never could have.** Orphan
+detection must find tuples whose object type is *absent* from the candidate schema, and
+`validateRelationshipFilter`'s anchoring grammar requires an `objectType` or a `subjectType` —
+a filter cannot name a type that does not exist. The pass is an unanchored full scan through
+the pre-existing `ReadAllTuples`, and the master plan's "per-type tuple enumeration" was the
+wrong shape for the question. `RelationshipFilter` therefore ends this initiative with exactly
+two consumers, EP-50's read/delete and EP-53's watch, and its field set never widened.
 
 Checked-at token plumbing is defined by EP-51: `check`/`lookup`/`expand` results in
 `en-core` gain the resolved revision, and every read response DTO gains a token field.
@@ -192,6 +200,18 @@ swaps it atomically; in-flight requests keep the old schema). Every other endpoi
 the schema through whatever handle EP-54 introduces; until then, plans use the existing
 immutable argument and EP-54 rewires them.
 
+**Landed 2026-07-10, and the handle is not the shape this paragraph implies.** The handle is
+`ActiveSchema { graph, source, origin, loadedAt }` in `en-servant/src/En/Servant/Seam.hs`
+(no `hash` field — ask for `active.graph.hash`). `Env.graph` is gone, replaced by
+`readActiveSchema :: IO ActiveSchema`, and `runPorts` gained an `ActiveSchema` parameter so a
+request's graph and its interpreters' schema hash come from one value. Every handler in
+`En.Servant.API` and `En.Servant.Authorize` begins with `active <- activeSchema env` and passes
+that snapshot to both `active.graph` and `engine env active`. All three `Env` construction sites
+were rewired (`en-server/app/Main.hs`, `en-example/src/En/Example/Host.hs`,
+`en-servant/test/Main.hs`), as EP-52 and EP-53 warned they would have to be; the two embedded
+hosts supply `readActiveSchema = pure <constant>` and ignore the snapshot in `runPorts`, since
+their interpreters embed no schema hash.
+
 **Two notes for EP-54, as of 2026-07-09.** `POST /v1/watch` reads no schema at all — tuple
 change events are schema-independent data — and EP-53 deliberately omitted the schema-hash
 check from watch-cursor validation for exactly that reason: expiring every watch consumer on
@@ -209,8 +229,8 @@ depends on that package.
 - [x] EP-51 (2026-07-09): every read response carries the token it was evaluated at; write-then-read-at-token round-trips
 - [x] EP-52 (2026-07-09): `POST /v1/lookup-subjects` returns a flat, cursored subject set with correct caveat, operator, and wildcard handling
 - [x] EP-53 (2026-07-09): `POST /v1/watch` streams tuple changes since a revision, cursor, or token, optionally filtered; expired cursors rejected with a typed error
-- [ ] EP-54: schema read endpoint and explicit reload without restart; old-schema requests drain safely
-- [ ] EP-54: stored-tuple validation against a candidate schema; compatible-change taxonomy documented
+- [x] EP-54 (2026-07-10): `GET /v1/schema` reports the live model; `SIGHUP` reloads it without a restart; a request holds one schema snapshot for its whole life, so a reload cannot tear its graph from its token's hash
+- [x] EP-54 (2026-07-10): stored-tuple validation against a candidate schema, gating reload and available offline as `en-server check-schema`; compatible-change taxonomy documented in `docs/user/service-and-operations.md`
 
 
 ## Surprises & Discoveries
@@ -467,6 +487,54 @@ depends on that package.
   all remains EP-54's to decide and record.
 
 
+- 2026-07-10 (EP-54 complete; **closes this initiative, and answers the two questions left open
+  for it**): the schema-read endpoint carries **no** `checkedAt`. `checkedAt` names the tuple-store
+  snapshot a read was evaluated at; `GET /v1/schema` reads an `IORef` and names no revision.
+  `loadedAt` is its freshness handle. It is also the one operation on `EnAPI` that is not a `POST`
+  and not a `MultiVerb` over `EnResponses`: it cannot fail, so it has no fault to return into a
+  response alternative, and the OpenAPI test now asserts it documents exactly a `200` so a later
+  refactor cannot quietly give it the shared five. Separately, EP-53's instruction that EP-54 must
+  not "fix" watch's missing schema-hash check was honoured: `POST /v1/watch` still validates no
+  schema hash, and a reload severs no watch consumer.
+
+- 2026-07-10 (EP-54 complete; **the third plan in this initiative to find its groundwork already
+  laid**): EP-54's M2 was to add an `EnumerateTuples` store operation. `ReadAllTuples` already was
+  it — same signature, same row-id ordering, both interpreters — added for `en-server export`, whose
+  drain has exactly the properties an orphan scan needs. Nothing was added to `TupleStore`. This is
+  now a pattern worth naming: EP-51 found `MintToken` pre-landed by master plan 7, EP-50 found
+  `TupleFilter` pre-landed by docs/plans/46, and EP-54 found `ReadAllTuples`. Read the effect before
+  extending it.
+
+- 2026-07-10 (EP-54 complete; **the safety argument for `Env`, for whoever changes it next**):
+  `Env.graph` is gone. `Env` now has `readActiveSchema :: IO ActiveSchema`, and
+  `runPorts :: ActiveSchema -> Eff es a -> IO (Either EnError a)` takes the snapshot rather than
+  letting the interpreters read one. This is not ceremony. The store interpreters embed the schema
+  hash in every token they mint and check it on every token they are shown; a handler that read its
+  graph and let its interpreters read their hash independently could, on a reload landing between
+  the two, evaluate the old model and stamp its answer with the new model's hash. Passing one
+  snapshot makes that state unspellable. `ActiveSchema` deliberately carries **no** `hash` field —
+  `ReachabilityGraph.hash` is the hash, and it is the value `En.Check` already keys `SubproblemKey`
+  on, which is *why* the decision cache self-invalidates across a reload.
+
+- 2026-07-10 (EP-54 complete; **binds any future plan that describes one value in two places**):
+  `demoSchema` was built with `En.Schema.Builder` while the new `GET /v1/schema` promised to return
+  its source text, so `en-server` had to carry a hand-written string asserting what the builder had
+  built. It was correct, and nothing enforced it. `demoSchema` is now `parseSchema demoSchemaSource`,
+  and the hash is unchanged (`fnv1a64:88633b46c783909e`) — which is the evidence the two spellings
+  had agreed. Adding a read endpoint converted a harmless duplication into a correctness obligation.
+
+- 2026-07-10 (EP-54 complete; **affects every future acceptance run in this repository**): the dev
+  database now holds 200,024 live grants left by earlier plans' benchmarks, nearly all `space:*`.
+  EP-54's reload scenarios could not use it — any candidate schema not modelling `space` is refused
+  with 200,023 orphan lines — and were run against a fresh database with the migrations applied. Two
+  further traps compound the master plan's existing port-8080 warning: `timeout N cabal run en-server`
+  spends most of `N` rebuilding and dies just after the port binds, so use `cabal list-bin en-server`;
+  and a background server started in one shell invocation does not survive into the next, so a `curl`
+  in a later step reads "connection refused" from a server whose log shows a clean startup. The store
+  pollution is not a defect — it is what a validation pass is for, and scanning all 200,024 rows takes
+  1.8 seconds, this initiative's only figure for the cost of an unanchored full scan.
+
+
 ## Decision Log
 
 - Decision: Prefer landing the versioned wire contract (docs/plans/35, master plan 6) before these endpoints.
@@ -520,8 +588,65 @@ depends on that package.
 - Decision: The watch feed is a pull API and stays one. EP-53 shipped no NDJSON, no SSE, and no long-poll.
   Rationale: Unchanged from EP-53's own 2026-07-07 entry, restated here because the endpoint now exists and the temptation to add streaming to it will arrive. Every streaming design still needs the cursor semantics EP-53 built, and wire streaming for large results is separately tracked as review gap E13.
   Date: 2026-07-09
+- Decision: `GET /v1/schema` carries no `checkedAt`, is a plain `Get` rather than a `MultiVerb` over `EnResponses`, and is the last operation on `EnAPI`.
+  Rationale: The Integration Points paragraph left the `checkedAt` question to EP-54. The field names the tuple-store snapshot a read resolved to, and this operation reads no tuples and names no revision; `loadedAt` answers the only freshness question a caller can ask of it. It cannot fail, so the shared five-alternative response list would document four statuses it can never produce. It goes last because `en-client`'s handler binding is positional and adding a route anywhere else silently re-binds every field after it.
+  Date: 2026-07-10
+- Decision: `Env` loses `graph` and gains `readActiveSchema`; `runPorts` takes the snapshot as an argument.
+  Rationale: See Surprises. The store interpreters stamp the schema hash into every token they mint and check it on every token they are shown. A handler reading its graph while its interpreters read their hash is two reads of one mutable cell, and a reload between them evaluates one model and stamps another's hash. Threading one snapshot through both makes the torn state unspellable rather than merely unlikely, and gives "in-flight requests finish on the old schema" for free. Confirmed live: a `fullyConsistent` check after a reload mints `checkedAt` under the new hash.
+  Date: 2026-07-10
+- Decision: EP-54 adds no store operation. `ReadAllTuples` is the enumeration primitive.
+  Rationale: It already had the signature EP-54 specified for `EnumerateTuples`, in the effect and in both interpreters, with the row-id ordering an unanchored scan needs. A synonym would give the store two names for one query and every future interpreter two obligations. EP-54's argument for *why* the scan must be unanchored survives intact: orphan detection must find tuples whose object type is absent from the candidate schema, and no filter over a type that does not exist can name them.
+  Date: 2026-07-10
+- Decision: `EN_SCHEMA_RELOAD_FORCE=true`, parsed in `en-server/app/Config.hs`, rather than the `=1` sniffed at reload time that EP-54's plan specified.
+  Rationale: Every other boolean this server reads is `true`/`false` through `Config.boolean`, every variable is in `knownVariables`, and the documented contract is that an invalid value fails startup. A variable read with `lookupEnv` inside a signal handler honours none of that: `EN_SCHEMA_RELOAD_FORCE=yes` would silently mean "do not force", discovered only when a reload the operator expected to succeed was refused. It cannot change in a running process either way.
+  Date: 2026-07-10
+- Decision: A `SIGHUP` whose candidate hashes equal to the active schema skips the swap and says "schema unchanged".
+  Rationale: EP-54's Idempotence section offered this as an implementer's choice. Taken — not for the cost of the scan, but because the swap's log line ends "all consistency tokens minted under the previous schema hash are now invalid", and about an unchanged file that sentence is false. Supervisors send `SIGHUP` for reasons unrelated to the schema.
+  Date: 2026-07-10
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+**Complete, 2026-07-10.** All five children landed. en's HTTP API now answers every question the
+gap analysis said it could not: `POST /v1/relationships/query` and `/delete-by-filter` (E2),
+`checkedAt` on every read response (E3), `POST /v1/lookup-subjects` (E4), `POST /v1/watch` (E5),
+and `GET /v1/schema` with `SIGHUP` reload, stored-tuple validation, and `en-server check-schema`
+(E6). Every endpoint was born inside the `/v1` contract and the `ErrorEnvelopeWire` error model;
+none shipped under the unversioned contract and none had to migrate.
+
+**The decomposition held.** Each child was one externally visible capability, demonstrable with
+curl, and none blocked another: EP-50 through EP-53 were implementable in parallel and EP-54's soft
+dependency on EP-50 dissolved on contact (see below). The rejected alternative — slicing by
+core/storage/API layer — would have produced fifteen plans, none independently verifiable.
+
+**The recurring surprise was that the groundwork was already there.** Three of five children found a
+primitive they had planned to build already in the tree, built for a different reason and fitting
+exactly: EP-51 found `MintToken`, added by master plan 7 to close a forgeable-cursor hole; EP-50
+found `TupleFilter`, added by docs/plans/46 for write preconditions; EP-54 found `ReadAllTuples`,
+added for `en-server export`. In each case the pre-existing shape was *better* than the plan's — most
+sharply `SubjectRelationFilter`, whose three-valued encoding removes an ambiguity the plan's
+`Maybe RelationName` would have introduced. The lesson is cheap to state and was learned three times:
+read the effect before extending it.
+
+**The recurring hazard was the consistency-token boundary.** EP-53 discovered that
+`validateTokenMetadata`'s garbage-collection rule (`xmax <= horizon`) is unusable for a cursor minted
+from a head revision *and* unsound for a revision window, in opposite directions — and that the same
+sharp edge sits under EP-51's `checkedAt` convention, which no child owned. It is now owned by
+docs/plans/60, outside this initiative, along with the `TokenDecodeError` constructor name that three
+successive children found leaking onto the wire and correctly declined to fix. That a defect was
+found, characterized, escalated, and *not* opportunistically patched inside a plan scoped to
+something else is the process working.
+
+**One capability was scoped out on purpose and is worth naming.** The compatible-change taxonomy
+EP-54 documents has a middle category — editing a permission's rewrite — that strands no data and
+that `check-schema` is silent about, yet can flip every decision the permission governs. Detecting
+behavioral schema drift means diffing decisions across two models over the stored graph. Nothing here
+does it; the documentation says so plainly rather than letting the validator's silence read as
+approval.
+
+**Two things every future plan in this repository inherits.** The dev database holds 200,024 live
+grants from earlier benchmarks, so any acceptance run whose schema does not model `space` must use a
+fresh database. And an acceptance run against `localhost:8080` may be talking to an `ssh` tunnel, a
+stale binary, or nothing at all: check with `lsof -nP -iTCP:8080 -sTCP:LISTEN`, run
+`cabal list-bin en-server` rather than `cabal run` under a `timeout`, and remember that a background
+server does not survive the shell invocation that started it.
