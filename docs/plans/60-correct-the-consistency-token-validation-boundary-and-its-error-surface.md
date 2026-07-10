@@ -72,8 +72,8 @@ This section must always reflect the actual current state of the work.
 - [x] M2: Replace `Text.pack (show err)` in `tokenMetadataFromPayload` with a rendering written for a client. Fix `parseExpiry`'s misuse of `TokenBadEscape` while there. (2026-07-10 — new `renderTokenDecodeError`; new `TokenBadExpiry` constructor.)
 - [x] M2: Reconcile malformed-cursor errors. `En.Lookup`/`En.LookupSubjects` now raise `InvalidCursor` for a structurally malformed cursor, matching `En.Postgres.Watch` and the `InvalidCursor` Haddock; the lookup sites were the deviation. (2026-07-10 — client-visible: a malformed lookup/lookup-subjects cursor's code changes from `invalid_consistency_token` to `invalid_cursor`.)
 - [x] M2: Update `en-servant/test/Main.hs`'s error-model table and the assertion in `en-postgres/integration-test/Main.hs` that currently pins the leak (`InvalidConsistencyToken "TokenBadPrefix"`). (2026-07-10 — error-model table gains `malformed_consistency_token`, `consistency_token_expired`, `invalid_cursor`; added a no-constructor-names regression guard driving the real `tokenMetadataFromPayload`.)
-- [ ] M3: Benchmark the watch drain against a populated table: cost per page as a function of window width and page size.
-- [ ] M3: Decide from the numbers — rewrite the window query, or record the cost and close the item. Both are acceptable outcomes; shipping an unmeasured rewrite is not.
+- [x] M3: Benchmark the watch drain against a populated table: cost per page as a function of window width and page size. (2026-07-10 — `EXPLAIN (ANALYZE, BUFFERS)` on dev PostgreSQL; table in Validation and Acceptance, M3.)
+- [x] M3: Decide from the numbers — rewrite the window query, or record the cost and close the item. (2026-07-10 — measured, documented, **not changed**; the drain is linear, and the one real cost is a bounded once-per-drain first-page scan of the pre-window live set that no simple index removes. See the M3-resolved Decision Log entry.)
 - [ ] Update `docs/plans/53`'s Surprises entry and `docs/masterplans/9-complete-the-en-api-surface.md`'s Decision Log to point at this plan's outcome.
 
 
@@ -115,6 +115,18 @@ implementation. Provide concise evidence.
   in-window bugs this plan opened on), and it is no worse on this shared dependency — but the full
   "not one transaction longer than the history it names survives" claim in Purpose needs the horizon
   to stop regressing, which is Milestone 4.
+
+- 2026-07-10 (M3, measured against dev PostgreSQL): the watch drain is __linear__, not the quadratic
+  `O(W²/L)` re-scan `docs/plans/53` and this plan's opening feared. `EXPLAIN (ANALYZE, BUFFERS)` of
+  `readChangesStatement` shows continuation pages keyset-seek on the primary key (`id > cursor`) and
+  cost ~10–20 buffers / <0.3 ms regardless of window width `W` or table size. The whole cost is the
+  __first__ page: the planner adaptively takes either a `BitmapOr`+`Sort` (`O(W)`) or a primary-key
+  `Index Scan`+`Filter` that walks past every live row older than the window (`O(pre-window live
+  set)`, ~11 ms per 100k older rows, confirmed linear in table size by a 100k→500k background sweep:
+  10.7 ms → 59.2 ms). So a drain is `O(pre-window live set)` once plus `O(W)` across the rest. The
+  fear was wrong about the shape; the real, bounded cost is a once-per-drain first-page scan
+  proportional to the live graph. Left unchanged (Decision Log, M3-resolved). Numbers in Validation
+  and Acceptance, M3.
 
 
 ## Decision Log
@@ -224,6 +236,22 @@ Record every decision made while working on the plan.
   index carries `id`, so a composite `(created_xid, id)` still cannot yield `id` order across a
   `created_xid` range — and a rewrite adopted without a number is how a plan trades a known cost
   for an unknown one. The milestone's deliverable is the number.
+  Date: 2026-07-10
+- Decision (M3, resolved): measured, documented, **not changed**. `readChangesStatement` is left as
+  it stands.
+  Rationale: the numbers (Validation and Acceptance, M3) contradict the feared per-page `O(W)`
+  re-scan. Continuation pages keyset-seek on the primary key and are sub-millisecond regardless of
+  window width or table size; the drain is linear, not quadratic. The one real cost is the *first*
+  page, which under the planner's primary-key-scan plan walks past every live row older than the
+  window — `O(pre-window live set)`, ~11 ms per 100k older rows, once per drain. No simple index
+  removes that: a composite `(created_xid, id)` would seek to `created_xid >= xmin` and skip the
+  older rows, but it cannot emit `id` order across the range without a `Sort`, it does not serve the
+  `deleted_xid` arm at all (a row created before the window and deleted inside it matches only there),
+  and a `UNION ALL` of two keyset seeks needs a `DISTINCT ON (id)` that reintroduces a sort — exactly
+  the dead ends the pre-implementation entry above anticipated. The rewrite would trade a bounded,
+  once-per-drain, table-proportional cost for an index maintained on every write plus a more complex
+  plan, and it would help only the wide-window, small-page first page. Not justified. `docs/plans/53`'s
+  `EXPLAIN` is superseded by this plan's measurement; the query is unchanged.
   Date: 2026-07-10
 
 
@@ -658,9 +686,45 @@ matches an internal constructor name. The three (or however many M2 settles on) 
 reachable, and each is asserted in `en-servant/test/Main.hs`'s error-model table. A malformed lookup
 cursor and a malformed watch cursor produce the same code as each other.
 
-**M3.** This section carries a table of time and buffers per page against window width and page size,
-and the Decision Log says what was done about it. If the query was rewritten, the table has a
-before-and-after column and `docs/plans/53`'s `EXPLAIN` is superseded here.
+**M3 (measured 2026-07-10; not changed).** `EXPLAIN (ANALYZE, BUFFERS)` of `readChangesStatement`'s
+exact SQL with literal parameters, against a scratch table shaped like `relation_tuple` (same
+`created_xid`/`deleted_xid` `xid8` columns and their two indexes) on the dev PostgreSQL. `W` is the
+number of in-window changes; a fixed pre-window live set of 100,000 older rows sits below them in `id`
+order (older rows always have lower `id`, since `id` is `bigserial` in creation order). Buffers are
+8 KiB shared-hit pages; time is `Execution Time`.
+
+| window `W` | page `L` | first page (`id > 0`) | continuation page (`id > cursor`) |
+| ---: | ---: | --- | --- |
+| 1,000 | 100 | BitmapOr + top-N sort — 22 buf, 0.42 ms | pkey seek — 7 buf, 0.07 ms |
+| 1,000 | 1,000 | BitmapOr + quicksort — 22 buf, 0.48 ms | pkey seek — 13 buf, 0.17 ms |
+| 10,000 | 100 | pkey scan + filter — 1,405 buf, 10.8 ms | pkey seek — 8 buf, 0.08 ms |
+| 10,000 | 1,000 | BitmapOr + top-N sort — 149 buf, 3.55 ms | pkey seek — 20 buf, 0.32 ms |
+| 100,000 | 100 | pkey scan + filter — 1,406 buf, 11.1 ms | pkey seek — 10 buf, 0.09 ms |
+| 100,000 | 1,000 | pkey scan + filter — 1,418 buf, 11.0 ms | pkey seek — 22 buf, 0.31 ms |
+
+First-page cost against the pre-window live set, holding `W = 10,000`, `L = 100` (the row that takes
+the pkey-scan plan):
+
+| pre-window live rows | first page |
+| ---: | --- |
+| 100,000 | 1,405 buf, 10.7 ms |
+| 500,000 | 7,045 buf, 59.2 ms |
+
+Two facts fall out, and both correct the plan's opening picture (a per-page `O(W)` re-scan, feared
+quadratic across a drain):
+
+1. *Continuation pages are sub-millisecond and independent of both `W` and table size.* Once the
+   cursor's `id` is past the pre-window rows, PostgreSQL keyset-seeks on the primary key (`id > cursor`)
+   and reads ~`L` rows to fill the page. The drain does **not** re-scan the window per page.
+2. *The cost is the __first__ page, and it scales with the __pre-window live set__, not with `W`.* The
+   planner adaptively picks between a `BitmapOr` over the two `xid` indexes followed by a `Sort` (cost
+   `O(W)`), and a primary-key `Index Scan` in `id` order with the window predicates as a `Filter`
+   (cost `O(rows older than the window)`, because it must walk past every lower-`id` live row to reach
+   the first in-window one). 5× the background → 5.2× the buffers and 5.5× the time, `W` fixed —
+   linear in table size, once per drain.
+
+So a full drain is `O(pre-window live set)` for its first page plus `O(W)` across the rest, i.e.
+linear, not quadratic. The Decision Log records the decision this bought.
 
 ### Test-level validation
 
