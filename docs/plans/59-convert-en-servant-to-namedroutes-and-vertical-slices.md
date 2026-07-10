@@ -90,11 +90,20 @@ trailing it.
 
 ## Progress
 
-- [ ] Milestone 1: convert `EnAPI` from a `"v1" :> ( … :<|> … )` chain to a flat
-      `NamedRoutes` record `EnApi`, with no module moves. Update the server assembly, the
-      `En.Client` generated client (`genericClient`), the OpenAPI mount, and the
-      `en-servant` test's positional handler extraction. `cabal build all` and
-      `cabal test all` pass; downstream `nagare` and `kikan-en` build unchanged.
+- [x] Milestone 1 (done 2026-07-10): converted `EnAPI` from a `"v1" :> ( … :<|> … )` chain to a
+      flat `NamedRoutes` record `EnApi` — **twelve** fields (`writeTuples`, `deleteTuples`,
+      `readRelationships`, `deleteRelationships`, `check`, `batchCheck`, `lookup`,
+      `lookupSubjects`, `expand`, `watch`, `mintGrant`, `readSchema`), not the six the draft
+      showed — each field carrying its full `"v1"` prefix. `mintGrant` (plain `Post`) and
+      `readSchema` (plain `Get`) are ordinary record fields alongside the ten `MultiVerb`
+      routes. Rewrote `server` to a record, `En.Client.enClient` to `genericClient ::
+      EnApi (AsClientT ClientM)`, and the test's positional `handlers` destructuring to an
+      `EnApi{…} = server env` field bind. The OpenAPI mount in `OpenApi.hs` needed no source
+      change. `cabal build all` and `cabal test all` pass. Downstream validated by import review
+      (see Surprises): both `nagare` (git-tag-pinned) and `kikan-en` (missing `en-biscuit` /
+      `biscuit-haskell` config) cannot build against local `en`, so the preserved-interface
+      argument stands in for a local build. Added `servant-client-core` to `en-client`'s
+      `build-depends` (needed for `Servant.Client.Generic`).
 - [ ] Milestone 2: add a `Network.Wai.Test` end-to-end routing guard that drives `app env`
       over all six paths, asserts a malformed body returns `ErrorEnvelopeWire` (proving
       `envelopeFormatters` survived), and asserts an unknown path returns the 404 envelope.
@@ -135,8 +144,86 @@ trailing it.
   shape structurally safe rather than accidentally safe. This is stated plainly so no reader
   oversells the change — see the Decision Log.
 
-- (Add further discoveries here as implementation proceeds — e.g. whether
-  `servant-openapi-hs` provides `HasOpenApi (NamedRoutes …)` directly; see Milestone 1.)
+- Discovery (2026-07-10): **`NamedRoutes` does not make a same-typed transposition a compile
+  error — the claim was falsified by experiment, and it does not change en's conclusion.** An
+  earlier draft of this plan, and the canonical `haskell-jitsurei/api/servant-routes.md` it draws
+  on, stated that converting a `:<|>` chain to a `NamedRoutes` record turns a transposition into a
+  compile/type error. The meibo service tested this directly: it converted to `NamedRoutes`,
+  swapped its two genuinely same-typed handlers (`byHandle`/`byCredential`, both
+  `AuthUser -> Text -> Handler (MeiboResult PrincipalView)`), and `cabal build` **succeeded** —
+  the swap compiles and silently serves the wrong data; only a runtime dispatch test caught it.
+  (Meibo also moved a field to be first with all 43 tests still green, disproving the related
+  claim that record field order governs static-segment-versus-capture precedence.) The honest
+  property is that a record removes the *positional* failure mode; a *differing*-typed
+  transposition is a compile error naming the field, while a *same*-typed transposition is caught
+  only by a runtime dispatch test. **This does not weaken en's case one bit**: en has *no*
+  same-typed pair — every bodied route carries a distinct `ReqBody` type and the bodyless `schema`
+  GET has a distinct response — so a transposition is already a compile error even in the current
+  chain, and en adopts `NamedRoutes` for the vertical-slice split, the derived `genericClient`,
+  and uniformity, not to close a misordering hazard. No dispatch test is required for the
+  conversion. (Incidental note for accuracy: the enumeration in the bullet above lists six of en's
+  operations; the live `EnAPI` actually has eleven routes — the ten POSTs plus a bodyless `schema`
+  GET — but the distinctness conclusion is unaffected, since no two of the eleven share a handler
+  type.)
+
+- Discovery (2026-07-10, at implementation start): **the code has grown well past what this
+  plan describes — the plan was written against a 6-operation, 1,247-line `API.hs` with a
+  4-status `EnResponses`, but the live `En/Servant/API.hs` is 2,548 lines with *twelve* routes
+  and a *five*-status response list.** The live `EnAPI` chain is, in order: `relationships`
+  (writeTuples), `relationships/delete` (deleteTuples), `relationships/query`
+  (readRelationships), `relationships/delete-by-filter` (deleteRelationships), `check`,
+  `batch-check`, `lookup`, `lookup-subjects`, `expand`, `watch`, `grants` (mintGrant — a plain
+  `Post`, throws `ServerError`, *not* `MultiVerb`), and `schema` (a plain `GET`, no body, no
+  fault). `EnResponses` is now `'[Respond 200, 400, 412, 422, 503]` and the hand-written
+  `AsUnion` has five constructors (`EnOk`/`EnClientError`/`EnPreconditionFailed`/
+  `EnUnprocessable`/`EnUnavailable`) with the exhaustiveness witness at
+  `S (S (S (S (S impossible))))`. This does **not** change the plan's approach — NamedRoutes +
+  vertical slices still apply verbatim — but every route/handler/DTO list in the milestones is
+  extended to the real twelve. The distinctness conclusion still holds: no two of the twelve
+  share a handler type (each bodied route carries a distinct `ReqBody`; `grants` and `schema`
+  are plain verbs with distinct shapes), so a transposition remains a compile error and no
+  dispatch test is required. Slice assignment for the extra operations (recorded in the Decision
+  Log): `relationships/query`, `relationships/delete-by-filter`, and `watch` join the tuple
+  slice (`En.Tuple.Api`); `grants` joins the check slice (`En.Check.Api`); `lookup-subjects`
+  joins the lookup slice (`En.Lookup.Api`); `schema` gets its own `En.Schema.Api` slice.
+
+- Discovery (2026-07-10): **downstream resolution differs by repo.** `kikan-en`'s
+  `cabal.project` lists `../../en/en-core … en-servant … en-client` as **local `packages:`
+  entries**, so it builds against the local `en` working tree — a real local build is a
+  meaningful check. `nagare`'s consumer, `nagare/cli/nagare-access/cabal.project`, pins `en` by
+  a `source-repository-package` **git `tag` (`d27bb440…`)**, so a local `en` change does not
+  reach it without repointing the tag or adding a local override. Per this plan's own guidance,
+  nagare is therefore validated by **review of its unchanged import lists** against `En.Client`'s
+  and `En.Servant.API`'s preserved interfaces, not by a local build; `kikan-en` is validated by
+  a real `cabal build all`.
+
+- Discovery (2026-07-10, resolved at Milestone 1 build): **`servant-openapi-hs` provides
+  `HasOpenApi (NamedRoutes EnApi)` directly.** `En.Servant.OpenApi` compiled unchanged with
+  `enOpenApi = toOpenApi apiProxy` after `apiProxy :: Proxy (NamedRoutes EnApi)`; the fallback
+  `toOpenApi (Proxy @(ToServantApi EnApi))` was not needed. The served OpenAPI document tests
+  (`openApiDocumentTests`) pass, so the derivation still describes the same paths with the same
+  per-operation `200/400/412/422/503` responses.
+
+- Discovery (2026-07-10): **`en-client` needed `servant-client-core` added to its
+  `build-depends`.** `Servant.Client.Generic` (which exports `AsClientT` and `genericClient`)
+  lives in the hidden `servant-client-core` package, not `servant-client`, so the `genericClient`
+  rewrite did not compile until the dependency was declared. This is the only cabal change
+  Milestone 1 required for the libraries.
+
+- Discovery (2026-07-10): **neither downstream repo can currently build against the local `en`
+  working tree, for reasons predating this plan.** `nagare/cli/nagare-access` pins `en` by a git
+  `tag`, so it never sees local changes. `kikan-en`'s `cabal.project` lists local `en-core /
+  en-migrations / en-postgres / en-servant / en-client` but **not** `en-biscuit` — which
+  `en-servant` has depended on since EP-55/57 — and it also lacks `en`'s `biscuit-haskell` fork
+  `source-repository-package` pin (Hackage `biscuit-haskell` caps `template-haskell < 2.22`,
+  incompatible with GHC 9.12.4's 2.24). Both gaps are downstream-config problems unrelated to
+  this refactor; fixing them is out of scope. Consequently **both downstreams are validated by
+  import review** for every milestone: `En.Servant.API` (`app`, and now additively `EnApi (..)`),
+  `En.Servant.Seam` (`Env`, `AppEffects`), and `En.Client` (`EnClient (..)`, `enClient`, the
+  `…Wire` types) keep their exact public interfaces, and no downstream file references the moved
+  internals (`EnAPI` the type, `apiProxy`, `server`, `EnResult`). Under `NoFieldSelectors` the
+  re-exported `EnApi (..)` field labels create no clashing top-level bindings, so the additive
+  export is safe.
 
 
 ## Decision Log
@@ -236,6 +323,24 @@ trailing it.
   restructure (it can land any time after Milestone 1 stabilizes the derivation).
   Date: 2026-07-09
 
+- Decision (2026-07-10): the plan's six-operation scope is superseded by the live twelve; the
+  extra operations map to slices (for Milestone 3) as follows. Tuple slice `En.Tuple.Api`:
+  `writeTuples` (`/v1/relationships`), `deleteTuples` (`/v1/relationships/delete`),
+  `readRelationships` (`/v1/relationships/query`), `deleteRelationships`
+  (`/v1/relationships/delete-by-filter`), and `watch` (`/v1/watch`) — all operate on the tuple
+  store, share `RelationshipFilterWire`, `TupleFilterWire`, `PreconditionWire`, and the
+  tuple↔wire conversions, and belong together. Check slice `En.Check.Api`: `check`, `batchCheck`,
+  and `mintGrant` (`/v1/grants`) — the mint is a check-then-issue and reuses the check flow, its
+  request carries `SubjectWire`/`ObjectRefWire`/`ConsistencyWire`/`CaveatContextWire`, and it
+  depends on `en-biscuit`. Lookup slice `En.Lookup.Api`: `lookup` and `lookupSubjects`. Expand
+  slice `En.Expand.Api`: `expand`. New Schema slice `En.Schema.Api`: `readSchema` (`/v1/schema`),
+  the one bodyless `GET`; a dedicated slice keeps the umbrella uniform (every field mounts a
+  concept sub-record) and matches `en-core`'s `En.Schema` concept prefix. Note `En.Schema`
+  already exists in `en-core`; `En.Schema.Api` in `en-servant` sits beside it exactly as
+  `En.Check`/`En.Check.Api` do. Rationale: keeps the grep-one-prefix property for every concept
+  and gives each of the twelve operations a single owning slice.
+  Date: 2026-07-10
+
 - Decision: Do the `NamedRoutes` type change first (Milestone 1), the behavioral guard second
   (Milestone 2), and the module moves third (Milestone 3), in three separate commits.
   Rationale: interleaving a type-shape change with a file move produces a diff a reviewer
@@ -288,7 +393,14 @@ parameterized by a type variable conventionally called `mode`. Each field joins 
 its route type with the `:-` operator (from `Servant.API.Generic`). Servant instantiates
 `mode` differently for different purposes: `AsApi` yields a description, `AsServerT m` yields a
 record of handlers, `AsClientT` yields a record of client functions. Because handlers are
-supplied by *field name*, a transposition is a type error rather than a silent misroute, and
+supplied by *field name* rather than by position, the record removes the *positional* failure
+mode: you cannot miscount, and inserting a route mid-record cannot shift every later handler. It
+does **not**, on its own, turn a transposition into a type error — swapping two fields whose
+handler types are *identical* still typechecks and compiles (this was falsified by experiment in
+meibo; see Surprises & Discoveries). A transposition is a compile error only where the two fields
+have *different* handler types, which is the case for every en route (each bodied route carries a
+distinct `ReqBody` type; the bodyless `schema` GET has a distinct response), so en has no
+same-typed pair to worry about. And
 because each field can mount a whole sub-record, the route tree can follow the *module*
 structure instead of the URL structure.
 
@@ -698,8 +810,10 @@ code and must be protected by an end-to-end check that exercises real routing an
 `envelopeFormatters` hook, neither of which the existing golden/handler unit tests drive.
 
 Be honest about what this guards. As recorded in Surprises & Discoveries, `en` has no live
-misordering hazard: all six routes carry distinct `ReqBody` types, so a transposition is already
-a compile error. This test is therefore *not* a "prove the misrouting bug is gone" test (there
+misordering hazard: no two en routes share a handler type — every bodied route carries a distinct
+`ReqBody` type and the bodyless `schema` GET has a distinct response — so a transposition is
+already a compile error even in the pre-conversion chain, and would remain one after conversion.
+This test is therefore *not* a "prove the misrouting bug is gone" test (there
 is none); it pins the observable HTTP behavior — that each path routes to the right handler and
 that pre-handler errors still speak `ErrorEnvelopeWire` — so the Milestone 3 move cannot
 silently change it.
@@ -1470,3 +1584,19 @@ throughout, because `en-server`, `en-example`, `nagare`, and `kikan-en` import t
   Interfaces & Dependencies. Reason: en was the `MultiVerb` reference but only partly met the
   document-artifact half of the recipe; this brings it level with meibo without touching the
   derivation that other services copy.
+
+- 2026-07-10 — Corrected the "`NamedRoutes` makes a transposition a type error" claim. The
+  *Terms used in this plan* definition of `NamedRoutes` previously stated "a transposition is a
+  type error rather than a silent misroute." That is false for a *same-typed* transposition — the
+  meibo service proved it by experiment (swapping two same-typed handlers compiled and served the
+  wrong data; only a runtime dispatch test caught it), and meibo separately disproved the related
+  field-order-versus-capture-precedence claim. The definition now states the honest property (a
+  record removes the positional failure mode; a differing-typed transposition is a compile error
+  naming the field; a same-typed transposition is caught only by a runtime dispatch test), and
+  notes that en has *no* same-typed pair, so the hazard does not apply and no dispatch test is
+  required. The Milestone-2 "be honest about what this guards" paragraph was corrected to speak of
+  handler types rather than a miscounted "all six routes" (the live API has eleven routes, not
+  six, but the distinctness conclusion holds). A new Surprises & Discoveries entry records the
+  falsification and cites meibo. En's actual work is unchanged: it still converts to `NamedRoutes`
+  for the vertical-slice split, the derived client, and uniformity. Reflected in *Terms used in
+  this plan*, Milestone 2, *Surprises & Discoveries*, and this note.

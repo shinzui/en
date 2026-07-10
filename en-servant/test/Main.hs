@@ -18,7 +18,7 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Time (UTCTime (..), fromGregorian, getCurrentTime, secondsToDiffTime)
 import Effectful (Eff, IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
-import Servant (Handler, ServerError (..), runHandler, type (:<|>) (..))
+import Servant (Handler, ServerError (..), runHandler)
 
 import Auth.Biscuit (toPublic)
 import En.Biscuit.Grant (Audience (..))
@@ -62,6 +62,7 @@ import En.Servant.API (
     DeleteRelationshipsRequestWire (..),
     DeleteRelationshipsResponseWire (..),
     DeleteTuplesRequestWire (..),
+    EnApi (..),
     EnResult (..),
     Env (..),
     ExpandNodeWire (..),
@@ -1480,18 +1481,20 @@ handlers env =
         , readSchema = readSchemaEndpoint
         }
   where
-    writeTuplesEndpoint
-        :<|> deleteTuplesEndpoint
-        :<|> readRelationshipsEndpoint
-        :<|> deleteRelationshipsEndpoint
-        :<|> checkEndpoint
-        :<|> batchCheckEndpoint
-        :<|> lookupEndpoint
-        :<|> lookupSubjectsEndpoint
-        :<|> expandEndpoint
-        :<|> watchEndpoint
-        :<|> mintGrantEndpoint
-        :<|> readSchemaEndpoint = server env
+    EnApi
+        { writeTuples = writeTuplesEndpoint
+        , deleteTuples = deleteTuplesEndpoint
+        , readRelationships = readRelationshipsEndpoint
+        , deleteRelationships = deleteRelationshipsEndpoint
+        , check = checkEndpoint
+        , batchCheck = batchCheckEndpoint
+        , lookup = lookupEndpoint
+        , lookupSubjects = lookupSubjectsEndpoint
+        , expand = expandEndpoint
+        , watch = watchEndpoint
+        , mintGrant = mintGrantEndpoint
+        , readSchema = readSchemaEndpoint
+        } = server env
 
 batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
 batchHandler env = (handlers env).batchCheck

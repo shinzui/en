@@ -3,6 +3,7 @@
 -- | The en HTTP API as a Servant API type plus server handlers.
 module En.Servant.API (
     EnAPI,
+    EnApi (..),
     apiProxy,
     EnServer,
     ActiveSchema (..),
@@ -99,6 +100,7 @@ import Effectful (Eff, IOE)
 import Effectful qualified
 import Effectful.Error.Static (Error)
 import GHC.Clock (getMonotonicTimeNSec)
+import GHC.Generics (Generic)
 import GHC.TypeLits (Symbol)
 import Servant (
     Application,
@@ -116,9 +118,10 @@ import Servant (
     err404,
     serveWithContext,
     throwError,
-    type (:<|>) (..),
     type (:>),
  )
+import Servant.API (NamedRoutes)
+import Servant.API.Generic (type (:-))
 import Servant.API.MultiVerb (AsUnion (..), MultiVerb, Respond)
 import Servant.Server (ErrorFormatter, ErrorFormatters (..), defaultErrorFormatters)
 
@@ -279,64 +282,109 @@ carries, so its handler throws 'Servant.ServerError' — carrying the same
 'En.Servant.Seam.ErrorEnvelopeWire' — rather than returning an 'EnResult'. See
 'mintGrantHandler'.
 -}
-type EnAPI =
-    "v1"
-        :> ( "relationships"
+data EnApi mode = EnApi
+    { writeTuples ::
+        mode
+            :- "v1"
+                :> "relationships"
                 :> ReqBody '[JSON] WriteTuplesRequestWire
                 :> MultiVerb 'POST '[JSON] (EnResponses "Consistency token for the write" WriteTuplesResponseWire) (EnResult WriteTuplesResponseWire)
-                :<|> "relationships"
-                    :> "delete"
-                    :> ReqBody '[JSON] DeleteTuplesRequestWire
-                    :> MultiVerb 'POST '[JSON] (EnResponses "Consistency token for the deletion" WriteTuplesResponseWire) (EnResult WriteTuplesResponseWire)
-                :<|> "relationships"
-                    :> "query"
-                    :> ReqBody '[JSON] ReadRelationshipsRequestWire
-                    :> MultiVerb 'POST '[JSON] (EnResponses "A page of stored relationships" ReadRelationshipsResponseWire) (EnResult ReadRelationshipsResponseWire)
-                :<|> "relationships"
-                    :> "delete-by-filter"
-                    :> ReqBody '[JSON] DeleteRelationshipsRequestWire
-                    :> MultiVerb 'POST '[JSON] (EnResponses "How many relationships the filter matched" DeleteRelationshipsResponseWire) (EnResult DeleteRelationshipsResponseWire)
-                :<|> "check"
-                    :> ReqBody '[JSON] CheckRequestWire
-                    :> MultiVerb 'POST '[JSON] (EnResponses "The authorization decision" CheckResponseWire) (EnResult CheckResponseWire)
-                :<|> "batch-check"
-                    :> ReqBody '[JSON] BatchCheckRequestWire
-                    :> MultiVerb 'POST '[JSON] (EnResponses "One decision per requested pair, in order" BatchCheckResponseWire) (EnResult BatchCheckResponseWire)
-                :<|> "lookup"
-                    :> ReqBody '[JSON] LookupRequestWire
-                    :> MultiVerb 'POST '[JSON] (EnResponses "A page of authorized objects" LookupPageWire) (EnResult LookupPageWire)
-                :<|> "lookup-subjects"
-                    :> ReqBody '[JSON] LookupSubjectsRequestWire
-                    :> MultiVerb 'POST '[JSON] (EnResponses "A page of authorized subjects" LookupSubjectsPageWire) (EnResult LookupSubjectsPageWire)
-                :<|> "expand"
-                    :> ReqBody '[JSON] ExpandRequestWire
-                    :> MultiVerb 'POST '[JSON] (EnResponses "The permission's subject tree" ExpandTreeWire) (EnResult ExpandTreeWire)
-                :<|> "watch"
-                    :> ReqBody '[JSON] WatchRequestWire
-                    :> MultiVerb 'POST '[JSON] (EnResponses "A batch of tuple changes, and a cursor to resume from" WatchResponseWire) (EnResult WatchResponseWire)
-                :<|> "grants"
-                    :> ReqBody '[JSON] MintGrantRequestWire
-                    :> Post '[JSON] MintGrantResponseWire
-                :<|> "schema" :> Get '[JSON] SchemaInfoWire
-           )
+    , deleteTuples ::
+        mode
+            :- "v1"
+                :> "relationships"
+                :> "delete"
+                :> ReqBody '[JSON] DeleteTuplesRequestWire
+                :> MultiVerb 'POST '[JSON] (EnResponses "Consistency token for the deletion" WriteTuplesResponseWire) (EnResult WriteTuplesResponseWire)
+    , readRelationships ::
+        mode
+            :- "v1"
+                :> "relationships"
+                :> "query"
+                :> ReqBody '[JSON] ReadRelationshipsRequestWire
+                :> MultiVerb 'POST '[JSON] (EnResponses "A page of stored relationships" ReadRelationshipsResponseWire) (EnResult ReadRelationshipsResponseWire)
+    , deleteRelationships ::
+        mode
+            :- "v1"
+                :> "relationships"
+                :> "delete-by-filter"
+                :> ReqBody '[JSON] DeleteRelationshipsRequestWire
+                :> MultiVerb 'POST '[JSON] (EnResponses "How many relationships the filter matched" DeleteRelationshipsResponseWire) (EnResult DeleteRelationshipsResponseWire)
+    , check ::
+        mode
+            :- "v1"
+                :> "check"
+                :> ReqBody '[JSON] CheckRequestWire
+                :> MultiVerb 'POST '[JSON] (EnResponses "The authorization decision" CheckResponseWire) (EnResult CheckResponseWire)
+    , batchCheck ::
+        mode
+            :- "v1"
+                :> "batch-check"
+                :> ReqBody '[JSON] BatchCheckRequestWire
+                :> MultiVerb 'POST '[JSON] (EnResponses "One decision per requested pair, in order" BatchCheckResponseWire) (EnResult BatchCheckResponseWire)
+    , lookup ::
+        mode
+            :- "v1"
+                :> "lookup"
+                :> ReqBody '[JSON] LookupRequestWire
+                :> MultiVerb 'POST '[JSON] (EnResponses "A page of authorized objects" LookupPageWire) (EnResult LookupPageWire)
+    , lookupSubjects ::
+        mode
+            :- "v1"
+                :> "lookup-subjects"
+                :> ReqBody '[JSON] LookupSubjectsRequestWire
+                :> MultiVerb 'POST '[JSON] (EnResponses "A page of authorized subjects" LookupSubjectsPageWire) (EnResult LookupSubjectsPageWire)
+    , expand ::
+        mode
+            :- "v1"
+                :> "expand"
+                :> ReqBody '[JSON] ExpandRequestWire
+                :> MultiVerb 'POST '[JSON] (EnResponses "The permission's subject tree" ExpandTreeWire) (EnResult ExpandTreeWire)
+    , watch ::
+        mode
+            :- "v1"
+                :> "watch"
+                :> ReqBody '[JSON] WatchRequestWire
+                :> MultiVerb 'POST '[JSON] (EnResponses "A batch of tuple changes, and a cursor to resume from" WatchResponseWire) (EnResult WatchResponseWire)
+    , mintGrant ::
+        mode
+            :- "v1"
+                :> "grants"
+                :> ReqBody '[JSON] MintGrantRequestWire
+                :> Post '[JSON] MintGrantResponseWire
+    , readSchema ::
+        mode
+            :- "v1"
+                :> "schema"
+                :> Get '[JSON] SchemaInfoWire
+    }
+    deriving stock (Generic)
+
+{- | Kept as a synonym so the many internal references to the name @EnAPI@ (and
+@apiProxy@'s type) keep reading naturally. @Server (NamedRoutes EnApi)@ is
+@EnApi (AsServerT Handler)@, so 'server' can still be spelled @Server EnAPI@.
+-}
+type EnAPI = NamedRoutes EnApi
 
 apiProxy :: Proxy EnAPI
 apiProxy = Proxy
 
 server :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> Server EnAPI
 server env =
-    writeTuplesHandler env
-        :<|> deleteTuplesHandler env
-        :<|> readRelationshipsHandler env
-        :<|> deleteRelationshipsHandler env
-        :<|> checkHandler env
-        :<|> batchCheckHandler env
-        :<|> lookupHandler env
-        :<|> lookupSubjectsHandler env
-        :<|> expandHandler env
-        :<|> watchHandler env
-        :<|> mintGrantHandler env
-        :<|> schemaHandler env
+    EnApi
+        { writeTuples = writeTuplesHandler env
+        , deleteTuples = deleteTuplesHandler env
+        , readRelationships = readRelationshipsHandler env
+        , deleteRelationships = deleteRelationshipsHandler env
+        , check = checkHandler env
+        , batchCheck = batchCheckHandler env
+        , lookup = lookupHandler env
+        , lookupSubjects = lookupSubjectsHandler env
+        , expand = expandHandler env
+        , watch = watchHandler env
+        , mintGrant = mintGrantHandler env
+        , readSchema = schemaHandler env
+        }
 
 app :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> Application
 app env =

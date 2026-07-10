@@ -32,8 +32,8 @@ module En.Client (
 import Prelude hiding (lookup)
 
 import Data.Text (Text)
-import Servant.API ((:<|>) (..))
-import Servant.Client (ClientM, client)
+import Servant.Client (ClientM)
+import Servant.Client.Generic (AsClientT, genericClient)
 
 import En.Servant.API
 
@@ -57,9 +57,11 @@ data EnClient = EnClient
     -- ^ Not an 'EnResult': @GET \/v1\/schema@ has no failure alternative to return into.
     }
 
-{- | The pattern match below is positional: its order must be the order of the operations
-in 'En.Servant.API.EnAPI'. Adding a route anywhere but the end silently re-binds every
-field after it, and the types will not catch it when the neighbours' shapes agree.
+{- | Built from servant's 'genericClient', which derives one client function per field of
+the 'En.Servant.API.EnApi' record. Association is by field name, so adding a route to the
+record cannot silently rebind the others — the fragility the positional @:\<|\>@
+destructuring this replaced was subject to. The @:: EnApi (AsClientT ClientM)@ annotation
+fixes the client monad to 'ClientM'.
 -}
 enClient :: EnClient
 enClient =
@@ -78,18 +80,20 @@ enClient =
         , readSchema
         }
   where
-    writeTuples
-        :<|> deleteTuples
-        :<|> readRelationships
-        :<|> deleteRelationships
-        :<|> check
-        :<|> batchCheck
-        :<|> lookup
-        :<|> lookupSubjects
-        :<|> expand
-        :<|> watch
-        :<|> mintGrant
-        :<|> readSchema = client apiProxy
+    EnApi
+        { writeTuples
+        , deleteTuples
+        , readRelationships
+        , deleteRelationships
+        , check
+        , batchCheck
+        , lookup
+        , lookupSubjects
+        , expand
+        , watch
+        , mintGrant
+        , readSchema
+        } = genericClient :: EnApi (AsClientT ClientM)
 
 {- | Ask for a read at least as fresh as a previous response's @checkedAt@.
 
