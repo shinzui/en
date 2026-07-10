@@ -65,6 +65,7 @@ import En.Tuple (
     Subject (..),
     Tuple (..),
  )
+import En.Watch (watchUnsupported)
 
 newtype DocumentView = DocumentView
     { documentId :: Text
@@ -117,6 +118,9 @@ mkEnv cStore tStore =
         , checkOperation = check
         , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
         , lookupSubjectsWithDeadlineOperation = LookupSubjects.lookupSubjectsWithDeadline
+        , -- This host serves its own guarded routes, not `EnAPI`, so nothing here can reach
+          -- the feed. The in-memory store keeps no history to feed it from either.
+          watchOperation = watchUnsupported
         , budget = defaultEvaluationBudget
         , maxBatchSize = 400
         , deadlineDefaultMillis = 3000

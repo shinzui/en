@@ -39,6 +39,7 @@ import En.Postgres.Database (Database, runDatabasePool, runSession)
 import En.Postgres.Datastore (resolveDatastoreIdSession)
 import En.Postgres.Revision (ConsistencyConfig (..), OptimizedRevisionCache, OptimizedRevisionConfig (..), newOptimizedRevisionCache, runConsistencyStorePostgres)
 import En.Postgres.TupleStore (runTupleStorePostgres, runTupleStorePostgresWithOptimizedRevisionCacheHandle)
+import En.Postgres.Watch qualified as Watch
 import En.Reachability (compile)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (Schema, ValidSchema, schemaHash, validateSchema)
@@ -275,6 +276,10 @@ runServe serverConfig validSchema pool config = do
                 , checkOperation
                 , lookupWithDeadlineOperation
                 , lookupSubjectsWithDeadlineOperation
+                , -- The feed reads the store and mints its own cursors; there is no
+                  -- decision cache to substitute, so it is `watch` partially applied to
+                  -- the datastore identity its cursors are stamped with.
+                  watchOperation = Watch.watch config
                 , budget
                 , maxBatchSize = serverConfig.maxBatchSize
                 , deadlineDefaultMillis = serverConfig.deadlineDefaultMillis

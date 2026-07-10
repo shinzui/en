@@ -14,7 +14,7 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
-import Effectful (IOE, runEff)
+import Effectful (Eff, IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Servant (Handler, ServerError (..), runHandler, type (:<|>) (..))
 
@@ -31,8 +31,8 @@ import En.Conformance.Kikan (
     testRevision,
  )
 import En.Decision (ResidualDecision)
-import En.Effect.ConsistencyStore (ConsistencyStore)
-import En.Effect.TupleStore (TupleStore)
+import En.Effect.ConsistencyStore (ConsistencyStore, mintToken)
+import En.Effect.TupleStore (ChangePage (..), RelationshipFilter, TupleStore, headRevision, readChanges)
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
@@ -46,6 +46,7 @@ import En.Servant.API (
     CaveatObligationWire (..),
     CaveatPayloadWire (..),
     CaveatValueWire (..),
+    ChangeKindWire (..),
     CheckDecisionWire (..),
     CheckRequestWire (..),
     CheckResponseWire (..),
@@ -76,8 +77,11 @@ import En.Servant.API (
     SubjectRelationFilterWire (..),
     SubjectWire (..),
     TupleCaveatWire (..),
+    TupleChangeWire (..),
     TupleFilterWire (..),
     TupleWire (..),
+    WatchRequestWire (..),
+    WatchResponseWire (..),
     WriteTuplesRequestWire (..),
     WriteTuplesResponseWire (..),
     server,
@@ -90,6 +94,7 @@ import En.Servant.Seam (
     faultToServerError,
  )
 import En.Tuple (ObjectRef (..))
+import En.Watch (WatchBatch (..), WatchStart (..))
 
 main :: IO ()
 main = do
@@ -108,6 +113,7 @@ main = do
                 , checkOperation = check
                 , lookupWithDeadlineOperation = Lookup.lookupWithDeadline
                 , lookupSubjectsWithDeadlineOperation = LookupSubjects.lookupSubjectsWithDeadline
+                , watchOperation = stubWatch
                 , budget = defaultEvaluationBudget
                 , maxBatchSize = 10
                 , deadlineDefaultMillis = 3000
@@ -512,6 +518,7 @@ writePreconditionTests env = do
             )
 
     relationshipEndpointTests env
+    watchEndpointTests env
   where
     bobOwnerTuple =
         TupleWire
@@ -570,7 +577,25 @@ openApiDocumentTests = do
         , "RelationshipsStateWire"
         , "DeleteRelationshipsRequestWire"
         , "DeleteRelationshipsResponseWire"
+        , "WatchRequestWire"
+        , "ChangeKindWire"
+        , "TupleChangeWire"
+        , "WatchResponseWire"
         ]
+
+    -- `limit` is the only required field of a watch request. A schema that also required
+    -- `cursor` would tell a code generator that a first poll is impossible.
+    assertEqual
+        "a watch request requires only its limit"
+        ["limit"]
+        (asTextList (document `at` "components" `at` "schemas" `at` "WatchRequestWire" `at` "required"))
+
+    -- The "cursor or startToken, never both" rule cannot be expressed in `required` either.
+    assertBool
+        "the watch request schema documents its start-position rule"
+        ( "startToken"
+            `Text.isInfixOf` asText (document `at` "components" `at` "schemas" `at` "WatchRequestWire" `at` "description")
+        )
 
     -- The filter's anchoring grammar cannot be expressed in `required`, so it must reach
     -- the reader through the description. Losing it makes the 400 look arbitrary.
@@ -599,6 +624,7 @@ openApiDocumentTests = do
         , "/v1/relationships/delete"
         , "/v1/relationships/delete-by-filter"
         , "/v1/relationships/query"
+        , "/v1/watch"
         ]
 
     asText :: Aeson.Value -> Text
@@ -651,6 +677,74 @@ emptyFilterWire =
 subjectFilterWire :: Text -> Text -> RelationshipFilterWire
 subjectFilterWire subjectType subjectId =
     relationshipFilterWire Nothing Nothing Nothing (Just subjectType) (Just subjectId) Nothing Nothing
+
+{- | The watch endpoint's wire surface, over 'stubWatch'.
+
+The store behind it reports every matching tuple as a touch, so what these assert is the
+handler's own work: that a start position is well-formed, that a filter is validated by the
+same grammar the relationship read uses, that the limit is positive and clamped, and that a
+batch always carries a cursor. The window's semantics belong to PostgreSQL and are asserted
+there.
+-}
+watchEndpointTests :: Env TestEffects -> IO ()
+watchEndpointTests env = do
+    let poll cursor startToken watchFilter limit =
+            watchHandler env WatchRequestWire{cursor, startToken, filter = watchFilter, limit}
+
+        okPoll label cursor startToken watchFilter limit =
+            runHandler (poll cursor startToken watchFilter limit) >>= \case
+                Right (EnOk response) -> pure response
+                other -> fail (label <> "\nexpected EnOk, got: " <> show other)
+
+        identify response =
+            [ (change.kind, change.tuple.object.objectType, change.tuple.object.objectId, change.tuple.relation)
+            | change <- response.changes
+            ]
+
+    fromNow <- okPoll "poll from now" Nothing Nothing Nothing 100
+    assertBool "a batch always carries a cursor" (not (Text.null fromNow.cursor))
+    assertEqual "a batch carries the token of the snapshot it ends at" testCheckedAt fromNow.checkedAt
+
+    -- A filter scopes the subscription, through the very grammar the relationship read uses.
+    scoped <- okPoll "poll alice's grants" Nothing Nothing (Just (subjectFilterWire "user" "alice")) 100
+    assertEqual
+        "a filtered subscription reports only the grants its filter names"
+        [ (TouchWire, "space", "project-x", "owner")
+        , (TouchWire, "intention", "42", "delegate")
+        ]
+        (identify scoped)
+
+    -- The limit is clamped to the server's page bound, not rejected above it.
+    let smallEnv = env{maxBatchSize = 1}
+    clamped <-
+        runHandler (watchHandler smallEnv WatchRequestWire{cursor = Nothing, startToken = Nothing, filter = Nothing, limit = 100}) >>= \case
+            Right (EnOk response) -> pure response
+            other -> fail ("expected a clamped page, got: " <> show other)
+    assertEqual "a limit above the server's bound is clamped, not rejected" 1 (length clamped.changes)
+
+    {- Exactly one start position. Supplying two is the mistake worth naming: a caller that
+    passes both a cursor and a token does not know where it wants to start, and choosing for
+    it would silently skip or replay a window of revocations. -}
+    assertEqual
+        "cursor and startToken together are a client error"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf (poll (Just "enwatch1.test.at.test-revision..") (Just "en1.token") Nothing 100)
+    assertEqual
+        "an empty cursor is a client error, not an implicit start-from-now"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf (poll (Just "") Nothing Nothing 100)
+    assertEqual
+        "an empty startToken is a client error"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf (poll Nothing (Just "") Nothing 100)
+    assertEqual
+        "a zero limit is a client error, because a drain over it would never advance"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf (poll Nothing Nothing Nothing 0)
+    assertEqual
+        "an unanchored subscription filter is a client error, exactly as it is for a read"
+        (Just "invalid_request")
+        =<< clientErrorCodeOf (poll Nothing Nothing (Just emptyFilterWire) 100)
 
 {- | The relationship query and delete-by-filter endpoints, against the in-memory store.
 
@@ -1147,6 +1241,48 @@ wireContractTests = do
         DeleteRelationshipsResponseWire{dryRun = False, count = 3, token = Just "en1.abc"}
 
     golden
+        "WatchRequestWire/fromNow"
+        "{\"cursor\":null,\"startToken\":null,\"filter\":null,\"limit\":100}"
+        WatchRequestWire{cursor = Nothing, startToken = Nothing, filter = Nothing, limit = 100}
+    golden
+        "WatchRequestWire/resumed"
+        "{\"cursor\":\"enwatch1.store.at.100:120:..\",\"startToken\":null,\"filter\":{\"subjectType\":\"user\",\"subjectId\":\"alice\"},\"limit\":50}"
+        WatchRequestWire
+            { cursor = Just "enwatch1.store.at.100:120:.."
+            , startToken = Nothing
+            , filter = Just (subjectFilterWire "user" "alice")
+            , limit = 50
+            }
+    -- Omitted is the same as null for every optional field: a first poll sends only a limit.
+    assertEqual
+        "WatchRequestWire decodes a body carrying only a limit"
+        (Just WatchRequestWire{cursor = Nothing, startToken = Nothing, filter = Nothing, limit = 100})
+        (decode "{\"limit\":100}")
+
+    golden "ChangeKindWire/touch" "\"touch\"" TouchWire
+    golden "ChangeKindWire/delete" "\"delete\"" DeleteWire
+    rejects "ChangeKindWire" (decode "\"rewritten\"" :: Maybe ChangeKindWire)
+
+    golden
+        "TupleChangeWire"
+        "{\"kind\":\"delete\",\"tuple\":{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"relation\":\"viewer\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"caveat\":null}}"
+        TupleChangeWire{kind = DeleteWire, tuple = viewerTuple}
+
+    -- checkedAt is last, as it is in every other read response.
+    golden
+        "WatchResponseWire"
+        "{\"changes\":[{\"kind\":\"touch\",\"tuple\":{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"relation\":\"viewer\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"caveat\":null}}],\"cursor\":\"enwatch1.store.at.100:120:..\",\"checkedAt\":\"en1.abc\"}"
+        WatchResponseWire
+            { changes = [TupleChangeWire{kind = TouchWire, tuple = viewerTuple}]
+            , cursor = "enwatch1.store.at.100:120:.."
+            , checkedAt = "en1.abc"
+            }
+    golden
+        "WatchResponseWire/caughtUp"
+        "{\"changes\":[],\"cursor\":\"enwatch1.store.at.100:120:..\",\"checkedAt\":\"en1.abc\"}"
+        WatchResponseWire{changes = [], cursor = "enwatch1.store.at.100:120:..", checkedAt = "en1.abc"}
+
+    golden
         "PreconditionWire/mustExist"
         "{\"kind\":\"mustExist\",\"filter\":{\"objectType\":\"space\",\"objectId\":\"project-x\",\"relation\":\"member\",\"subjectType\":\"user\",\"subjectId\":\"alice\",\"subjectRelation\":{\"match\":\"none\"}}}"
         (TupleMustExistWire (exactFilterWire "member" "alice"))
@@ -1253,6 +1389,7 @@ data Handlers = Handlers
     , lookup :: LookupRequestWire -> Handler (EnResult LookupPageWire)
     , lookupSubjects :: LookupSubjectsRequestWire -> Handler (EnResult LookupSubjectsPageWire)
     , expand :: ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
+    , watch :: WatchRequestWire -> Handler (EnResult WatchResponseWire)
     }
 
 handlers :: Env TestEffects -> Handlers
@@ -1267,6 +1404,7 @@ handlers env =
         , lookup = lookupEndpoint
         , lookupSubjects = lookupSubjectsEndpoint
         , expand = expandEndpoint
+        , watch = watchEndpoint
         }
   where
     writeTuplesEndpoint
@@ -1277,7 +1415,8 @@ handlers env =
         :<|> batchCheckEndpoint
         :<|> lookupEndpoint
         :<|> lookupSubjectsEndpoint
-        :<|> expandEndpoint = server env
+        :<|> expandEndpoint
+        :<|> watchEndpoint = server env
 
 batchHandler :: Env TestEffects -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
 batchHandler env = (handlers env).batchCheck
@@ -1299,6 +1438,27 @@ deleteTuplesHandler env = (handlers env).deleteTuples
 
 expandHandler :: Env TestEffects -> ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
 expandHandler env = (handlers env).expand
+
+watchHandler :: Env TestEffects -> WatchRequestWire -> Handler (EnResult WatchResponseWire)
+watchHandler env = (handlers env).watch
+
+{- | A watch feed over the in-memory store, standing in for 'En.Postgres.Watch.watch'.
+
+The real orchestration parses revisions as PostgreSQL snapshots, and this store's one
+revision is the text @test-revision@ — so the handler tests cannot call it, which is exactly
+why 'Env.watchOperation' is a field. What is under test here is the handler: request
+validation, the limit clamp, and the wire shape. The window's semantics are integration-
+tested against a real PostgreSQL in @en-postgres/integration-test/Main.hs@.
+
+The cursor is a constant. A drain loop is not being tested; a cursor being /present/ on
+every response is.
+-}
+stubWatch :: WatchStart -> Maybe RelationshipFilter -> Int -> Eff TestEffects WatchBatch
+stubWatch _start relationshipFilter limit = do
+    revision <- headRevision
+    checkedAt <- mintToken revision
+    page <- readChanges revision revision relationshipFilter limit Nothing
+    pure WatchBatch{changes = page.changes, cursor = "enwatch1.test.at.test-revision..", checkedAt}
 
 readRelationshipsHandler :: Env TestEffects -> ReadRelationshipsRequestWire -> Handler (EnResult ReadRelationshipsResponseWire)
 readRelationshipsHandler env = (handlers env).readRelationships

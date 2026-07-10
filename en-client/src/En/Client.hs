@@ -47,6 +47,7 @@ data EnClient = EnClient
     , lookup :: LookupRequestWire -> ClientM (EnResult LookupPageWire)
     , lookupSubjects :: LookupSubjectsRequestWire -> ClientM (EnResult LookupSubjectsPageWire)
     , expand :: ExpandRequestWire -> ClientM (EnResult ExpandTreeWire)
+    , watch :: WatchRequestWire -> ClientM (EnResult WatchResponseWire)
     }
 
 {- | The pattern match below is positional: its order must be the order of the operations
@@ -65,6 +66,7 @@ enClient =
         , lookup
         , lookupSubjects
         , expand
+        , watch
         }
   where
     writeTuples
@@ -75,7 +77,8 @@ enClient =
         :<|> batchCheck
         :<|> lookup
         :<|> lookupSubjects
-        :<|> expand = client apiProxy
+        :<|> expand
+        :<|> watch = client apiProxy
 
 {- | Ask for a read at least as fresh as a previous response's @checkedAt@.
 

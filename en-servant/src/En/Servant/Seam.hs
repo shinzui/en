@@ -35,7 +35,7 @@ import System.IO (stderr)
 import En.Budget (EvaluationBudget)
 import En.Check (CheckOutcome)
 import En.Effect.ConsistencyStore (ConsistencyStore)
-import En.Effect.TupleStore (TupleStore)
+import En.Effect.TupleStore (RelationshipFilter, TupleStore)
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
@@ -44,6 +44,7 @@ import En.Reachability (ReachabilityGraph)
 import En.Revision (Consistency)
 import En.Schema (RelationName)
 import En.Tuple (CaveatContext, ObjectRef, Subject)
+import En.Watch qualified as Watch
 
 type AppEffects = '[ConsistencyStore, TupleStore, Error EnError, Database, IOE]
 
@@ -55,6 +56,12 @@ data Env es = Env
     , lookupSubjectsWithDeadlineOperation :: !(Lookup.Deadline (Eff es) -> ReachabilityGraph -> Consistency -> LookupSubjects.LookupSubjectsRequest -> Eff es LookupSubjects.LookupSubjectsPage)
     {- ^ Takes a 'Lookup.Deadline', not a deadline of its own: the two traversals poll the
     same kind of live clock, and one @deadlineMillis@ ceiling governs both.
+    -}
+    , watchOperation :: !(Watch.WatchStart -> Maybe RelationshipFilter -> Int -> Eff es Watch.WatchBatch)
+    {- ^ One poll of the changelog feed. A field rather than a store call the handler makes
+    itself — unlike the relationship read, which is a 'TupleStore' effect and nothing more —
+    because the cursor codec is the datastore's, so only the host knows how to mint and
+    validate one. A host that serves no feed supplies 'Watch.watchUnsupported'.
     -}
     , budget :: !EvaluationBudget
     {- ^ Static evaluation bounds. The operations above are already partially

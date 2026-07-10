@@ -51,6 +51,10 @@ module En.Servant.API (
     ReadRelationshipsResponseWire (..),
     DeleteRelationshipsRequestWire (..),
     DeleteRelationshipsResponseWire (..),
+    WatchRequestWire (..),
+    ChangeKindWire (..),
+    TupleChangeWire (..),
+    WatchResponseWire (..),
     relationshipFilterFromWire,
     objectRefToWire,
     objectRefFromWire,
@@ -109,11 +113,13 @@ import Servant.Server (ErrorFormatter, ErrorFormatters (..), defaultErrorFormatt
 import En.Check (BatchOutcome (..), BatchPair (..), CaveatObligation (..), CheckDecision (..), CheckOutcome (..), checkMany)
 import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), mintToken, resolveConsistency)
 import En.Effect.TupleStore (
+    ChangeKind (..),
     PageState (..),
     Precondition (..),
     RelationshipFilter (..),
     StoreCursor (..),
     SubjectRelationFilter (..),
+    TupleChange (..),
     TupleFilter (..),
     TuplePage (..),
     TupleRow (..),
@@ -152,6 +158,7 @@ import En.Tuple (
     Tuple (..),
     TupleCaveat (..),
  )
+import En.Watch qualified as Watch
 
 {- | The statuses any en operation can answer with, as response alternatives of the
 API type. Making them part of the type is what puts them in the generated OpenAPI
@@ -272,6 +279,9 @@ type EnAPI =
                 :<|> "expand"
                     :> ReqBody '[JSON] ExpandRequestWire
                     :> MultiVerb 'POST '[JSON] (EnResponses "The permission's subject tree" ExpandTreeWire) (EnResult ExpandTreeWire)
+                :<|> "watch"
+                    :> ReqBody '[JSON] WatchRequestWire
+                    :> MultiVerb 'POST '[JSON] (EnResponses "A batch of tuple changes, and a cursor to resume from" WatchResponseWire) (EnResult WatchResponseWire)
            )
 
 apiProxy :: Proxy EnAPI
@@ -288,6 +298,7 @@ server env =
         :<|> lookupHandler env
         :<|> lookupSubjectsHandler env
         :<|> expandHandler env
+        :<|> watchHandler env
 
 app :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> Application
 app env =
@@ -1441,6 +1452,132 @@ instance FromJSON DeleteRelationshipsResponseWire where
     parseJSON = withObject "DeleteRelationshipsResponseWire" \o ->
         DeleteRelationshipsResponseWire <$> o .: "dryRun" <*> o .: "count" <*> o .:? "token"
 
+{- | One poll of the changelog feed.
+
+Exactly one start position. @cursor@ resumes a subscription; @startToken@ opens one at the
+snapshot an ordinary consistency token pins ("everything since my write"); both absent
+starts one at the current head, returning no changes and the cursor to poll with next.
+Both present is a @400@ — a caller that supplied two start positions does not know where it
+wants to start, and picking one for it would silently skip or replay history.
+
+There is no @consistency@ field, and its absence is the contract. A poll's window is fixed
+by its start position and the store's head; a resuming poll reads the window its cursor
+names and nothing else. A caller able to ask for a fresher snapshot mid-drain could span two
+of them and receive a batch with gaps.
+
+@filter@ scopes the subscription. It is 'RelationshipFilterWire', unchanged, so "watch every
+grant naming @user:alice@" and "read every grant naming @user:alice@" are the same filter.
+-}
+data WatchRequestWire = WatchRequestWire
+    { cursor :: !(Maybe Text)
+    , startToken :: !(Maybe Text)
+    , filter :: !(Maybe RelationshipFilterWire)
+    , limit :: !Int
+    }
+    deriving stock (Eq, Show)
+
+instance ToJSON WatchRequestWire where
+    toJSON wire =
+        Aeson.object
+            [ "cursor" .= wire.cursor
+            , "startToken" .= wire.startToken
+            , "filter" .= wire.filter
+            , "limit" .= wire.limit
+            ]
+    toEncoding wire =
+        pairs
+            ( "cursor" .= wire.cursor
+                <> "startToken" .= wire.startToken
+                <> "filter" .= wire.filter
+                <> "limit" .= wire.limit
+            )
+
+instance FromJSON WatchRequestWire where
+    parseJSON = withObject "WatchRequestWire" \o ->
+        WatchRequestWire
+            <$> o .:? "cursor"
+            <*> o .:? "startToken"
+            <*> o .:? "filter"
+            <*> o .: "limit"
+
+{- | What happened to a tuple: it became live, or it stopped being live.
+
+A bare string rather than the discriminated object the other sum types carry, because it has
+no variant-specific fields to discriminate. It is itself the @kind@ discriminator of
+'TupleChangeWire'.
+-}
+data ChangeKindWire
+    = TouchWire
+    | DeleteWire
+    deriving stock (Eq, Show)
+
+instance ToJSON ChangeKindWire where
+    toJSON = \case
+        TouchWire -> Aeson.String "touch"
+        DeleteWire -> Aeson.String "delete"
+    toEncoding = \case
+        TouchWire -> toEncoding ("touch" :: Text)
+        DeleteWire -> toEncoding ("delete" :: Text)
+
+instance FromJSON ChangeKindWire where
+    parseJSON = Aeson.withText "ChangeKindWire" \case
+        "touch" -> pure TouchWire
+        "delete" -> pure DeleteWire
+        other -> unknownVariant "change kind" other ["touch", "delete"]
+
+data TupleChangeWire = TupleChangeWire
+    { kind :: !ChangeKindWire
+    , tuple :: !TupleWire
+    }
+    deriving stock (Eq, Show)
+
+instance ToJSON TupleChangeWire where
+    toJSON wire = Aeson.object ["kind" .= wire.kind, "tuple" .= wire.tuple]
+    toEncoding wire = pairs ("kind" .= wire.kind <> "tuple" .= wire.tuple)
+
+instance FromJSON TupleChangeWire where
+    parseJSON = withObject "TupleChangeWire" \o ->
+        TupleChangeWire <$> o .: "kind" <*> o .: "tuple"
+
+{- | A batch of changes, the cursor that resumes after them, and the snapshot they end at.
+
+@changes@ carries no order. It is the set difference of the live tuple set across the
+batch's window: transaction ids are assigned at transaction start and visibility flips at
+commit, so the store cannot say which of two changes happened first, and pretending
+otherwise would be a promise it could not keep. Order holds only /between/ batches.
+
+@cursor@ is always present, including on an empty batch — a caught-up consumer must still be
+able to poll again. It is opaque: the only thing to do with it is send it back.
+
+@changes@ can be empty while the feed still has more to give, because a grant written and
+retired inside one window contributes no event yet still consumes a page. A drain therefore
+ends when a poll's @cursor@ stops advancing, not at the first empty page.
+-}
+data WatchResponseWire = WatchResponseWire
+    { changes :: ![TupleChangeWire]
+    , cursor :: !Text
+    , checkedAt :: !Text
+    }
+    deriving stock (Eq, Show)
+
+instance ToJSON WatchResponseWire where
+    toJSON wire =
+        Aeson.object
+            [ "changes" .= wire.changes
+            , "cursor" .= wire.cursor
+            , "checkedAt" .= wire.checkedAt
+            ]
+    toEncoding wire =
+        pairs
+            ( "changes" .= wire.changes
+                <> "cursor" .= wire.cursor
+                <> "checkedAt" .= wire.checkedAt
+            )
+
+instance FromJSON WatchResponseWire where
+    parseJSON = withObject "WatchResponseWire" \o ->
+        WatchResponseWire <$> o .: "changes" <*> o .: "cursor" <*> o .: "checkedAt"
+
 newtype WriteTuplesResponseWire = WriteTuplesResponseWire
     { token :: Text
     }
@@ -1678,6 +1815,21 @@ expandHandler env request = enHandler do
             )
     pure (expandTreeToWire tree)
 
+{- | One poll of the changelog feed.
+
+@limit@ is clamped to 'maxBatchSize' rather than rejected above it, following the deadline's
+precedent: asking for as much as the server will give is reasonable, and the server decides
+how much that is. It must still be positive — a zero limit returns an empty page whose
+cursor equals the caller's own, so a drain loop over it never terminates and never advances.
+-}
+watchHandler :: Env es -> WatchRequestWire -> Handler (EnResult WatchResponseWire)
+watchHandler env request = enHandler do
+    start <- orInvalid (watchStartFromWire request.cursor request.startToken)
+    relationshipFilter <- orInvalid (traverse relationshipFilterFromWire request.filter)
+    limit <- orInvalid (positiveLimit request.limit)
+    batch <- engine env (env.watchOperation start relationshipFilter (min env.maxBatchSize limit))
+    pure (watchBatchToWire batch)
+
 objectRefToWire :: ObjectRef -> ObjectRefWire
 objectRefToWire ObjectRef{objectType = ObjectType objectType, objectId} =
     ObjectRefWire{objectType, objectId}
@@ -1799,6 +1951,38 @@ relationshipsPageToWire (ConsistencyToken checkedAt) TuplePage{rows, state} =
         , state = relationshipsStateToWire state
         , checkedAt
         }
+
+{- | Exactly one start position, or a client fault naming which rule was broken.
+
+An empty string is rejected rather than read as an absent field, as everywhere else in this
+module: @cursor: ""@ is a cursor this store never issued, and silently starting the feed
+from now in its place would tell a resuming consumer it was caught up while a window's worth
+of revocations went unread.
+-}
+watchStartFromWire :: Maybe Text -> Maybe Text -> Either Text Watch.WatchStart
+watchStartFromWire maybeCursor maybeStartToken =
+    case (maybeCursor, maybeStartToken) of
+        (Just _, Just _) -> Left "watch takes cursor or startToken, not both"
+        (Just cursor, Nothing)
+            | Text.null cursor -> Left "cursor must not be empty"
+            | otherwise -> Right (Watch.StartFromCursor cursor)
+        (Nothing, Just startToken)
+            | Text.null startToken -> Left "startToken must not be empty"
+            | otherwise -> Right (Watch.StartFromToken startToken)
+        (Nothing, Nothing) -> Right Watch.StartFromNow
+
+watchBatchToWire :: Watch.WatchBatch -> WatchResponseWire
+watchBatchToWire Watch.WatchBatch{changes, cursor, checkedAt = ConsistencyToken checkedAt} =
+    WatchResponseWire{changes = tupleChangeToWire <$> changes, cursor, checkedAt}
+
+tupleChangeToWire :: TupleChange -> TupleChangeWire
+tupleChangeToWire TupleChange{kind, tuple} =
+    TupleChangeWire{kind = changeKindToWire kind, tuple = tupleToWire tuple}
+
+changeKindToWire :: ChangeKind -> ChangeKindWire
+changeKindToWire = \case
+    ChangeTouch -> TouchWire
+    ChangeDelete -> DeleteWire
 
 relationshipsStateToWire :: PageState -> RelationshipsStateWire
 relationshipsStateToWire =

@@ -82,6 +82,7 @@ import En.Servant.API (
     CaveatObligationWire,
     CaveatPayloadWire,
     CaveatValueWire,
+    ChangeKindWire,
     CheckDecisionWire,
     CheckRequestWire,
     CheckResponseWire,
@@ -112,8 +113,11 @@ import En.Servant.API (
     SubjectRelationFilterWire,
     SubjectWire,
     TupleCaveatWire,
+    TupleChangeWire,
     TupleFilterWire,
     TupleWire,
+    WatchRequestWire,
+    WatchResponseWire,
     WriteTuplesRequestWire,
     WriteTuplesResponseWire,
     apiProxy,
@@ -581,6 +585,54 @@ instance ToSchema DeleteRelationshipsResponseWire where
                 partialObjectSchema
                     [("dryRun", primitive OpenApiBoolean), ("count", primitive OpenApiInteger)]
                     [("token", nullable textRef)]
+
+{- | Every field is optional but @limit@. The "exactly one start position" rule — @cursor@ or
+@startToken@ or neither, never both — is a constraint OpenAPI cannot express, so it lives in
+the description and is enforced by 'En.Servant.API.watchStartFromWire'.
+-}
+instance ToSchema WatchRequestWire where
+    declareNamedSchema _ = do
+        relationshipFilter <- declareSchemaRef (Proxy @RelationshipFilterWire)
+        pure $
+            NamedSchema (Just "WatchRequestWire") $
+                partialObjectSchema
+                    [("limit", primitive OpenApiInteger)]
+                    [ ("cursor", nullable textRef)
+                    , ("startToken", nullable textRef)
+                    , ("filter", nullable relationshipFilter)
+                    ]
+                    & description
+                        ?~ "Supply cursor to resume a subscription, startToken to start from the \
+                           \snapshot a consistency token pins, or neither to start from now. \
+                           \Supplying both is rejected with 400. There is no consistency field: a \
+                           \poll's window is fixed by its start position and the store's head."
+
+instance ToSchema ChangeKindWire where
+    declareNamedSchema _ =
+        pure $
+            NamedSchema (Just "ChangeKindWire") $
+                mempty
+                    & type_ ?~ OpenApiTypeSingle OpenApiString
+                    & enum_ ?~ [Aeson.String "touch", Aeson.String "delete"]
+
+instance ToSchema TupleChangeWire where
+    declareNamedSchema _ = do
+        kind <- declareSchemaRef (Proxy @ChangeKindWire)
+        tuple <- declareSchemaRef (Proxy @TupleWire)
+        pure (NamedSchema (Just "TupleChangeWire") (objectSchema [("kind", kind), ("tuple", tuple)]))
+
+instance ToSchema WatchResponseWire where
+    declareNamedSchema _ = do
+        change <- declareSchemaRef (Proxy @TupleChangeWire)
+        pure $
+            NamedSchema (Just "WatchResponseWire") $
+                objectSchema [("changes", arrayOf change), ("cursor", textRef), ("checkedAt", textRef)]
+                    & description
+                        ?~ "changes carries no order: it is the set difference of the live tuple set \
+                           \across the batch's window. cursor is always present, including on an empty \
+                           \batch, and is the only thing to send back. An empty changes array does not \
+                           \mean the feed is caught up; a caught-up feed returns a cursor equal to the \
+                           \one it was given."
 
 instance ToSchema PreconditionWire where
     declareNamedSchema _ = do
