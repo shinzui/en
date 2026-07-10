@@ -5,6 +5,7 @@ title: "Add a watch changelog API"
 kind: exec-plan
 created_at: 2026-07-07T15:25:10Z
 master_plan: "docs/masterplans/9-complete-the-en-api-surface.md"
+intention: intention_01kx4y4empedt9g83mprcrew89
 ---
 
 # Add a watch changelog API
@@ -44,9 +45,9 @@ Use a checklist to summarize granular steps. Every stopping point must be docume
 even if it requires splitting a partially completed task into two ("done" vs. "remaining").
 This section must always reflect the actual current state of the work.
 
-- [ ] M1: Define `ChangeKind`, `TupleChange`, `ChangePage` and the `ReadChanges` operation in `en-core/src/En/Effect/TupleStore.hs`; stub it in the in-memory interpreter (`en-core/src/En/Conformance/Kikan.hs`).
-- [ ] M1: Implement the window query in `en-postgres/src/En/Postgres/TupleStore.hs` (two `UNION ALL` arms with xmin bounds; id-keyset pagination within the window).
-- [ ] M1: Integration tests in `en-postgres/integration-test/Main.hs`: write→window shows touch; delete→window shows delete; create+delete inside one window is skipped; within-window pagination is complete and duplicate-free; `EXPLAIN` confirms the `created_xid`/`deleted_xid` indexes serve the arms.
+- [x] M1 (2026-07-09): Define `ChangeKind`, `TupleChange`, `ChangePage` and the `ReadChanges` operation in `en-core/src/En/Effect/TupleStore.hs`; stub it in the in-memory interpreter (`en-core/src/En/Conformance/Kikan.hs`). Also added `En.Watch` (`WatchStart`, `WatchBatch`, `watchUnsupported`) to en-core — see Decision Log.
+- [x] M1 (2026-07-09): Implement the window query in `en-postgres/src/En/Postgres/TupleStore.hs`. One statement with an `OR` of two xmin-bounded arms, not `UNION ALL`: the planner produces a `BitmapOr` over both xid indexes, so the fallback the plan reserved was not needed.
+- [x] M1 (2026-07-09): Integration tests in `en-postgres/integration-test/Main.hs` (`runWatchWindowScenario`): write→window shows touch; delete→window shows delete; create+delete inside one window is skipped; within-window pagination at `limit = 1` is complete and duplicate-free across rows that emit no event; a filtered window narrows to the grants it names; `EXPLAIN` confirms both xid indexes serve the arms under a `BitmapOr`.
 - [ ] M2: Watch cursor codec and validation in `en-postgres/src/En/Postgres/Watch.hs` (new module), including accepting an `en1.` consistency token as a start position and the GC-horizon expiry check; unit tests in `en-postgres/test/Main.hs`.
 - [ ] M2: The `watch` orchestration function (window selection, draining state machine, resumption cursor, `checkedAt` token) in `En.Postgres.Watch`, integration-tested.
 - [ ] M3: `POST /watch` route, wire DTOs, `Env.watchOperation`, server wiring, `EnClient.watch`; servant tests including the cursor-expired error path.
@@ -61,7 +62,47 @@ This section must always reflect the actual current state of the work.
 Document unexpected behaviors, bugs, optimizations, or insights discovered during
 implementation. Provide concise evidence.
 
-(None yet.)
+- 2026-07-09 (M1): the `OR` of the two window arms is index-served on the first attempt, so
+  the `UNION ALL` fallback this plan reserved is unnecessary. Against a 20,000-row
+  `relation_tuple` with a window opened after the bulk, `EXPLAIN (COSTS OFF)` gives:
+
+  ```text
+  Limit
+    ->  Sort
+          Sort Key: id
+          ->  Bitmap Heap Scan on relation_tuple
+                Recheck Cond: ((created_xid >= '803'::xid8) OR ((deleted_xid IS NOT NULL) AND (deleted_xid >= '803'::xid8)))
+                Filter: ((id > 0) AND (((created_xid >= '803'::xid8) AND pg_visible_in_snapshot(created_xid, '805:805:'::pg_snapshot) AND (NOT pg_visible_in_snapshot(created_xid, '803:803:'::pg_snapshot))) OR ((deleted_xid IS NOT NULL) AND (deleted_xid >= '803'::xid8) AND pg_visible_in_snapshot(deleted_xid, '805:805:'::pg_snapshot) AND (NOT pg_visible_in_snapshot(deleted_xid, '803:803:'::pg_snapshot)))))
+                ->  BitmapOr
+                      ->  Bitmap Index Scan on relation_tuple_created_xid_idx
+                            Index Cond: (created_xid >= '803'::xid8)
+                      ->  Bitmap Index Scan on relation_tuple_deleted_xid_idx
+                            Index Cond: ((deleted_xid IS NOT NULL) AND (deleted_xid >= '803'::xid8))
+  ```
+
+  The `Index Cond` on each arm is exactly the `xmin` bound, which is what this plan claimed
+  it was for. `relation_tuple_created_xid_idx` — kept by `docs/plans/49` for this plan alone
+  — is now demonstrably load-bearing.
+
+- 2026-07-09 (M1, a cost this plan should not hide): the plan above sorts. Neither xid index
+  carries `id`, so the bitmap scan cannot produce rows in `id` order and the keyset predicate
+  `id > $4` is a `Filter`, not an index condition. A drain of a window holding `W` changes at
+  page size `L` therefore re-scans and re-sorts all `W` matched rows on each of its `W/L`
+  pages, rather than seeking to the cursor. The window is bounded by the GC horizon, so this
+  is bounded, not unbounded — but a consumer that has been offline for most of `EN_GC_WINDOW`
+  pays it. It is acceptable for a polling feed and is not fixed here: the obvious remedy,
+  an index on `(created_xid, id)` plus one on `(deleted_xid, id)`, cannot serve an `OR` across
+  two different leading columns with a shared `id` ordering, so the real fix is the `UNION`
+  rewrite with per-arm keyset seeks. Recorded so a future plan can price it rather than
+  rediscover it.
+
+- 2026-07-09 (M1, paging): the resumption cursor must name the last row **fetched**, not the
+  last event **emitted**. A row created and retired inside one window is fetched by the
+  statement and then classified away, so a page can hold fewer events than its limit while
+  still having more to give. `changePageFromRows` therefore splits on raw rows and classifies
+  afterwards, and cannot reuse `pageFromRows`. The `limit = 1` drain in
+  `runWatchWindowScenario` is the assertion that catches getting this backwards: it places a
+  skipped row between two reported ones.
 
 
 ## Decision Log
@@ -98,6 +139,15 @@ Record every decision made while working on the plan.
 - Decision: The datastore-specific parts (cursor codec, validation, window orchestration) live in a new module `en-postgres/src/En/Postgres/Watch.hs`; en-core gets only the event/page types and the `ReadChanges` storage operation. The Servant handler reaches the orchestration through a new `Env.watchOperation` field.
   Rationale: Snapshot parsing and token codecs are PostgreSQL-specific (they live in `En.Postgres.Revision` today), and `en-servant` already depends on `en-postgres` (`En.Servant.Seam` imports `En.Postgres.Database`). Forcing a datastore-neutral watch abstraction through en-core would invent effects with exactly one real interpreter.
   Date: 2026-07-07
+- Decision: `WatchStart` and `WatchBatch` live in a new en-core module `En.Watch`, not in `En.Postgres.Watch` as the entry above says. Only `WatchCursorState`, the `enwatch1.` codec, its validation, and `watch` itself are datastore-specific.
+  Rationale: `Env.watchOperation`'s type mentions both. `en-servant`'s own test suite and `en-example` each build an `Env`, and neither depends on `en-postgres` — the test suite would have had to take the dependency purely to name a type whose two constructors carry `Text`. The types are genuinely neutral: the cursor is opaque `Text` at this layer, and `checkedAt` is a `ConsistencyToken`. `En.Watch` also carries `watchUnsupported`, the `watchOperation` an embedded host that serves no feed supplies; it raises rather than returning an empty batch with a fixed cursor, which a consumer would read as "caught up" forever.
+  Date: 2026-07-09
+- Decision: `ReadChanges` takes `Maybe RelationshipFilter` from the start rather than deferring the subscription filter to a later plan, and `WatchDraining` carries a `StoreCursor` rather than the `TupleRowId` this plan's sketch named.
+  Rationale: `docs/plans/50` has landed, so `RelationshipFilter`, `validateRelationshipFilter`, `relationshipFilterFromWire`, and the `compileFilter` predicate composition all exist; threading the filter through the window query costs one `compileFilter` call and one wire field, and adding it later would mean revisiting the storage operation, the effect, the stub, and the endpoint. `StoreCursor` is what `PageState`'s `HasMore` carries and what `readChanges` accepts, so carrying `TupleRowId` would mean converting at both ends of a value the store round-trips unchanged.
+  Date: 2026-07-09
+- Decision: A malformed watch cursor is `InvalidCursor`; an expired one is `InvalidConsistencyToken "watch cursor is older than the garbage-collection window"`.
+  Rationale: The plan's Decision Log only fixed the expired case. The two failures are different artifacts obtained different ways, which is precisely the distinction `En.Error.InvalidCursor`'s own Haddock draws — a cursor this store never issued is a client fault about a pagination token, and it maps to the stable wire code `invalid_cursor`, while an expired window is the token-staleness class and maps to `invalid_consistency_token`.
+  Date: 2026-07-09
 
 
 ## Outcomes & Retrospective

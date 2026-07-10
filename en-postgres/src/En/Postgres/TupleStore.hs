@@ -33,11 +33,14 @@ import Effectful.Dispatch.Dynamic (interpret_)
 import Effectful.Error.Static (Error, throwError)
 
 import En.Effect.TupleStore (
+    ChangeKind (..),
+    ChangePage (..),
     PageState (..),
     Precondition (..),
     RelationshipFilter (..),
     StoreCursor (..),
     SubjectRelationFilter (..),
+    TupleChange (..),
     TupleFilter (..),
     TuplePage (..),
     TupleRow (..),
@@ -60,6 +63,7 @@ import En.Postgres.Revision (
     newOptimizedRevisionCache,
     parsePgSnapshot,
     renderPgSnapshot,
+    revisionToPgSnapshot,
     storeOptimizedRevisionCache,
  )
 import En.Revision (
@@ -140,6 +144,10 @@ interpretTupleStorePostgres config readOptimizedRevision =
             (count, anchor) <- orThrow =<< runSession (deleteRelationshipsSession config relationshipFilter)
             token <- mintToken config anchor
             pure (count, token)
+        ReadChanges start end relationshipFilter limit cursor -> do
+            cursorId <- resolveCursor cursor
+            startXmin <- either throwError pure (windowStartXmin start)
+            orThrow =<< runSession (readChangesSession start end startXmin relationshipFilter limit cursorId)
         ApplyTupleWrites request -> do
             outcome <- orThrow =<< runSession (applyTupleWritesSession config request)
             anchor <- either (throwError . WritePreconditionFailed) pure outcome
@@ -458,6 +466,29 @@ countRelationshipsSession :: Revision -> RelationshipFilter -> Session Int64
 countRelationshipsSession revision relationshipFilter =
     Session.statement () (countRelationshipsStatement revision relationshipFilter)
 
+readChangesSession :: Revision -> Revision -> Word64 -> Maybe RelationshipFilter -> Int -> Int64 -> Session ChangePage
+readChangesSession start end startXmin relationshipFilter limit cursorId = do
+    let limitPlusOne = fromIntegral (max 0 limit + 1)
+    rows <- Session.statement () (readChangesStatement start end startXmin relationshipFilter limitPlusOne cursorId)
+    pure (changePageFromRows cursorId limit rows)
+
+{- | The window-start snapshot's @xmin@: the sargable bound the window query needs.
+
+Every transaction below a snapshot's @xmin@ is visible in it, so no row created or deleted
+by such a transaction can have /become/ visible inside a window starting there. The bound
+is therefore free of information — it excludes nothing the visibility predicates would
+have kept — and it is what turns each arm of the query from a sequential scan into a range
+scan over @relation_tuple_created_xid_idx@ or @relation_tuple_deleted_xid_idx@.
+
+A revision that is not a snapshot is a client fault, not a store failure: it reached here
+from a watch cursor or a consistency token the caller supplied.
+-}
+windowStartXmin :: Revision -> Either EnError Word64
+windowStartXmin revision =
+    case revisionToPgSnapshot revision of
+        Left err -> Left (InvalidConsistencyToken ("watch window start is not a PostgreSQL snapshot: " <> err))
+        Right snapshot -> Right snapshot.xmin
+
 {- | Match and retire in one transaction, returning the count and the anchor.
 
 The count and the anchor's token therefore describe the same set of rows. Read the
@@ -647,6 +678,103 @@ deleteRelationshipsStatement writeXid relationshipFilter =
                    , "SELECT count(*) FROM deleted"
                    ]
     encoder = constTextParam writeXid <> filterEncoder
+
+{- | Every row whose live-set membership changed in the window @(start, end]@, one keyset
+page at a time.
+
+A row's creation /became visible/ in the window exactly when it is visible in @end@ and not
+in @start@, and likewise for its deletion; the live set at either end is the rows whose
+creation is visible there and whose deletion is not. So the two arms of the @OR@ are the
+two ways a row can differ between the ends, and the two booleans the statement selects say
+which happened. Classification is 'changePageFromRows'' job, because "created and deleted
+inside one window" is a row that satisfies both and must contribute nothing.
+
+@created_xid >= $3::xid8@ and its @deleted_xid@ twin are 'windowStartXmin''s bound. Without
+them each arm reads the whole table on every poll. With them, @relation_tuple_created_xid_idx@
+and the partial @relation_tuple_deleted_xid_idx@ each serve their arm, and the planner
+combines them under a @BitmapOr@.
+
+The filter's predicates are composed rather than sent as @($n IS NULL OR column = $n)@
+guards, for the reason 'compileFilter' gives at length: such a guard is opaque to a generic
+plan, and hasql prepares its statements.
+-}
+readChangesStatement :: Revision -> Revision -> Word64 -> Maybe RelationshipFilter -> Int64 -> Int64 -> Statement () [ChangeRow]
+readChangesStatement start end startXmin relationshipFilter limitPlusOne cursorId =
+    Statement.preparable sql encoder (Decoders.rowList changeRowDecoder)
+  where
+    (predicates, filterEncoder) = maybe ([], mempty) (compileFilter 6) relationshipFilter
+    sql =
+        Text.unlines $
+            [ "SELECT id, object_type, object_id, relation, subject_type, subject_id, subject_relation,"
+            , "       caveat_name, caveat_payload, created_xid::text, deleted_xid::text,"
+            , "       ( pg_visible_in_snapshot(created_xid, $2::pg_snapshot)"
+            , "         AND NOT pg_visible_in_snapshot(created_xid, $1::pg_snapshot) ) AS created_in_window,"
+            , "       ( deleted_xid IS NOT NULL"
+            , "         AND pg_visible_in_snapshot(deleted_xid, $2::pg_snapshot)"
+            , "         AND NOT pg_visible_in_snapshot(deleted_xid, $1::pg_snapshot) ) AS deleted_in_window"
+            , "FROM relation_tuple"
+            , "WHERE id > $4"
+            , "  AND ( ( created_xid >= $3::xid8"
+            , "          AND pg_visible_in_snapshot(created_xid, $2::pg_snapshot)"
+            , "          AND NOT pg_visible_in_snapshot(created_xid, $1::pg_snapshot) )"
+            , "     OR ( deleted_xid IS NOT NULL"
+            , "          AND deleted_xid >= $3::xid8"
+            , "          AND pg_visible_in_snapshot(deleted_xid, $2::pg_snapshot)"
+            , "          AND NOT pg_visible_in_snapshot(deleted_xid, $1::pg_snapshot) ) )"
+            ]
+                <> fmap ("  AND " <>) predicates
+                <> [ "ORDER BY id ASC"
+                   , "LIMIT $5"
+                   ]
+    encoder =
+        constTextParam start.revisionEncoding
+            <> constTextParam end.revisionEncoding
+            -- As in 'reapDeletedTuplesStatement': hasql has no @xid8@ encoder, and an
+            -- @xid8@ does not fit a signed @int8@ near wraparound, so it travels as text.
+            <> constTextParam (Text.pack (show startXmin))
+            <> constInt8Param cursorId
+            <> constInt8Param limitPlusOne
+            <> filterEncoder
+
+-- | A row of 'readChangesStatement': the tuple, and the two visibility facts about it.
+type ChangeRow = (TupleRow, Bool, Bool)
+
+changeRowDecoder :: Decoders.Row ChangeRow
+changeRowDecoder =
+    (,,)
+        <$> tupleRowDecoder
+        <*> Decoders.column (Decoders.nonNullable Decoders.bool)
+        <*> Decoders.column (Decoders.nonNullable Decoders.bool)
+
+{- | Classify the fetched rows into events, and say where the next page resumes.
+
+Paging is decided on the /fetched/ rows and not on the emitted events, which is why this
+cannot reuse 'pageFromRows'. A row created and deleted inside the window emits nothing, so
+a page can hold fewer events than its limit and still have more to give; the resumption
+cursor must name the last row the statement returned regardless of whether it produced an
+event, or the next page would re-read it.
+
+The classification is the 'ChangeKind' Haddock's rule. A row whose creation and deletion
+both became visible here is a net no-op for the live set and is skipped: no consumer of
+this feed — cache invalidation, index sync, revocation — has anything to do about a grant
+that appeared and vanished between two snapshots it never observed.
+-}
+changePageFromRows :: Int64 -> Int -> [ChangeRow] -> ChangePage
+changePageFromRows cursorId limit rows =
+    let (visibleRows, extraRows) = splitAt (max 0 limit) rows
+        pageState =
+            case extraRows of
+                [] -> Exhausted
+                _ : _ ->
+                    case reverse visibleRows of
+                        [] -> HasMore (StoreCursor (Text.pack (show cursorId)))
+                        (lastRow, _, _) : _ -> HasMore (StoreCursor lastRow.rowId.rowIdEncoding)
+     in ChangePage{changes = concatMap classify visibleRows, state = pageState}
+  where
+    classify (row, createdInWindow, deletedInWindow)
+        | deletedInWindow && createdInWindow = []
+        | deletedInWindow = [TupleChange{kind = ChangeDelete, tuple = row.tuple, rowId = row.rowId}]
+        | otherwise = [TupleChange{kind = ChangeTouch, tuple = row.tuple, rowId = row.rowId}]
 
 {- | Answer a point-membership question with one indexed read.
 

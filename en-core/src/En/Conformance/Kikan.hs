@@ -55,11 +55,14 @@ import Effectful.State.Static.Local (evalState, get, modify, put)
 
 import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (..))
 import En.Effect.TupleStore (
+    ChangeKind (..),
+    ChangePage (..),
     PageState (..),
     Precondition (..),
     RelationshipFilter (..),
     StoreCursor (..),
     SubjectRelationFilter (..),
+    TupleChange (..),
     TupleFilter (..),
     TuplePage (..),
     TupleRow (..),
@@ -210,6 +213,20 @@ runTupleStoreInMemory initialTuples =
             let (retired, kept) = partition (matchesRelationshipFilter relationshipFilter) tuples
             put kept
             pure (fromIntegral (length retired), ConsistencyToken "in-memory-write")
+        {- This store keeps no history, so it cannot compute a set difference between two
+        snapshots. It reports every tuple matching the filter as a 'ChangeTouch', which is
+        what the window @(before-anything, now]@ would in fact contain, and is enough for a
+        handler test to exercise paging and the wire shape. The visibility algebra is
+        integration-tested against PostgreSQL, where it is real. -}
+        ReadChanges _ _ relationshipFilter limit cursor -> do
+            tuples <- get
+            let matching = maybe tuples (\requested -> filter (matchesRelationshipFilter requested) tuples) relationshipFilter
+                TuplePage{rows, state} = pageTuples limit cursor matching
+            pure
+                ChangePage
+                    { changes = [TupleChange{kind = ChangeTouch, tuple = row.tuple, rowId = row.rowId} | row <- rows]
+                    , state
+                    }
         ProbeTuples _ object relation subjects -> do
             tuples <- get
             pure

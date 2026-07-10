@@ -64,6 +64,7 @@ library
     En.Schema.TH
     En.Schema.Types
     En.Tuple
+    En.Watch
 
   build-depends:
     , base                  >=4.19 && <5

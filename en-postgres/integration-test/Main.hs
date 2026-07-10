@@ -12,7 +12,7 @@ import Data.Foldable (traverse_)
 import Data.Functor.Contravariant ((>$<))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
-import Data.List (sort)
+import Data.List (nub, sort)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -28,11 +28,14 @@ import En.Conformance.Kikan (matchesRelationshipFilter)
 import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), TokenMetadata (..))
 import En.Effect.ConsistencyStore qualified as ConsistencyStore
 import En.Effect.TupleStore (
+    ChangeKind (..),
+    ChangePage (..),
     PageState (..),
     Precondition (..),
     RelationshipFilter (..),
     StoreCursor (..),
     SubjectRelationFilter (..),
+    TupleChange (..),
     TuplePage (..),
     TupleRow (..),
     TupleStore (..),
@@ -80,6 +83,8 @@ main = do
         runReadAllTuplesScenario connection
         resetSchema connection
         runRelationshipFilterScenario connection
+        resetSchema connection
+        runWatchWindowScenario connection
         resetSchema connection
         runMigrationDedupeScenario connection
         Connection.release connection
@@ -1092,6 +1097,189 @@ runRelationshipFilterScenario connection = do
     -- Idempotent in effect: nothing is left live for the filter to retire.
     (again, _) <- runPgOrFail connection config (TupleStore.deleteRelationships aliceFilter)
     assertEqual "re-running the same delete retires nothing" 0 again
+
+{- | The visibility algebra of the changelog window, against a real PostgreSQL.
+
+Everything the feed promises is a claim about @pg_visible_in_snapshot@ over @created_xid@
+and @deleted_xid@, and none of it can be checked in memory: the in-memory store keeps no
+history and has one revision. So this is where the contract lives.
+
+Four claims. A write inside the window is a touch. A delete inside the window is a delete.
+A grant written /and/ retired inside one window is nothing at all — the live set is
+unchanged across it, and emitting a touch/delete pair would force consumers to order two
+events the store cannot order. And a drain at @limit = 1@ visits every change exactly once,
+including across the rows that emit no event, which is the case a paging bug hides in: the
+resumption cursor names the last row /fetched/, not the last event /emitted/.
+-}
+runWatchWindowScenario :: Connection.Connection -> IO ()
+runWatchWindowScenario connection = do
+    config <- testConfig
+    let space name = ObjectRef (ObjectType "space") name
+        grant name = Tuple (space name) (RelationName "viewer") (SubjectId (ObjectRef (ObjectType "user") "alice")) Nothing
+        kept = grant "kept"
+        retired = grant "retired"
+        ephemeral = grant "ephemeral"
+
+        changesBetween start end limit =
+            let step cursor seen = do
+                    ChangePage{changes, state} <-
+                        runPgOrFail connection config (TupleStore.readChanges start end Nothing limit cursor)
+                    let seenNow = seen <> changes
+                    case state of
+                        Exhausted -> pure seenNow
+                        HasMore next -> step (Just next) seenNow
+                        Truncated next -> step (Just next) seenNow
+             in step Nothing []
+
+        event kind tuple = (kind, tuple)
+        eventsOf = fmap (\change -> event change.kind change.tuple)
+
+    before <- runPgOrFail connection config TupleStore.headRevision
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [kept, retired])
+    afterWrites <- runPgOrFail connection config TupleStore.headRevision
+
+    writeWindow <- changesBetween before afterWrites 100
+    assertEqual
+        "a write becomes a touch in the window that first sees it"
+        (sort [event ChangeTouch kept, event ChangeTouch retired])
+        (sort (eventsOf writeWindow))
+
+    _ <- runPgOrFail connection config (TupleStore.deleteTuples [retired])
+    afterDelete <- runPgOrFail connection config TupleStore.headRevision
+
+    deleteWindow <- changesBetween afterWrites afterDelete 100
+    assertEqual
+        "a delete becomes a delete in the window that first sees it"
+        [event ChangeDelete retired]
+        (eventsOf deleteWindow)
+
+    caughtUp <- changesBetween afterDelete afterDelete 100
+    assertEqual "an empty window reports no changes" [] (eventsOf caughtUp)
+
+    {- The net-no-op rule. @retired@ was written before @afterWrites@ and deleted before
+    @afterDelete@, so the window spanning both sees its creation and its deletion become
+    visible together, and must report neither. @kept@ still reports its touch. -}
+    spanningWindow <- changesBetween before afterDelete 100
+    assertEqual
+        "a grant written and retired inside one window is not reported at all"
+        [event ChangeTouch kept]
+        (eventsOf spanningWindow)
+
+    {- Paging across a window whose middle row emits nothing. @ephemeral@ sits between
+    @kept@ and a later grant by row id, and is retired before the window closes, so a
+    drain at @limit = 1@ must step over it without losing the row after it. -}
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [ephemeral])
+    _ <- runPgOrFail connection config (TupleStore.deleteTuples [ephemeral])
+    let latecomers = [grant "late-a", grant "late-b"]
+    _ <- runPgOrFail connection config (TupleStore.writeTuples latecomers)
+    afterLatecomers <- runPgOrFail connection config TupleStore.headRevision
+
+    drained <- changesBetween before afterLatecomers 1
+    wholeWindow <- changesBetween before afterLatecomers 100
+    assertEqual
+        "a drain at limit 1 sees every change exactly once, across rows that emit none"
+        (sort (eventsOf wholeWindow))
+        (sort (eventsOf drained))
+    assertEqual
+        "the drained window is the live-set delta, and nothing else"
+        (sort (event ChangeTouch <$> (kept : latecomers)))
+        (sort (eventsOf drained))
+    assertEqual "a drain at limit 1 emits no duplicates" (length (eventsOf drained)) (length (nub (eventsOf drained)))
+
+    -- A filter narrows the window to the grants it names, without changing their kinds.
+    filtered <-
+        runPgOrFail
+            connection
+            config
+            ( TupleStore.readChanges
+                before
+                afterLatecomers
+                (Just (relationshipFilter (Just "space") (Just "late-a") Nothing Nothing Nothing AnySubjectRelation Nothing))
+                100
+                Nothing
+            )
+    assertEqual
+        "a filtered window reports only the grants the filter names"
+        [event ChangeTouch (grant "late-a")]
+        (eventsOf filtered.changes)
+
+    {- The sargability claim, which no assertion above can reach: on a table of three rows
+    every plan is a sequential scan, so the fixture is grown until the planner has a choice
+    to make. The window is then opened /after/ the bulk, so the xmin bound excludes almost
+    all of it — which is the shape a real poll has, and the shape the bound exists for. -}
+    runSessionOrFail connection (Session.statement 20000 seedHistoryStatement)
+    runSessionOrFail connection (Session.script "ANALYZE relation_tuple")
+    explainStart <- runPgOrFail connection config TupleStore.headRevision
+    _ <- runPgOrFail connection config (TupleStore.writeTuples [grant "explain-a"])
+    _ <- runPgOrFail connection config (TupleStore.deleteTuples [grant "explain-a"])
+    explainEnd <- runPgOrFail connection config TupleStore.headRevision
+    planLines <- runSessionOrFail connection (Session.statement () (explainWatchWindowStatement explainStart explainEnd))
+    let plan = Text.unlines planLines
+    assertBool
+        ("the window query must not sequentially scan relation_tuple; plan was:\n" <> Text.unpack plan)
+        (not (Text.isInfixOf "Seq Scan" plan))
+    assertBool
+        ("the created_xid arm must be index-served; plan was:\n" <> Text.unpack plan)
+        (Text.isInfixOf "relation_tuple_created_xid_idx" plan)
+    assertBool
+        ("the deleted_xid arm must be index-served; plan was:\n" <> Text.unpack plan)
+        (Text.isInfixOf "relation_tuple_deleted_xid_idx" plan)
+
+{- | Fill @relation_tuple@ with history, so the planner has a reason to prefer an index.
+
+Every row is created by this statement's own transaction, so they share one @created_xid@
+and sit below the @xmin@ of any snapshot taken afterwards — which is exactly the backlog a
+poll's window bound must exclude.
+-}
+seedHistoryStatement :: Statement Int64 ()
+seedHistoryStatement =
+    Statement.preparable
+        """
+        INSERT INTO relation_tuple
+          (object_type, object_id, relation, subject_type, subject_id, created_xid)
+        SELECT 'space', 'seed-' || n, 'viewer', 'user', 'seed-user-' || n, pg_current_xact_id()
+        FROM generate_series(1, $1) AS n
+        """
+        (Encoders.param (Encoders.nonNullable Encoders.int8))
+        Decoders.noResult
+
+{- | Ask the planner how it would answer a window query, with the bindings inlined.
+
+@EXPLAIN@ of a prepared statement reports the generic plan, which is not the plan the
+window's actual parameters produce — the same trap 'explainProbeStatement' documents.
+
+Both @*_xid_idx@ indexes must appear, under a @BitmapOr@. They serve nothing else in the
+tree (docs/plans/49's sweep measured @idx_scan = 0@ for @relation_tuple_created_xid_idx@
+across a driven workload and kept it for this plan alone), so this assertion is the only
+thing standing between the feed and a full scan of @relation_tuple@ on every poll. If it
+ever fails, the fix is to split the @OR@ into two @UNION@ arms — not to drop the assertion.
+-}
+explainWatchWindowStatement :: Revision -> Revision -> Statement () [Text]
+explainWatchWindowStatement start end =
+    Statement.preparable
+        ( Text.unlines
+            [ "EXPLAIN (COSTS OFF)"
+            , "SELECT id FROM relation_tuple"
+            , "WHERE id > 0"
+            , "  AND ( ( created_xid >= '" <> showText startXmin <> "'::xid8"
+            , "          AND pg_visible_in_snapshot(created_xid, " <> snapshotLiteral end <> ")"
+            , "          AND NOT pg_visible_in_snapshot(created_xid, " <> snapshotLiteral start <> ") )"
+            , "     OR ( deleted_xid IS NOT NULL"
+            , "          AND deleted_xid >= '" <> showText startXmin <> "'::xid8"
+            , "          AND pg_visible_in_snapshot(deleted_xid, " <> snapshotLiteral end <> ")"
+            , "          AND NOT pg_visible_in_snapshot(deleted_xid, " <> snapshotLiteral start <> ") ) )"
+            , "ORDER BY id ASC"
+            , "LIMIT 101"
+            ]
+        )
+        Encoders.noParams
+        (Decoders.rowList (Decoders.column (Decoders.nonNullable Decoders.text)))
+  where
+    snapshotLiteral revision = "'" <> revision.revisionEncoding <> "'::pg_snapshot"
+    startXmin =
+        case parsePgSnapshot start.revisionEncoding of
+            Right snapshot -> snapshot.xmin
+            Left _ -> 0
 
 {- | The batched touch protocol's retry ladder, which only a race can reach.
 

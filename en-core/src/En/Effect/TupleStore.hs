@@ -30,6 +30,10 @@ module En.Effect.TupleStore (
     readRelationships,
     countRelationships,
     deleteRelationships,
+    ChangeKind (..),
+    TupleChange (..),
+    ChangePage (..),
+    readChanges,
     Precondition (..),
     TupleWriteRequest (..),
     exactTupleFilter,
@@ -245,6 +249,46 @@ validateRelationshipFilter relationshipFilter
             AnySubjectRelation -> False
             _ -> not hasSubjectType
 
+{- | What happened to a tuple's membership of the live set across a revision window.
+
+Two kinds, not three. A tuple whose caveat was rewritten is a 'ChangeDelete' of the old
+row and a 'ChangeTouch' of the new one, because the store retires and re-inserts rather
+than updating in place — and that is the honest report: a consumer holding a decision
+derived from the old caveat must discard it.
+-}
+data ChangeKind
+    = -- | The tuple became live: it is in the live set at the window's end and was not at its start.
+      ChangeTouch
+    | -- | The tuple stopped being live: it was in the live set at the window's start and is not at its end.
+      ChangeDelete
+    deriving stock (Eq, Ord, Show)
+
+{- | One tuple's change, carrying the storage row it happened to.
+
+'rowId' is the row's identity, not the tuple's: a grant retired and rewritten under a new
+caveat produces two rows and therefore two 'rowId's. It is here because it is the key the
+window pages on, so a consumer that persists it can reason about where in a drain it is.
+-}
+data TupleChange = TupleChange
+    { kind :: !ChangeKind
+    , tuple :: !Tuple
+    , rowId :: !TupleRowId
+    }
+    deriving stock (Eq, Show)
+
+{- | One page of a revision window's changes.
+
+The changes are the /set difference/ of the live tuple set between two snapshots, so they
+carry no order among themselves; 'rowId' order is a pagination key, not an event order.
+Transaction ids are assigned at transaction start and visibility flips at commit, and
+those two orders need not agree, so no faithful total order of events exists to report.
+-}
+data ChangePage = ChangePage
+    { changes :: ![TupleChange]
+    , state :: !PageState
+    }
+    deriving stock (Eq, Show)
+
 {- | A fact the write transaction re-verifies before applying any change.
 
 This is Zanzibar's /lock tuple/: a writer names the facts its decision depended
@@ -390,6 +434,18 @@ data TupleStore :: Effect where
     counted. The returned count and token therefore describe the same set of rows.
     -}
     DeleteRelationships :: RelationshipFilter -> TupleStore m (Int64, ConsistencyToken)
+    {- | Every tuple whose live-set membership changed between the two revisions,
+    optionally narrowed by a filter, ordered by row id and keyset-paginated.
+
+    The changelog the watch feed is built from. It needs no new table: a store that
+    soft-deletes already records when each row entered and left the live set, so
+    "what changed between these two snapshots" is a question about the tuples
+    themselves. The revisions are a half-open window @(start, end]@, and a row whose
+    creation /and/ deletion both became visible inside it contributes nothing: the
+    live set is the same at both ends, and reporting a phantom pair would force every
+    consumer to order events the store cannot order.
+    -}
+    ReadChanges :: Revision -> Revision -> Maybe RelationshipFilter -> Int -> Maybe StoreCursor -> TupleStore m ChangePage
     HeadRevision :: TupleStore m Revision
     OptimizedRevision :: TupleStore m Revision
     OldestRetainedXid :: TupleStore m Word64
@@ -436,6 +492,15 @@ countRelationships revision relationshipFilter =
 deleteRelationships :: (TupleStore :> es) => RelationshipFilter -> Eff es (Int64, ConsistencyToken)
 deleteRelationships =
     send . DeleteRelationships
+
+{- | A page of the changes between two revisions. See 'ReadChanges'.
+
+The filter, when present, must have come from 'validateRelationshipFilter', for the reason
+'readRelationships' gives.
+-}
+readChanges :: (TupleStore :> es) => Revision -> Revision -> Maybe RelationshipFilter -> Int -> Maybe StoreCursor -> Eff es ChangePage
+readChanges start end relationshipFilter limit cursor =
+    send (ReadChanges start end relationshipFilter limit cursor)
 
 -- | An unguarded write: 'applyTupleWrites' with no preconditions and no deletes.
 writeTuples :: (TupleStore :> es) => [Tuple] -> Eff es ConsistencyToken
