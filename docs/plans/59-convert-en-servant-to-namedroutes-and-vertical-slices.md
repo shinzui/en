@@ -87,6 +87,24 @@ third conformance test** (every DTO's `ToJSON` validates against its own `ToSche
 Milestone 5 adds exactly those, so en matches meibo — the fullest reference — rather than
 trailing it.
 
+**A conformance audit against the canonical documents was run on 2026-07-21, after the five
+milestones landed, and its verdict is recorded in this plan.** The canonical repository is
+`/Users/shinzui/Keikaku/bokuno/haskell-jitsurei`, and its `api/` directory now holds *three*
+documents, not the two this plan was written against: `api/servant-routes.md` (the `NamedRoutes`
+and vertical-slice rules, plus the `MultiVerb` response convention), `api/openapi-from-types.md`
+(the derived-document recipe), and — added 2026-07-16, six days *after* this plan completed —
+`api/rfc7807-problem-details.md`, which standardizes the error *body* itself as an RFC 7807
+problem document served as `application/problem+json`. The audit's finding, in one sentence:
+**this plan's own two rules are fully met and every route, module, and OpenAPI obligation it
+undertook is satisfied, but four conventions that sit outside its scope are unmet in `en`** —
+the RFC 7807 error body (which postdates the work), the `MultiVerb` obligation on
+`POST /v1/grants`, the 500-versus-503 discipline for genuine internal faults, and the OpenAPI
+document's silence about the bearer authentication `en-server` actually enforces. Each is
+recorded below in Surprises & Discoveries with evidence, decided in the Decision Log, and
+carried as a named follow-up in Outcomes & Retrospective. None of them is repaired here: this
+plan is complete, and reopening it to absorb four unrelated contract changes would destroy the
+property that makes it reviewable.
+
 
 ## Progress
 
@@ -153,6 +171,24 @@ trailing it.
       The derivation is unchanged (`toOpenApi apiProxy`). `cabal build all`, `cabal test all`, and
       `just openapi` all pass. Added `openapi-hs` to the test stanza and an `en-openapi` executable
       stanza (`aeson-pretty`, `directory`).
+- [x] Conformance audit against `haskell-jitsurei/api/` (done 2026-07-21): read all three canonical
+      documents against the shipped `en` tree and the checked-in `docs/api/openapi.json`. **Both of
+      this plan's rules pass, and every Milestone 5 deliverable is present.** Confirmed:
+      `En.Servant.API` enumerates no routes with `:<|>` (the only `:<|>` in `en-servant` is the
+      `ServedAPI` mount in `OpenApi.hs`, which is the correct use); the five umbrella fields mount
+      five slice sub-records at one `"v1"` prefix, which is the shared-prefix shape the document
+      prescribes; the concept is a directory component in every slice path; `En.Client` is built
+      from `genericClient` and destructures by record pattern, so it never trips the
+      `OverloadedRecordDot`-on-route-fields pitfall; ten of twelve routes are `MultiVerb` over one
+      shared five-status list with a hand-written `AsUnion` and its exhaustiveness witness; and the
+      fork pins match the fleet cohort exactly (`openapi-hs` `965340a3…`, `servant-openapi-hs`
+      `7cbbc234…` — byte-identical to meibo, mori, and relay-pagination). Also confirmed: `en`
+      declares no `Header`, `QueryParam`, or `Capture` combinator anywhere, so the recipe's
+      `ToParamSchema` requirement and the fourth `ErrorFormatters` hook
+      (`headerParseErrorFormatter`) are both genuinely unreachable rather than forgotten. Four gaps
+      found, all outside this plan's scope, recorded in Surprises & Discoveries and carried as
+      follow-ups: the RFC 7807 error body, `POST /v1/grants` throwing rather than declaring, the
+      absent 500 arm, and the undocumented bearer authentication. No code changed.
 
 
 ## Surprises & Discoveries
@@ -269,6 +305,136 @@ trailing it.
   internals (`EnAPI` the type, `apiProxy`, `server`, `EnResult`). Under `NoFieldSelectors` the
   re-exported `EnApi (..)` field labels create no clashing top-level bindings, so the additive
   export is safe.
+
+- Discovery (2026-07-21, conformance audit): **the canonical API convention grew a third
+  document six days after this plan completed, and `en` does not implement it.**
+  `haskell-jitsurei/api/rfc7807-problem-details.md` was committed on 2026-07-16 (`8dfd8e5`,
+  "docs(api): add RFC 7807 problem-details error-body standard"); this plan's work landed
+  2026-07-10. The new rule is that *every* error body every service returns is an RFC 7807
+  problem document — a JSON object carrying `type` (always the string `"about:blank"` until a
+  service really hosts error-documentation URLs), `title` (a short human phrase, **stable per
+  code**, never request-specific), `status` (the HTTP status mirrored into the body, so the body
+  still identifies itself in a log line), and `detail` (the request-specific prose), plus two
+  extension members the fleet adds: `code` (the stable `snake_case` machine key clients branch
+  on) and `retryable`. It must be served under the media type `application/problem+json`, which
+  RFC 7807 §3 assigns and which is what makes the body self-describing to generic tooling. The
+  same commit added a banner to `api/servant-routes.md` saying its `ErrorEnvelopeWire` examples —
+  the ones written *from en's code* — now predate the convention. `en` today answers with
+  `ErrorEnvelopeWire` (`{code, message, retryable}`) under plain `application/json`, from four
+  separate surfaces: the `MultiVerb` alternatives in `En.Servant.Response`, the thrown
+  `ServerError`s built by `En.Servant.Seam.envelopeError`, the `envelopeFormatters` hook in
+  `En.Servant.API`, and `en-server`'s own WAI middleware (the `401`/`403`/`429` rejections in
+  `en-server/app/Middleware.hs`, which hard-code `(hContentType, "application/json")`). A grep
+  proves the convention has never been considered here — `grep -rn "7807\|problem+json" docs/`
+  matches nothing but the digits `27807` inside consistency-token examples. Note the migration is
+  mostly mechanical for `en` and *does not* rename anything a client reads: the document's own
+  instruction is to carry existing `code` strings forward verbatim, so en's `store_error`,
+  `unknown_relation`, `not_found`, and the rest survive; `message` becomes `detail`, and each code
+  gains a stable `title`. Structurally nothing this plan built changes — the response list, the
+  result sum, the hand-written `AsUnion`, and `faultToResult` all apply unchanged; only the
+  payload type and the error alternatives' combinator (`RespondAs ProblemJSON` in place of
+  `Respond`) differ. This is a separate ExecPlan's worth of work spanning `en-servant`,
+  `en-server`, and `en-client`, and is recorded as follow-up (1) below.
+
+- Discovery (2026-07-21, conformance audit): **`POST /v1/grants` answers two statuses that
+  exist in no type, no document, and no client signature.** `En.Check.Api.mintGrant` is a plain
+  `Post '[JSON] MintGrantResponseWire`, not a `MultiVerb`, and its handler throws: `err404` with
+  code `minting_disabled` when `Env.mint` is `Nothing`, `err403` with code `decision_not_allowed`
+  when the check comes back `Denied` or `Conditional`, and `faultToServerError` for its input
+  faults. This is exactly the anti-pattern `api/servant-routes.md` names ("Don't Throw
+  `ServerError` for Domain Errors — the 404 is invisible to the type, the OpenAPI doc, and the
+  client"), and the invisibility is observable in the checked-in artifact:
+
+  ```text
+  POST  /v1/grants     responses=['200', '400']   opId=createV1Grants
+  POST  /v1/check      responses=['200', '400', '412', '422', '503']   opId=createV1Check
+  ```
+
+  The `400` on `/v1/grants` is not en's — it is the one `servant-openapi-hs` derives from the
+  presence of a JSON request body. The `403` and `404` a caller will really receive are absent.
+  The same hole reaches `en-client`, whose `mintGrant` field is typed
+  `MintGrantRequestWire -> ClientM MintGrantResponseWire` rather than returning an `EnResult`, so
+  a caller must catch a transport-shaped `ClientError` to learn that minting is disabled. The
+  existing test at `en-servant/test/Main.hs` *asserts* the two-status document rather than
+  flagging it, which is how the gap survived: the assertion is honest about what is served, but it
+  pins the deviation instead of the convention. Note the canonical document anticipates precisely
+  this case in "The Tail Spans Two Sources": a status raised at the handler edge (a lookup that
+  returns `Nothing`, a decision that is not `Allowed`) is still a declared response alternative;
+  it is simply constructed where the condition is detected rather than routed through
+  `faultToResult`. The fix is a `MintGrantResponses` list carrying `403`/`404` alongside the
+  shared tail, not a widening of `EnResponses` — the other eleven operations can produce neither.
+  Recorded as follow-up (2). `GET /v1/schema` is the other non-`MultiVerb` route and is *not* a
+  finding: it reads an `IORef` and has no failure mode, its `200`-only document shape is asserted
+  deliberately, and the canonical rule's purpose (statuses in the type) is vacuously met.
+
+- Discovery (2026-07-21, conformance audit): **`en` folds genuine internal faults into a
+  retryable `503`, which the canonical document calls out by name.** `EnResponses` is
+  `200/400/412/422/503` with no `500` arm, and `En.Servant.Seam.enErrorToFault` maps every
+  `En.Error.StoreError` to `UnavailableFault` with `retryable = True` and the message "the tuple
+  store failed; retry later". That is right for an outage, and `api/servant-routes.md` agrees a
+  failed dependency is a 503 and not a 500. But it also says the converse is equally wrong, and
+  gives the exact counterexample `en` now contains: "a decode failure is not retryable, and
+  mislabelling it tells the caller to hammer a request that can never succeed." Two `StoreError`
+  producers in `en-postgres/src/En/Postgres/TupleStore.hs` are internal faults, not outages: the
+  hasql column decoder that fails a statement on an undecodable `caveat_payload`, and
+  `StoreError ("could not mint write token: " <> …)` at line 189 when a freshly built anchor will
+  not parse. Both were made loud deliberately by
+  `docs/plans/47-fail-loudly-on-storage-decode-errors-and-tighten-write-snapshots.md`, whose
+  Decision Log chose the row decoder as "the natural, unbypassable choke point" — the *detection*
+  is right and should stay; only the status and the `retryable` flag it lands on are wrong. A
+  client obeying `retryable` will retry a request that cannot ever succeed until it gives up. The
+  canonical guidance ("Omit the 500 arm only if the fault type provably has no internal case")
+  therefore does not license en's omission: `EnError` does have internal cases, they are just
+  spelled `StoreError`. This guidance predates the implementation — it landed in
+  `haskell-jitsurei` on 2026-07-09 (`1356289`, "docs(api): three gaps found while planning the
+  migrations") — so this is a real miss and not a moving target; it went unnoticed because this
+  plan's first Decision Log entry deliberately froze the response machinery. Fixing it means
+  splitting `StoreError` (or adding an `InternalFault`), adding a sixth `Respond 500` alternative,
+  a sixth `EnResult` constructor, and shifting the exhaustiveness witness to
+  `S (S (S (S (S (S impossible)))))`. Recorded as follow-up (3), and it should land *with* the RFC
+  7807 work, since both rewrite `EnResponses` and doing them separately means two breaking client
+  changes instead of one.
+
+- Discovery (2026-07-21, conformance audit): **the checked-in OpenAPI document describes an
+  unauthenticated API; the server it describes rejects unauthenticated requests.**
+  `docs/api/openapi.json` has no top-level `security`, no `securitySchemes` under `components`
+  (its only key is `schemas`), and no per-operation `security`. Meanwhile
+  `en-server/app/Middleware.hs` rejects every request that does not present a configured bearer
+  key in `Authorization`, answering `401` with `WWW-Authenticate: Bearer` — enabled by default,
+  and disabled only by the explicitly-warned `EN_AUTH_DISABLED=true`. The mismatch is structural,
+  not an oversight in the generator: `en`'s authentication is WAI middleware wrapped *around* the
+  servant `Application`, so it is nowhere in the API type, and a document derived from that type
+  cannot know about it. That layering is itself a deliberate and defensible difference from
+  `api/servant-routes.md`'s "Auth Goes on the Field, Not the Record" guidance, which assumes a
+  servant auth combinator: `en-servant` is a *library* that `nagare` and `kikan-en` embed inside
+  their own authenticated hosts, so baking one host's auth scheme into the shared route types
+  would be wrong. The consequence is nonetheless real and points the other way from the
+  layering's benefit — `api/openapi-from-types.md` asks that an authenticated API assert every
+  operation carries its security requirement, and a non-Haskell client generated from en's
+  artifact (the entire reason Milestone 5 checked it in) will emit code that sends no
+  `Authorization` header and gets a `401` on every call. The fix does not require moving auth into
+  the type: a `securitySchemes` entry plus a blanket security requirement can be added to
+  `enOpenApi` as post-derivation enrichment, exactly like `withOperationIds`, with a conformance
+  test asserting it. Recorded as follow-up (4).
+
+- Discovery (2026-07-21, conformance audit): **en's fork pins match the fleet cohort exactly, and
+  the one repository that diverges is not en.** `api/openapi-from-types.md` warns that
+  `openapi-hs` and `servant-openapi-hs` are coupled and that different services pinning different
+  commits will emit subtly different documents from equivalent types. Checking every
+  `cabal.project` in the workspace that mentions the forks:
+
+  ```text
+  en                  openapi-hs 965340a3…  servant-openapi-hs 7cbbc234…
+  meibo-project/meibo openapi-hs 965340a3…  servant-openapi-hs 7cbbc234…
+  mori-project/mori   openapi-hs 965340a3…  servant-openapi-hs 7cbbc234…
+  relay-pagination    openapi-hs 965340a3…  servant-openapi-hs 7cbbc234…
+  shomei              openapi-hs 89e9ed07…  servant-openapi   558b7b9e…  (different fork name)
+  ```
+
+  `en` is on the cohort tag with three other repositories; `shomei` is the outlier, on an older
+  `openapi-hs` and on `shinzui/servant-openapi` rather than `shinzui/servant-openapi-hs`. Nothing
+  to do in `en`; recorded so a future reader does not "fix" en's pins to match shomei's, which
+  would be backwards.
 
 
 ## Decision Log
@@ -400,6 +566,35 @@ trailing it.
   and gives each of the twelve operations a single owning slice.
   Date: 2026-07-10
 
+- Decision (2026-07-21): the four conformance gaps the audit found are recorded here and
+  carried as named follow-ups, but **not** repaired inside this plan; no sixth milestone is
+  added.
+  Rationale: this plan's contract with a reader is that it changed the *shape* of the API — the
+  route type, the module layout, and the document artifact — and changed no wire byte, no status,
+  and no error code. All four gaps break that contract: RFC 7807 rewrites every error body and its
+  media type, `POST /v1/grants` gains two declared statuses and a client signature change, the
+  500 arm adds a response alternative and an `EnResult` constructor, and the security scheme
+  changes the published document. Each is a visible contract change with its own downstream story
+  for `nagare` and `kikan-en`, and folding them into a completed refactor would make the refactor
+  unreviewable and the contract changes untraceable. They are also not independent: (1) and (3)
+  both rewrite `EnResponses` and should ship as one breaking client change rather than two. The
+  audit's job is to state the truth about where `en` stands; the repairs are their own plans.
+  Date: 2026-07-21
+
+- Decision (2026-07-21): resolve the loose end Milestone 5 left open — `enOpenApi` does **not**
+  set `servers`, and that omission is now deliberate rather than unrecorded.
+  Rationale: Milestone 5 said "optionally also set `servers .~ ["http://localhost:8080"]`, as
+  meibo does; note the choice in the Decision Log if you add it." It was not added and no note was
+  written, leaving a reader unable to tell an intentional omission from a forgotten step. The
+  omission is right for `en` and for a reason that does not apply to meibo: `en-servant` is a
+  library, and its two known consumers embed the API inside *their own* hosts at their own base
+  URLs, while `en-server` itself serves on a configurable `EN_PORT`. A checked-in artifact
+  asserting `http://localhost:8080` would be false for every real deployment and would seed that
+  URL into any client generated from it. The remaining members of the recipe's "enrichment the
+  types cannot carry" list — title, version, description, and stable `operationId`s — are all
+  present. This decision is cheap to reverse if `en` ever publishes a canonical public base URL.
+  Date: 2026-07-21
+
 - Decision: Do the `NamedRoutes` type change first (Milestone 1), the behavioral guard second
   (Milestone 2), and the module moves third (Milestone 3), in three separate commits.
   Rationale: interleaving a type-shape change with a file move produces a diff a reviewer
@@ -459,9 +654,67 @@ exact public interfaces, and no downstream file references the relocated interna
 export list is a proven superset — `OpenApi.hs`, the test, and `En.Client` all compile against
 their pre-existing `En.Servant.API` imports.
 
-**Follow-ups worth noting (out of scope here).** (1) `kikan-en`'s `cabal.project` should gain
+**Conformance audit against `haskell-jitsurei/api/` (2026-07-21).** After the milestones landed,
+`en` was read back against all three canonical documents to answer one question: did this work
+actually follow the fleet's API practices? For everything this plan undertook, yes — and the audit
+found nothing to repair inside its scope.
+
+Rule 1, `NamedRoutes` over a positional `:<|>` chain, is met without qualification.
+`En.Servant.API` contains no `:<|>` at all; the only occurrence anywhere in `en-servant` is
+`ServedAPI = EnAPI :<|> "v1" :> "openapi.json" :> Get '[JSON] OpenApi` in `OpenApi.hs`, which is
+`:<|>` used to *mount* an API next to another route — the one use the document endorses. The
+umbrella's five fields each mount a slice sub-record at the same `"v1"` prefix, which is the
+shared-prefix composition the document holds up as the whole point of the record form. Rule 2,
+modules by concept with the layer as the leaf, is met: `En/Tuple/Api.hs`, `En/Check/Api.hs`,
+`En/Lookup/Api.hs`, `En/Expand/Api.hs`, `En/Schema/Api.hs` — concept as a directory component,
+`Api` as the filename, never the reverse. The derived client is `genericClient`, and because
+`En.Client` destructures it with record patterns rather than dot syntax it never trips the
+document's `OverloadedRecordDot`-does-not-work-on-route-fields pitfall. The same-typed-transposition
+hazard remains inapplicable: all twelve routes still carry pairwise-distinct handler types, so no
+dispatch test is owed, and `routingTests` pins five paths end-to-end anyway.
+
+The OpenAPI recipe is met item for item: the forks are pinned by git URL and tag (never Hackage,
+never a local path) on the same cohort tag as meibo, mori, and relay-pagination; the document is
+derived by `toOpenApi apiProxy` and never hand-edited; the orphan `ToSchema` instances are confined
+to the single generator module under `-Wno-orphans`; `operationId`s are stable and deterministic;
+the artifact is written by an executable rather than a test, checked in with sorted keys and a
+trailing newline, and guarded by `just openapi`; and all three conformance properties are tested
+(exact path set, per-operation error responses, and `ToJSON`-validates-against-`ToSchema`). Two
+recipe items turned out to be vacuous for `en` rather than skipped: it declares no `Capture` or
+`QueryParam` anywhere, so no `ToParamSchema` is owed, and no `Header`, so the fourth
+`ErrorFormatters` hook has nothing to format. On the `MultiVerb` half, ten of twelve routes share
+one over-broad response list with a hand-written `AsUnion`, its exhaustiveness witness, and a total
+`faultToResult` — the design the canonical document was itself written from.
+
+Four gaps sit *outside* this plan and are unmet in `en`. They are stated plainly here because a
+reader coming to this plan for "does en follow the API practices" deserves the whole answer, and
+because three of the four are contract bugs a caller can hit today. In priority order:
+
+1. **The RFC 7807 error body is not adopted.** Every error `en` returns is the pre-7807
+   `ErrorEnvelopeWire` under `application/json`, from four surfaces (`MultiVerb` alternatives,
+   thrown `ServerError`s, `envelopeFormatters`, and `en-server`'s auth/rate-limit middleware).
+   The convention postdates this work by six days. Migration keeps every existing `code` verbatim
+   and every structure this plan built; it changes the payload type, the media type, and the error
+   alternatives' combinator (`RespondAs ProblemJSON`). Largest of the four, and the one that
+   touches `en-server` and `en-client` as well as `en-servant`.
+2. **`POST /v1/grants` throws its `403` and `404` instead of declaring them,** so neither the
+   checked-in document nor `en-client`'s `mintGrant` signature mentions statuses a caller will
+   really receive. Fix with a `MintGrantResponses` list carrying `403`/`404` beside the shared
+   tail — not by widening `EnResponses`, which the other eleven operations would then over-declare.
+3. **There is no `500` arm, and genuine internal faults are reported as retryable `503`s.**
+   Undecodable `caveat_payload`s and unparseable freshly-minted write tokens both surface as
+   `StoreError`, which `enErrorToFault` labels `retryable = True` — telling a client to retry a
+   request that can never succeed. Should ship together with (1), since both rewrite `EnResponses`
+   and downstream deserves one breaking change rather than two.
+4. **The document does not describe the bearer authentication `en-server` enforces.** No
+   `securitySchemes`, no `security`, while the middleware `401`s every unauthenticated request by
+   default. Fixable as post-derivation enrichment in `enOpenApi` (like `withOperationIds`) without
+   moving auth into the route types, which would be wrong for a library `nagare` and `kikan-en`
+   embed in their own hosts.
+
+**Other follow-ups worth noting (out of scope here).** (5) `kikan-en`'s `cabal.project` should gain
 `../../en/en-biscuit` and en's `biscuit-haskell`/OpenAPI `source-repository-package` pins so it can
-build against local `en` again — it has been stale since EP-55/57. (2) en has no general build CI
+build against local `en` again — it has been stale since EP-55/57. (6) en has no general build CI
 (only `bench.yml`); when one is added, `just openapi` should be a required step, as the plan notes.
 
 
@@ -688,8 +941,9 @@ error-model, OpenAPI, and handler tests) among others across packages. The `just
 
 ### The rules this plan implements
 
-These are recorded canonically in the `haskell-jitsurei` repository at `api/servant-routes.md`.
-Per the ExecPlan requirement of self-containment, the two rules are restated in full:
+These are recorded canonically in the `haskell-jitsurei` repository, whose working copy is at
+`/Users/shinzui/Keikaku/bokuno/haskell-jitsurei`, in `api/servant-routes.md`. Per the ExecPlan
+requirement of self-containment, the two rules are restated in full:
 
 1. **Define the API as a `NamedRoutes` record, never as a positional `:<|>` chain.** A record
    makes handler↔route association by field name. `:<|>` stays correct for *mounting* records
@@ -708,6 +962,27 @@ one file, so the URL structure dictates the module structure and every operation
 and handlers pile into one `API.hs` that nobody can own a slice of. With `NamedRoutes`, each
 concept exports its own route record and handler record, the umbrella record names them as
 fields, and several fields mount at the same `/v1` prefix.
+
+### The neighbouring documents this plan does *not* implement
+
+Two further canonical documents live beside `api/servant-routes.md`, and a reader should know
+which of them this plan is answerable for. `api/openapi-from-types.md` is the derived-document
+recipe, and Milestone 5 implements it in full — so this plan *is* answerable for it.
+`api/rfc7807-problem-details.md` was added on 2026-07-16, six days after this plan's work landed,
+and this plan does **not** implement it; a later plan must. Its rule, stated here so a reader need
+not fetch it: every error body every service returns is an RFC 7807 problem document — a JSON
+object with `type` (the literal string `"about:blank"` unless the service really hosts error
+documentation at a URL), `title` (a short human phrase that is *stable for a given code*, never
+request-specific), `status` (the HTTP status repeated inside the body so the body still identifies
+itself when separated from its response), `detail` (the request-specific prose), plus two extension
+members: `code`, the stable `snake_case` key clients branch on, and `retryable` — and it must be
+served under the media type `application/problem+json`, not `application/json`. In a `MultiVerb`
+API the way to say this is the stock servant 0.20 combinator
+`RespondAs ProblemJSON <status> <description> ProblemDetails` in place of `Respond`, which pins
+that one alternative's Content-Type regardless of the verb's content-type list. `en` answers with
+its own `ErrorEnvelopeWire` (`{code, message, retryable}`) under `application/json` everywhere, so
+it does not meet this; the 2026-07-21 audit recorded the gap and its scope, and nothing in this
+plan should be edited to look as though it were addressed.
 
 
 ## Plan of Work
@@ -1556,7 +1831,76 @@ grep -n ':<|>' en-servant/src/En/Servant/API.hs
 ```
 
 Expected: no matches (the umbrella record has no `:<|>`; the only `:<|>` left in `en-servant`
-is the OpenAPI *mount* in `OpenApi.hs`, which is correct).
+is the OpenAPI *mount* in `OpenApi.hs`, which is correct). Widen it to the whole package to see
+where the remaining ones live:
+
+```bash
+grep -rn ':<|>' en-servant/src | sed 's/:.*//' | sort | uniq -c
+```
+
+Expected: exactly one file, with three occurrences — `en-servant/src/En/Servant/OpenApi.hs`, at its
+import of `type (:<|>) (..)`, the `ServedAPI` type, and the `server env :<|> pure enOpenApi`
+assembly in `appWithOpenApi`. Any hit in a slice or in `API.hs` means a route list regressed to a
+positional chain.
+
+### Re-running the conformance audit
+
+These commands reproduce the 2026-07-21 audit from the repository root. Run them after any change
+to the API surface; each one answers a single question from the canonical documents, so a reader
+can tell which practice a red result corresponds to.
+
+The document's per-operation statuses, operation ids, and media types — the single most
+informative view of the whole contract:
+
+```bash
+python3 - <<'PY'
+import json
+d = json.load(open("docs/api/openapi.json"))
+print("openapi:", d["openapi"], "| servers:", d.get("servers"),
+      "| components:", sorted(d.get("components", {})), "| security:", "security" in d)
+for p in sorted(d["paths"]):
+    for m, o in d["paths"][p].items():
+        if m in ("get", "post", "put", "delete"):
+            ct = set()
+            for r in o.get("responses", {}).values():
+                ct |= set(r.get("content", {}))
+            print("%-5s %-38s %s opId=%s sec=%s ct=%s"
+                  % (m.upper(), p, sorted(o.get("responses", {})),
+                     o.get("operationId"), o.get("security"), sorted(ct)))
+PY
+```
+
+Expected today: `3.1.0`, `servers: None` (a recorded decision — see the Decision Log), components
+holding only `schemas`, no top-level `security`; ten `POST`s each listing
+`['200', '400', '412', '422', '503']`; `GET /v1/schema` listing `['200']`; and
+`POST /v1/grants` listing only `['200', '400']`. The last two lines are the audit's findings (2)
+and (4): grants throws statuses it does not declare, and nothing anywhere states that the server
+requires a bearer key. The `ct=` column shows `application/json` — under the RFC 7807 convention
+every error alternative would instead read `application/problem+json`, which is finding (1).
+
+Whether the RFC 7807 shape has been adopted at all:
+
+```bash
+grep -rn "problem+json\|ProblemDetails\|RespondAs" en-servant/src en-server/app en-client/src | wc -l
+grep -rn "application/json" en-servant/src/En/Servant/Seam.hs en-server/app/Middleware.hs | wc -l
+```
+
+Expected today: `0` and `4` — no problem-details machinery anywhere, and four hard-coded
+`application/json` error content types (one in `envelopeError`, three in the middleware's
+`401`/`403` responses). After follow-up (1) lands these numbers invert.
+
+Whether the fork pins still match the fleet cohort (the coupled-tag rule):
+
+```bash
+grep -A3 -E "openapi-hs" /Users/shinzui/Keikaku/bokuno/en/cabal.project \
+                         /Users/shinzui/Keikaku/bokuno/meibo-project/meibo/cabal.project \
+  | grep -E "location:|tag:"
+```
+
+Expected: `en` and `meibo` name the same two fork URLs and the same two tags
+(`965340a30fad0782f2c964ab97b4ab0f12fa044d` for `openapi-hs`,
+`7cbbc234cb7c0e900495b2f676e2912a7f456ff0` for `servant-openapi-hs`). A divergence means one of
+the two repositories will emit a subtly different document from equivalent types.
 
 Downstream proof — both external consumers build against the new layout with no edits:
 
@@ -1711,3 +2055,33 @@ throughout, because `en-server`, `en-example`, `nagare`, and `kikan-en` import t
   falsification and cites meibo. En's actual work is unchanged: it still converts to `NamedRoutes`
   for the vertical-slice split, the derived client, and uniformity. Reflected in *Terms used in
   this plan*, Milestone 2, *Surprises & Discoveries*, and this note.
+
+- 2026-07-21 — Audited the shipped code against the canonical API practices in
+  `/Users/shinzui/Keikaku/bokuno/haskell-jitsurei/api/` and recorded the verdict. Reason: this
+  plan asserts conformance with those documents in several places — its Purpose calls en "the
+  reference implementation of the `MultiVerb` convention" and Milestone 5 claims en "matches
+  meibo" — and those assertions had never been checked back against the delivered tree, nor
+  against the canonical documents as they now stand. Two things changed the picture since the
+  work landed on 2026-07-10: the `api/` directory gained a *third* document
+  (`rfc7807-problem-details.md`, committed 2026-07-16), and the code itself was read end to end
+  rather than trusted. **The audit changed no code and no milestone; every claim this plan makes
+  about its own two rules held.** What it added: (a) a Purpose paragraph naming all three canonical
+  documents and stating the verdict up front, so a reader is not left with the older two-document
+  framing; (b) a new *The neighbouring documents this plan does not implement* subsection under
+  Context and Orientation, restating the RFC 7807 wire shape in full — per the self-containment
+  requirement — and stating plainly that this plan does not implement it; (c) a checked Progress
+  entry for the audit itself, listing what was verified positively (no `:<|>` enumerating routes,
+  concept-as-directory in every slice, `genericClient`, the hand-written `AsUnion`, cohort-matched
+  fork pins, and two recipe items that are vacuous for en because it declares no `Capture`,
+  `QueryParam`, or `Header`); (d) five Surprises & Discoveries entries, four recording gaps with
+  evidence — the unadopted RFC 7807 body, `POST /v1/grants` throwing a `403`/`404` that reach no
+  document or client signature, the missing `500` arm that mislabels decode failures as retryable
+  `503`s, and an OpenAPI document silent about the bearer auth `en-server` enforces — and one
+  recording a clean result (en is on the fleet's fork tags; shomei is the outlier); (e) two
+  Decision Log entries, one scoping the four gaps out of this plan and explaining why folding them
+  in would destroy its reviewability, and one closing Milestone 5's unrecorded `servers` loose end
+  as a deliberate omission; (f) an *Conformance audit* subsection in Outcomes & Retrospective
+  giving the rule-by-rule verdict and renumbering the follow-up list from two entries to six; and
+  (g) a *Re-running the conformance audit* subsection in Validation and Acceptance with the exact
+  commands and today's expected output, so the audit is reproducible rather than a one-time
+  opinion. Nothing in the plan was edited to look as though a gap had been addressed.
