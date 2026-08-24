@@ -65,7 +65,7 @@ the local development database in `db/` is recreated from scratch as part of the
 - [x] Milestone 3 (2026-08-24T14:50Z): ship the `en-migrate` executable and rewire the developer workflow (`Justfile`, `process-compose.yaml`).
 - [x] Milestone 4 (2026-08-24T14:55Z): make the tests use the real plan — `en-postgres` integration suite migrates with `pg-migrate-test-support`, hand-written `schemaSql` deleted, plan-construction test added.
 - [x] Milestone 5 (2026-08-24T15:00Z): retire codd from en's prose and metadata — `README.md`, `mori.dhall`, `en-server/app/Main.hs` operator guidance — and delete `en-migrations/db/`.
-- [ ] Milestone 6: ADR distillation and retrospective.
+- [x] Milestone 6 (2026-08-24T15:05Z): ADR distillation and retrospective.
 
 
 ## Surprises & Discoveries
@@ -392,7 +392,99 @@ still documents codd and points `resource:` at the now-deleted `en-migrations/db
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+All six milestones are complete. en's schema is owned by `pg-migrate`, applied by the
+`en-migrate` executable, and described in exactly one place in the repository.
+
+### en's schema fingerprint
+
+```text
+en/0001-en-bootstrap position=1 kind=sql transaction=transactional
+checksum=4a265abb6513df8f7ac8a4faf9f0e4105257b3205075694a7a7fa20cdaf7ea96
+```
+
+That checksum is now the identity of en's schema. It is stored in every database that
+applies the migration, and `en-migrate verify` fails if the file's bytes ever stop matching
+it.
+
+### What was verified, and how
+
+  * **The squash is exact.** `pg_dump --schema-only` of the old six-file sequence and of the
+    bootstrap applied through `en-migrate up` (excluding `-N pgmigrate`) are identical, once
+    pg_dump 17's random `\restrict` nonce is filtered out. Both databases carry the same
+    seeded `en_gc_horizon` row.
+  * **Applying is idempotent.** Against a freshly created database, `up` reports
+    `applied_now` and a second `up` reports `already_applied` and changes nothing; `verify`
+    and `status` then agree with the plan.
+  * **Tampering is detected.** Appending one space to the applied SQL file makes `verify`
+    report `MigrationChecksumMismatch` and exit 2; reverting the byte restores exit 0.
+  * **A stray migration fails the build.** An unlisted `en-migrations/migrations/junk.sql`
+    fails compilation with `UnlistedSqlFiles ["junk.sql"]`.
+  * **The plan is inspectable without a database.** `plan`, `list`, and `check` all succeed
+    with no PostgreSQL involved and no `DATABASE_URL` set, in text and `--json`.
+  * **The service runs on the migrated schema.** `process-compose` brought up the full stack,
+    en-server minted its `en_datastore_metadata` row on the migrated database, and the HTTP
+    smoke test returned `allowed`.
+  * **Every test passes.** All eight suites, including the new `en-migrations-tests` and the
+    integration suite now running against the real plan.
+  * **Nothing claims codd.** Outside `docs/plans/`, `docs/masterplans/`, and the dated
+    `docs/reviews/` record, no reference remains.
+
+### What the plan got right
+
+Milestone 1 was rehearsed before the plan was written, and it landed exactly as described --
+same two `.cabal` lines, same resolved versions, no Haskell source change, no third surprise.
+Naming `cabal test en-biscuit` in advance as *the* signal for the `memory`-to-`ram` swap was
+the single most useful sentence in the plan: it turned "does it still typecheck" into "is it
+still correct".
+
+The Decision Log's argument for squashing held up under measurement rather than assertion.
+The dedupe `UPDATE` really does report `UPDATE 0` on a fresh database, and the index trim
+really does drop indexes the first file had just created.
+
+### What the plan got wrong, and what that cost
+
+Three things, all small, all recorded under Surprises & Discoveries:
+
+  * **`withMigratedDatabaseOptions` cannot serve this test suite.** It yields one connection;
+    four scenarios need the `EphemeralPg.Database` handle to open concurrent ones. Using
+    `runMigrationPlan` inside the existing `Pg.with` bracket meets the milestone's actual goal
+    with no churn in the suite's most delicate tests. Recorded as a Decision Log entry.
+  * **The Step 8 cabal file omits `DuplicateRecordFields`**, without which the executable's
+    `commandOutputFormat` does not compile. `pg-migrate`'s own `examples/basic` has it, which
+    is the lesson: read the upstream example before writing the integration, not after.
+  * **Step 10's diff is never empty as written**, because pg_dump 17.10 emits a random
+    per-invocation nonce.
+
+Two more things the plan could not have known: `en-server/app/Main.hs` and
+`en-postgres/integration-test/Main.hs` had both drifted from the repository's own `fourmolu`
+configuration, so touching either dragged a four-figure reformat along with it. Each was
+landed as a separate `style(...)` commit -- verified pure by checking that the file's
+identifier multiset was unchanged -- so this plan's functional diffs stayed at 21 and 179
+lines rather than 1415 and 4351.
+
+### Durable context recorded
+
+`docs/adr/` did not exist and no OKF bundle governed it, so two records were created as plain
+Markdown with no OKF frontmatter or invented Mori identity, per the ADR workflow's rule for a
+repository before ADR adoption:
+
+  * [ADR 1 — en's schema is an append-only pg-migrate component](../adr/0001-en-s-schema-is-an-append-only-pg-migrate-component.md)
+  * [ADR 2 — crypton 1.1 binds en's dependency closure through a biscuit-haskell fork](../adr/0002-crypton-1-1-binds-en-s-dependency-closure-through-a-biscuit-haskell-fork.md)
+
+Both capture things a future contributor would otherwise rediscover painfully: that editing an
+applied migration is forbidden and why, and that `allow-newer` on the crypton bound looks like
+a fix but is not one.
+
+### Left for someone else
+
+A concurrent process was writing `docs/capabilities/` (an OKF `capabilities` bundle) and a
+large `mori.dhall` `dependencyRefs` addition throughout this implementation. None of it was
+committed here. Two loose ends belong to whoever owns it:
+`docs/capabilities/postgres-migrations.md` still documents codd and points `resource:` at the
+deleted `en-migrations/db/migrations`, and the uncommitted `mori.dhall` still carries a
+`Schema.MoriRef` for `mzabani/codd` (corrected in the working tree, not committed by this
+plan). If that work later adds a profiled `docs/adr` bundle, the two ADRs above predate it and
+will need migrating with the `adopt-architecture-decisions` blueprint rather than hand-editing.
 
 
 ## Context and Orientation
