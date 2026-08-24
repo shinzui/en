@@ -18,6 +18,7 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Word (Word64)
+import Database.PostgreSQL.Migrate (defaultRunOptions, runMigrationPlan)
 import Effectful (Eff, IOE, liftIO, runEff, (:>))
 import Effectful.Dispatch.Dynamic (interpose, passthrough)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
@@ -45,6 +46,7 @@ import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError (..))
 import En.Lookup (LookupCursor (..), LookupLimit (..), LookupObject (..), LookupPage (..), LookupRequest (..), LookupState (..))
 import En.Lookup qualified as Lookup
+import En.Migrations (enMigrationPlan)
 import En.Postgres.Database (Database, runDatabaseConnection)
 import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgSnapshot, parsePgSnapshot, renderPgSnapshot, retainedHistoryVisible, runConsistencyStorePostgres, tokenMetadataFromPayload, transactionVisible)
 import En.Postgres.TupleStore (pruneTransactionsBatchSession, reapDeletedTuplesBatchSession, runTupleStorePostgres)
@@ -69,8 +71,8 @@ import Numeric (readDec)
 main :: IO ()
 main = do
   result <- Pg.with \database -> do
+    migrateDatabase database
     connection <- acquire database
-    resetSchema connection
     runTupleStoreScenario connection
     runProbeScenario connection
     runTouchSemanticsScenario connection
@@ -94,8 +96,6 @@ main = do
     runWatchWindowScenario connection
     resetSchema connection
     runWatchFeedScenario connection
-    resetSchema connection
-    runMigrationDedupeScenario connection
     Connection.release connection
   case result of
     Left err -> fail ("ephemeral-pg failed to start: " <> Text.unpack (Pg.renderStartError err))
@@ -107,11 +107,37 @@ acquire database =
     Right connection -> pure connection
     Left err -> fail ("Could not connect to PostgreSQL: " <> show err)
 
+-- | Apply the real migration plan, the same one @en-migrate up@ applies.
+--
+-- This suite used to carry its own copy of the schema in a Haskell string literal,
+-- which had already drifted -- it omitted @en_datastore_metadata@ entirely, so the
+-- tests proved en worked against a schema no real database had. Migrating here
+-- makes that drift structurally impossible.
+--
+-- @Pg.with@ is kept rather than @Database.PostgreSQL.Migrate.Test.withMigratedDatabase@
+-- because four scenarios need the 'Pg.Database' handle to open additional concurrent
+-- connections, and that helper yields only one connection.
+migrateDatabase :: Pg.Database -> IO ()
+migrateDatabase database = do
+  plan <- either (\planError -> fail ("en migration plan is invalid: " <> show planError)) pure enMigrationPlan
+  runMigrationPlan defaultRunOptions (Pg.connectionSettings database) plan >>= \case
+    Right _ -> pure ()
+    Left migrationError -> fail ("Could not migrate the test database: " <> show migrationError)
+
+-- | Wipe application state between scenarios without disturbing the ledger.
+--
+-- Truncating rather than dropping and recreating is what keeps pg-migrate's
+-- @pgmigrate@ ledger honest: dropping the application tables under a live ledger
+-- would leave it claiming a migration that no longer describes the database.
+-- @en_datastore_metadata@ needs no reset because this suite never writes to it.
 resetSchema :: Connection.Connection -> IO ()
 resetSchema connection =
-  Connection.use connection (Session.script schemaSql) >>= \case
-    Right () -> pure ()
-    Left err -> fail ("Could not reset schema: " <> show err)
+  Connection.use
+    connection
+    (Session.script "TRUNCATE relation_tuple, en_transaction RESTART IDENTITY; UPDATE en_gc_horizon SET horizon = 0;")
+    >>= \case
+      Right () -> pure ()
+      Left err -> fail ("Could not reset schema: " <> show err)
 
 runTupleStoreScenario :: Connection.Connection -> IO ()
 runTupleStoreScenario connection = do
@@ -1833,87 +1859,6 @@ testConfig = do
         gcWindow = "24 hours"
       }
 
--- | The migration's duplicate-resolution rule, against the schema it will meet.
---
--- Recreates the /old/ index shape, seeds the duplicate live rows only that shape
--- permits, then runs the migration's SQL and asserts the newest write survived.
--- The SQL below must stay in sync with
--- @en-migrations/db/migrations/20260709202037_touch-semantics-live-unique.sql@ --
--- the same convention 'schemaSql' follows for the base migration.
-runMigrationDedupeScenario :: Connection.Connection -> IO ()
-runMigrationDedupeScenario connection = do
-  runSessionOrFail connection (Session.script oldLiveUniqueSql)
-  runSessionOrFail connection (Session.script duplicateSeedSql)
-  liveBefore <- runSessionOrFail connection (Session.statement () (countStatement "SELECT count(*) FROM relation_tuple WHERE deleted_xid IS NULL"))
-  assertEqual "the old index shape admits one live row per caveat name" 3 liveBefore
-
-  runSessionOrFail connection (Session.script dedupeAndReindexSql)
-  liveAfter <- runSessionOrFail connection (Session.statement () (countStatement "SELECT count(*) FROM relation_tuple WHERE deleted_xid IS NULL"))
-  assertEqual "the migration leaves one live row per identity" 1 liveAfter
-
-  survivor <- runSessionOrFail connection (Session.statement () (textStatement "SELECT caveat_name FROM relation_tuple WHERE deleted_xid IS NULL"))
-  assertEqual "the migration keeps the row with the highest created_xid" ["newest"] survivor
-
-  retired <- runSessionOrFail connection (Session.statement () (countStatement "SELECT count(*) FROM relation_tuple WHERE deleted_xid IS NOT NULL"))
-  assertEqual "the migration soft-deletes the losers rather than removing them" 2 retired
-
--- | The pre-migration @relation_tuple_live_unique@, keyed on the caveat name too.
-oldLiveUniqueSql :: Text
-oldLiveUniqueSql =
-  """
-  DROP INDEX relation_tuple_live_unique;
-
-  CREATE UNIQUE INDEX relation_tuple_live_unique
-    ON relation_tuple
-      (object_type, object_id, relation, subject_type, subject_id, coalesce(subject_relation, ''), coalesce(caveat_name, ''))
-    WHERE deleted_xid IS NULL;
-  """
-
--- | Three live rows for one identity, distinguished only by caveat name, with
--- ascending @created_xid@. Only the pre-migration index shape permits this.
-duplicateSeedSql :: Text
-duplicateSeedSql =
-  """
-  INSERT INTO relation_tuple
-    (object_type, object_id, relation, subject_type, subject_id, caveat_name, created_xid)
-  VALUES
-    ('space', 'dupe', 'viewer', 'user', 'alice', 'oldest', '100'::xid8),
-    ('space', 'dupe', 'viewer', 'user', 'alice', 'middle', '200'::xid8),
-    ('space', 'dupe', 'viewer', 'user', 'alice', 'newest', '300'::xid8);
-  """
-
-dedupeAndReindexSql :: Text
-dedupeAndReindexSql =
-  """
-  WITH ranked AS (
-    SELECT id,
-           row_number() OVER (
-             PARTITION BY object_type, object_id, relation,
-                          subject_type, subject_id, coalesce(subject_relation, '')
-             ORDER BY created_xid DESC, id DESC
-           ) AS keep_rank
-    FROM relation_tuple
-    WHERE deleted_xid IS NULL
-  )
-  UPDATE relation_tuple
-  SET deleted_xid = pg_current_xact_id()
-  WHERE id IN (SELECT id FROM ranked WHERE keep_rank > 1);
-
-  DROP INDEX relation_tuple_live_unique;
-
-  CREATE UNIQUE INDEX relation_tuple_live_unique
-    ON relation_tuple
-      (object_type, object_id, relation, subject_type, subject_id, coalesce(subject_relation, ''))
-    WHERE deleted_xid IS NULL;
-  """
-
-textStatement :: Text -> Statement () [Text]
-textStatement sql =
-  Statement.preparable
-    sql
-    Encoders.noParams
-    (Decoders.rowList (Decoders.column (Decoders.nonNullable Decoders.text)))
-
 -- | Bounded-work maintenance: batched reap and batched prune.
 --
 -- Seeds a backlog larger than the batch size, drains it, and proves three properties the
@@ -2403,63 +2348,3 @@ userSubject =
 wildcardUserSubject :: Set.Set AllowedSubject
 wildcardUserSubject =
   Set.singleton AllowedSubject {objectType = ObjectType "user", relation = Nothing, wildcard = True}
-
-schemaSql :: Text
-schemaSql =
-  """
-  DROP TABLE IF EXISTS relation_tuple;
-  DROP TABLE IF EXISTS en_transaction;
-  DROP TABLE IF EXISTS en_gc_horizon;
-
-  -- The garbage-collection horizon's durable high-water mark; see
-  -- en-migrations/db/migrations/20260710150000_gc-horizon-high-water-mark.sql
-  -- and docs/plans/60 Milestone 4. Seeded to 0 so validation and the reaper
-  -- always find the singleton row.
-  CREATE TABLE en_gc_horizon
-    ( singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton)
-    , horizon bigint NOT NULL DEFAULT 0
-    );
-
-  INSERT INTO en_gc_horizon (singleton, horizon) VALUES (true, 0);
-
-  CREATE TABLE en_transaction
-    ( xid xid8 PRIMARY KEY
-    , snapshot pg_snapshot NOT NULL DEFAULT pg_current_snapshot()
-    , schema_hash text NOT NULL
-    , created_at timestamptz NOT NULL DEFAULT now()
-    );
-
-  CREATE TABLE relation_tuple
-    ( id bigserial PRIMARY KEY
-    , object_type text NOT NULL
-    , object_id text NOT NULL
-    , relation text NOT NULL
-    , subject_type text NOT NULL
-    , subject_id text NOT NULL
-    , subject_relation text NULL
-    , caveat_name text NULL
-    , caveat_payload jsonb NULL
-    , created_xid xid8 NOT NULL
-    , deleted_xid xid8 NULL
-    , CHECK ((subject_relation IS NULL) OR (subject_relation <> ''))
-    );
-
-  CREATE UNIQUE INDEX relation_tuple_live_unique
-    ON relation_tuple
-      (object_type, object_id, relation, subject_type, subject_id, coalesce(subject_relation, ''))
-    WHERE deleted_xid IS NULL;
-
-  CREATE INDEX relation_tuple_object_hist_idx
-    ON relation_tuple (object_type, object_id, relation, id);
-
-  CREATE INDEX relation_tuple_subject_hist_idx
-    ON relation_tuple
-      (subject_type, subject_id, coalesce(subject_relation, ''), object_type, relation, id);
-
-  CREATE INDEX relation_tuple_created_xid_idx
-    ON relation_tuple (created_xid);
-
-  CREATE INDEX relation_tuple_deleted_xid_idx
-    ON relation_tuple (deleted_xid)
-    WHERE deleted_xid IS NOT NULL;
-  """

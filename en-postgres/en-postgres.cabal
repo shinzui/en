@@ -82,9 +82,11 @@ test-suite en-postgres-integration-tests
     , effectful
     , effectful-core
     , en-core
+    , en-migrations
     , en-postgres
     , ephemeral-pg
     , hasql
+    , pg-migrate      ^>=1.1.0.0
     , text
     , time
 

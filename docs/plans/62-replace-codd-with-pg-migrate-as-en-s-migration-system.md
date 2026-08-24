@@ -63,7 +63,7 @@ the local development database in `db/` is recreated from scratch as part of the
 - [x] Milestone 1 (2026-08-24T14:32Z): unblock the dependency closure — widen the `biscuit-haskell` fork onto `crypton` 1.1 / `ram`, re-pin it in `cabal.project`, and prove `pg-migrate` 1.1.0.0 solves and builds inside en.
 - [x] Milestone 2 (2026-08-24T14:40Z): turn `en-migrations` into a `pg-migrate` component — new `en-migrations/migrations/` directory with `0001-en-bootstrap.sql` and `manifest`, rewritten `En.Migrations`, and a proof that the squashed bootstrap produces byte-identical schema to the old six-file sequence.
 - [x] Milestone 3 (2026-08-24T14:50Z): ship the `en-migrate` executable and rewire the developer workflow (`Justfile`, `process-compose.yaml`).
-- [ ] Milestone 4: make the tests use the real plan — `en-postgres` integration suite migrates with `pg-migrate-test-support`, hand-written `schemaSql` deleted, plan-construction test added.
+- [x] Milestone 4 (2026-08-24T14:55Z): make the tests use the real plan — `en-postgres` integration suite migrates with `pg-migrate-test-support`, hand-written `schemaSql` deleted, plan-construction test added.
 - [ ] Milestone 5: retire codd from en's prose and metadata — `README.md`, `mori.dhall`, `en-server/app/Main.hs` operator guidance — and delete `en-migrations/db/`.
 - [ ] Milestone 6: ADR distillation and retrospective.
 
@@ -270,6 +270,22 @@ That is the Milestone 3 acceptance signal: process-compose ran `just run-migrati
 start-and-test` 404s for someone else, check `lsof -nP -iTCP:8080 -sTCP:LISTEN` before
 suspecting the migration.
 
+**The duplicated schema had drifted exactly as the plan described, and it is now gone.**
+`schemaSql` created `en_gc_horizon`, `en_transaction`, and `relation_tuple` with five
+indexes -- and no `en_datastore_metadata`, so every integration run tested en against a
+schema no real database has. Both acceptance greps are now empty:
+
+```console
+$ grep -rn "CREATE TABLE relation_tuple" --include="*.hs" . | grep -v dist-newstyle
+$ grep -rln "CREATE TABLE" --include="*.hs" . | grep -v dist-newstyle
+```
+
+There is no `CREATE TABLE` in any Haskell source in the repository at all. All eight test
+suites pass, `en-postgres-integration-tests` among them, now against the migrated schema.
+
+Deleting `runMigrationDedupeScenario` also orphaned `textStatement`, which nothing else
+used; `-Wall` caught it and it was removed rather than left behind.
+
 (Add further discoveries here as work proceeds, with evidence.)
 
 
@@ -314,6 +330,25 @@ suspecting the migration.
   would mean maintaining a fourth copy of retired migration SQL inside a test. The touch
   semantics it protects — one live tuple per (object, relation, subject) — remain covered by
   `runTouchSemanticsScenario` and by the live unique index itself.
+  Date: 2026-08-24
+
+- Decision: Migrate the integration suite with `runMigrationPlan` inside the existing
+  `Pg.with` bracket, rather than replacing the bracket with `withMigratedDatabaseOptions`
+  as Milestone 4 specified.
+  Rationale: `withMigratedDatabaseOptions` hands the callback exactly one
+  `Connection.Connection` and does not expose the `EphemeralPg.Database` it started. Four
+  scenarios need that handle to open *additional* concurrent connections --
+  `runWriteRaceScenario` acquires three (`leftConnection`, `rightConnection`, `blocker`),
+  `runBatchTouchRaceScenario` two, `runSnapshotRepeatabilityScenario` one holder, and
+  `runHorizonMonotonicityScenario` likewise -- and without them the write-race and
+  batch-touch-race scenarios cannot contend at all. Adopting the helper would have meant
+  rewriting those four scenarios to thread connection settings instead of a database handle,
+  which is unrelated churn in the most delicate tests in the suite.
+  `runMigrationPlan defaultRunOptions (Pg.connectionSettings database) enMigrationPlan` is
+  the same plan applied by the same runner the helper itself calls, so the milestone's actual
+  goal -- tests run against the migration plan `en-migrate up` applies, with no second copy
+  of the schema anywhere -- is met exactly. `pg-migrate-test-support` is therefore not a
+  dependency of this suite; `pg-migrate` is.
   Date: 2026-08-24
 
 - Decision: Widen the existing `shinzui/biscuit-haskell-project` fork rather than adding
