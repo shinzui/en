@@ -177,12 +177,32 @@ rotation.
 
 ### Migrations
 
-`en-migrations` ships codd-compatible plain SQL under
-`en-migrations/db/migrations/`, named with UTC timestamps. The dev shell has no codd
-binary; `just run-migrations` applies each file with a `to_regclass`-guarded `psql`
-invocation, so re-running it is a no-op. `en-server` does not verify migration state at
-startup in general — but it does read `en_datastore_metadata`, so a database missing the
-most recent migration fails loudly rather than serving.
+`en-migrations` owns en's schema as a [pg-migrate](https://hackage.haskell.org/package/pg-migrate)
+component: ordered SQL under `en-migrations/migrations/`, listed in a `manifest` file and
+embedded into the binary at compile time. The `en-migrate` executable applies it.
+
+```shell
+DATABASE_URL='postgresql://user@localhost:5432/en' en-migrate status   # what is applied, what is pending
+DATABASE_URL='postgresql://user@localhost:5432/en' en-migrate up       # apply everything pending
+DATABASE_URL='postgresql://user@localhost:5432/en' en-migrate verify   # exits 2 if the database disagrees with the plan
+```
+
+`up` is idempotent: it consults a ledger in the database's `pgmigrate` schema and applies
+only what is pending, so a second run reports `already_applied` and changes nothing. Two
+processes running it at once are safe — the second waits on a PostgreSQL advisory lock. In
+development, `just run-migrations` wraps `en-migrate up` against `$PG_CONNECTION_STRING`.
+
+Migrations are **append-only**. The ledger records a SHA-256 checksum over each applied
+file's exact bytes, so editing a file that a database has already applied makes `verify`
+fail with a checksum mismatch. The forward path is always a new migration — create one with
+`just make-migration 0002-name "description"`, which writes the file and registers it in the
+manifest in one step. A `.sql` file in `en-migrations/migrations/` that is missing from the
+manifest fails the build rather than being silently skipped.
+
+Run `en-migrate verify` before a deploy: it compares the declared plan against the ledger and
+exits 2 on any disagreement. `en-server` neither applies nor verifies migrations at startup —
+migrations belong to an explicit deployment or administrative job — but it does read
+`en_datastore_metadata`, so a database missing the schema fails loudly rather than serving.
 
 ### Bulk import and export
 

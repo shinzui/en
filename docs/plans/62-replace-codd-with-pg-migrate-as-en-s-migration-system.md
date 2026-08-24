@@ -64,7 +64,7 @@ the local development database in `db/` is recreated from scratch as part of the
 - [x] Milestone 2 (2026-08-24T14:40Z): turn `en-migrations` into a `pg-migrate` component — new `en-migrations/migrations/` directory with `0001-en-bootstrap.sql` and `manifest`, rewritten `En.Migrations`, and a proof that the squashed bootstrap produces byte-identical schema to the old six-file sequence.
 - [x] Milestone 3 (2026-08-24T14:50Z): ship the `en-migrate` executable and rewire the developer workflow (`Justfile`, `process-compose.yaml`).
 - [x] Milestone 4 (2026-08-24T14:55Z): make the tests use the real plan — `en-postgres` integration suite migrates with `pg-migrate-test-support`, hand-written `schemaSql` deleted, plan-construction test added.
-- [ ] Milestone 5: retire codd from en's prose and metadata — `README.md`, `mori.dhall`, `en-server/app/Main.hs` operator guidance — and delete `en-migrations/db/`.
+- [x] Milestone 5 (2026-08-24T15:00Z): retire codd from en's prose and metadata — `README.md`, `mori.dhall`, `en-server/app/Main.hs` operator guidance — and delete `en-migrations/db/`.
 - [ ] Milestone 6: ADR distillation and retrospective.
 
 
@@ -285,6 +285,36 @@ suites pass, `en-postgres-integration-tests` among them, now against the migrate
 
 Deleting `runMigrationDedupeScenario` also orphaned `textStatement`, which nothing else
 used; `-Wall` caught it and it was removed rather than left behind.
+
+**Two live documents outside Milestone 5's named scope also claimed codd, and were
+corrected.** The milestone names `README.md`, `mori.dhall`, and `en-server/app/Main.hs`, but
+the acceptance grep is wider than that, and it found two more files making false claims
+about how en is migrated:
+
+  * `docs/spec/0001-en-overview.md` (package table) described `en-migrations` as the "codd
+    PostgreSQL schema" listing only two of its four tables.
+  * `docs/user/service-and-operations.md` (Migrations section) told operators that
+    `just run-migrations` applies each file with a `to_regclass`-guarded `psql` invocation.
+    That is the exact mechanism this plan deletes, and it is the section an operator reads
+    first. It now documents `en-migrate status` / `up` / `verify`, the ledger, advisory-lock
+    safety, and the append-only rule.
+
+**What deliberately still says codd.** `docs/plans/` and `docs/masterplans/` are historical
+records and are not rewritten, as the milestone states. `docs/reviews/2026-07-07-architecture-performance-review.md`
+is left alone for the same reason -- it is a dated review, and its finding ("README says
+migrations are codd-managed; the Justfile applies them with raw `psql`") is precisely the
+defect this plan closes. Rewriting it would erase the evidence that the problem was known.
+
+**A concurrent process was writing this repository during implementation.** A `docs/capabilities/`
+OKF bundle (including `profile.dhall`, `log.md`, and `postgres-migrations.md`) and a large
+`mori.dhall` change adding `dependencyRefs` appeared in the working tree mid-session, with new
+files still being created between commits. None of it was authored by this plan and none of it
+was committed here. `mori.dhall` was handled by staging only this plan's two codd lines against
+`HEAD` while leaving the concurrent edits unstaged, so this plan's commit carries exactly its
+own change. Two consequences for whoever owns that work: their uncommitted `mori.dhall` still
+carries a `Schema.MoriRef` for `mzabani/codd` (updated in the working tree to
+`shinzui/pg-migrate`, but not committed by this plan), and `docs/capabilities/postgres-migrations.md`
+still documents codd and points `resource:` at the now-deleted `en-migrations/db/migrations`.
 
 (Add further discoveries here as work proceeds, with evidence.)
 

@@ -270,7 +270,7 @@ silently breaks read-your-writes. This is the one place to be most careful.
 | Package | Role |
 | --- | --- |
 | `en-core` | Engine: `En.Schema`, `En.Tuple`, `En.Revision`, `En.Reachability` (compiler), `En.Check`, `En.Lookup`, `En.Effect.TupleStore`, `En.Error`. No transport/DB deps. |
-| `en-migrations` | codd PostgreSQL schema: `relation_tuple` (xid8 soft-delete), `en_transaction` (snapshot). |
+| `en-migrations` | pg-migrate PostgreSQL schema component: `relation_tuple` (xid8 soft-delete), `en_transaction` (snapshot), `en_datastore_metadata`, `en_gc_horizon`. Applied by the `en-migrate` executable. |
 | `en-postgres` | hasql `TupleStore` impl + `pg_snapshot` revision/token machinery. |
 | `en-servant` | Servant API (check/lookup/expand/write) + a `RequirePermission` combinator (composes *after* shomei authn). |
 | `en-server` | Standalone service (thin app). |

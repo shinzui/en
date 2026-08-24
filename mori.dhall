@@ -30,7 +30,7 @@ in  Schema.Project::{
         , language = Schema.Language.Haskell
         , path = Some "en-migrations"
         , description = Some
-            "codd-managed PostgreSQL schema migrations: relation tuples with xid8 soft-delete and the revision/transaction table"
+            "pg-migrate-managed PostgreSQL schema migrations: relation tuples with xid8 soft-delete and the revision/transaction table"
         , dependencies = [ Schema.Dependency.ByName "en-core" ]
         }
       , Schema.Package::{
@@ -94,7 +94,7 @@ in  Schema.Project::{
     , dependencies =
       [ "haskell-servant/servant"
       , "hasql/hasql"
-      , "mzabani/codd"
+      , "shinzui/pg-migrate"
       , "haskell-hvr/uuid"
       , "haskell/time"
       , "system-f/validation"
