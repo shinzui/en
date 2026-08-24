@@ -62,7 +62,7 @@ the local development database in `db/` is recreated from scratch as part of the
 
 - [x] Milestone 1 (2026-08-24T14:32Z): unblock the dependency closure — widen the `biscuit-haskell` fork onto `crypton` 1.1 / `ram`, re-pin it in `cabal.project`, and prove `pg-migrate` 1.1.0.0 solves and builds inside en.
 - [x] Milestone 2 (2026-08-24T14:40Z): turn `en-migrations` into a `pg-migrate` component — new `en-migrations/migrations/` directory with `0001-en-bootstrap.sql` and `manifest`, rewritten `En.Migrations`, and a proof that the squashed bootstrap produces byte-identical schema to the old six-file sequence.
-- [ ] Milestone 3: ship the `en-migrate` executable and rewire the developer workflow (`Justfile`, `process-compose.yaml`).
+- [x] Milestone 3 (2026-08-24T14:50Z): ship the `en-migrate` executable and rewire the developer workflow (`Justfile`, `process-compose.yaml`).
 - [ ] Milestone 4: make the tests use the real plan — `en-postgres` integration suite migrates with `pg-migrate-test-support`, hand-written `schemaSql` deleted, plan-construction test added.
 - [ ] Milestone 5: retire codd from en's prose and metadata — `README.md`, `mori.dhall`, `en-server/app/Main.hs` operator guidance — and delete `en-migrations/db/`.
 - [ ] Milestone 6: ADR distillation and retrospective.
@@ -234,6 +234,41 @@ false "clean" here: `fourmolu.yaml` is discovered by walking up from the file, s
 `/tmp` is formatted with fourmolu's defaults rather than the project's; and `treefmt` only
 processes files git tracks, so an untracked scratch file inside the repository is silently
 skipped ("emitted 0 files"). Check formatting on the real tracked path, or not at all.
+
+**`just` recipe arguments are positional, so `just make-migration name=foo` silently
+misfires.** The plan's Milestone 3 text describes the invocation as
+`just make-migration name=whatever`; `just` treats that as the *value* of the first
+positional parameter, not an assignment, so it created
+`en-migrations/migrations/name=0002-scratch-probe.sql` and dutifully registered that
+filename in the manifest. The recipe's doc comment now spells out the positional form.
+Both paths were exercised and then reverted: an explicit
+`just make-migration 0002-scratch-probe "..."` produced `0002-scratch-probe.sql`, and
+`just make-migration "" "..."` let pg-migrate infer `0002.sql`. In every case the file and
+the manifest line appeared together, which is the property the old `touch`-based recipe
+could not offer.
+
+Note also that `just`'s `--list` summary is the *last* comment line above a recipe, which is
+why the migration recipes put their prose first and the one-line summary immediately above
+the attribute -- matching the existing `openapi` recipe.
+
+**`just start-and-test` fails in this environment for a reason that has nothing to do with
+en.** Apple's `container` runtime (pid 26315,
+`/nix/store/...-container-1.2.2/libexec/container/plugins/container-runtime-linux`) holds
+`127.0.0.1:8080`, while en-server binds `*:8080`; the more specific loopback binding wins, so
+`http://localhost:8080` reaches the container's static file server -- which answers `/healthz`
+with its SPA fallback (200, so the readiness wait passes) and then 404s the real API.
+Addressing en-server directly works:
+
+```console
+$ EN_SERVER_URL="http://192.168.1.115:8080" just test-server
+server smoke test passed: allowed
+```
+
+That is the Milestone 3 acceptance signal: process-compose ran `just run-migrations`
+(now `en-migrate up`), en-server started on the migrated schema, minted its
+`en_datastore_metadata` row, and served a write / token / check round trip. If `just
+start-and-test` 404s for someone else, check `lsof -nP -iTCP:8080 -sTCP:LISTEN` before
+suspecting the migration.
 
 (Add further discoveries here as work proceeds, with evidence.)
 

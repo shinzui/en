@@ -1,4 +1,3 @@
-migrationDate := `date -u '+%Y%m%d%H%M%S'`
 processComposeSocket := ".dev/process-compose.sock"
 
 # Show available recipes
@@ -51,49 +50,50 @@ start-and-test: process-up
     fi; \
     just test-server
 
-# Create new migration file with timestamp
+# `en-migrate new` writes the file and appends it to the manifest atomically, so a
+# migration can never exist unregistered -- there is no second step to forget.
+#
+# Arguments are positional, not `name=...`:
+#
+#   just make-migration 0002-add-watch-cursor "add the watch cursor column"
+#   just make-migration "" "let pg-migrate number it"   # -> 0002.sql
+#
+# The name must continue the manifest's numbering; 0001-en-bootstrap.sql is taken.
+# Never edit an applied file -- append a new one.
+#
+# Create a new migration file and register it in the ordered manifest
 [group("database")]
-make-migration name:
-  touch en-migrations/db/migrations/{{migrationDate}}_{{name}}.sql
+make-migration name="" description="":
+  cabal run -v0 en-migrate -- new \
+    --manifest en-migrations/migrations/manifest \
+    {{ if name == "" { "" } else { "--name " + name + ".sql" } }} \
+    --description "{{ if description == "" { name } else { description } }}"
 
 # Create database if it doesn't exist
 [group("database")]
 create-database:
   @psql postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$PGDATABASE'" | grep -qx 1 || createdb "$PGDATABASE"
 
-# Apply local PostgreSQL migrations
+# Idempotent by construction: en-migrate consults the ledger and applies only what
+# is pending, so this is safe to run on every start (process-compose does).
+#
+# Apply pending PostgreSQL migrations
 [group("database")]
 run-migrations: create-database
-  @if [ "$(psql "$PG_CONNECTION_STRING" -tAc "SELECT to_regclass('public.relation_tuple') IS NOT NULL")" = "f" ]; then \
-      psql "$PG_CONNECTION_STRING" -v ON_ERROR_STOP=1 -f en-migrations/db/migrations/20260623044157_create-relation-tuples.sql; \
-    else \
-      echo "base migration already applied"; \
-    fi
-  @if [ "$(psql "$PG_CONNECTION_STRING" -tAc "SELECT to_regclass('public.relation_tuple_object_hist_idx') IS NOT NULL")" = "f" ]; then \
-      psql "$PG_CONNECTION_STRING" -v ON_ERROR_STOP=1 -f en-migrations/db/migrations/20260623160000_historical-read-indexes.sql; \
-    else \
-      echo "historical-read indexes already applied"; \
-    fi
-  @if [ "$(psql "$PG_CONNECTION_STRING" -tAc "SELECT to_regclass('public.en_datastore_metadata') IS NOT NULL")" = "f" ]; then \
-      psql "$PG_CONNECTION_STRING" -v ON_ERROR_STOP=1 -f en-migrations/db/migrations/20260709023019_datastore-metadata.sql; \
-    else \
-      echo "datastore metadata already applied"; \
-    fi
-  @if psql "$PG_CONNECTION_STRING" -tAc "SELECT indexdef FROM pg_indexes WHERE indexname = 'relation_tuple_live_unique'" | grep -q caveat_name; then \
-      psql "$PG_CONNECTION_STRING" -v ON_ERROR_STOP=1 -f en-migrations/db/migrations/20260709202037_touch-semantics-live-unique.sql; \
-    else \
-      echo "touch-semantics unique index already applied"; \
-    fi
-  @if [ "$(psql "$PG_CONNECTION_STRING" -tAc "SELECT to_regclass('public.relation_tuple_object_live_idx') IS NOT NULL")" = "t" ]; then \
-      psql "$PG_CONNECTION_STRING" -v ON_ERROR_STOP=1 -f en-migrations/db/migrations/20260709232320_drop-dead-live-indexes.sql; \
-    else \
-      echo "dead live indexes already dropped"; \
-    fi
-  @if [ "$(psql "$PG_CONNECTION_STRING" -tAc "SELECT to_regclass('public.en_gc_horizon') IS NOT NULL")" = "f" ]; then \
-      psql "$PG_CONNECTION_STRING" -v ON_ERROR_STOP=1 -f en-migrations/db/migrations/20260710150000_gc-horizon-high-water-mark.sql; \
-    else \
-      echo "gc-horizon high-water mark already applied"; \
-    fi
+  DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" cabal run -v0 en-migrate -- up
+
+# Exits 2 on a checksum mismatch or a missing/unknown migration, which is the
+# pre-deploy check the old guarded-psql recipe could not offer.
+#
+# Compare the declared migration plan with the database's ledger
+[group("database")]
+verify-migrations:
+  DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" cabal run -v0 en-migrate -- verify
+
+# Show which migrations this database has and which are pending
+[group("database")]
+migration-status:
+  DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" cabal run -v0 en-migrate -- status
 
 # Run a write-token-check HTTP smoke test against a running en-server
 [group("testing")]
