@@ -50,7 +50,6 @@ executable en-server
     , effectful-core
     , en-biscuit
     , en-core
-    , en-migrations
     , en-postgres
     , en-servant
     , hasql

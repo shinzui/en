@@ -28,7 +28,6 @@ import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError)
 import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
-import En.Migrations (migrationsDir)
 import En.Postgres.Database (Database, runDatabasePool, runSession)
 import En.Postgres.Datastore (resolveDatastoreIdSession)
 import En.Postgres.Revision (ConsistencyConfig (..), OptimizedRevisionCache, OptimizedRevisionConfig (..), newOptimizedRevisionCache, runConsistencyStorePostgres)
@@ -205,9 +204,8 @@ withStore say storeConfig action = do
       configFailure $
         "Could not reach PostgreSQL through EN_DATABASE_URL. "
           <> err
-          <> "\nApply the migrations in "
-          <> Text.pack migrationsDir
-          <> " before starting en-server."
+          <> "\n"
+          <> migrationHint
   -- Only PostgreSQL can adjudicate its own interval grammar, so this waits for a
   -- reachable database -- but it still runs before the port binds.
   validateGcWindow runDbSession storeConfig.gcWindow >>= either configFailure pure
@@ -744,9 +742,8 @@ resolveDatastoreId runDbSession = do
       configFailure $
         "Could not resolve this database's datastore identity: "
           <> err
-          <> "\nIs the en_datastore_metadata migration from "
-          <> Text.pack migrationsDir
-          <> " applied?"
+          <> "\nThis database's migrations are missing or out of date. "
+          <> migrationHint
 
 -- | A startup-time database failure, in prose rather than as hasql's constructors.
 --
@@ -768,6 +765,14 @@ configFailure :: Text.Text -> IO a
 configFailure message = do
   Text.hPutStrLn stderr ("en-server: " <> message)
   exitFailure
+
+-- | What an operator should actually run when the schema is missing or stale.
+--
+-- en-server deliberately neither applies nor verifies migrations itself: pg-migrate's
+-- guidance is that migrations belong to an explicit deployment or administrative job,
+-- not to service startup. All this does is name that job.
+migrationHint :: Text.Text
+migrationHint = "Apply migrations with `cabal run en-migrate -- up`."
 
 -- | Run Warp until SIGTERM or SIGINT, then drain.
 --
@@ -852,7 +857,7 @@ describeSchemaSource :: SchemaSource -> Text.Text
 describeSchemaSource =
   \case
     BuiltInDemoSchema ->
-      "Using built-in demo schema; run migrations from " <> Text.pack migrationsDir <> " before writes."
+      "Using built-in demo schema; " <> migrationHint <> " before writes."
     SchemaFile path ->
       "Loaded schema from " <> Text.pack path
 

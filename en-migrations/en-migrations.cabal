@@ -1,16 +1,23 @@
 cabal-version:      3.0
 name:               en-migrations
 version:            0.1.0.0
-synopsis:           codd-managed PostgreSQL schema for en's relationship tuples
+synopsis:
+  pg-migrate-managed PostgreSQL schema for en's relationship tuples
+
 description:
-  PostgreSQL schema migrations for en: the relation-tuple table (with xid8
-  created/deleted columns for MVCC point-in-time reads) and the revision /
-  transaction table. SQL is managed by codd, mirroring shomei-migrations.
+  en's PostgreSQL schema as a pg-migrate migration component: the relation-tuple
+  table (with xid8 created/deleted columns for MVCC point-in-time reads), the
+  revision / transaction table, the datastore identity row, and the
+  garbage-collection horizon high-water mark. SQL is embedded at compile time
+  from an ordered manifest and applied by the @en-migrate@ executable.
 
 license:            MIT
 author:             Nadeem Bitar
 maintainer:         nadeem@gmail.com
 category:           Security, Authorization, Database
+extra-source-files:
+  migrations/*.sql
+  migrations/manifest
 
 common warnings
   ghc-options:
@@ -20,12 +27,47 @@ common warnings
 common shared
   default-language:   GHC2024
   default-extensions:
+    LambdaCase
     OverloadedStrings
 
 library
-  import:          warnings, shared
-  hs-source-dirs:  src
-  exposed-modules:  En.Migrations
+  import:             warnings, shared
+  hs-source-dirs:     src
+  default-extensions: TemplateHaskell
+  exposed-modules:    En.Migrations
+  other-modules:      En.Migrations.Internal.Definition
   build-depends:
-    , base   >=4.19 && <5
+    , base              >=4.19     && <5
+    , bytestring
+    , containers
+    , pg-migrate        ^>=1.1.0.0
+    , pg-migrate-embed  ^>=1.1.0.0
+
+executable en-migrate
+  import:             warnings, shared
+  hs-source-dirs:     app
+  main-is:            Main.hs
+
+  -- pg-migrate-cli's option records each declare a field named `output`, and the
+  -- library exports them ambiguously; without this, commandOutputFormat's record
+  -- patterns do not resolve. pg-migrate's own examples/basic does the same.
+  default-extensions: DuplicateRecordFields
+  build-depends:
+    , aeson
+    , base
+    , bytestring
+    , en-migrations
+    , hasql                 >=1.10     && <1.11
+    , optparse-applicative
+    , pg-migrate            ^>=1.1.0.0
+    , pg-migrate-cli        ^>=1.1.0.0
     , text
+
+test-suite en-migrations-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , en-migrations

@@ -61,7 +61,7 @@ the local development database in `db/` is recreated from scratch as part of the
 ## Progress
 
 - [x] Milestone 1 (2026-08-24T14:32Z): unblock the dependency closure — widen the `biscuit-haskell` fork onto `crypton` 1.1 / `ram`, re-pin it in `cabal.project`, and prove `pg-migrate` 1.1.0.0 solves and builds inside en.
-- [ ] Milestone 2: turn `en-migrations` into a `pg-migrate` component — new `en-migrations/migrations/` directory with `0001-en-bootstrap.sql` and `manifest`, rewritten `En.Migrations`, and a proof that the squashed bootstrap produces byte-identical schema to the old six-file sequence.
+- [x] Milestone 2 (2026-08-24T14:40Z): turn `en-migrations` into a `pg-migrate` component — new `en-migrations/migrations/` directory with `0001-en-bootstrap.sql` and `manifest`, rewritten `En.Migrations`, and a proof that the squashed bootstrap produces byte-identical schema to the old six-file sequence.
 - [ ] Milestone 3: ship the `en-migrate` executable and rewire the developer workflow (`Justfile`, `process-compose.yaml`).
 - [ ] Milestone 4: make the tests use the real plan — `en-postgres` integration suite migrates with `pg-migrate-test-support`, hand-written `schemaSql` deleted, plan-construction test added.
 - [ ] Milestone 5: retire codd from en's prose and metadata — `README.md`, `mori.dhall`, `en-server/app/Main.hs` operator guidance — and delete `en-migrations/db/`.
@@ -151,6 +151,89 @@ and `withMigratedDatabaseOptions :: RunOptions -> MigrationPlan -> (Connection -
 IO (Either MigratedDatabaseError value)`. `new` takes `--manifest`, `--description`, and an
 optional `--name`, as the Justfile recipe assumes. A manifest entry's `.sql` suffix is
 stripped to form the migration's local name, confirming the `en/0001-en-bootstrap` identity.
+
+**The squash is exact, and en's schema now has a fingerprint.** Proven twice, first with
+`psql` applying the six old files and then with the real `en-migrate up` path:
+
+```text
+$ diff -u <old six files, pg_dump --schema-only>  <bootstrap via en-migrate up, -N pgmigrate>
+schemas identical
+$ psql -d en_old -tAc 'SELECT horizon FROM en_gc_horizon'   -> 0
+$ psql -d en_new -tAc 'SELECT horizon FROM en_gc_horizon'   -> 0
+```
+
+The surviving objects are exactly the four tables and five `relation_tuple` indexes the
+plan predicted, with `relation_tuple_object_live_idx` and `relation_tuple_subject_live_idx`
+absent and `relation_tuple_live_unique` free of `caveat_name`. The dedupe `UPDATE` from
+`20260709202037_touch-semantics-live-unique.sql` reported `UPDATE 0` against the fresh old
+database, confirming the Decision Log's claim that it is dead work on any database
+pg-migrate would ever start from.
+
+en's schema fingerprint from now on:
+
+```text
+en/0001-en-bootstrap position=1 kind=sql transaction=transactional
+checksum=4a265abb6513df8f7ac8a4faf9f0e4105257b3205075694a7a7fa20cdaf7ea96
+```
+
+**`pg_dump` 17.10 emits a random nonce, so Step 10's diff is never empty as written.**
+PostgreSQL 17.10's `pg_dump` brackets its output with `\restrict <random>` /
+`\unrestrict <random>` lines whose token is regenerated per invocation, so two dumps of
+byte-identical schemas still differ in two lines:
+
+```text
+-\restrict akNa2LxUuC0cH2NvSDeokdGw2ZHjkzCB7DWJ7OYtSWVZWWLlciRAdfNemShY8Zd
++\restrict 2oZ2alfAcGKuxA46DayqipMIuWcExCsk4fHK2KpmQbi6qi6BJVeYKFvBwMqOV1v
+```
+
+This is not schema content. Filter both dumps through
+`grep -v '^\\\(un\)\?restrict '` before diffing; with those two lines removed the diff is
+genuinely empty. Anyone re-running Step 10 on PostgreSQL 17.10 or later needs this.
+
+**The manifest-membership guard works, but only a clean build reaches it.** Dropping
+`en-migrations/migrations/junk.sql` into the directory and rebuilding fails as intended:
+
+```text
+src/En/Migrations/Internal/Definition.hs:36:6: error: [GHC-39584]
+    • invalid pg-migrate manifest: UnlistedSqlFiles ["junk.sql"]
+```
+
+Note what did *not* work: `cabal build en-migrations --ghc-options=-fforce-recomp` and
+`touch`-ing the module both printed `Up to date` without invoking GHC at all, exactly the
+limitation the `RecompilePlugin` comment describes -- the plugin governs GHC's
+recompilation decision, and cabal never got as far as asking GHC. Removing
+`dist-newstyle/build/aarch64-osx/ghc-9.12.4/en-migrations-0.1.0.0` is what forces the check
+to run locally; CI gets it for free from a cold build.
+
+**Tamper detection is real.** Appending one space to the applied SQL file and rebuilding:
+
+```text
+verification failed
+issue MigrationChecksumMismatch (MigrationId {component = "en", name = "0001-en-bootstrap"})
+  (stored 15b0c98954...) (declared 4a265abb65...)
+verify exit: 2
+```
+
+Reverting the byte restores `verification ok` and exit 0.
+
+**`en-server/app/Main.hs` had drifted from the repository's own formatter, so touching it
+at all costs 1425 lines.** `nix/treefmt.nix` wires `fourmolu` (with the project's
+`fourmolu.yaml`), `cabal-fmt`, and `nixpkgs-fmt`; `.pre-commit-config.yaml` runs
+`treefmt --fail-on-change`. Running that formatter over `HEAD`'s copy of
+`en-server/app/Main.hs` rewrites 1425 lines -- mostly sorting every import into a single
+group and converting `{- | -}` Haddock to `-- |` -- so the pre-commit hook rejects any
+commit touching the file until that reformat lands. Every other Haskell file spot-checked
+(`en-core/src/En/Check.hs`, `en-postgres/src/En/Postgres/TupleStore.hs`,
+`en-server/app/Config.hs`, `en-servant/src/En/Servant/Wire.hs`) was already clean, so this
+one file was the outlier. It was landed as its own `style(en-server)` commit -- verified a
+pure reformat by checking that the multiset of identifiers in the file is unchanged -- which
+keeps this plan's functional `en-server` diff at 21 lines.
+
+Two traps when checking formatter cleanliness in this repository, both of which produced a
+false "clean" here: `fourmolu.yaml` is discovered by walking up from the file, so a copy in
+`/tmp` is formatted with fourmolu's defaults rather than the project's; and `treefmt` only
+processes files git tracks, so an untracked scratch file inside the repository is silently
+skipped ("emitted 0 files"). Check formatting on the real tracked path, or not at all.
 
 (Add further discoveries here as work proceeds, with evidence.)
 
