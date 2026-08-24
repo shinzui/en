@@ -15,6 +15,11 @@ packages:
 -- ============================================================
 
 constraints:
+    -- pg-migrate computes migration checksums with crypton >= 1.1 && < 1.2. The
+    -- widened biscuit-haskell fork below admits both crypton 1.0 and 1.1, so
+    -- without this the solver would quietly stay on 1.0.6 and reintroduce the
+    -- conflict. See docs/plans/62-replace-codd-with-pg-migrate-as-en-s-migration-system.md.
+    crypton >= 1.1,
     ephemeral-pg ==0.2.1.0,
     tasty-bench ==0.5
 
@@ -29,11 +34,18 @@ constraints:
 -- Until a fixed release is on Hackage, pin the GHC-9.12-compatible source here.
 -- biscuit-servant and biscuit-wai are deliberately not pulled in yet; add their
 -- subdirs when a later plan needs Servant/WAI integration.
+--
+-- The pinned commit also widens `crypton ^>= 1.0` to `>= 1.0 && < 1.2` and swaps
+-- the deprecated `memory` package for its maintained fork `ram`. pg-migrate
+-- (mori://shinzui/pg-migrate) requires crypton >= 1.1, and crypton 1.1 dropped
+-- `memory` in favour of `ram` -- so relaxing the bound without the `ram` swap
+-- makes the solver succeed but the compile fail on a missing `ByteArrayAccess
+-- Ed25519.PublicKey` instance. Both halves are needed together.
 -- ------------------------------------------------------------
 source-repository-package
     type:     git
     location: https://github.com/shinzui/biscuit-haskell-project.git
-    tag:      aef4272f0d44eec75c79aa6c2dd00c4200401829
+    tag:      61f2b31063db6bc7fe0fb885dd2da957634a525b
     subdir:   biscuit-haskell/biscuit
 
 -- ------------------------------------------------------------
