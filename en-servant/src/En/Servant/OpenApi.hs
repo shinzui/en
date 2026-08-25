@@ -29,7 +29,7 @@ module En.Servant.OpenApi (
 import Control.Lens ((%~), (&), (.~), (?~), _Just)
 import Data.Aeson qualified as Aeson
 import Data.Char (toUpper)
-import Data.HashMap.Strict.InsOrd qualified as InsOrdHashMap
+import Data.HashMap.Strict.InsOrd.Compat qualified as InsOrdHashMap
 import Data.OpenApi (
     AdditionalProperties (..),
     Definitions,

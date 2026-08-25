@@ -51,7 +51,7 @@ library
 
   build-depends:
     , aeson
-    , base                       >=4.19 && <5
+    , base                >=4.19 && <5
     , biscuit-haskell
     , bytestring
     , containers
@@ -60,7 +60,6 @@ library
     , en-biscuit
     , en-core
     , en-postgres
-    , insert-ordered-containers
     , lens
     , openapi-hs
     , servant
