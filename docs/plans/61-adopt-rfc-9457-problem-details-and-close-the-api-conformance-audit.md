@@ -1,13 +1,13 @@
 ---
 id: 61
-slug: adopt-rfc-7807-problem-details-and-close-the-api-conformance-audit
-title: "Adopt RFC 7807 problem details and close the API conformance audit"
+slug: adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit
+title: "Adopt RFC 9457 problem details and close the API conformance audit"
 kind: exec-plan
 created_at: 2026-07-22T04:59:56Z
 intention: "intention_01ky42xb8mebsv979g07nrhwp9"
 ---
 
-# Adopt RFC 7807 problem details and close the API conformance audit
+# Adopt RFC 9457 problem details and close the API conformance audit
 
 This ExecPlan is a living document. The sections Progress, Surprises & Discoveries,
 Decision Log, and Outcomes & Retrospective must be kept up to date as work proceeds.
@@ -27,7 +27,7 @@ minting endpoint, and the writes that create and delete tuples. Today, when any 
 ```
 
 served under the media type `application/json`. Every other service in this fleet has moved to
-**RFC 7807 problem details** — an IETF-standard error body served as `application/problem+json`
+**RFC 9457 problem details** — an IETF-standard error body served as `application/problem+json`
 — so a client that talks to two services needs two error decoders, a log pipeline needs two
 parsers, and no off-the-shelf HTTP tooling recognizes either. After this change `en` answers the
 same failure like this, under `application/problem+json`:
@@ -82,10 +82,12 @@ operation. The exact commands and expected output are in Validation and Acceptan
 ## Progress
 
 - [ ] Milestone 1 — Build the machinery in isolation (`ProblemDetails`, the `ProblemJSON` content
-      type, the spec catalog, the two renderers) and prove it with a throwaway spike that
-      exercises **three** legs: the wire's media type, a client round-trip, and the generated
-      document's content key. Legs 2 and 3 fail on en's pins unless the two workarounds recorded
-      in the Decision Log are applied — watch them fail first. No production route changes.
+      type, the spec catalog, the two renderers), add the `http-media` dependency and the OpenAPI
+      cohort bounds to `en-servant/en-servant.cabal`, and prove the machinery with a throwaway
+      spike that exercises **three** legs: the wire's media type, a client round-trip, and the
+      generated document's content keys on *both* the error and the success alternative. Legs 2
+      and 3 fail on en's resolved packages unless the workarounds recorded in the Decision Log
+      are applied — watch them fail first. No production route changes.
 - [ ] Milestone 2 — Convert the whole servant surface: the shared `EnResponses` list, `EnResult`,
       the hand-written `AsUnion`, `EnFault`, `enErrorToFault`, every thrown `ServerError`, and
       `envelopeFormatters` (setting all four hooks, not three). Widen every `MultiVerb`'s
@@ -103,8 +105,9 @@ operation. The exact commands and expected output are in Validation and Acceptan
       rejections in `en-server/app/Middleware.hs`, and the `/readyz` failure body in
       `en-server/app/Health.hs`. Delete the duplicated `errorBody` helper in favour of the shared
       renderer.
-- [ ] Milestone 6 — Close the OpenAPI half: narrow each response's content map to the media type
-      actually served (repairing the fork's flattening), bridge `ToSchema ProblemDetails` through
+- [ ] Milestone 6 — Close the OpenAPI half: narrow each **success** response's content map to the
+      media type actually served (the errors arrive keyed correctly; see the 2026-08-25 Decision
+      Log entry), bridge `ToSchema ProblemDetails` through
       the codec's own aeson `Options`, declare the bearer security scheme and require it on every
       operation, add the conformance tests (errors keyed by `application/problem+json` and
       successes not; every documented code present in the catalog at the status it is sent with;
@@ -129,9 +132,14 @@ operation. The exact commands and expected output are in Validation and Acceptan
   `Shomei/Servant/Middleware.hs`), and that is real, running code. The practical consequence for
   this plan: kotei's code blocks are a *design* that has never been compiled, so they are treated
   here as a proposal to verify rather than a pattern to copy — which is why Milestone 1 exists as
-  a spike, and why the mechanics below were checked against the servant and fork sources directly
-  rather than taken on the document's word. Where shomei and kotei disagree, this plan follows
-  shomei, because shomei's version has run.
+  a spike, and why the mechanics below were checked against the servant and OpenAPI package
+  sources directly rather than taken on the document's word. Where shomei and kotei disagree,
+  this plan follows shomei, because shomei's version has run.
+  **Confirmed upstream 2026-08-25**: the canonical document now says this itself — kotei is
+  described there as "the `MultiVerb`-style adoption *as a design plan*", with "as of 2026-07-24
+  the plan's milestones are unimplemented and no kotei code ships them. For working code, shomei
+  is the only reference." Nothing in this plan changes; the finding simply stopped being ours
+  alone.
 
 - Discovery (2026-07-22, verified against source): **`RespondAs` does everything this plan needs,
   in stock servant, with no fork and no dependency beyond `http-media`.** From
@@ -158,11 +166,15 @@ operation. The exact commands and expected output are in Validation and Acceptan
   would not resolve. `en` uses no `RespondEmpty` today (every operation returns a body), so the
   two never meet here, but the constraint governs how `ProblemJSON` is declared.
 
-- Discovery (2026-07-22, **proved by running the code**, and it falsifies the canonical
-  document): **on en's exact pins, a naive `RespondAs ProblemJSON` swap breaks the Haskell client
-  at runtime and silently lies in the OpenAPI document. Neither failure is a compile error.**
-  The canonical `api/rfc7807-problem-details.md` states that "the media type reaches the document
-  for free" because the pinned `servant-openapi-hs` fork carries
+- Discovery (2026-07-22, **proved by running the code**, and it falsified the canonical
+  document as it then stood): **on the pins en had at the time, a naive `RespondAs ProblemJSON`
+  swap breaks the Haskell client at runtime and silently lies in the OpenAPI document. Neither
+  failure is a compile error.** **Superseded in part on 2026-08-25**: the *client* half below
+  still holds exactly as written and its fix is still required; the *document* half was an
+  upstream defect that has since been fixed and released — see the 2026-08-25 entry at the end
+  of this section before writing the repair pass (renamed `narrowSuccessContent`).
+  The canonical problem-details document stated that "the media type reaches the document
+  for free" because the then-pinned `servant-openapi-hs` fork carried
   `IsSwaggerResponse (RespondAs (ct :: Type) s desc a)`. That instance does exist — but the claim
   built on it is wrong, because the *enclosing* instance discards its work. Both failures were
   found by compiling and running probes in `cabal repl en-servant` and `cabal repl en-client`
@@ -234,9 +246,17 @@ operation. The exact commands and expected output are in Validation and Acceptan
   hit this concretely: its `cabal.project` pinned `openapi-hs` at one tag while the local checkout
   was ahead, and the two disagreed about a type it depended on (`HttpStatusCode` was a data type
   in the checkout and a type synonym at the pin), so code written from the checkout would not
-  compile. `en` is in exactly this position — it pins `openapi-hs` at `965340a3…` from GitHub
-  while `/Users/shinzui/Keikaku/bokuno/openapi-hs-project` exists locally. **Read the pinned
-  unpack at `dist-newstyle/src/openapi-hs-<hash>/`** when checking any OpenAPI type or instance.
+  compile. `en` was in exactly this position on 2026-07-22 — it pinned `openapi-hs` at
+  `965340a3…` from GitHub while `/Users/shinzui/Keikaku/bokuno/openapi-hs-project` existed
+  locally. **Superseded 2026-08-25**: `en` no longer pins either package by
+  `source-repository-package`; both now resolve from Hackage (commit `673ab4b`, "build(deps):
+  consume openapi-hs and servant-openapi-hs from Hackage"). The hazard is unchanged in
+  substance, only in shape: the local checkout at
+  `/Users/shinzui/Keikaku/bokuno/openapi-hs-project` is the *development* tree and may be ahead
+  of the released version en resolves. Read the source that matches the resolved version — check
+  `dist-newstyle/cache/plan.json` for what that is, then either `cabal unpack
+  servant-openapi-hs-<version>` or confirm the checkout's `version:` field matches before
+  reading it.
 
 - Discovery (2026-07-22, while planning): **kotei's design has one weakness `en` should not
   inherit: the problem document's `status` member is hand-passed and has no mechanical tie to the
@@ -260,13 +280,60 @@ operation. The exact commands and expected output are in Validation and Acceptan
   the single most valuable regression guard in this migration, because the whole risk of a
   catalog refactor is a code silently changing status or retryability.
 
+- Discovery (2026-08-25, verified against the resolved source): **the upstream document defect is
+  fixed, and the plan's own escape clause for that eventuality is wrong.** `en` moved off the
+  `shinzui` forks onto the released Hackage cohort and now resolves `openapi-hs` 5.0.0 with
+  `servant-openapi-hs` 5.1.0 (`dist-newstyle/cache/plan.json`). In 5.1.0 the `addMime` helper
+  that re-keyed every response's content map by the verb's whole content-type list **no longer
+  exists** — `grep -rn addMime` over the package source matches nothing — and the per-alternative
+  instance now keys the response by that alternative's own media type and nothing else:
+
+  ```haskell
+  instance
+    (KnownSymbol desc, ToSchema a, Accept ct) =>
+    IsSwaggerResponse cs (RespondAs (ct :: Type) s desc a)
+    where
+    responseSwagger = simpleResponseSwagger @a @'[ct] @desc
+  ```
+
+  The Concrete Steps of the 2026-07-22 draft said "if a future pin bump removes `addMime`,
+  delete that pass" — **do not do that.** The defect it compensated for is gone, but a *second*
+  distortion remains and has the same visible symptom. The client fix (widening every verb's
+  content-type list to `'[JSON, ProblemJSON]`) is still required, and `Respond` — unlike
+  `RespondAs` — still keys its content map by the whole list:
+
+  ```haskell
+  instance
+    (KnownSymbol desc, ToSchema a, AllMime cs) =>
+    IsSwaggerResponse (cs :: [Type]) (Respond s desc a)
+    where
+    responseSwagger = simpleResponseSwagger @a @cs @desc
+  ```
+
+  So after Milestone 2 the **error** responses are keyed correctly by `application/problem+json`
+  alone, and the **success** responses wrongly claim `application/problem+json` alongside
+  `application/json`. The repair pass therefore narrows in one direction only, and the conformance
+  test's second clause — "and no success response is keyed by `application/problem+json`" — is now
+  the clause carrying the weight. Milestone 6 and Concrete Steps are updated accordingly.
+
+- Discovery (2026-08-25, while revising): **`en-servant.cabal` names `openapi-hs` and
+  `servant-openapi-hs` with no version bounds at all.** That was defensible while both came from
+  `source-repository-package` pins, where the tag *is* the version. It is not defensible now that
+  the solver picks from Hackage: the two are a compatibility cohort, and the canonical OpenAPI
+  document requires one released cohort per service (`openapi-hs >= 5.0 && < 5.1`,
+  `servant-openapi-hs >= 5.1 && < 5.2` at the time it was written, re-verified 2026-07-24). A
+  service that silently drifts across the cohort boundary can emit a different document from
+  identical types. Milestone 1 now adds the bounds alongside the `http-media` line.
+
 
 ## Decision Log
 
-- Decision: Work around servant's and the fork's two `RespondAs` gaps **inside `en`** — widen each
-  `MultiVerb`'s content-type list to `'[JSON, ProblemJSON]`, and re-key the document's content maps
-  in `enOpenApi` after derivation — rather than patching `servant-openapi-hs` and repinning the
-  cohort. Report the upstream defects separately.
+- Decision: Work around servant's and the OpenAPI generator's two `RespondAs` gaps **inside
+  `en`** — widen each `MultiVerb`'s content-type list to `'[JSON, ProblemJSON]`, and re-key the
+  document's content maps in `enOpenApi` after derivation — rather than patching
+  `servant-openapi-hs` and repinning the cohort. Report the upstream defects separately.
+  **Amended 2026-08-25** (see the entry below): the first half stands unchanged; the second half
+  is narrowed, because the generator defect it worked around was fixed upstream and released.
   Rationale: The two failures found by experiment (see Surprises) have different fixes and only one
   of them *could* be fixed upstream. The client failure is in Hackage `servant-client-core`, which
   this fleet does not fork; the only lever from inside `en` is the verb's `cs` list, because that is
@@ -304,7 +371,7 @@ operation. The exact commands and expected output are in Validation and Acceptan
 - Decision: Give `en` a **catalog of problem specifications as values** — one `ProblemSpec` per
   code, carrying the code, its HTTP status, and its stable title, plus a `problemCatalog` listing
   all of them — rather than inlining title and status at each of the twenty construction sites.
-  Rationale: RFC 7807 requires `title` to be *stable per code* (dashboards and documentation key
+  Rationale: RFC 9457 requires `title` to be *stable per code* (dashboards and documentation key
   on it) and `status` to mirror the HTTP status line. Both invariants are trivially violated by
   hand-written call sites: two sites building the same code with different titles, or a body whose
   `status` says 400 while the response line says 403, are silent bugs. A catalog makes both
@@ -383,6 +450,74 @@ operation. The exact commands and expected output are in Validation and Acceptan
   prevent. A hard cutover makes GHC's error list the migration checklist.
   Date: 2026-07-22
 
+- Decision: Refresh this plan against the pattern catalog as it stands on 2026-08-25 rather than
+  executing the 2026-07-22 draft as written, and rename the plan from "RFC 7807" to "RFC 9457" —
+  file, `slug`, `title`, heading, and every `ExecPlan:` trailer in the commit-message blocks.
+  Rationale: nothing in this plan has been implemented — every Progress box is unchecked,
+  `grep -rn ProblemDetails` over the Haskell tree matches nothing, `ErrorEnvelopeWire` is still
+  live in `en-servant/src/En/Servant/Seam.hs`, and `docs/api/openapi.json` still keys every error
+  on `application/json`. Meanwhile the canonical source moved underneath it in four ways: the
+  standard was renamed to RFC 9457 (identical wire format), the catalog was restructured so the
+  three governing documents now live under `patterns/api/` and carry canonical `mori://` URIs,
+  the OpenAPI packages were released to Hackage and `en` moved onto them, and the generator
+  defect this plan works around was fixed in that release. A plan whose Context and Orientation
+  cites paths that no longer exist and pins that no longer apply is no longer self-contained,
+  which is the one non-negotiable ExecPlan requirement — so refreshing it is not optional
+  tidying. The rename is worth its churn precisely because the plan is unstarted: no commit,
+  branch, or sibling document references the old filename (`grep -rn 61-adopt-rfc-7807` over the
+  repository matches only the plan itself), so the cost is one `git mv` and the benefit is that
+  the artifact and the standard it implements share a name.
+  Date: 2026-08-25
+
+- Decision: Keep Milestone 6's repair pass — renamed `narrowSuccessContent` — but narrow **only success
+  responses**, and delete the 2026-07-22 instruction that said to drop the pass entirely if a
+  version bump ever removed `addMime`.
+  Rationale: that instruction was written as a conditional and its condition has now fired — and
+  following it would ship the exact divergence the pass exists to prevent. `addMime` is indeed
+  gone in `servant-openapi-hs` 5.1.0, so a `RespondAs ProblemJSON` alternative now reaches the
+  document keyed by `application/problem+json` alone, correctly and for free. But the *client*
+  workaround is unrelated to that fix and is still required, and it is what pollutes the success
+  side: widening every verb's content-type list to `'[JSON, ProblemJSON]` feeds that whole list
+  to `Respond`'s `IsSwaggerResponse` instance, which keys its content map by all of it. So the
+  document's errors are now right by construction and its successes are wrong, an exact inversion
+  of the 2026-07-22 situation, with the same symptom in a `just openapi` diff. One-directional
+  narrowing is also strictly safer than the two-directional version: a pass that force-keys 4xx
+  and 5xx to `problem+json` would *manufacture* a correct-looking document over a route
+  accidentally written as plain `Respond … ProblemDetails`, hiding the very mistake Milestone 6's
+  conformance test exists to catch. Leaving the error side untouched lets that test see the truth.
+  Date: 2026-08-25
+
+- Decision: The Kubernetes health-endpoints standard is **out of scope** for this plan. `en` keeps
+  `/healthz` and `/readyz` at their current paths and keeps answering them from its own
+  `en-server/app/Health.hs`; only the *body* `/readyz` returns on failure converts, exactly as
+  Milestone 5 already specifies. Record the migration to `/health/live`, `/health/ready`, and the
+  released `servant-health` package as a follow-up for a separate plan.
+  Rationale: the standard at `mori://shinzui/haskell-jitsurei/docs/api-health-endpoints` did not
+  exist when this plan was written and is a genuine conformance gap, so it must be recorded
+  rather than quietly ignored. But it is a different change with a different blast radius: it
+  renames two operator-visible URLs that Kubernetes probes, Docker health checks, and
+  `just start-server` all reference, adds a dependency, and — most importantly — asks whether
+  en's readiness check has the right *contents*, which is a service-behaviour question this plan
+  has no opinion on. Folding it in would mix a body-format migration with a URL migration in one
+  plan, which is the "never mix a type change with a file move" sequencing rule this plan's own
+  Plan of Work opens with, one level up. The two are independent: whichever lands first, the
+  other still applies unchanged.
+  Date: 2026-08-25
+
+- Decision: Add cohort version bounds for `openapi-hs` and `servant-openapi-hs` to
+  `en-servant/en-servant.cabal` as part of Milestone 1, rather than leaving them unbounded or
+  treating it as separate housekeeping.
+  Rationale: they were unbounded because they used to arrive by `source-repository-package`,
+  where the pinned tag is the version and a bound would be noise. Since commit `673ab4b` they
+  come from Hackage and the solver is free to move them, and the canonical OpenAPI document is
+  explicit that the two are one compatibility cohort that must never be mixed. The risk is not
+  hypothetical for this plan specifically: the whole Milestone 6 repair is calibrated to which
+  `IsSwaggerResponse` instances the resolved version carries, and this plan has already been
+  wrong-footed once by that source changing. It belongs in Milestone 1 because Milestone 1 is
+  where the cabal file is already being edited for `http-media`, so it costs one extra stanza
+  and no extra commit.
+  Date: 2026-08-25
+
 
 ## Outcomes & Retrospective
 
@@ -446,7 +581,7 @@ content-type list (for `en`, `'[JSON]`, i.e. `application/json`).
 `RespondAs contentType status description payload` is the same thing with that one alternative's
 Content-Type pinned to `contentType` regardless of the verb's list. It ships in stock servant
 0.20 — **no fork is involved** — and swapping `Respond` for `RespondAs ProblemJSON` on the error
-alternatives is the entire mechanism by which en's error bodies acquire the RFC 7807 media type
+alternatives is the entire mechanism by which en's error bodies acquire the RFC 9457 media type
 while its success bodies stay plain JSON.
 
 **`AsUnion`** is the servant type class that maps a handler's result sum onto the response list.
@@ -463,7 +598,7 @@ the list means growing that clause — which is the point, and this plan grows i
 **The seam** is `en-servant/src/En/Servant/Seam.hs`, the module that joins `en`'s `effectful`
 engine stack to servant's `Handler` monad. It owns the error vocabulary this plan replaces.
 
-**An RFC 7807 problem document** is the IETF-standard error body. It is a JSON object with four
+**An RFC 9457 problem document** is the IETF-standard error body. It is a JSON object with four
 members from the RFC — `type` (a URI naming the error *kind*; always the literal `"about:blank"`
 until a service really hosts error-documentation pages, because a made-up URL that 404s is worse
 than none), `title` (a short human phrase that is **stable for a given code**, never
@@ -473,22 +608,36 @@ request-specific prose) — plus two extension members this fleet adds, which th
 permits: `code` (the stable `snake_case` machine key clients branch on) and `retryable` (true
 only when retrying the *unchanged* request can succeed, which in practice means the `503`
 "a dependency is down" case). It must be served as `application/problem+json`; a problem body
-under plain `application/json` is the shape without the self-description. RFC 7807 was
-renumbered **RFC 9457** with an identical wire format; the fleet says "7807" because that is the
-name it standardized on.
+under plain `application/json` is the shape without the self-description. A note on the name:
+this convention was first written against **RFC 7807**, which **RFC 9457** obsoletes with an
+*identical wire format* — 9457's additions are an IANA registry of common problem types and
+guidance on multiple problems and on non-dereferenceable `type` URIs, none of which changes a
+byte on the wire. The canonical document and this plan now say 9457; older fleet code and
+comments, shomei's included, still say 7807 and should be read as 9457.
 
 ### Where the rules come from
 
-The conventions this plan implements are recorded canonically in a separate repository whose
-working copy is at `/Users/shinzui/Keikaku/bokuno/haskell-jitsurei`, in three documents:
-`api/servant-routes.md` (routes as a `NamedRoutes` record; statuses declared as `MultiVerb`
-alternatives; modules by concept), `api/openapi-from-types.md` (the OpenAPI document is derived
-from the route types and never hand-written), and `api/rfc7807-problem-details.md` (this plan's
-subject). Per the ExecPlan self-containment requirement, everything needed from them is restated
-here; a reader does not need that repository to execute this plan. Two reference implementations
-are named there and were read while planning: **kotei** (the `MultiVerb`-style adopter, whose
-approach `en` follows) and **shomei** (the `ServerError`-style adopter, whose single rendering
-function and error catalog `en` borrows).
+The conventions this plan implements are recorded canonically in a separate repository, the
+fleet's Haskell pattern catalog. Cite it by its canonical Mori URIs rather than by a path on one
+machine — a `mori://` URI survives the repository being restructured, which this one was between
+this plan's authoring and its 2026-08-25 revision. Three documents govern this work:
+
+- `mori://shinzui/haskell-jitsurei/docs/api-servant-routes` — routes as a `NamedRoutes` record,
+  statuses declared as `MultiVerb` alternatives, modules by concept.
+- `mori://shinzui/haskell-jitsurei/docs/api-openapi-from-types` — the OpenAPI document is derived
+  from the route types and never hand-written.
+- `mori://shinzui/haskell-jitsurei/docs/api-rfc9457-problem-details` — this plan's subject.
+
+Resolve any of them to a file on this machine with `mori path <uri>`; today all three land under
+`patterns/api/` in the working copy at `/Users/shinzui/Keikaku/bokuno/haskell-jitsurei`, which is
+where they moved from the flat `api/` directory the 2026-07-22 draft of this plan named. Per the
+ExecPlan self-containment requirement, everything needed from them is restated here; a reader
+does not need that repository — or a working `mori` — to execute this plan.
+
+Two reference implementations are named there and were read while planning: **kotei** (the
+`MultiVerb`-style adoption, whose approach `en` follows) and **shomei** (the `ServerError`-style
+adopter, whose single rendering function and error catalog `en` borrows). Only shomei ships as
+code; see the first entry in Surprises & Discoveries.
 
 `en` already satisfies the first two documents. That work is
 `docs/plans/59-convert-en-servant-to-namedroutes-and-vertical-slices.md`, which converted the API
@@ -496,6 +645,16 @@ to a `NamedRoutes` record, split it into vertical slices, and brought the OpenAP
 full recipe (a checked-in artifact written by an executable, stable `operationId`s, a drift
 check, three conformance tests). Its 2026-07-21 audit is what produced this plan; the four gaps
 it lists as follow-ups (1) through (4) are exactly this plan's four milestone groups.
+
+The catalog has grown since. Five further standards now sit beside the three above —
+Kubernetes health endpoints, Relay pagination, OpenTelemetry integration, production request
+logging, and Hurl integration testing. Exactly one of them touches ground this plan stands on:
+`mori://shinzui/haskell-jitsurei/docs/api-health-endpoints` requires every service to serve
+`/health/live` and `/health/ready` from the released `servant-health` package, whereas `en`
+serves hand-written `/healthz` and `/readyz` out of `en-server/app/Health.hs`. That is a real
+gap and it is **deliberately out of scope here** — see the 2026-08-25 Decision Log entry. This
+plan converts the *body* `/readyz` answers with; a separate plan moves the *endpoints*. The
+other four are unrelated to error bodies and are not this plan's business.
 
 ### The current error surface, in full
 
@@ -572,7 +731,7 @@ rate_limited                429  en-server Middleware (retryable)
 Two codes have two producers each (`not_found`, `permission_denied`). That is a mild vocabulary
 smell — a client cannot tell "no such endpoint" from "grant minting is disabled" by `code` alone —
 but renaming codes is explicitly forbidden during an envelope migration: the canonical rule is
-that the move to RFC 7807 changes the envelope and must not simultaneously change the vocabulary,
+that the move to RFC 9457 changes the envelope and must not simultaneously change the vocabulary,
 so that client migration reads "get `code` from the new shape" rather than "re-map every code".
 Both are carried forward as-is; disambiguating them, if ever, is its own change with its own
 deprecation story.
@@ -686,7 +845,7 @@ Second, the content type. This is the mechanism by which error bodies get the RF
 while success bodies stay plain JSON:
 
 ```haskell
--- | The application/problem+json content type (RFC 7807 §3).
+-- | The application/problem+json content type (RFC 9457 §3).
 data ProblemJSON
 
 instance Accept ProblemJSON where
@@ -783,20 +942,47 @@ route **in the test file only**, not in the API, whose success alternative is
    server (or through `runClientM` over the WAI app), and assert the `400` comes back as the
    *value* `UnrenderSuccess`-style — pattern-matched as the error constructor — and **not** as a
    `Left (UnsupportedContentType …)`.
-3. **The document.** Call `toOpenApi` on the spike's proxy and assert the `400` response's
-   `content` map is keyed by `application/problem+json`.
+3. **The document.** Call `toOpenApi` on the spike's proxy and assert **two** things, not one:
+   the `400` response's `content` map is keyed by `application/problem+json` *and nothing else*,
+   and the `200` response's `content` map does **not** contain `application/problem+json`.
 
 Legs 2 and 3 are not padding: each of them **fails** if the route is written the obvious way, for
 reasons recorded in Surprises & Discoveries, and each is fixed by a specific measure this plan
-adopts. Write the spike first *without* the fixes and watch legs 2 and 3 go red — that red is the
-evidence the fixes are necessary, and it is worth thirty seconds to see. Then apply them: give the
-verb the content-type list `'[JSON, ProblemJSON]` (which fixes leg 2), and re-key the document's
-content maps after derivation (which fixes leg 3). Delete the spike at the end of Milestone 2,
-when ten real routes prove the same three properties.
+adopts. Write the spike first *without* the fixes and watch them go red — that red is the
+evidence the fixes are necessary, and it is worth thirty seconds to see. Expect this exact
+pattern on the packages `en` resolves today (`openapi-hs` 5.0.0, `servant-openapi-hs` 5.1.0):
+
+- Leg 1 is green from the start. `RespondAs` stamps the media type on the wire in stock servant.
+- Leg 2 is **red**, and is fixed by giving the verb the content-type list `'[JSON, ProblemJSON]`.
+  Without that the client rejects the response before it ever decodes the body.
+- Leg 3's first assertion is **green** from the start — `RespondAs`'s `IsSwaggerResponse`
+  instance keys the response by its own `ct` alone. Its second assertion goes **red the moment
+  you apply leg 2's fix**, because `Respond`'s instance keys *its* content map by the verb's
+  whole list, so the `200` inherits `application/problem+json`. That is what Milestone 6's
+  `narrowSuccessContent` pass exists to undo. Run leg 3 before and after the leg-2 fix and watch
+  the failure move from nothing to the `200` — that transition is the clearest possible statement
+  of why the pass is needed and why it must only touch successes.
+
+Delete the spike at the end of Milestone 2, when ten real routes prove the same properties.
+
+While the cabal file is open, give the OpenAPI cohort explicit bounds in the `en-servant` library
+stanza. They are absent today, which was fine when both packages arrived by pinned git tag and is
+not fine now that the solver picks them from Hackage:
+
+```cabal
+    , openapi-hs         >=5.0 && <5.1
+    , servant-openapi-hs >=5.1 && <5.2
+```
+
+Those are the released cohort `en` resolves today and the pair the canonical OpenAPI document
+names. Re-check Hackage and the upstream release tags before widening them; never let the two
+drift into different cohorts.
 
 Acceptance: `cabal build all && cabal test all` passes; the two unit tests and all three legs of
-the spike are green; `git diff --stat` shows one new module, one cabal line, and test additions;
-and `docs/api/openapi.json` is **unchanged**, because no production route changed.
+the spike are green; `cabal build all` still resolves `openapi-hs` 5.0.0 and `servant-openapi-hs`
+5.1.0 (`grep -A2 '"pkg-name": "openapi-hs"' dist-newstyle/cache/plan.json`); `git diff --stat`
+shows one new module, three cabal lines, and test additions; and `docs/api/openapi.json` is
+**unchanged**, because no production route changed.
 
 ### Milestone 2 — Convert the servant surface
 
@@ -905,10 +1091,13 @@ Acceptance: `cabal build all && cabal test all` passes;
 `grep -rn "ErrorEnvelopeWire" en-servant/src en-client/src` is empty; and a live `curl` of a
 malformed body returns the transcript shown in Validation. Regenerate the document
 (`cabal run en-openapi`) and commit it, but **do not expect it to be right yet**: at this point
-every response's `content` map lists both `application/json` and `application/problem+json`,
-because the fork re-keys each response by the verb's whole content-type list. Milestone 6 is what
-narrows them. Recording the intermediate state here rather than "fixing" it early is what keeps
-each commit's diff about one thing.
+every *success* response's `content` map lists both `application/json` and
+`application/problem+json`, because widening each verb's content-type list to
+`'[JSON, ProblemJSON]` (the client fix from Milestone 1) feeds that whole list to `Respond`'s
+OpenAPI instance. The *error* responses are already keyed correctly by `application/problem+json`
+alone, because `RespondAs`'s instance uses its own content type. Milestone 6 is what narrows the
+successes. Recording the intermediate state here rather than "fixing" it early is what keeps each
+commit's diff about one thing.
 
 ### Milestone 3 — A 500 for genuine internal faults
 
@@ -1059,31 +1248,44 @@ media type and the authentication the server enforces.
 
 Three additions to `enOpenApi`, all post-derivation enrichment in the style of the existing
 `withOperationIds`. The first is not enrichment so much as repair, and without it the document
-lies about the media type.
+lies about the media type of every successful response.
 
-**Re-key the content maps.** As recorded in Surprises & Discoveries, the fork's `HasOpenApi`
-instance for `MultiVerb` discards each alternative's own media type and re-keys every response by
-the verb's whole content-type list — so after Milestone 2 every response, success and error alike,
-claims both `application/json` and `application/problem+json`. Neither claim is right: successes
-are served as JSON and errors as problem documents. Fix it where en already lens-rewrites the
-document:
+**Narrow the success responses' content maps.** Read the 2026-08-25 entries in Surprises &
+Discoveries before writing this; the situation is the *opposite* of what the 2026-07-22 draft of
+this plan described, and the difference decides what the pass may touch.
+
+Error responses need no repair. `servant-openapi-hs` 5.1.0 keys a `RespondAs ct …` alternative by
+`ct` and nothing else, so every one of en's error responses arrives in the derived document keyed
+by `application/problem+json` already. Success responses do need repair, and for a reason
+entirely internal to this plan: Milestone 1's client fix widens every verb's content-type list to
+`'[JSON, ProblemJSON]`, `Respond`'s OpenAPI instance keys its content map by that whole list, and
+so every `200` claims it may answer with a problem document. It cannot. Fix it where en already
+lens-rewrites the document:
 
 ```haskell
--- | Narrow each response's content map to the media type actually served.
+-- | Drop application/problem+json from non-error responses' content maps.
 --
--- The MultiVerb HasOpenApi instance re-keys every response by the verb's whole content-type
--- list, discarding what each RespondAs alternative declared, so the derived document claims
--- both media types on every response. Errors are served as application/problem+json and
--- successes as application/json; this restores that distinction. Remove this pass if the
--- servant-openapi-hs fork ever stops flattening per-alternative content types.
-narrowResponseContent :: OpenApi -> OpenApi
+-- Errors need no help: servant-openapi-hs keys a RespondAs alternative by its own content type,
+-- so they arrive keyed by application/problem+json alone. Successes do: every verb's
+-- content-type list is widened to '[JSON, ProblemJSON] so that servant-client-core's
+-- Content-Type check accepts problem responses (it checks the verb's list, not the
+-- alternative's), and Respond's OpenAPI instance keys its content map by that whole list. A 200
+-- is only ever served as application/json; this says so.
+narrowSuccessContent :: OpenApi -> OpenApi
 ```
 
-keyed on the status code: `>= 400` keeps only `application/problem+json`, everything else keeps
-only the JSON entries. Write the comment above it in full — a future reader finding a
-hand-written media-type rewrite next to a *derived* document deserves to know it is compensating
-for an upstream defect rather than hand-authoring the contract, which is otherwise exactly the
-anti-pattern the OpenAPI recipe forbids.
+keyed on the status code: responses below `400` keep only the JSON entries, and responses at
+`400` and above are **left exactly as derived**. Write the comment above it in full — a future
+reader finding a hand-written media-type rewrite next to a *derived* document deserves to know
+it is compensating for a workaround this plan introduced elsewhere, rather than hand-authoring
+the contract, which is otherwise exactly the anti-pattern the OpenAPI recipe forbids.
+
+Do not be tempted to make the pass symmetric and force `4xx`/`5xx` to `application/problem+json`
+as well. It would be dead code today, and worse than dead: it would *manufacture* a correct-
+looking content key over a route accidentally written as plain `Respond … ProblemDetails`, which
+serves the right body under `application/json`. That mistake is invisible in a body diff, and the
+conformance test below is the only thing that catches it. A pass that rewrites the error side
+would blind the test to the one failure it exists for.
 
 Then the two genuine enrichments, neither of which can come from the route types. First, the
 security scheme. `en`'s authentication is WAI middleware wrapped around the servant `Application`, so it
@@ -1111,10 +1313,10 @@ Then three conformance tests, added to `openApiDocumentTests`. **Every error res
 is keyed by exactly `application/problem+json`, and no success response is** — this is the
 assertion that catches a route quietly written with plain `Respond … ProblemDetails`, which would
 serve the right body under the wrong media type and is invisible in a body diff, and it is *also*
-the assertion that fails loudly if the `narrowResponseContent` pass is ever dropped or if a future
-fork bump changes the flattening behaviour. Given that this plan is only aware of the upstream
-defect because someone ran `toOpenApi` and read the output, this test is the single most valuable
-thing in the milestone. **Every code named in the document exists in
+the assertion that fails loudly if the `narrowSuccessContent` pass is ever dropped or if a future
+version bump changes how either `Respond` or `RespondAs` keys its content map. Given that this
+plan has twice been wrong-footed by exactly that — once when the generator flattened everything,
+once when it stopped — this test is the single most valuable thing in the milestone. **Every code named in the document exists in
 `problemCatalog`, at a status the catalog says it is sent with** — assert membership, not
 uniqueness, because `not_found` and `permission_denied` each legitimately have two producers.
 **Every operation carries the security requirement** — a route that lost it would be a security
@@ -1125,7 +1327,8 @@ the visible proof of the whole plan, and the one artifact a client generator con
 
 Acceptance: `cabal build all && cabal test all` passes; `just openapi` is clean on a freshly
 regenerated tree; and the Python summary in Validation prints `securitySchemes: ['bearerAuth']`,
-`sec=True` on all twelve operations, and `['application/problem+json']` for every error response.
+`sec=True` on all twelve operations, `['application/problem+json']` for every error response, and
+no `application/problem+json` on any `200`.
 
 ### Milestone 7 — Update the documents of record
 
@@ -1134,7 +1337,7 @@ is the ExecPlan that established `ErrorEnvelopeWire`; its Milestone 3 and 3b cod
 type that no longer exists, and a novice reading it alone would rebuild the shape this plan
 removed. Per the revision protocol, do not rewrite its history: update those blocks in place to
 the `ProblemDetails` form, and append a dated revision note naming this plan, stating that the
-error *body* moved to RFC 7807 while the `MultiVerb` response model it specifies is unchanged and
+error *body* moved to RFC 9457 while the `MultiVerb` response model it specifies is unchanged and
 every `code` string it lists survives verbatim.
 
 Then mark follow-ups (1) through (4) closed in
@@ -1142,9 +1345,23 @@ Then mark follow-ups (1) through (4) closed in
 Retrospective, naming this plan, and note that its `Re-running the conformance audit` commands now
 expect the converted output — the `grep` for `problem+json` that expected `0` should now be
 non-zero, and the one for hard-coded `application/json` error content types should now be `0`.
+While editing that file, replace its references to `haskell-jitsurei/api/…` filesystem paths with
+the canonical `mori://shinzui/haskell-jitsurei/docs/api-…` URIs listed in Context and
+Orientation; those paths no longer exist in that repository, so a reader following them today
+finds nothing.
 
-Acceptance: neither plan file describes a type that no longer exists; both carry dated revision
-notes naming this plan.
+Record two follow-ups in this plan's Outcomes & Retrospective rather than acting on them here.
+The first is the health-endpoints gap: `en` serves `/healthz` and `/readyz` from hand-written
+code, while the fleet standard at `mori://shinzui/haskell-jitsurei/docs/api-health-endpoints`
+requires `/health/live` and `/health/ready` from the released `servant-health` package. The
+second is the upstream report on `servant-client-core`, whose `HasClient` instance for
+`MultiVerb` checks a response's Content-Type against the verb's content-type list rather than the
+matching alternative's — the defect that forces this plan's `'[JSON, ProblemJSON]` widening onto
+every service that adopts the convention. Its sibling defect in `servant-openapi-hs` was fixed and
+released between this plan's authoring and its revision; this one has not been.
+
+Acceptance: neither plan file describes a type that no longer exists; neither cites a
+`haskell-jitsurei` path that no longer exists; both carry dated revision notes naming this plan.
 
 
 ## Concrete Steps
@@ -1172,25 +1389,38 @@ grep -rn "errBody\|ErrorEnvelopeWire\|\"application/json\"" \
 Treat the resulting hit list as the checklist for Milestones 2 and 5, and re-run it at the end of
 Milestone 5 — it must then contain only success-path content types.
 
-One more check before relying on any OpenAPI type or instance. `en` pins `openapi-hs` and
-`servant-openapi-hs` by `source-repository-package`, and a local checkout of either may sit
-*ahead* of the pinned commit; shomei lost time to exactly this, writing code against a working
-tree whose types had already diverged from its pin. Read the pinned unpack, never
-`/Users/shinzui/Keikaku/bokuno/openapi-hs-project`:
+One more check before relying on any OpenAPI type or instance, and do not skip it: this plan's
+Milestone 6 is calibrated to exactly which `IsSwaggerResponse` instances the resolved
+`servant-openapi-hs` carries, and that has already changed once underneath this plan. First find
+out what the solver actually chose:
 
 ```bash
-ls dist-newstyle/src/                        # openapi-hs-<hash>/, servant-o_-<hash>/
-grep -rn "IsSwaggerResponse (RespondAs" dist-newstyle/src/servant-o_-*/src
-grep -rn -A3 "addMime" dist-newstyle/src/servant-o_-*/src/Servant/OpenApi/Internal.hs
+python3 -c 'import json; p=json.load(open("dist-newstyle/cache/plan.json")); \
+  print(sorted({(u["pkg-name"], u["pkg-version"]) for u in p["install-plan"] \
+  if u.get("pkg-name") in ("openapi-hs","servant-openapi-hs","servant-client-core")}))'
 ```
 
-Expected on the pins as they stand today (`openapi-hs` 4.1.0, `servant-openapi-hs` 4.1.0, both
-verified byte-identical to their pinned tags): the `IsSwaggerResponse (RespondAs (ct :: Type) s desc a)`
-instance **is** present, requiring `(KnownSymbol desc, ToSchema a, Accept ct)` — *and* the
-`addMime` helper in the enclosing `HasOpenApi (MultiVerb …)` instance is present too, re-keying
-every response's content map by the verb's content-type list. That second grep is the one that
-matters: `addMime` is why Milestone 6 needs `narrowResponseContent`. If a future pin bump removes
-`addMime`, delete that pass and let the conformance test confirm the document is still right.
+Expected as of 2026-08-25: `openapi-hs 5.0.0`, `servant-openapi-hs 5.1.0`,
+`servant-client-core 0.20.3.0`. Both OpenAPI packages come from Hackage — `en` moved off the
+`shinzui` git pins in commit `673ab4b`. Then read the source of the version that was resolved,
+**not** the development checkout at `/Users/shinzui/Keikaku/bokuno/openapi-hs-project`, which may
+be ahead of it; shomei lost time to exactly that mistake. Either `cabal unpack
+servant-openapi-hs-<version>` into a scratch directory, or verify the checkout's `version:` field
+matches before reading it, then:
+
+```bash
+grep -rn "IsSwaggerResponse (RespondAs" <source>/src
+grep -rn "IsSwaggerResponse (cs :: \[Type\]) (Respond " <source>/src
+grep -rn "addMime" <source>/src        # must match nothing on 5.1.0
+```
+
+Expected on 5.1.0: `RespondAs`'s instance calls `simpleResponseSwagger @a @'[ct] @desc` — keyed by
+that alternative's own content type alone, which is why error responses need no repair.
+`Respond`'s instance calls `simpleResponseSwagger @a @cs @desc` — keyed by the verb's whole
+content-type list, which is why success responses do. And `addMime`, the helper that used to
+flatten both, is gone. If any of those three greps disagrees with this description, stop and
+re-derive what Milestone 6's pass must do before writing it; the plan's answer is only correct
+for the instances described here.
 
 Then proceed milestone by milestone, building after each file so GHC's errors name the next site.
 Every commit on this plan carries both trailers.
@@ -1205,7 +1435,7 @@ git diff --stat docs/api/openapi.json      # must be empty: no route changed
 ```
 
 ```text
-feat(en-servant): RFC 7807 problem details, the content type, and the code catalog
+feat(en-servant): RFC 9457 problem details, the content type, and the code catalog
 
 Add En.Servant.Problem: the ProblemDetails record with one shared aeson Options
 value driving its codec (and later its schema), the application/problem+json
@@ -1214,7 +1444,7 @@ title, and retryability, and the two renderers for thrown ServerErrors and for W
 middleware. Nothing is wired up yet; a throwaway test-only MultiVerb route proves
 RespondAs really stamps the media type per alternative.
 
-ExecPlan: docs/plans/61-adopt-rfc-7807-problem-details-and-close-the-api-conformance-audit.md
+ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
 Intention: intention_01ky42xb8mebsv979g07nrhwp9
 ```
 
@@ -1228,7 +1458,7 @@ git add -A
 ```
 
 ```text
-refactor(en-servant)!: serve RFC 7807 problem documents on every error
+refactor(en-servant)!: serve RFC 9457 problem documents on every error
 
 Convert the shared EnResponses error alternatives from Respond to RespondAs
 ProblemJSON, carrying ProblemDetails; rewrite enErrorToFault as a dispatch over
@@ -1237,7 +1467,7 @@ hooks; rewrite servant's unreachable empty 405 into a problem document with a WA
 middleware installed inside app, so embedders get it too. ErrorEnvelopeWire is
 deleted. Every code string, status, and retryable flag is unchanged.
 
-ExecPlan: docs/plans/61-adopt-rfc-7807-problem-details-and-close-the-api-conformance-audit.md
+ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
 Intention: intention_01ky42xb8mebsv979g07nrhwp9
 ```
 
@@ -1260,7 +1490,7 @@ mismatch is en's own bug (500, not retryable). An undecodable caveat_payload and
 unparseable freshly-minted write token were both telling clients to retry forever.
 Grows EnResponses, EnResult, and the exhaustiveness witness by one.
 
-ExecPlan: docs/plans/61-adopt-rfc-7807-problem-details-and-close-the-api-conformance-audit.md
+ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
 Intention: intention_01ky42xb8mebsv979g07nrhwp9
 ```
 
@@ -1274,7 +1504,7 @@ can produce), a result sum, and a hand-written AsUnion; the handler returns inst
 of throwing. en-client's mintGrant now yields MintGrantResult, so a disabled minter
 or a non-Allowed decision is a value rather than an opaque transport error.
 
-ExecPlan: docs/plans/61-adopt-rfc-7807-problem-details-and-close-the-api-conformance-audit.md
+ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
 Intention: intention_01ky42xb8mebsv979g07nrhwp9
 ```
 
@@ -1293,7 +1523,7 @@ renderer, so the 401, 403, and 429 the auth and rate-limit middleware answer wit
 and the 503 from /readyz — speak the same dialect as everything servant serves.
 /healthz and /metrics are exempt by name and unchanged.
 
-ExecPlan: docs/plans/61-adopt-rfc-7807-problem-details-and-close-the-api-conformance-audit.md
+ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
 Intention: intention_01ky42xb8mebsv979g07nrhwp9
 ```
 
@@ -1319,7 +1549,7 @@ the three conformance tests: problem+json on every error response, every documen
 code present in the catalog at the status it is sent with, and security on every
 operation.
 
-ExecPlan: docs/plans/61-adopt-rfc-7807-problem-details-and-close-the-api-conformance-audit.md
+ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
 Intention: intention_01ky42xb8mebsv979g07nrhwp9
 ```
 
@@ -1328,7 +1558,7 @@ Milestone 7 — the documents of record:
 ```text
 docs(en): update EP-35 and close EP-59's audit follow-ups
 
-ExecPlan: docs/plans/61-adopt-rfc-7807-problem-details-and-close-the-api-conformance-audit.md
+ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
 Intention: intention_01ky42xb8mebsv979g07nrhwp9
 ```
 
@@ -1458,16 +1688,21 @@ for p in sorted(d["paths"]):
         if m in ("get", "post"):
             errs = {c: sorted(r.get("content", {}))
                     for c, r in o.get("responses", {}).items() if c >= "400"}
-            print("%-5s %-38s sec=%s errors=%s"
-                  % (m.upper(), p, bool(o.get("security")), errs))
+            oks = {c: sorted(r.get("content", {}))
+                   for c, r in o.get("responses", {}).items() if c < "400"}
+            print("%-5s %-38s sec=%s ok=%s errors=%s"
+                  % (m.upper(), p, bool(o.get("security")), oks, errs))
 PY
 ```
 
 Expected after Milestone 6: `3.1.0`; `securitySchemes: ['bearerAuth']`; `sec=True` on every one
-of the twelve operations; and every error response's content keyed by
-`['application/problem+json']` — never `['application/json']`, which would mean a route was
-written with plain `Respond … ProblemDetails` and serves the right body under the wrong media
-type. `POST /v1/grants` must now list `403` and `404` alongside the shared tail, and every
+of the twelve operations; every error response's content keyed by `['application/problem+json']`
+— never `['application/json']`, which would mean a route was written with plain
+`Respond … ProblemDetails` and serves the right body under the wrong media type; and **no `200`
+listing `application/problem+json`**, which would mean `narrowSuccessContent` was dropped or
+never ran, leaving the document claiming every successful response might be an error document.
+Those two failures look alike in a diff and have opposite causes, which is why the summary prints
+both columns. `POST /v1/grants` must now list `403` and `404` alongside the shared tail, and every
 `MultiVerb` operation must list `500`.
 
 ### What the test suite must additionally prove
@@ -1538,40 +1773,50 @@ mid-milestone, commit nothing and use `git stash`.
 
 **If the OpenAPI document comes back missing its error responses at any point** — that is, if
 `just openapi` produces a `docs/api/openapi.json` whose operations list only `200` — stop. It
-means the derivation is no longer going through the pinned `shinzui` forks (`openapi-hs`,
-`servant-openapi-hs`), because Hackage's `openapi3`/`servant-openapi3` carry no `HasOpenApi`
-instance for `MultiVerb` and silently drop every declared error response. Check `cabal.project`
-still carries both `source-repository-package` blocks before changing anything else. Do not
-"fix" it by hand-editing the artifact: it is a build product, and an edit is lost the next time
-anyone runs the generator.
+means the derivation is no longer going through `openapi-hs` / `servant-openapi-hs`, the only
+packages that carry a `HasOpenApi` instance for `MultiVerb`. Their upstream ancestors
+`openapi3` / `servant-openapi3` do not: against those an API using `MultiVerb` does not
+typecheck at all, so a "fix" that gets it compiling again by flattening routes back to plain
+`Verb`s would throw away every declared error response. Check what
+`en-servant/en-servant.cabal` depends on and what `dist-newstyle/cache/plan.json` resolved
+before changing anything else. Do not "fix" it by hand-editing the artifact: it is a build
+product, and an edit is lost the next time anyone runs the generator.
 
 
 ## Interfaces and Dependencies
 
 ### Libraries
 
-**No new fork, and no change to any pin** — though not because everything works out of the box.
-Two defects in the resolved toolchain (servant-client-core's content-type check, and the
-`servant-openapi-hs` fork's flattening of per-alternative content types) are worked around inside
-`en`, for the reasons in the Decision Log, and reported upstream as a follow-up. The versions this
-plan was verified against, from `dist-newstyle/cache/plan.json`: GHC 9.12.4, servant /
-servant-server / servant-client / servant-client-core all 0.20.3.0, `http-media` 0.8.1.1,
-`openapi-hs` 4.1.0 and `servant-openapi-hs` 4.1.0 from the pinned source repositories.
+**No new package, no new git pin, and no cohort change** — though not because everything works
+out of the box. One defect in the resolved toolchain is worked around inside `en`, for the
+reasons in the Decision Log: `servant-client-core`'s `HasClient` instance for `MultiVerb` checks
+a response's Content-Type against the *verb's* content-type list rather than the matching
+alternative's, so every problem response is rejected before its body is decoded unless the verb's
+list is widened to `'[JSON, ProblemJSON]`. Report it upstream as a follow-up. Its sibling defect,
+`servant-openapi-hs`'s flattening of per-alternative content types, **was** fixed upstream and
+released between this plan's authoring and its 2026-08-25 revision; what remains of Milestone 6's
+repair pass is cleaning up after the client workaround, not after the generator.
+
+The versions this revision was verified against, from `dist-newstyle/cache/plan.json`: GHC 9.12.4,
+servant / servant-server / servant-client / servant-client-core all 0.20.3.0, `http-media`
+0.8.1.1, `openapi-hs` 5.0.0 and `servant-openapi-hs` 5.1.0 — both from **Hackage**, not from a
+`source-repository-package` pin. `en` moved onto the released cohort in commit `673ab4b`
+("build(deps): consume openapi-hs and servant-openapi-hs from Hackage"), which is a change from
+what the 2026-07-22 draft of this plan described.
 
 The `RespondAs` combinator this plan is built on ships in stock servant 0.20, which `en` already
-depends on. The OpenAPI toolchain stays exactly as it
-is: `cabal.project` keeps its `source-repository-package` blocks for `github.com/shinzui/openapi-hs`
-(tag `965340a30fad0782f2c964ab97b4ab0f12fa044d`) and `github.com/shinzui/servant-openapi-hs`
-(tag `7cbbc234cb7c0e900495b2f676e2912a7f456ff0`). Those pins are load-bearing and must not be
-"simplified" to Hackage `openapi3`/`servant-openapi3`, which carry no `HasOpenApi` instance for
-`MultiVerb` and would silently drop every declared error response from the document. They also
-match the rest of the fleet (meibo, mori, relay-pagination pin the same two tags), which the
-canonical recipe requires so that a shared DTO gets the same schema in two services.
+depends on. The two OpenAPI packages must stay as they are and must not be "simplified" to
+`openapi3` / `servant-openapi3`: those carry no `HasOpenApi` instance for `MultiVerb`, so an API
+written as en's now is cannot derive a document at all. `cabal.project` needs no edit — the only
+`source-repository-package` block it carries is the unrelated `biscuit-haskell` pin.
 
-One `build-depends` addition is needed: **`http-media`** in the `en-servant` library stanza in
-`en-servant/en-servant.cabal`. It supplies the `(//)` operator used to write
-`contentType _ = "application" // "problem+json"`. Servant depends on it transitively, but cabal
-requires the direct dependency to be declared. Nothing else is added anywhere:
+Two `build-depends` changes are needed, both in the `en-servant` library stanza in
+`en-servant/en-servant.cabal`. First, add **`http-media`**: it supplies the `(//)` operator used
+to write `contentType _ = "application" // "problem+json"`. Servant depends on it transitively,
+but cabal requires the direct dependency to be declared. Second, give the OpenAPI cohort the
+version bounds it currently lacks — `openapi-hs >=5.0 && <5.1` and
+`servant-openapi-hs >=5.1 && <5.2` — because the two are one compatibility cohort that the solver
+is otherwise free to split now that they come from Hackage. Nothing else is added anywhere:
 `en-server/en-server.cabal` already depends on `en-servant`, so Milestone 5 imports the shared
 renderer rather than growing its dependency list, and the test stanza already has everything it
 needs.
@@ -1660,10 +1905,10 @@ At the end of **Milestone 6**, in `en-servant/src/En/Servant/OpenApi.hs`:
 
 ```haskell
 instance ToSchema ProblemDetails       -- genericDeclareNamedSchema (fromAesonOptions problemJsonOptions)
-narrowResponseContent :: OpenApi -> OpenApi  -- 4xx/5xx keep only problem+json; others only JSON
+narrowSuccessContent :: OpenApi -> OpenApi   -- responses < 400 keep only JSON; 4xx/5xx untouched
 withSecurityScheme :: OpenApi -> OpenApi     -- declares bearerAuth and requires it on every operation
 enOpenApi :: OpenApi                         -- toOpenApi apiProxy, then withOperationIds,
-                                             -- narrowResponseContent, withSecurityScheme
+                                             -- narrowSuccessContent, withSecurityScheme
 ```
 
 ### Modules that must not change
@@ -1674,3 +1919,55 @@ throws changes), because `en-example` and embedded hosts call it. `En.Servant.Se
 and `kikan-en` import that module directly. `En.Servant.API` keeps exporting `app`, `EnApi (..)`,
 and the whole re-export umbrella, and no module moves: this plan changes payload types, not
 module layout.
+
+
+## Revision Note — 2026-08-25
+
+**What changed.** This plan was refreshed against the fleet's Haskell pattern catalog as it
+stands today, and renamed from "RFC 7807" to "RFC 9457" — file, `slug`, `title`, heading, and the
+`ExecPlan:` trailers in every commit-message block. No milestone was added, removed, or
+reordered, and the plan's scope, its twenty error codes, and its seven-milestone shape are
+unchanged.
+
+**Why.** Nothing in this plan has been implemented — every Progress box is unchecked,
+`grep -rn ProblemDetails` over the Haskell tree matches nothing, `ErrorEnvelopeWire` is still the
+live error type in `en-servant/src/En/Servant/Seam.hs`, and `docs/api/openapi.json` still keys
+every error on `application/json`. In the month it sat unstarted, four things it depends on moved:
+
+1. **The standard was renamed.** RFC 9457 obsoletes RFC 7807 with an identical wire format, and
+   the canonical document renamed itself accordingly. Nothing on the wire changes.
+2. **The catalog was restructured.** The three governing documents moved from a flat `api/`
+   directory into `patterns/api/` and acquired canonical `mori://` URIs. Context and Orientation
+   now cites those URIs instead of filesystem paths, per the cross-repository reference rule, and
+   Milestone 7 picks up repairing the same stale paths in ExecPlan 59.
+3. **The OpenAPI packages were released and `en` moved onto them.** `openapi-hs` and
+   `servant-openapi-hs` are no longer `source-repository-package` pins; `en` resolves 5.0.0 and
+   5.1.0 from Hackage (commit `673ab4b`). Interfaces and Dependencies, Concrete Steps, and
+   Idempotence and Recovery all described the old pinned world and would have sent an implementer
+   looking for `dist-newstyle/src/` unpacks and `cabal.project` stanzas that no longer exist.
+4. **The upstream generator defect was fixed.** `addMime` — the helper that flattened every
+   response's content map onto the verb's whole content-type list — is gone in
+   `servant-openapi-hs` 5.1.0. This is the substantive change, and it is *not* the simple
+   deletion the old draft anticipated. The 2026-07-22 text said "if a future pin bump removes
+   `addMime`, delete that pass"; following that instruction would now ship a document claiming
+   every `200` might answer with a problem document, because the still-necessary client
+   workaround (widening each verb's list to `'[JSON, ProblemJSON]`) pollutes the success side
+   through `Respond`'s OpenAPI instance. The pass is therefore kept, renamed
+   `narrowSuccessContent`, and narrowed to touch only responses below `400` — deliberately
+   leaving the error side alone so Milestone 6's conformance test can still catch a route
+   accidentally written as plain `Respond … ProblemDetails`. Milestone 1's spike, Milestone 2's
+   intermediate-state note, Milestone 6, Concrete Steps, Validation, and the Interfaces
+   signature block were all updated to match.
+
+**Also recorded.** A fifth catalog change is noted but deliberately not acted on: the new
+Kubernetes health-endpoints standard requires `/health/live` and `/health/ready` from the
+released `servant-health` package, while `en` serves hand-written `/healthz` and `/readyz`. That
+is a genuine conformance gap, it is a URL migration rather than a body-format migration, and it
+belongs in its own plan; the Decision Log says so and Milestone 7 records it as a follow-up.
+`en-servant/en-servant.cabal`'s missing OpenAPI cohort bounds were folded into Milestone 1, which
+already edits that file.
+
+All four living sections were updated: Progress (two milestone bullets restated), Surprises &
+Discoveries (three entries marked superseded or confirmed, two new dated entries added), the
+Decision Log (one entry amended, four new entries), and this note. Outcomes & Retrospective stays
+empty, because the plan remains unimplemented.
