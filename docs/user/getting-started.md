@@ -13,13 +13,17 @@ object types and relations as values.
 ```haskell
 import Data.Map.Strict qualified as Map
 
+import Effectful (runEff)
+import Effectful.Error.Static (runErrorNoCallStack)
+import En.Check (CheckDecision (..), CheckOutcome (..), check)
+import En.Effect.TupleStore (writeTuples)
 import En.Error (EnError)
+import En.Reachability (compile)
+import En.Revision (Consistency (AtLeastAsFresh))
 import En.Schema (ObjectType (..), RelationName (..), Schema, validateSchema)
 import En.Schema.Builder qualified as Schema
+import En.Store.InMemory (newInMemoryWorld, runInMemoryStores)
 import En.Tuple
-import En.Reachability (compile)
-import En.Revision (Consistency (MinimizeLatency))
-import En.Check (CheckDecision (..), check)
 
 userType, spaceType :: ObjectType
 userType = ObjectType "user"
@@ -68,11 +72,11 @@ let graph = compile validSchema
 `compile` runs schema validation before building the `ReachabilityGraph` used by
 `check`, `lookup`, and `expand`.
 
-## 4. Write relationship tuples
+## 4. Create a test store and write relationship tuples
 
-Tuple writes are performed through a `TupleStore`. PostgreSQL users normally
-construct one with `En.Postgres.TupleStore.postgresTupleStoreIO`; tests can
-provide their own in-memory `TupleStore`.
+Tuple writes are performed through the `TupleStore` effect. For a test or a
+databaseless demo, create one mutable world and install both of its store
+interpreters with `runInMemoryStores`:
 
 ```haskell
 alice, planning :: ObjectRef
@@ -88,34 +92,46 @@ grant =
         , caveat = Nothing
         }
 
-token <- tupleStore.writeTuples [grant]
+world <- newInMemoryWorld
 ```
 
-The returned `ConsistencyToken` can be supplied to later reads with
-`AtLeastAsFresh token` for read-your-writes behavior.
+The world is process-local. It is not a production store: it is not durable,
+separate application instances cannot agree on it, and its revision counter only
+models PostgreSQL snapshot semantics inside one process. Use `en-postgres` before
+serving real traffic.
 
 ## 5. Check access
+
+Run writes and authorization queries in one effect program over that world:
 
 ```haskell
 let context = CaveatContext Map.empty
 
-decision <-
-    check
-        consistencyStore
-        tupleStore
-        graph
-        MinimizeLatency
-        context
-        (SubjectId alice)
-        view
-        planning
+result <-
+    runEff
+        . runErrorNoCallStack
+        . runInMemoryStores world
+        $ do
+            token <- writeTuples [grant]
+            CheckOutcome{decision} <-
+                check
+                    graph
+                    (AtLeastAsFresh token)
+                    context
+                    (SubjectId alice)
+                    view
+                    planning
+            pure decision
 
-case decision of
+case result of
     Right Allowed -> putStrLn "allow"
     Right Denied -> putStrLn "deny"
     Right (Conditional obligations) -> print obligations
     Left err -> print err
 ```
+
+`writeTuples` returns a `ConsistencyToken`. Passing it to `AtLeastAsFresh`
+gives the check read-your-writes behavior.
 
 Use `Allowed` as the only successful authorization result. `Denied` and
 `Conditional` should both fail closed at the request boundary unless your caller

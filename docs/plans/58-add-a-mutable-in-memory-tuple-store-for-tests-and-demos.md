@@ -55,10 +55,15 @@ independent application instances cannot agree on its state. Production deployme
 - [x] M2: correct build or behavioral failures exposed by the new assertions. (2026-08-25)
 - [x] M2: prove `check` and `lookup` end to end over tuples written through the mutable
       interpreter; validate `cabal test en-core`. (2026-08-25; both core suites pass.)
-- [ ] M3: migrate `en-example` from fixed Kikan fixture lists to a shared mutable world and
-      seed its demo grant through `writeTuples`.
-- [ ] M3: update `docs/user/getting-started.md` with the public interpreter and its
-      non-production posture; validate `cabal build all` and `cabal test all`.
+- [x] M3: migrate `en-example` from fixed Kikan fixture lists to a shared mutable world and
+      seed its demo grant through `writeTuples`. (2026-08-25; code written, workspace build
+      correction remains below.)
+- [x] M3: correct build/type issues found by the first workspace compiler pass. (2026-08-25)
+- [x] M3: update `docs/user/getting-started.md` with the public interpreter and its
+      non-production posture. (2026-08-25)
+- [x] M3: complete full validation. (2026-08-25; `cabal build all` exits 0,
+      `cabal test all -j1` passes all eight suites, and `cabal run en-example` reaches the
+      database-free listening message before an intentional Ctrl-C.)
 - [ ] Complete ADR distillation and write Outcomes & Retrospective.
 
 
@@ -92,6 +97,25 @@ independent application instances cannot agree on its state. Production deployme
   because this test module imports several records with a `subject` field. The pagination
   fixture now constructs `Tuple` positionally, matching the module's existing ambiguity
   avoidance for `RelationshipFilter`.
+
+- 2026-08-25: the first M3 workspace build reached `en-example/app/Main.hs` and could not
+  infer the `Error` effect's error type around the polymorphic `runInMemoryStores`. The
+  startup and test seeds now specify `runErrorNoCallStack @EnError`, as the core tests do.
+
+- 2026-08-25: the first full test build found the monomorphism restriction on a local
+  `tupleStore = runTupleStoreInMemory world` binding in `en-example/test/Main.hs`; the
+  rank-n interpreter could not be passed to `mkEnv` twice. Applying the interpreter at each
+  call site preserves its required polymorphism.
+
+- 2026-08-25: after the example test compiled and passed, parallel `cabal test all` failed
+  only because `en-biscuit-tests` reported `authorization rejected: Timeout` while the
+  PostgreSQL integration suite ran concurrently. All other suites, including `en-example`,
+  passed. Full validation is being repeated with `-j1` to remove suite contention.
+
+- 2026-08-25: the serial rerun confirms contention rather than regression: all eight suites
+  pass under `nix develop -c cabal test all -j1`, including `en-biscuit-tests` and the
+  PostgreSQL integration suite. The example smoke run prints `en-example listening on :8080`
+  and its Alice grant message without opening a database connection.
 
 
 ## Decision Log

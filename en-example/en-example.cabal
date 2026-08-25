@@ -52,6 +52,8 @@ executable en-example
   main-is:        Main.hs
   build-depends:
     , base
+    , effectful
+    , effectful-core
     , en-core
     , en-example
     , text

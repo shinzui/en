@@ -9,8 +9,11 @@ module En.Example.Host
     exampleSchema,
     exampleActiveSchema,
     ExampleEffects,
+    InMemoryWorld,
+    newInMemoryWorld,
     runTupleStoreInMemory,
     runConsistencyStoreInMemory,
+    runInMemoryStores,
     runConsistencyStoreFailing,
     mkEnv,
     server,
@@ -37,18 +40,24 @@ import Effectful.Dispatch.Dynamic (interpret_)
 import Effectful.Error.Static (Error, runErrorNoCallStack, throwError)
 import En.Budget (defaultEvaluationBudget)
 import En.Check (CheckDecision (..), CheckOutcome (..), check)
-import En.Conformance.Kikan qualified as Kikan
-import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
+import En.Effect.ConsistencyStore (ConsistencyStore (..), TokenMetadata (TokenMetadata))
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
 import En.Reachability (compileSchema)
-import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
+import En.Revision (Consistency (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
 import En.Schema.Builder qualified as Schema
 import En.Servant.Authorize (requirePermission)
 import En.Servant.Seam (ActiveSchema (..), Env (..))
+import En.Store.InMemory
+  ( InMemoryWorld,
+    newInMemoryWorld,
+    runConsistencyStoreInMemory,
+    runInMemoryStores,
+    runTupleStoreInMemory,
+  )
 import En.Tuple
   ( CaveatContext (..),
     ObjectRef (..),
@@ -133,7 +142,7 @@ mkEnv cStore tStore =
       lookupWithDeadlineOperation = Lookup.lookupWithDeadline,
       lookupSubjectsWithDeadlineOperation = LookupSubjects.lookupSubjectsWithDeadline,
       -- This host serves its own guarded routes, not `EnAPI`, so nothing here can reach
-      -- the feed. The in-memory store keeps no history to feed it from either.
+      -- the feed even though the mutable in-memory store retains snapshot history.
       watchOperation = watchUnsupported,
       budget = defaultEvaluationBudget,
       maxBatchSize = 400,
@@ -184,22 +193,6 @@ resolveWithGate Env {runPorts, readActiveSchema, checkOperation} subject object 
         Denied -> pure (Left ResolverForbidden)
         Conditional _ -> pure (Left ResolverForbidden)
     Left _ -> pure (Left ResolverForbidden)
-
-runTupleStoreInMemory :: (Error EnError Effectful.:> es) => [Tuple] -> Eff (TupleStore : es) a -> Eff es a
-runTupleStoreInMemory =
-  Kikan.runTupleStoreInMemory
-
-runConsistencyStoreInMemory :: Eff (ConsistencyStore : es) a -> Eff es a
-runConsistencyStoreInMemory =
-  interpret_ \case
-    DecodeToken token ->
-      pure (TokenMetadata token testRevision (DatastoreId "en-example") (SchemaHash "schema") Nothing)
-    ValidateToken _ ->
-      pure ()
-    ResolveConsistency consistency ->
-      pure ResolvedConsistency {consistency, revision = testRevision}
-    MintToken revision ->
-      pure (ConsistencyToken ("en-example:" <> revision.revisionEncoding))
 
 runConsistencyStoreFailing :: (Error EnError Effectful.:> es) => Eff (ConsistencyStore : es) a -> Eff es a
 runConsistencyStoreFailing =

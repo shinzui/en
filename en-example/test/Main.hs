@@ -1,13 +1,19 @@
 module Main (main) where
 
+import Effectful (runEff)
+import Effectful.Error.Static (runErrorNoCallStack)
+import En.Effect.TupleStore (writeTuples)
+import En.Error (EnError)
 import En.Example.Host
   ( DocumentView (..),
     ResolverError (..),
     mkEnv,
+    newInMemoryWorld,
     resolveDocument,
     resolveSecret,
     runConsistencyStoreFailing,
     runConsistencyStoreInMemory,
+    runInMemoryStores,
     runTupleStoreInMemory,
     secretReaderTuple,
     userRef,
@@ -20,15 +26,24 @@ import Servant (Handler, ServerError (..), runHandler)
 
 main :: IO ()
 main = do
+  world <- newInMemoryWorld
   let alice = userRef "alice"
       bob = userRef "bob"
-      tupleStore =
-        runTupleStoreInMemory
-          [ viewerTuple "doc1" alice,
-            secretReaderTuple "s1" alice
-          ]
-      env = mkEnv runConsistencyStoreInMemory tupleStore
-      failingEnv = mkEnv runConsistencyStoreFailing tupleStore
+  seeded <-
+    runEff
+      ( runErrorNoCallStack @EnError
+          ( runInMemoryStores
+              world
+              ( writeTuples
+                  [ viewerTuple "doc1" alice,
+                    secretReaderTuple "s1" alice
+                  ]
+              )
+          )
+      )
+  _ <- either (fail . show) pure seeded
+  let env = mkEnv (runConsistencyStoreInMemory world) (runTupleStoreInMemory world)
+      failingEnv = mkEnv runConsistencyStoreFailing (runTupleStoreInMemory world)
   assertEqual "allowed route returns success" Nothing =<< httpCodeOf (viewDocument env (SubjectId alice) "doc1")
   assertEqual "denied route returns 403" (Just 403) =<< httpCodeOf (viewDocument env (SubjectId bob) "doc1")
   assertEqual "conditional route returns 403" (Just 403) =<< httpCodeOf (viewSecret env (SubjectId alice) "s1")
