@@ -46,10 +46,9 @@ data EnClient = EnClient
     lookupSubjects :: LookupSubjectsRequestWire -> ClientM (EnResult LookupSubjectsPageWire),
     expand :: ExpandRequestWire -> ClientM (EnResult ExpandTreeWire),
     watch :: WatchRequestWire -> ClientM (EnResult WatchResponseWire),
-    -- | Not an 'EnResult': @POST \/v1\/grants@ throws its non-200 outcomes (404 when minting
-    --     is disabled, 403 when the decision is not Allowed, 400 on a bad request) as client
-    --     errors rather than returning them, so 'runClientM' surfaces them as 'Left'.
-    mintGrant :: MintGrantRequestWire -> ClientM MintGrantResponseWire,
+    -- | Grant-specific outcomes are typed values: the shared error tail plus 403 when
+    --     the decision is not Allowed and 404 when minting is disabled.
+    mintGrant :: MintGrantRequestWire -> ClientM MintGrantResult,
     -- | Not an 'EnResult': @GET \/v1\/schema@ has no failure alternative to return into.
     readSchema :: ClientM SchemaInfoWire
   }

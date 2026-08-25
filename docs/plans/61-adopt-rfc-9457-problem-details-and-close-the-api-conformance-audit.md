@@ -103,7 +103,7 @@ operation. The exact commands and expected output are in Validation and Acceptan
       Split `En.Error.EnError`'s store failures into a dependency outage and an internal fault,
       classify hasql's `SessionError` structurally in `en-postgres`, and grow the response list,
       the result sum, and the exhaustiveness witness.
-- [ ] Milestone 4 — Make `POST /v1/grants` declare its statuses: a `MintGrantResponses` list
+- [x] (2026-08-25 22:47Z) Milestone 4 — Made `POST /v1/grants` declare its statuses: a `MintGrantResponses` list
       (shared tail plus `403` and `404`), a result sum, a hand-written `AsUnion`, a handler that
       returns rather than throws, and an `en-client` field that surfaces the outcomes as values.
 - [ ] Milestone 5 — Convert `en-server`: the authentication, read-only-key, and rate-limit

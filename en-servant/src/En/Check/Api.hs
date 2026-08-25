@@ -17,6 +17,8 @@ module En.Check.Api
     BatchCheckResponseWire (..),
     MintGrantRequestWire (..),
     MintGrantResponseWire (..),
+    MintGrantResponses,
+    MintGrantResult (..),
 
     -- * Handlers
     checkHandler,
@@ -39,6 +41,7 @@ import Data.Aeson
   )
 import Data.Aeson qualified as Aeson
 import Data.List.NonEmpty qualified as NonEmpty
+import Data.SOP (I (..), NS (..))
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding (decodeUtf8)
@@ -55,9 +58,9 @@ import En.Reachability (ReachabilityGraph (..))
 import En.Revision (Consistency, ConsistencyToken (..))
 import En.Schema (RelationName (..))
 import En.Servant.Problem
-  ( ProblemJSON,
+  ( ProblemDetails,
+    ProblemJSON,
     problem,
-    problemError,
     specDecisionNotAllowed,
     specGrantNotMintable,
     specNotFound,
@@ -73,12 +76,11 @@ import En.Servant.Response
   )
 import En.Servant.Seam
   ( ActiveSchema (..),
-    EnFault,
+    EnFault (..),
     Env (..),
     MintEnv (..),
     badRequest,
     batchTooLarge,
-    faultToServerError,
     invalidRequest,
     runEngineEither,
   )
@@ -100,17 +102,12 @@ import GHC.Generics (Generic)
 import Servant
   ( Handler,
     JSON,
-    Post,
     ReqBody,
-    ServerError,
     StdMethod (..),
-    err403,
-    err404,
-    throwError,
     type (:>),
   )
 import Servant.API.Generic (type (:-))
-import Servant.API.MultiVerb (MultiVerb)
+import Servant.API.MultiVerb (AsUnion (..), MultiVerb, Respond, RespondAs)
 import Servant.Server.Generic (AsServerT)
 
 -- * Routes
@@ -130,7 +127,7 @@ data CheckRoutes mode = CheckRoutes
       mode
         :- "grants"
           :> ReqBody '[JSON] MintGrantRequestWire
-          :> Post '[JSON] MintGrantResponseWire
+          :> MultiVerb 'POST '[JSON, ProblemJSON] MintGrantResponses MintGrantResult
   }
   deriving stock (Generic)
 
@@ -360,6 +357,49 @@ instance FromJSON MintGrantResponseWire where
       <*> o .: "revocationIds"
       <*> o .: "checkedAt"
 
+type MintGrantResponses =
+  '[ Respond 200 "The minted grant" MintGrantResponseWire,
+     RespondAs ProblemJSON 400 "Invalid request" ProblemDetails,
+     RespondAs ProblemJSON 403 "The decision was not Allowed" ProblemDetails,
+     RespondAs ProblemJSON 404 "Grant minting is not enabled" ProblemDetails,
+     RespondAs ProblemJSON 412 "Write precondition failed" ProblemDetails,
+     RespondAs ProblemJSON 422 "Resolution limit exceeded" ProblemDetails,
+     RespondAs ProblemJSON 500 "Internal error" ProblemDetails,
+     RespondAs ProblemJSON 503 "Tuple store unavailable" ProblemDetails
+   ]
+
+data MintGrantResult
+  = MintGrantOk !MintGrantResponseWire
+  | MintBadRequest !ProblemDetails
+  | MintForbidden !ProblemDetails
+  | MintNotFound !ProblemDetails
+  | MintPreconditionFailed !ProblemDetails
+  | MintUnprocessable !ProblemDetails
+  | MintInternal !ProblemDetails
+  | MintUnavailable !ProblemDetails
+  deriving stock (Eq, Show)
+
+instance AsUnion MintGrantResponses MintGrantResult where
+  toUnion = \case
+    MintGrantOk response -> Z (I response)
+    MintBadRequest details -> S (Z (I details))
+    MintForbidden details -> S (S (Z (I details)))
+    MintNotFound details -> S (S (S (Z (I details))))
+    MintPreconditionFailed details -> S (S (S (S (Z (I details)))))
+    MintUnprocessable details -> S (S (S (S (S (Z (I details))))))
+    MintInternal details -> S (S (S (S (S (S (Z (I details)))))))
+    MintUnavailable details -> S (S (S (S (S (S (S (Z (I details))))))))
+  fromUnion = \case
+    Z (I response) -> MintGrantOk response
+    S (Z (I details)) -> MintBadRequest details
+    S (S (Z (I details))) -> MintForbidden details
+    S (S (S (Z (I details)))) -> MintNotFound details
+    S (S (S (S (Z (I details))))) -> MintPreconditionFailed details
+    S (S (S (S (S (Z (I details)))))) -> MintUnprocessable details
+    S (S (S (S (S (S (Z (I details))))))) -> MintInternal details
+    S (S (S (S (S (S (S (Z (I details)))))))) -> MintUnavailable details
+    S (S (S (S (S (S (S (S impossible))))))) -> case impossible of {}
+
 -- * Handlers
 
 checkHandler :: Env es -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
@@ -443,11 +483,9 @@ data MintInputs = MintInputs
 -- | Mint a Biscuit decision token for one subject/permission/object, if an
 -- authenticated caller's request is 'Allowed'.
 --
--- Unlike every other en operation this throws its failures as
--- 'Servant.ServerError's rather than returning an 'EnResult': its status set — 404
--- when minting is disabled, 403 when the decision is not 'Allowed', 400 on a bad
--- request — is not the shared 'EnResponses'. Each thrown error still carries the
--- RFC 9457 problem document with a stable @code@.
+-- Its response sum extends the shared error tail with the two edge outcomes unique
+-- to minting: 403 when the decision is not 'Allowed', and 404 when no issuer is
+-- configured. Every domain failure is returned as a typed value.
 --
 -- The flow is check-then-mint-at-that-token, and it never trusts a caller-asserted
 -- decision: it runs its own check through 'Env.checkOperation' and mints only on
@@ -455,71 +493,72 @@ data MintInputs = MintInputs
 -- ('CheckOutcome.checkedAt') and to the hash of the very schema snapshot the check
 -- ran against (@active.graph.hash@). 'mintObjectGrantWithExpiry' enforces the
 -- 'Allowed'-only rule again, independently.
-mintGrantHandler :: Env es -> MintGrantRequestWire -> Handler MintGrantResponseWire
+mintGrantHandler :: Env es -> MintGrantRequestWire -> Handler MintGrantResult
 mintGrantHandler env request =
   case env.mint of
-    Nothing -> throwError mintingDisabled
-    Just mintEnv -> do
-      inputs <- either (throwError . faultToServerError) pure (decodeMintRequest mintEnv request)
-      active <- liftIO env.readActiveSchema
-      outcome <-
-        runEngineEither env active $
-          env.checkOperation
-            active.graph
-            inputs.consistency
-            inputs.context
-            inputs.subject
-            inputs.permission
-            inputs.object
-      CheckOutcome {decision, checkedAt} <- either (throwError . faultToServerError) pure outcome
-      case decision of
-        Denied -> throwError (decisionNotAllowed "the authorization decision was Denied")
-        Conditional _ -> throwError (decisionNotAllowed "the authorization decision was Conditional")
-        Allowed -> do
-          mintedAt <- liftIO getCurrentTime
-          let expiry = addUTCTime inputs.ttl mintedAt
-              grant =
-                EnGrant
-                  { subject = inputs.subject,
-                    permission = inputs.permission,
-                    object = inputs.object,
-                    consistencyToken = checkedAt,
-                    schemaHash = active.graph.hash,
-                    expiresAt = expiry,
-                    audience = Audience inputs.audience,
-                    requestId = RequestId <$> inputs.requestId,
-                    revocationId = Nothing
-                  }
-              config =
-                MintConfig
-                  { issuerSecretKey = mintEnv.issuerSecretKey,
-                    issuerKeyId = mintEnv.issuerKeyId,
-                    defaultTtl = mintEnv.defaultTtl,
-                    now = pure mintedAt
-                  }
-          minted <- mintObjectGrantWithExpiry config expiry decision grant
-          case minted of
-            Left mintErr ->
-              throwError (faultToServerError (badRequest specGrantNotMintable (Text.pack (show mintErr))))
-            Right MintedGrant {token, expiresAt, revocationIds} ->
-              let ConsistencyToken checkedAtText = checkedAt
-               in pure
-                    MintGrantResponseWire
-                      { token = decodeUtf8 token,
-                        expiresAt,
-                        revocationIds = encodeHex <$> NonEmpty.toList revocationIds,
-                        checkedAt = checkedAtText
-                      }
+    Nothing -> pure (MintNotFound (problem specNotFound "grant minting is not enabled"))
+    Just mintEnv ->
+      case decodeMintRequest mintEnv request of
+        Left fault -> pure (faultToMintResult fault)
+        Right inputs -> do
+          active <- liftIO env.readActiveSchema
+          outcome <-
+            runEngineEither env active $
+              env.checkOperation
+                active.graph
+                inputs.consistency
+                inputs.context
+                inputs.subject
+                inputs.permission
+                inputs.object
+          case outcome of
+            Left fault -> pure (faultToMintResult fault)
+            Right CheckOutcome {decision, checkedAt} ->
+              case decision of
+                Denied -> pure (MintForbidden (problem specDecisionNotAllowed "the authorization decision was Denied"))
+                Conditional _ -> pure (MintForbidden (problem specDecisionNotAllowed "the authorization decision was Conditional"))
+                Allowed -> do
+                  mintedAt <- liftIO getCurrentTime
+                  let expiry = addUTCTime inputs.ttl mintedAt
+                      grant =
+                        EnGrant
+                          { subject = inputs.subject,
+                            permission = inputs.permission,
+                            object = inputs.object,
+                            consistencyToken = checkedAt,
+                            schemaHash = active.graph.hash,
+                            expiresAt = expiry,
+                            audience = Audience inputs.audience,
+                            requestId = RequestId <$> inputs.requestId,
+                            revocationId = Nothing
+                          }
+                      config =
+                        MintConfig
+                          { issuerSecretKey = mintEnv.issuerSecretKey,
+                            issuerKeyId = mintEnv.issuerKeyId,
+                            defaultTtl = mintEnv.defaultTtl,
+                            now = pure mintedAt
+                          }
+                  minted <- mintObjectGrantWithExpiry config expiry decision grant
+                  pure case minted of
+                    Left mintErr -> faultToMintResult (badRequest specGrantNotMintable (Text.pack (show mintErr)))
+                    Right MintedGrant {token, expiresAt, revocationIds} ->
+                      let ConsistencyToken checkedAtText = checkedAt
+                       in MintGrantOk
+                            MintGrantResponseWire
+                              { token = decodeUtf8 token,
+                                expiresAt,
+                                revocationIds = encodeHex <$> NonEmpty.toList revocationIds,
+                                checkedAt = checkedAtText
+                              }
 
--- | 404 for @POST \/v1\/grants@ on a server that configured no issuer key.
-mintingDisabled :: ServerError
-mintingDisabled =
-  problemError err404 (problem specNotFound "grant minting is not enabled")
-
--- | 403 for a mint whose check was 'Denied' or 'Conditional'. Never retryable.
-decisionNotAllowed :: Text -> ServerError
-decisionNotAllowed message =
-  problemError err403 (problem specDecisionNotAllowed message)
+faultToMintResult :: EnFault -> MintGrantResult
+faultToMintResult = \case
+  BadRequestFault details -> MintBadRequest details
+  PreconditionFailedFault details -> MintPreconditionFailed details
+  UnprocessableFault details -> MintUnprocessable details
+  InternalFault details -> MintInternal details
+  UnavailableFault details -> MintUnavailable details
 
 -- | Decode and validate a mint request, or a 400 'EnFault' naming the fault.
 --

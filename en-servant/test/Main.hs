@@ -79,6 +79,7 @@ import En.Servant.API
     LookupSubjectsStateWire (..),
     MintGrantRequestWire (..),
     MintGrantResponseWire (..),
+    MintGrantResult (..),
     ObjectRefWire (..),
     PreconditionWire (..),
     ReadRelationshipsRequestWire (..),
@@ -130,7 +131,7 @@ import En.Watch (WatchBatch (..), WatchStart (..))
 import Network.HTTP.Types (methodDelete, methodPost, statusCode)
 import Network.Wai (Application, Request (..), defaultRequest)
 import Network.Wai.Test (SRequest (..), SResponse (..), runSession, setPath, srequest)
-import Servant (Handler, ServerError (..), runHandler)
+import Servant (Handler, ServerError (errHTTPCode), runHandler)
 
 main :: IO ()
 main = do
@@ -865,6 +866,28 @@ routingTests env = do
   batchResponse <- postJson application "/v1/batch-check" (encode batchBody)
   assertEqual "POST /v1/batch-check returns 200" 200 (statusCode batchResponse.simpleStatus)
 
+  let grantBody =
+        MintGrantRequestWire
+          { consistency = MinimizeLatencyWire,
+            context = CaveatContextWire Map.empty,
+            subject = SubjectIdWire ObjectRefWire {objectType = "user", objectId = "alice"},
+            permission = "view",
+            object = ObjectRefWire {objectType = "space", objectId = "project-x"},
+            audience = "document-service",
+            ttlSeconds = Just 120,
+            requestId = Just "req-disabled-mint"
+          }
+  disabledGrant <- postJson application "/v1/grants" (encode grantBody)
+  assertEqual "a disabled grant minter returns 404" 404 (statusCode disabledGrant.simpleStatus)
+  assertEqual
+    "a disabled grant minter returns its typed not_found problem"
+    (Just "not_found")
+    (fmap (.code) (decode disabledGrant.simpleBody :: Maybe ProblemDetails))
+  assertEqual
+    "a disabled grant minter uses application/problem+json"
+    (Just "application/problem+json")
+    (lookup "Content-Type" disabledGrant.simpleHeaders)
+
   {- The point of the milestone: a malformed body comes back as a machine-readable
   problem, proving envelopeFormatters' bodyParserErrorFormatter survived the refactor. -}
   malformed <- postJson application "/v1/check" "not json at all"
@@ -950,17 +973,17 @@ openApiDocumentTests = do
 
   assertEqual
     "openapi document lists exactly the served operations"
-    (List.sort ("/v1/schema" : "/v1/grants" : postPaths))
+    (List.sort ("/v1/schema" : postPaths))
     (List.sort (objectKeys (document `at` "paths")))
 
   mapM_
-    ( \path ->
+    ( \(path, expectedStatuses) ->
         assertEqual
           ("operation " <> Text.unpack path <> " documents its error responses")
-          ["200", "400", "412", "422", "500", "503"]
+          expectedStatuses
           (List.sort (objectKeys (document `at` "paths" `at` Key.fromText path `at` "post" `at` "responses")))
     )
-    postPaths
+    responseExpectations
 
   -- GET /v1/schema reads an IORef. It has no EnResponses alternatives to document,
   -- and asserting that is what keeps a later refactor from quietly giving it some.
@@ -968,16 +991,6 @@ openApiDocumentTests = do
     "the schema endpoint is a GET with only a 200"
     ["200"]
     (List.sort (objectKeys (document `at` "paths" `at` "/v1/schema" `at` "get" `at` "responses")))
-
-  -- POST /v1/grants throws its authorization outcomes (404 disabled, 403 not-allowed) and
-  -- its input faults as ServerErrors carrying ProblemDetails, rather than declaring
-  -- them as MultiVerb alternatives. The document therefore shows only the 200 and the 400
-  -- that servant-openapi derives from the JSON request body itself — not the 412/422/503
-  -- every EnResponses operation carries. See 'En.Servant.API.mintGrantHandler'.
-  assertEqual
-    "the grants endpoint is a POST with only a 200 and the body-parse 400"
-    ["200", "400"]
-    (List.sort (objectKeys (document `at` "paths" `at` "/v1/grants" `at` "post" `at` "responses")))
 
   assertBool
     "openapi document defines RFC 9457 problem details"
@@ -1036,7 +1049,7 @@ openApiDocumentTests = do
     )
   where
     -- Every operation but GET /v1/schema, which has no request body and cannot fault.
-    postPaths =
+    sharedPostPaths =
       [ "/v1/batch-check",
         "/v1/check",
         "/v1/expand",
@@ -1048,6 +1061,11 @@ openApiDocumentTests = do
         "/v1/relationships/query",
         "/v1/watch"
       ]
+    sharedStatuses = ["200", "400", "412", "422", "500", "503"]
+    responseExpectations =
+      ("/v1/grants", ["200", "400", "403", "404", "412", "422", "500", "503"])
+        : [(path, sharedStatuses) | path <- sharedPostPaths]
+    postPaths = fst <$> responseExpectations
 
     asText :: Aeson.Value -> Text
     asText (Aeson.String text) = text
@@ -1979,25 +1997,25 @@ assertOk label (Left err) =
 testSigningKey :: Text
 testSigningKey = "1:a2c4ead323536b925f3488ee83e0888b79c2761405ca7c0c9a018c7c1905eecc"
 
--- | The HTTP status and stable @code@ of a thrown 'ServerError', or 'Nothing' if
--- the handler returned a value instead of throwing. @POST \/v1\/grants@ signals its
--- non-200 outcomes by throwing rather than through an 'EnResult', so this is how the
--- mint tests pin both the status and the code at once.
-thrownProblem :: Either ServerError a -> Maybe (Int, Text)
-thrownProblem = \case
-  Left err -> do
-    details <- decode err.errBody :: Maybe ProblemDetails
-    pure (err.errHTTPCode, details.code)
-  Right _ -> Nothing
+mintOutcome :: Either err MintGrantResult -> Maybe (Int, Text)
+mintOutcome = \case
+  Right (MintBadRequest details) -> Just (400, details.code)
+  Right (MintForbidden details) -> Just (403, details.code)
+  Right (MintNotFound details) -> Just (404, details.code)
+  Right (MintPreconditionFailed details) -> Just (412, details.code)
+  Right (MintUnprocessable details) -> Just (422, details.code)
+  Right (MintInternal details) -> Just (500, details.code)
+  Right (MintUnavailable details) -> Just (503, details.code)
+  _ -> Nothing
 
 -- | @POST \/v1\/grants@ over the wire, against the in-memory store.
 --
 -- Pins the endpoint contract without a live server: an 'Allowed' request mints a
 -- token that 'verifyGrant' accepts for the same subject/operation/resource/audience
 -- and whose recovered consistency token equals the response's @checkedAt@; a
--- 'Denied' request throws 403 and no token; a @ttlSeconds@ above the maximum and a
+-- 'Denied' request returns a typed 403 and no token; a @ttlSeconds@ above the maximum and a
 -- non-concrete subject are 400; and a server with no issuer configured
--- (@mint = Nothing@) throws 404. Milestone 3 adds the live end-to-end proof.
+-- (@mint = Nothing@) returns a typed 404.
 mintGrantTests :: Env TestEffects -> IO ()
 mintGrantTests baseEnv = do
   (keyId, secret) <- either (fail . Text.unpack) pure (parseSigningKeyText testSigningKey)
@@ -2030,8 +2048,8 @@ mintGrantTests baseEnv = do
   -- Allowed -> 200 with a token that verifies locally.
   response <-
     runHandler (grantsFor mintEnv request) >>= \case
-      Right r -> pure r
-      Left err -> fail ("mint: expected 200, got a thrown error " <> show err)
+      Right (MintGrantOk r) -> pure r
+      other -> fail ("mint: expected MintGrantOk, got " <> show other)
   assertEqual "mint: checkedAt is the snapshot the check evaluated at" testCheckedAt response.checkedAt
   assertBool "mint: at least one revocation id" (not (null response.revocationIds))
 
@@ -2064,25 +2082,25 @@ mintGrantTests baseEnv = do
   assertEqual
     "mint: a Denied decision is 403 decision_not_allowed"
     (Just (403, "decision_not_allowed"))
-    (thrownProblem denied)
+    (mintOutcome denied)
 
   -- ttlSeconds above the configured maximum -> 400 (rejected, not clamped).
   tooLong <- runHandler (grantsFor mintEnv request {ttlSeconds = Just 999999})
   assertEqual
     "mint: ttlSeconds above the maximum is 400 invalid_request"
     (Just (400, "invalid_request"))
-    (thrownProblem tooLong)
+    (mintOutcome tooLong)
 
   -- A non-concrete subject -> 400.
   nonConcrete <- runHandler (grantsFor mintEnv request {subject = SubjectWildcardWire "user"})
   assertEqual
     "mint: a non-concrete subject is 400 invalid_request"
     (Just (400, "invalid_request"))
-    (thrownProblem nonConcrete)
+    (mintOutcome nonConcrete)
 
   -- mint = Nothing -> 404, and every other endpoint still works.
   disabled <- runHandler (grantsFor baseEnv request)
   assertEqual
     "mint: a server with no issuer key answers 404 not_found"
     (Just (404, "not_found"))
-    (thrownProblem disabled)
+    (mintOutcome disabled)

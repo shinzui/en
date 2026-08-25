@@ -88,9 +88,8 @@ import Servant.Server (ErrorFormatter, ErrorFormatters (..), defaultErrorFormatt
 -- @\/v1\/relationships\/delete@, not a @DELETE@ carrying a body (HTTP intermediaries may drop
 -- a @DELETE@ body, and a @405@ — which servant raises outside 'ErrorFormatters' — does not
 -- consume the request body). @GET \/v1\/schema@ is the one non-@POST@: it reads the server's
--- configuration from memory and cannot fail. @POST \/v1\/grants@ is a @POST@ but, like schema,
--- not a @MultiVerb@: its non-200 statuses are a different set from the shared 'EnResponses',
--- so its handler throws 'Servant.ServerError' carrying the same 'ProblemDetails'.
+-- configuration from memory and cannot fail. @POST \/v1\/grants@ has its own @MultiVerb@
+-- response list: the shared tail plus its operation-specific 403 and 404 outcomes.
 data EnApi mode = EnApi
   { relationships :: mode :- "v1" :> NamedRoutes TupleRoutes,
     checks :: mode :- "v1" :> NamedRoutes CheckRoutes,
