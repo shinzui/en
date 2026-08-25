@@ -7,7 +7,7 @@ import En.Schema.TH (schema)
 
 duplicateQuotedSchema :: ValidSchema
 duplicateQuotedSchema =
-    [schema|
+  [schema|
 object user {}
 object space {
   relation owner: user

@@ -9,13 +9,13 @@ import En.Schema.TH (mkValidSchemaEither)
 
 duplicateSchema :: ValidSchema
 duplicateSchema =
-    $$( mkValidSchemaEither $ do
-            space <-
-                Schema.object
-                    "space"
-                    [ Schema.relation "owner" [Schema.subject "user"] Schema.this
-                    , Schema.relation "owner" [Schema.subject "user"] Schema.this
-                    ]
-            user <- Schema.object "user" []
-            Schema.build [space, user]
-      )
+  $$( mkValidSchemaEither $ do
+        space <-
+          Schema.object
+            "space"
+            [ Schema.relation "owner" [Schema.subject "user"] Schema.this,
+              Schema.relation "owner" [Schema.subject "user"] Schema.this
+            ]
+        user <- Schema.object "user" []
+        Schema.build [space, user]
+    )

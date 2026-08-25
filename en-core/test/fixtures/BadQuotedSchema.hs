@@ -7,7 +7,7 @@ import En.Schema.TH (schema)
 
 badQuotedSchema :: ValidSchema
 badQuotedSchema =
-    [schema|
+  [schema|
 object user {}
 object space {
   relation owner: user
