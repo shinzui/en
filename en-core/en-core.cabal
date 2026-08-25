@@ -64,6 +64,7 @@ library
     En.Schema.TH
     En.Schema.Types
     En.SchemaCheck
+    En.Store.InMemory
     En.Tuple
     En.Watch
 

@@ -15,395 +15,368 @@ Decision Log, and Outcomes & Retrospective must be kept up to date as work proce
 
 ## Purpose / Big Picture
 
-en's storage boundary is the `TupleStore` effect
-(`en-core/src/En/Effect/TupleStore.hs`): eight operations covering snapshot reads
-(`ReadObjectRelation`, `ReadStartingWithUser`), writes and deletes that return a
-`ConsistencyToken`, revision queries (`HeadRevision`, `OptimizedRevision`), and
-garbage-collection maintenance (`OldestRetainedXid`, `ReapDeletedTuples`). Two
-interpreters exist today: the production PostgreSQL interpreter
-(`en-postgres/src/En/Postgres/TupleStore.hs`) and a deliberately *read-only* conformance
-fixture, `En.Conformance.Kikan.runTupleStoreInMemory`
-(`en-core/src/En/Conformance/Kikan.hs`), which evaluates reads against a fixed pure list
-and answers `WriteTuples`/`DeleteTuples` with dummy tokens without storing anything.
+en's algorithms use two `effectful` effects rather than talking to a database directly.
+`TupleStore` stores relationship tuples and reads them at named revisions;
+`ConsistencyStore` turns a caller's consistency request into one of those revisions. The
+production interpreters live in `en-postgres`. `En.Conformance.Kikan` has a small pure,
+stateful fixture interpreter, but it intentionally has no historical snapshots: every read
+sees its current list and maintenance operations are placeholders.
 
-That leaves a hole: anyone who embeds en and wants to test their authorization wiring —
-or run a databaseless demo — has no interpreter that *remembers writes*. The gap is not
-hypothetical. en's own example host works around it (`en-example/src/En/Example/Host.hs`
-threads pre-built tuple lists), and the sibling project Shōmei's integration plan
-(`shomei/docs/plans/47-en-integration-examples-and-guidance-for-the-recommended-authorization-layer.md`,
-in `/Users/shinzui/Keikaku/bokuno/shomei`) ships its own bespoke `IORef`-backed
-interpreter precisely because en does not provide one, and lists this plan's deliverable
-as external companion work it will migrate onto.
+After this plan, `en-core` exports `En.Store.InMemory`, a reusable mutable interpreter for
+tests and databaseless demonstrations. A caller creates one opaque `InMemoryWorld`, installs
+both effects over it, writes a grant, and sees an ordinary engine `check` change from
+`Denied` to `Allowed`. Deleting the grant changes the answer back, while an
+`AtExactSnapshot` read at the pre-delete token still sees the grant. The store also implements
+the current filter, precondition, bulk-read, changelog, and garbage-collection operations, so
+it is a complete interpreter of today's `TupleStore` rather than a narrowly compiling fake.
 
-After this plan, en-core exports `En.Store.InMemory` with a pair of interpreters —
-`runTupleStoreInMemory` over a mutable world and a matching
-`runConsistencyStoreInMemory` — such that this program works with no database:
-
-```haskell
-world <- newInMemoryWorld
-runEff . runInMemoryStores world $ do
-  token <- writeTuples [Tuple projectRef (RelationName "editor") (SubjectId alice) Nothing]
-  -- a check through the ordinary engine now sees the write:
-  decision <- check graph checkRequest{consistency = AtLeastAsFresh token}
-  ...
-```
-
-Writes are visible to subsequent reads, deletes hide tuples, snapshot reads at an older
-revision still see the pre-delete state (honest `AtExactSnapshot` semantics), and the
-maintenance operations behave sensibly. The module's haddock states loudly what this is
-**not**: a production store. Authorization data must survive restarts and agree across
-instances, and en's consistency guarantees are grounded in PostgreSQL's
-`pg_snapshot`/xid8 machinery (`en-postgres/src/En/Postgres/Revision.hs`) that a
-process-local counter only imitates within a single process. The target users are test
-suites, examples, and demos — the same posture as Shōmei's `Shomei.Effect.InMemory`,
-which this design copies on purpose (one `World` record in an `IORef`, per-effect
-interpreters reading through it).
+The module states that it is not a production store. Its process-local state is not durable,
+its total-order counter only models PostgreSQL's partially ordered transaction snapshots, and
+independent application instances cannot agree on its state. Production deployments must use
+`en-postgres`.
 
 
 ## Progress
 
-Use a checklist to summarize granular steps. Every stopping point must be documented here,
-even if it requires splitting a partially completed task into two ("done" vs. "remaining").
-This section must always reflect the actual current state of the work.
-
-- [ ] M1: `En.Store.InMemory` module with `InMemoryWorld`, `newInMemoryWorld`,
-      `runTupleStoreInMemory`, `runConsistencyStoreInMemory`, and the combined
-      `runInMemoryStores`; compiles and is exported from `en-core.cabal`.
-- [ ] M1: production-non-goal haddock written on the module header (restating the
-      Purpose section's reasons).
-- [ ] M2: unit tests in `en-core/test/Main.hs` covering write-then-read visibility,
-      delete hiding, snapshot isolation at `AtExactSnapshot`, `AtLeastAsFresh`
-      resolution, pagination/cursor stability under interleaved writes, and
-      reap-after-delete.
-- [ ] M2: engine-level test: `check` and `lookup` run end-to-end over the in-memory
-      stores with tuples written through `writeTuples` (not fixture lists).
-- [ ] M3: `en-example` host migrated from pre-built lists to the new store, proving the
-      write path in a runnable demo; conformance fixture (`En.Conformance.Kikan`) left
-      untouched.
-- [ ] M3: docs touch: `en-docs` embedding page (or the module haddock, if no page fits)
-      mentions the interpreter and its test/demo-only posture; note left for Shōmei's
-      plan 47 that the upstream interpreter now exists.
-- [ ] Living sections of this plan updated; Outcomes & Retrospective written.
+- [x] Refresh the 2026-07-07 draft against the 2026-08-25 tree: current effect surface,
+      touch writes, preconditions, relationship filters, changelog, GC horizon, example host,
+      test harness, docs, ADRs, and canonical cross-repository references. (2026-08-25)
+- [x] M1: add and export `En.Store.InMemory` with an opaque `InMemoryWorld`, complete
+      `TupleStore` and `ConsistencyStore` interpreters, and combined `runInMemoryStores`.
+      (2026-08-25; implementation written, build correction remains below.)
+- [x] M1: correct build/type issues found by the first compiler pass. (2026-08-25)
+- [x] M1: document the test/demo-only boundary and validate `cabal build en-core` plus
+      `cabal haddock en-core`. (2026-08-25; both exit 0, Haddock reports 100% coverage for
+      `En.Store.InMemory`.)
+- [ ] M2: add focused `en-core/test/Main.hs` assertions for mutation, exact snapshots,
+      consistency resolution, stable cursors, touch/precondition/filter operations,
+      changelog, reaping, and malformed tokens/cursors.
+- [ ] M2: prove `check` and `lookup` end to end over tuples written through the mutable
+      interpreter; validate `cabal test en-core`.
+- [ ] M3: migrate `en-example` from fixed Kikan fixture lists to a shared mutable world and
+      seed its demo grant through `writeTuples`.
+- [ ] M3: update `docs/user/getting-started.md` with the public interpreter and its
+      non-production posture; validate `cabal build all` and `cabal test all`.
+- [ ] Complete ADR distillation and write Outcomes & Retrospective.
 
 
 ## Surprises & Discoveries
 
-Document unexpected behaviors, bugs, optimizations, or insights discovered during
-implementation. Provide concise evidence.
+- 2026-08-25: the original plan described the eight-operation `TupleStore` that existed on
+  2026-07-07. The effect now has fourteen constructors. Plans 39, 45, 46, 48, 50, 53, and 60
+  added point probes, touch semantics, atomic preconditions, bulk/filter operations, a net
+  changelog, and a monotone garbage-collection horizon. Evidence: the constructors in
+  `en-core/src/En/Effect/TupleStore.hs` now run from `ReadObjectRelation` through
+  `ReapDeletedTuples`; plan 45 is complete rather than unimplemented.
 
-(None yet.)
+- 2026-08-25: `En.Conformance.Kikan.runTupleStoreInMemory` is no longer read-only. Plan 45
+  made it a pure stateful touch store, but it still deliberately has no historical revisions,
+  stable row identities across mutations, or real reaping. It remains useful for conformance
+  fixtures and does not satisfy this plan's snapshot-store purpose.
+
+- 2026-08-25: `en-core/test/Main.hs` is a plain assertion executable, not a Tasty tree. The
+  refreshed validation names assertion labels visible on failure rather than promising a
+  nonexistent test-group listing.
+
+- 2026-08-25: baseline `nix develop -c cabal test en-core` exits 0. Both `en-core-conformance`
+  and `en-core-interface-tests` pass; the latter reports an existing incomplete-pattern
+  warning in an unrelated inline test interpreter.
+
+- 2026-08-25: the first M1 build reached `En.Store.InMemory` and failed because the explicit
+  `En.Effect.TupleStore` import list omitted `TupleChange` while the implementation referred
+  to it qualified. This is an import-list correction, not a design change.
 
 
 ## Decision Log
 
-Record every decision made while working on the plan.
+- Decision: keep the new interpreter in `en-core` as `En.Store.InMemory`, and leave
+  `En.Conformance.Kikan` unchanged.
+  Rationale: the public store is useful to embedders and demos, while Kikan's pure fixture
+  contract and fixed-data call sites remain independently useful. A new package would add
+  deployment and dependency surface for one module that uses only dependencies already in
+  `en-core`.
+  Date: 2026-07-07; confirmed 2026-08-25.
 
-- Decision: The module lives in **en-core** (new module `En.Store.InMemory`), not a
-  separate package and not `En.Conformance`.
-  Rationale: en-core already hosts the read-only fixture and has zero heavy
-  dependencies; a separate package would burden every consumer's build for one module.
-  `En.Conformance.Kikan` stays exactly as it is — it is a *fixture* (fixed data, fixed
-  schema) with different guarantees, and the conformance suite must not silently start
-  depending on mutation. The name `En.Store.InMemory` mirrors the effect it interprets
-  rather than a test-suite location, because demos (not just tests) consume it.
-  Date: 2026-07-07
+- Decision: make `InMemoryWorld` opaque and have `newInMemoryWorld :: IO InMemoryWorld`,
+  rather than exporting its `IORef` representation.
+  Rationale: callers need a shared handle, not the ability to violate row-id, revision, or GC
+  invariants. The original draft exposed `IORef InMemoryWorld`; today's broader atomic write
+  contract makes representation hiding materially safer without reducing test ergonomics.
+  Date: 2026-08-25.
 
-- Decision: Revisions are a **monotonic `Int` counter** encoded through the existing
-  opaque `Revision`/`ConsistencyToken` `Text` wrappers (e.g. `Revision "mem:42"`), with
-  visibility rules `createdAt <= r && (deletedAt == Nothing || deletedAt > r)`.
-  Rationale: within one process writes are genuinely totally ordered, so a counter gives
-  *honest* snapshot semantics rather than pretending at xid8 arithmetic. The `mem:`
-  prefix makes tokens self-describing and unambiguously non-PostgreSQL, so a token that
-  leaks across store kinds fails decoding loudly instead of resolving to nonsense.
-  Date: 2026-07-07
+- Decision: use monotonically increasing `Word64` revisions and row ids. Revisions encode as
+  `mem:<world-id>:<counter>` and row cursors as `mem-row:<row-id>`.
+  Rationale: one process has a genuine total order. A per-world id lets token validation reject
+  a token from a different in-memory world, while stable row ids make keyset pagination immune
+  to interleaved writes. The distinct prefixes make a PostgreSQL token or cursor fail loudly.
+  Date: 2026-08-25, superseding the draft's world-agnostic `mem:<counter>` token.
 
-- Decision: Write semantics match the **current** PostgreSQL interpreter: plain
-  insert-per-tuple in one revision (`writeTuplesSession`,
-  `en-postgres/src/En/Postgres/TupleStore.hs` ~158-166), no touch/upsert behavior.
-  Plan 45 (`docs/plans/45-adopt-touch-semantics-for-tuple-writes.md`, unimplemented at
-  the time of writing — zero checked progress items) will change tuple identity to
-  SpiceDB-style touch semantics; when it lands, its scope must include this interpreter,
-  and a note saying so belongs in *its* plan text as part of this plan's M1.
-  Rationale: an in-memory store that diverges from the production store's observable
-  write behavior would make tests pass that production fails, defeating its purpose.
-  Date: 2026-07-07
+- Decision: implement the complete current `TupleStore` effect and mirror production-visible
+  semantics: atomic preconditions, deletes-before-writes, last-write-wins request deduplication,
+  touch identity `(object, relation, subject)`, snapshot visibility, relationship filters, and
+  net live-set changes in `(start,end]`.
+  Rationale: tests using the public interpreter must not pass because an operation is a
+  placeholder or because it follows the obsolete pre-plan-45 insert semantics.
+  Date: 2026-08-25, superseding the 2026-07-07 plain-insert decision.
 
-- Decision: `runConsistencyStoreInMemory` ships in the same module and reads the same
-  `InMemoryWorld`, resolving `MinimizeLatency`/`FullyConsistent` to the head counter,
-  `AtLeastAsFresh t` to `max(head, decode t)` (which in-process is always `head`), and
-  `AtExactSnapshot t` to `decode t`; `DecodeToken` fails with a decode error on tokens
-  lacking the `mem:` prefix.
-  Rationale: the two effects are meaningless apart — a mutable tuple store consulted at
-  revisions no consistency resolver can produce is a foot-gun. Shipping the pair (plus a
-  `runInMemoryStores` convenience that installs both) is what makes the module a working
-  harness rather than a parts kit.
-  Date: 2026-07-07
+- Decision: one successful mutating request advances the revision once, including an empty or
+  no-op request; a failed precondition advances nothing. All mutation is one
+  `atomicModifyIORef'`.
+  Rationale: this matches the production transaction boundary and makes concurrent test
+  threads observe whole requests rather than partially applied batches.
+  Date: 2026-08-25.
 
-- Decision: This interpreter is documented as **test/demo-only**, and no configuration
-  flag ever selects it in `en-server`.
-  Rationale: durability and cross-instance agreement are non-negotiable for
-  authorization data; the new-enemy guarantee en exists to provide cannot be honored by
-  a process-local store in any multi-instance deployment. Keeping it out of en-server's
-  configuration space forecloses the tempting-but-wrong "quick start in production"
-  path.
-  Date: 2026-07-07
+- Decision: `MinimizeLatency` and `FullyConsistent` resolve to head;
+  `AtLeastAsFresh` resolves to the larger of head and the validated token revision; and
+  `AtExactSnapshot` resolves to the validated token revision. `DecodeToken` checks structure,
+  `ValidateToken` checks world identity and retained history, and `MintToken` only accepts a
+  revision belonging to the world.
+  Rationale: this preserves each current consistency mode's observable promise in the store's
+  total-order model and mirrors the production separation between decode and validate.
+  Date: 2026-08-25.
 
-- Decision: Cursors encode the last-seen **row id** (`mem-row:<n>`), not a list index.
-  Rationale: the Kikan fixture's index-based cursors are sound over immutable data but
-  break under interleaved writes (a new row shifts indices and pages skip or repeat
-  rows). Row ids are allocated once and never reused, so resuming a page after a write
-  is well-defined: strictly-greater row ids, filtered by the read's snapshot revision.
-  Date: 2026-07-07
+- Decision: `AdvanceGcHorizon` raises an in-memory high-water mark to head.
+  `ReapDeletedTuples h` removes rows deleted strictly before `h` and atomically raises the
+  high-water mark to at least `h`; validation expires older tokens.
+  Rationale: strict-before matches PostgreSQL's `deleted_xid < horizon` rule. Raising the mark
+  during direct reap keeps this test store sound even when a test invokes the public primitive
+  without first following the production background worker's advance-then-reap sequence.
+  Date: 2026-08-25.
+
+- Decision: document the interpreter in the repository-local
+  `docs/user/getting-started.md`, not the separate en-docs checkout named by the old draft.
+  Rationale: en now has a maintained user-guide corpus in this repository, so the public module
+  and its exact versioned API can be documented and committed atomically with the code.
+  Date: 2026-08-25.
+
+- Decision: no ADR is required at refresh time.
+  Rationale: `docs/adr/0001-en-s-schema-is-an-append-only-pg-migrate-component.md` concerns
+  migration ownership and `docs/adr/0002-crypton-1-1-binds-en-s-dependency-closure-through-a-biscuit-haskell-fork.md`
+  concerns the cryptography dependency closure. Neither governs a test-only interpreter, and
+  this plan does not change the production storage boundary.
+  Date: 2026-08-25.
 
 
 ## Outcomes & Retrospective
-
-Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
-Compare the result against the original purpose.
 
 (To be filled during and after implementation.)
 
 
 ## Context and Orientation
 
-en is a Haskell relationship-based authorization (ReBAC) toolkit: hosts define a schema
-(object types with relations and permissions), write **relation tuples** ("subject S has
-relation R on object O" — `En.Tuple.Tuple` in `en-core/src/En/Tuple.hs`), and ask the
-engine questions (`En.Check.check`, `En.Lookup`, `En.Expand`). The engine never touches
-storage directly; it sends operations of two `effectful` dynamic effects:
+en is a Haskell relationship-based authorization toolkit. A `Tuple` in
+`en-core/src/En/Tuple.hs` says that a subject has a named relation on an object. A
+`Revision` in `en-core/src/En/Revision.hs` names a snapshot. A `ConsistencyToken` is the
+opaque value returned after a write and accepted by later reads for read-your-writes.
 
-- `TupleStore` (`en-core/src/En/Effect/TupleStore.hs`) — the eight-operation storage
-  interface described below. Reads take a `Revision` (an opaque `Text`-wrapped snapshot
-  identifier, `en-core/src/En/Revision.hs`) and return a `TuplePage` of `TupleRow`s
-  (`rowId :: TupleRowId`, `tuple :: Tuple`, `createdAt :: Revision`,
-  `deletedAt :: Maybe Revision` — the store is append-only with soft deletes). Writes
-  return a `ConsistencyToken`, the opaque "zookie" a caller can present later to demand
-  read-your-writes.
-- `ConsistencyStore` (`en-core/src/En/Effect/ConsistencyStore.hs`) — resolves a
-  requested `Consistency` (`MinimizeLatency` | `AtLeastAsFresh token` |
-  `AtExactSnapshot token` | `FullyConsistent`) to the concrete `Revision` a read uses,
-  and decodes/validates tokens (`TokenMetadata` carries revision, datastore id, schema
-  hash, expiry).
+`en-core/src/En/Effect/TupleStore.hs` is the full storage port. Snapshot reads return
+`TupleRow`s carrying a stable `TupleRowId`, `createdAt`, and optional `deletedAt`. Mutation
+flows through `ApplyTupleWrites`, whose `TupleWriteRequest` checks preconditions, applies
+deletes, then applies writes atomically. Writes have touch semantics: a live tuple's identity
+is its object, relation, and subject; the caveat is replaceable data. Operator-facing
+operations read, count, or delete a validated `RelationshipFilter`. `ReadChanges` reports the
+net difference between the live sets at two revisions. The final operations read revisions
+and maintain the garbage-collection horizon.
 
-Interpreters supply meaning: `en-postgres` implements both over PostgreSQL
-(`En.Postgres.TupleStore`, `En.Postgres.Revision` — revisions are `pg_snapshot` values,
-deliberately only *partially* ordered, which is why `Revision` has no `Ord` instance).
-The only in-memory interpretation today is the conformance fixture
-`En.Conformance.Kikan.runTupleStoreInMemory` (`en-core/src/En/Conformance/Kikan.hs`): it
-pages a fixed `[Tuple]` (`pageTuples`, index-based cursors, every row stamped
-`testRevision`, `deletedAt = Nothing`) and answers `WriteTuples`/`DeleteTuples` with
-constant tokens (`ConsistencyToken "in-memory-write"`) **without storing anything**. Its
-sibling `runConsistencyStoreInMemory` resolves every consistency mode to `testRevision`.
-That is exactly right for conformance tests over fixed fixtures and exactly wrong for
-anyone testing a write path.
+`en-core/src/En/Effect/ConsistencyStore.hs` decodes and validates tokens, resolves the four
+`Consistency` modes, and mints tokens for read responses. The PostgreSQL reference behavior is
+in `en-postgres/src/En/Postgres/TupleStore.hs` and
+`en-postgres/src/En/Postgres/Revision.hs`. The implementation uses `effectful`'s dynamic
+`interpret_`; Mori locates that dependency at `mori://effectful/effectful`, with source at the
+registered `effectful/effectful` repository. No new dependency or bound is needed.
 
-The model to copy is Shōmei's in-memory assembly
-(`/Users/shinzui/Keikaku/bokuno/shomei/shomei-core/src/Shomei/Effect/InMemory.hs`): one
-`World` record of maps held in a single `IORef`, one interpreter per effect reading and
-atomically modifying it, exported per-port so hybrid stacks can mix real and fake
-interpreters. Shōmei ships it explicitly for pure test suites — never production — and
-this plan adopts the same posture, stated in the module haddock.
+`en-core/src/En/Conformance/Kikan.hs` remains the pure conformance fixture. The new module is
+an IO-backed historical store. `en-core/test/Main.hs` is one assertion executable whose
+`main` calls focused test functions. `en-example/src/En/Example/Host.hs` defines a small
+embedded host and `en-example/app/Main.hs` currently seeds it by passing a fixed tuple list to
+Kikan's interpreter; milestone 3 replaces that startup path with `writeTuples` against one
+shared world.
 
-Term of art: **new-enemy problem** — the Zanzibar failure mode where a permission
-revocation and a subsequent read race such that stale data is served to a principal who
-was just denied. en prevents it with snapshot reads at carefully chosen revisions; an
-in-process counter preserves the property within one process and cannot across
-processes, which is one of the two reasons (with durability) this store must never back
-a real deployment.
+The sibling integration work is
+`mori://shinzui/shomei/plans/47-en-integration-examples-and-guidance-for-the-recommended-authorization-layer`.
+The currently released Mori CLI cannot yet resolve that plan-kind URI, but the canonical plan
+shape is retained rather than falling back to an ambiguous path. This plan does not edit
+Shōmei.
+
+No local ADR is relevant, as recorded in the Decision Log.
 
 
 ## Plan of Work
 
-### Milestone 1 — The module
+### Milestone 1 — Complete mutable store interpreters
 
-Create `en-core/src/En/Store/InMemory.hs`, register it in `en-core.cabal`'s
-`exposed-modules` (alphabetical placement near `En.Schema` — check the existing list
-ordering convention), and implement:
+Create `en-core/src/En/Store/InMemory.hs` and expose it from `en-core/en-core.cabal`. Define an
+opaque world containing an `IORef` of historical rows, head revision, next row id, and retained
+horizon, plus an immutable per-world identity. Every read first parses its revision and cursor,
+then snapshots the world with `readIORef`. A row is visible at revision `r` when
+`createdAt <= r` and it has no deletion revision at or before `r`. Page filtered rows in row-id
+order and resume strictly after the cursor; `Truncated` is never produced because this store
+has no external read deadline.
 
-    data InMemoryRow = InMemoryRow
-      { rowId     :: !Int
-      , tuple     :: !Tuple
-      , createdAt :: !Int
-      , deletedAt :: !(Maybe Int)
-      }
+Implement every current `TupleStore` constructor. `ReadObjectRelation`,
+`ReadStartingWithUser`, `ReadAllTuples`, `ProbeTuples`, `ReadRelationships`, and
+`CountRelationships` filter the visible row set. `ApplyTupleWrites` checks the preconditions
+against the live head, then performs delete-by-key and touch writes at one new revision.
+`DeleteRelationships` retires matching live rows at one new revision and returns their count.
+`ReadChanges` compares visibility at its two endpoints and emits one `ChangeTouch` or
+`ChangeDelete` for each row whose membership differs. Revision and maintenance constructors
+follow the Decision Log.
 
-    data InMemoryWorld = InMemoryWorld
-      { rows :: !(Seq InMemoryRow)   -- or Map Int InMemoryRow keyed by rowId
-      , headCounter :: !Int
-      , nextRowId :: !Int
-      }
+Implement `runConsistencyStoreInMemory` over the same world and expose
+`runInMemoryStores` as the normal paired composition. Malformed tokens raise
+`MalformedConsistencyToken`, foreign-world tokens raise `InvalidConsistencyToken`, expired
+history raises `ConsistencyTokenExpired`, malformed cursors raise `InvalidCursor`, and a
+foreign direct `Revision` raises `StoreError`. Put the production warning in the module
+Haddock with pointers to `En.Postgres.TupleStore` and `En.Conformance.Kikan`.
 
-    newInMemoryWorld :: IO (IORef InMemoryWorld)
+At milestone completion, from the repository root run:
 
-`runTupleStoreInMemory :: (IOE :> es) => IORef InMemoryWorld -> Eff (TupleStore : es) a -> Eff es a`
-interprets (use `atomicModifyIORef'` for every mutation so concurrent test threads are
-safe — this was a lesson from Shōmei's suite, whose plain `modifyIORef'` interpreters
-needed atomizing for concurrency regression tests):
+```bash
+nix develop -c cabal build en-core
+nix develop -c cabal haddock en-core
+```
 
-- `ReadObjectRelation revision object relation limit cursor` — decode the revision
-  counter (reject non-`mem:` encodings with the same error channel the Postgres
-  interpreter uses for decode failures — `Error EnError` with a `StoreError`; check how
-  `interpretTupleStorePostgres`'s `orThrow` constructs it and mirror the constructor);
-  filter rows by object+relation and snapshot visibility
-  (`createdAt <= r && maybe True (> r) deletedAt`); order by `rowId`; apply the cursor
-  (strictly greater `rowId` than `mem-row:<n>`) and `limit`; produce `TuplePage` with
-  `Exhausted`/`HasMore` exactly as `pageTuples` does (there is no truncation source in
-  memory, so `Truncated` is never produced — say so in a comment).
-- `ReadStartingWithUser revision query` — same visibility/paging over the
-  `UsersetQuery` filter (type, relation, `subject ∈ querySubjects`), mirroring the
-  Kikan fixture's filter at `En/Conformance/Kikan.hs` (`ReadStartingWithUser` case).
-- `WriteTuples tuples` — one counter bump for the whole batch (matches the Postgres
-  session: one anchored transaction per call, `writeTuplesSession`); append one row per
-  tuple with fresh `rowId`s; return `ConsistencyToken ("mem:" <> show newCounter)`. No
-  touch/dedup semantics (Decision Log; revisit with en plan 45).
-- `DeleteTuples tuples` — bump once; set `deletedAt = Just newCounter` on every *live*
-  row whose `tuple` equals a requested tuple; return the token. Deleting an absent
-  tuple is a no-op for that tuple (verify the Postgres `deleteTuplesSession` behaves
-  this way — read the statement — and match it; record what you find in Surprises if
-  it differs).
-- `HeadRevision` / `OptimizedRevision` — `Revision ("mem:" <> show headCounter)` (no
-  quantization; in memory the optimized revision *is* head — note the comment).
-- `OldestRetainedXid` — `0` (no GC window in memory; everything is retained until
-  reaped).
-- `ReapDeletedTuples horizon` — hard-drop rows with `deletedAt <= horizon` (decode the
-  `Word64` against the counter), returning the count dropped — enough to test that
-  reaping is wired, without simulating xid arithmetic.
+Both commands must exit 0 and Haddock must include `En.Store.InMemory`.
 
-`runConsistencyStoreInMemory :: (IOE :> es, Error EnError :> es) => IORef InMemoryWorld -> Eff (ConsistencyStore : es) a -> Eff es a`:
 
-- `DecodeToken t` — parse `mem:<n>`; failure throws the same token-decode `EnError` the
-  Postgres consistency store throws (find it in `en-postgres`'s consistency module and
-  reuse the constructor); success returns `TokenMetadata` with
-  `DatastoreId "in-memory"`, the world's schema-agnostic `SchemaHash "in-memory"`, and
-  `expiresAt = Nothing`. (If `ValidateToken`'s production implementation checks
-  datastore/schema identity, mirror the shape but validate only the prefix — document
-  the difference in the haddock.)
-- `ResolveConsistency` — per the Decision Log: head for
-  `MinimizeLatency`/`FullyConsistent`; `AtLeastAsFresh` = head (in-process, head
-  dominates every issued token — comment why); `AtExactSnapshot t` = `decode t`.
+### Milestone 2 — Behavioral and engine tests
 
-`runInMemoryStores` composes both over one world. Module haddock: the production
-non-goal, verbatim reasons (durability, cross-instance agreement, xid8-grounded
-new-enemy guarantee), pointer to `en-postgres` for real deployments, pointer to
-`En.Conformance.Kikan` for fixed-fixture conformance runs.
+Add `testMutableInMemoryStore` to `en-core/test/Main.hs` and call it from `main`. Exercise the
+public operations, not internal helpers. At minimum assert write/read visibility, delete hiding,
+pre-delete exact-snapshot visibility, `AtLeastAsFresh`, stable row-id pagination across an
+interleaved write, identical-touch no duplication, differing-caveat replacement, failed
+preconditions with no state change, relationship read/count/delete, net changelog behavior,
+strict cursor/token failures, and reap counts plus expired old tokens.
 
-Acceptance: `cabal build en-core` succeeds; haddock renders
-(`cabal haddock en-core`).
+In the same test, compile a small schema, run `Check.check` before and after a grant written via
+`writeTuples`, and run `Lookup.lookup` at `FullyConsistent` to observe the written object. Delete
+the grant and assert the check returns to `Denied`. This is the executable proof of the purpose.
 
-### Milestone 2 — Tests
+Run:
 
-Extend `en-core/test/Main.hs` (study its existing tasty structure and group naming
-before adding) with a `Store.InMemory` group:
+```bash
+nix develop -c cabal test en-core
+```
 
-1. write → `ReadObjectRelation` at the returned token's revision sees the tuple.
-2. delete → read at post-delete head does not see it; read `AtExactSnapshot` at the
-   pre-delete token still does (snapshot isolation).
-3. `AtLeastAsFresh` after a write resolves to a revision that sees the write.
-4. Pagination: write 5 tuples on one object/relation, page with `limit = 2`; then
-   interleave a write between pages and assert no row is skipped or repeated
-   (rowId-cursor stability — the reason index cursors were rejected).
-5. `ReapDeletedTuples` drops exactly the soft-deleted rows at/below the horizon and
-   subsequent reads are unchanged (they were already invisible).
-6. Engine end-to-end: build a small schema with `En.Schema.Builder` (the
-   `en-example/src/En/Example/Host.hs` builder usage is the template), compile with
-   `compileSchema`, run `check` over the in-memory stores where the granting tuple
-   arrives via `writeTuples` mid-test: denied before, permitted after, denied again
-   after `deleteTuples` with `FullyConsistent`.
+The command must exit 0. A regression should fail with one of the new descriptive assertion
+labels, such as `mutable store: exact snapshot survives delete`.
 
-Acceptance: `cabal test en-core` green; the new group visible in the tasty tree.
 
-### Milestone 3 — Consumers and docs
+### Milestone 3 — Example and user guide
 
-Migrate `en-example`'s host (`en-example/src/En/Example/Host.hs`) from fixed tuple
-lists to `En.Store.InMemory`, adding a small write path to the demo so the example
-exercises mutation (follow its existing route conventions; keep the schema unchanged).
-The conformance fixture and suite are deliberately untouched.
+Replace `En.Example.Host`'s Kikan alias with imports from `En.Store.InMemory`. Keep its injected
+interpreter shape so the existing failure-path tests remain possible, but make
+`en-example/app/Main.hs` allocate one world and seed `viewerTuple "doc1" alice` by running
+`writeTuples` through `runInMemoryStores`. Update `en-example/test/Main.hs` similarly. The
+executable must still say that Alice can read `/documents/doc1`, now because startup exercised
+the real mutable write path.
 
-Docs: add the interpreter to whatever en-docs page introduces embedding/interpreters
-(search `/Users/shinzui/Keikaku/bokuno/en-docs/content/docs/` for the page that
-currently mentions interpreters or the example host; if none fits, the module haddock
-is the documentation of record and en-docs gets a one-paragraph mention on the example
-page). State the test/demo-only posture wherever it is mentioned. Finally, note in the
-plan's Outcomes that Shōmei's
-`docs/plans/47-en-integration-examples-and-guidance-for-the-recommended-authorization-layer.md`
-(External Companion Work, in the shomei repo) can now consume this interpreter instead
-of its bespoke one — do not edit the shomei repo from this plan.
+Update `docs/user/getting-started.md` so its embedded example uses `newInMemoryWorld`,
+`runInMemoryStores`, `writeTuples`, and `check` with the current effect API. State beside the
+snippet that the interpreter is for tests and demos only and that production uses
+`en-postgres`.
 
-Acceptance: `cabal build all && cabal test all` green in the en repo;
-`cabal run en-example` (or its documented invocation — check the package's executable
-stanza) demonstrates a write followed by a permitted check.
+Run:
+
+```bash
+nix develop -c cabal build all
+nix develop -c cabal test all
+```
+
+Both must exit 0. A short timeout smoke run of `cabal run en-example` must reach the listening
+message without requiring PostgreSQL; the timeout may terminate the server after startup.
 
 
 ## Concrete Steps
 
-All commands run from the en repository root, `/Users/shinzui/Keikaku/bokuno/en`,
-inside its dev shell (`nix develop`).
+All commands run from `/Users/shinzui/Keikaku/bokuno/en`. Use `nix develop -c` so the checked-in
+development environment selects the expected compiler and package set.
 
-```bash
-nix develop
-cabal build en-core                 # after M1
-cabal haddock en-core               # haddock must render the new module
-cabal test en-core                  # after M2
-cabal build all && cabal test all   # after M3
-```
-
-Expected test excerpt after M2 (names indicative; match the suite's real convention):
-
-```text
-en-core
-  Store.InMemory
-    write-then-read visibility:        OK
-    delete hides at head:              OK
-    at-exact-snapshot sees pre-delete: OK
-    cursor stable under writes:        OK
-    reap drops soft-deleted:           OK
-    engine check over mutable store:   OK
-```
-
-Commit after each milestone with the trailer:
+After each milestone, update Progress, Surprises & Discoveries, and Decision Log before making a
+Conventional Commit. Every commit carries both trailers:
 
 ```text
 ExecPlan: docs/plans/58-add-a-mutable-in-memory-tuple-store-for-tests-and-demos.md
+Intention: intention_01kx20y2tyeem9wat59b32ke7g
 ```
+
+Before declaring completion, inspect `git diff --check`, run the complete validation above,
+write Outcomes & Retrospective, and repeat the ADR distillation described by `agents/skills/exec-plan/ADR.md`.
 
 
 ## Validation and Acceptance
 
-The plan is done when a developer with no database can, in `ghci` or a test, create a
-world, write a tuple, and watch a `check` flip from denied to permitted — and when
-reverting the grant with `deleteTuples` under `FullyConsistent` flips it back. The
-milestone-2 engine test is the executable form of that sentence. Additionally:
-`grep -rn "runTupleStoreInMemory" en-core/src` shows both the Kikan fixture and the new
-module (they intentionally share a function name in different modules — if that
-collides for a consumer importing both, qualify at the import; do NOT rename the Kikan
-one, the conformance suite and external references depend on it — reconsider and record
-in the Decision Log if this proves too confusing during implementation); the module
-haddock contains the words "not a production store"; en-example runs without PostgreSQL.
+The feature is accepted when a developer can create an `InMemoryWorld`, run an effect program
+through `runInMemoryStores`, and observe all of these behaviors without PostgreSQL:
+
+1. A check is denied before a grant, allowed after `writeTuples`, and denied after
+   `deleteTuples` at `FullyConsistent`.
+2. `AtExactSnapshot` at the write token still sees the grant after its deletion.
+3. A multi-page read neither repeats nor skips old rows when a write occurs between pages.
+4. Atomic writes honor touch identity and preconditions, filter operations mutate exactly their
+   matching live set, changelog reads describe net membership changes, and reaping expires only
+   snapshots older than the raised horizon.
+5. A token from another in-memory world and a non-`mem-row:` cursor fail through typed
+   `EnError`s rather than silently producing a result.
+6. `en-example` reaches its listening state without a database after seeding its grant through
+   the public write effect.
+
+The authoritative commands are:
+
+```bash
+nix develop -c cabal build all
+nix develop -c cabal haddock en-core
+nix develop -c cabal test all
+git diff --check
+```
 
 
 ## Idempotence and Recovery
 
-Every step is additive and re-runnable: the module and tests can be rebuilt repeatedly;
-`en-example`'s migration is a self-contained diff revertible with git. No migrations, no
-data, no external services are touched. If milestone 3's example migration stalls, the
-module + tests (M1-M2) stand alone and should be committed as such.
+The changes are source-only and additive. Builds, tests, Haddock, and the example seed may be run
+repeatedly. Each example process creates a fresh world, so repeated startup cannot accumulate
+rows. No database, migration, network service, or external repository is mutated. If a milestone
+fails, keep the last working milestone committed and resume from the first unchecked Progress
+item; do not replace or weaken the Kikan fixture to make the new tests pass.
 
 
 ## Interfaces and Dependencies
 
-New module `En.Store.InMemory` in en-core, depending only on existing en-core modules
-(`En.Effect.TupleStore`, `En.Effect.ConsistencyStore`, `En.Revision`, `En.Tuple`,
-`En.Error`) plus `base`/`containers`/`effectful-core` — all already in
-`en-core.cabal`'s build-depends; add nothing new. Exports at end of M1:
+`En.Store.InMemory` exports:
 
-    data InMemoryWorld
-    newInMemoryWorld        :: IO (IORef InMemoryWorld)
-    runTupleStoreInMemory   :: (IOE :> es, Error EnError :> es) => IORef InMemoryWorld -> Eff (TupleStore : es) a -> Eff es a
-    runConsistencyStoreInMemory :: (IOE :> es, Error EnError :> es) => IORef InMemoryWorld -> Eff (ConsistencyStore : es) a -> Eff es a
-    runInMemoryStores       :: (IOE :> es, Error EnError :> es) => IORef InMemoryWorld -> Eff (ConsistencyStore : TupleStore : es) a -> Eff es a
+```haskell
+data InMemoryWorld
 
-(Exact constraint rows must be confirmed against the effect stacks the engine
-functions demand — read `En.Check.check`'s signature and the Postgres interpreters'
-constraints before committing to these; adjust and record deviations in the Decision
-Log.) Consumers after M3: `en-core` tests, `en-example`; external (not this plan's
-scope): Shōmei's `examples/embedded-with-en` per its plan 47.
+newInMemoryWorld :: IO InMemoryWorld
+
+runTupleStoreInMemory
+  :: (IOE :> es, Error EnError :> es)
+  => InMemoryWorld
+  -> Eff (TupleStore : es) a
+  -> Eff es a
+
+runConsistencyStoreInMemory
+  :: (IOE :> es, Error EnError :> es)
+  => InMemoryWorld
+  -> Eff (ConsistencyStore : es) a
+  -> Eff es a
+
+runInMemoryStores
+  :: (IOE :> es, Error EnError :> es)
+  => InMemoryWorld
+  -> Eff (ConsistencyStore : TupleStore : es) a
+  -> Eff es a
+```
+
+The implementation depends only on `base`, `containers`, `effectful`, `effectful-core`, and
+`text`, all already present in `en-core/en-core.cabal`. No dependency bounds change. Mori's
+local dependency record for the only non-platform API consulted is
+`mori://effectful/effectful`; the implementation follows the repository's existing
+`interpret_` patterns, verified against that registered source.
+
+
+Revision note (2026-08-25): refreshed the pre-implementation plan after plans 39, 45, 46, 48,
+50, 53, and 60 expanded the store contract. The revision replaces obsolete plain-insert and
+eight-operation assumptions with the complete current effect, changes the world to an opaque
+handle with per-world tokens, moves documentation into this repository, corrects the test
+harness description, records the green baseline, and canonicalizes the Shōmei plan reference.
