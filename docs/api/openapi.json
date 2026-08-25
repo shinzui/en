@@ -1664,6 +1664,16 @@
             },
             "description": "Resolution limit exceeded"
           },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal error"
+          },
           "503": {
             "content": {
               "application/problem+json": {
@@ -1740,6 +1750,16 @@
             },
             "description": "Resolution limit exceeded"
           },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal error"
+          },
           "503": {
             "content": {
               "application/problem+json": {
@@ -1815,6 +1835,16 @@
               }
             },
             "description": "Resolution limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal error"
           },
           "503": {
             "content": {
@@ -1921,6 +1951,16 @@
             },
             "description": "Resolution limit exceeded"
           },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal error"
+          },
           "503": {
             "content": {
               "application/problem+json": {
@@ -1996,6 +2036,16 @@
               }
             },
             "description": "Resolution limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal error"
           },
           "503": {
             "content": {
@@ -2073,6 +2123,16 @@
             },
             "description": "Resolution limit exceeded"
           },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal error"
+          },
           "503": {
             "content": {
               "application/problem+json": {
@@ -2148,6 +2208,16 @@
               }
             },
             "description": "Resolution limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal error"
           },
           "503": {
             "content": {
@@ -2225,6 +2295,16 @@
             },
             "description": "Resolution limit exceeded"
           },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal error"
+          },
           "503": {
             "content": {
               "application/problem+json": {
@@ -2300,6 +2380,16 @@
               }
             },
             "description": "Resolution limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal error"
           },
           "503": {
             "content": {
@@ -2393,6 +2483,16 @@
               }
             },
             "description": "Resolution limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal error"
           },
           "503": {
             "content": {
