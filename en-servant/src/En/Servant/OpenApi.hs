@@ -22,6 +22,7 @@ module En.Servant.OpenApi
   ( ServedAPI,
     servedProxy,
     enOpenApi,
+    narrowSuccessContent,
     appWithOpenApi,
   )
 where
@@ -33,18 +34,24 @@ import Data.HashMap.Strict.InsOrd.Compat qualified as InsOrdHashMap
 import Data.OpenApi
   ( AdditionalProperties (..),
     Definitions,
+    HttpStatusCode,
     NamedSchema (..),
     OpenApi,
     OpenApiItems (..),
     OpenApiType (..),
     OpenApiTypeValue (..),
     Referenced (..),
+    Response,
     Schema,
     ToSchema (..),
     additionalProperties,
+    allOperations,
+    content,
     declareSchemaRef,
     description,
     enum_,
+    fromAesonOptions,
+    genericDeclareNamedSchema,
     get,
     info,
     items,
@@ -54,9 +61,11 @@ import Data.OpenApi
     post,
     properties,
     required,
+    responses,
     title,
     type_,
     version,
+    _Inline,
   )
 import Data.OpenApi.Declare (Declare)
 import Data.Proxy (Proxy (..))
@@ -122,6 +131,7 @@ import En.Servant.API
     envelopeFormatters,
     server,
   )
+import En.Servant.Problem (ProblemDetails, problemJsonOptions)
 import En.Servant.Seam (ErrorEnvelopeWire)
 import Servant
   ( Application,
@@ -152,6 +162,22 @@ enOpenApi =
     & info . version .~ "v1"
     & info . description ?~ "Relationship-based authorization: check, lookup, expand, and write."
     & withOperationIds
+
+-- | Drop @application/problem+json@ from non-error responses' content maps.
+--
+-- The generated client must advertise both JSON media types because Servant checks a
+-- response against the verb's whole content-type list. The released OpenAPI generator
+-- consequently gives plain 'Respond' successes both keys, while 'RespondAs' errors are
+-- already keyed correctly by their own media type. This pass repairs only statuses below
+-- 400; touching errors would hide a route accidentally declared as plain 'Respond'.
+narrowSuccessContent :: OpenApi -> OpenApi
+narrowSuccessContent =
+  allOperations . responses . responses %~ InsOrdHashMap.mapWithKey narrow
+  where
+    narrow :: HttpStatusCode -> Referenced Response -> Referenced Response
+    narrow responseStatus
+      | responseStatus < 400 = _Inline . content %~ InsOrdHashMap.delete "application/problem+json"
+      | otherwise = id
 
 -- | Assign a stable @operationId@ to every operation, derived deterministically from its
 -- method and path, so a code generator consuming the checked-in @docs/api/openapi.json@ emits
@@ -253,6 +279,9 @@ sumSchema name alternatives =
   NamedSchema (Just name) (mempty & oneOf ?~ map Inline alternatives)
 
 -- * Instances
+
+instance ToSchema ProblemDetails where
+  declareNamedSchema = genericDeclareNamedSchema (fromAesonOptions problemJsonOptions)
 
 instance ToSchema ObjectRefWire where
   declareNamedSchema _ =

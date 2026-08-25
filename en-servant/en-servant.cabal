@@ -43,6 +43,7 @@ library
     En.Servant.API
     En.Servant.Authorize
     En.Servant.OpenApi
+    En.Servant.Problem
     En.Servant.Response
     En.Servant.Seam
     En.Servant.Wire
@@ -59,15 +60,18 @@ library
     , en-biscuit
     , en-core
     , en-postgres
+    , http-media
+    , http-types
     , lens
-    , openapi-hs
+    , openapi-hs          >=5.0  && <5.1
     , servant
-    , servant-openapi-hs
+    , servant-openapi-hs  >=5.1  && <5.2
     , servant-server
     , sop-core
     , text
     , time
     , transformers
+    , wai
 
 -- Writes docs/api/openapi.json. An executable rather than a test so the artifact is a
 -- deterministic build product, and a `just openapi` git-diff check catches drift.
@@ -85,6 +89,7 @@ executable en-openapi
 test-suite en-servant-tests
   import:         warnings, shared
   type:           exitcode-stdio-1.0
+  ghc-options:    -threaded -rtsopts
   hs-source-dirs: test
   main-is:        Main.hs
   build-depends:
@@ -99,11 +104,16 @@ test-suite en-servant-tests
     , en-core
     , en-postgres
     , en-servant
+    , http-client
     , http-types
     , openapi-hs
     , servant
+    , servant-client
+    , servant-openapi-hs  >=5.1 && <5.2
     , servant-server
+    , sop-core
     , text
     , time
     , wai
     , wai-extra
+    , warp

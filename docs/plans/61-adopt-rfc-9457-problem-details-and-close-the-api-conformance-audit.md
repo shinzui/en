@@ -4,7 +4,7 @@ slug: adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit
 title: "Adopt RFC 9457 problem details and close the API conformance audit"
 kind: exec-plan
 created_at: 2026-07-22T04:59:56Z
-intention: "intention_01ky42xb8mebsv979g07nrhwp9"
+intention: "intention_01m0xaavwqeznrgzs3j67m0q21"
 master_plan: "docs/masterplans/11-bring-en-into-conformance-with-the-haskell-jitsurei-pattern-catalog.md"
 ---
 
@@ -82,7 +82,11 @@ operation. The exact commands and expected output are in Validation and Acceptan
 
 ## Progress
 
-- [ ] Milestone 1 — Build the machinery in isolation (`ProblemDetails`, the `ProblemJSON` content
+- [x] (2026-08-25 22:22Z) Established the implementation baseline: `cabal build all` and
+      `just openapi` passed. `cabal test all` reproduced EP-63's pre-existing
+      `en-biscuit-tests` authorization timeout; the other seven suites passed, including
+      `en-servant-tests` and the PostgreSQL integration suite.
+- [x] (2026-08-25 22:22Z) Milestone 1 — Built the machinery in isolation (`ProblemDetails`, the `ProblemJSON` content
       type, the spec catalog, the two renderers), add the `http-media` dependency and the OpenAPI
       cohort bounds to `en-servant/en-servant.cabal`, and prove the machinery with a throwaway
       spike that exercises **three** legs: the wire's media type, a client round-trip, and the
@@ -120,6 +124,32 @@ operation. The exact commands and expected output are in Validation and Acceptan
 
 
 ## Surprises & Discoveries
+
+- Discovery (2026-08-25, EP-61 Milestone 1 spike): **the resolved Servant client still has the
+  exact runtime failure the plan predicts.** With the throwaway route's verb list temporarily
+  narrowed to `'[JSON]`, the wire test passed but the real generated client returned:
+
+  ```text
+  Left (UnsupportedContentType application/problem+json (Response {responseStatusCode = 400, ...}))
+  ```
+
+  Restoring `'[JSON, ProblemJSON]` makes the client return the typed `ProblemSpikeBad` value.
+  The OpenAPI leg simultaneously confirms the released generator keys the `400` only by
+  `application/problem+json` and exposes the known success-content pollution for Milestone 6.
+
+- Discovery (2026-08-25, EP-61 Milestone 1): **the plan understated the direct dependencies of
+  its own shared WAI renderer.** `problemResponse` necessarily imports `Response` and
+  `responseLBS` from `wai`, and building the new module exposed that `http-types` is also needed
+  directly for its `Header` and `Status` values. Both packages were already in en's resolved
+  closure and test stanza, but Cabal correctly rejected relying on them transitively. The
+  library stanza now declares `wai` and `http-types` alongside the planned `http-media`.
+
+- Discovery (2026-08-25, implementation baseline): **the known Biscuit smoke-test timeout is
+  still intermittent and remains unrelated to the HTTP-contract work.** The baseline
+  `cabal test all` run failed only `en-biscuit-tests` with `authorization rejected: Timeout`;
+  all seven other suites passed. EP-63 already recorded the same baseline flake, so milestone
+  validation runs the affected suite separately and reports both results rather than
+  attributing the timeout to this plan.
 
 - Discovery (2026-07-22, while planning): **the `MultiVerb`-style reference implementation this
   plan was told to follow does not exist as code.** The canonical convention document names
@@ -328,6 +358,35 @@ operation. The exact commands and expected output are in Validation and Acceptan
 
 
 ## Decision Log
+
+- Decision: Introduce the pure `narrowSuccessContent` helper during Milestone 1 so the
+  throwaway OpenAPI spike can prove both the raw generator defect and the repair, but do not
+  apply it to `enOpenApi` until Milestone 6.
+  Rationale: widening the spike's verb list fixes the real client and necessarily pollutes its
+  raw `200` content map. A test that merely expects the pollution would leave the plan's third
+  leg incomplete. Defining the exact one-directional repair now keeps production routes and the
+  checked-in artifact unchanged while letting the spike prove the final algorithm; Milestone 6
+  still owns wiring the helper into the published document and adding whole-API conformance
+  tests.
+  Date: 2026-08-25
+
+- Decision: Declare `wai` and `http-types` as direct `en-servant` library dependencies, and
+  temporarily declare `servant-client`, `servant-openapi-hs`, `http-client`, `warp`, and
+  `sop-core` in the test stanza for Milestone 1's real-client spike.
+  Rationale: the plan requires a reusable raw-WAI `problemResponse` and an actual
+  `servant-client` round trip. Those APIs cannot be imported legally through transitive
+  dependencies. Every package was already present in the project closure; the temporary spike
+  dependencies will be removed with the spike at the end of Milestone 2.
+  Date: 2026-08-25
+
+- Decision: Re-associate this adopted child plan with MasterPlan 11's active intention,
+  `intention_01m0xaavwqeznrgzs3j67m0q21`, replacing the intention under which the standalone
+  draft was authored.
+  Rationale: MasterPlan implement mode makes the parent's non-empty intention authoritative for
+  every child implemented in the session. Keeping the older child-only intention in frontmatter
+  and commit examples would make the durable metadata contradict the trailers required by the
+  active initiative. The plan's scope and implementation decisions are unchanged.
+  Date: 2026-08-25
 
 - Decision: Work around servant's and the OpenAPI generator's two `RespondAs` gaps **inside
   `en`** — widen each `MultiVerb`'s content-type list to `'[JSON, ProblemJSON]`, and re-key the
@@ -1446,7 +1505,7 @@ middleware. Nothing is wired up yet; a throwaway test-only MultiVerb route prove
 RespondAs really stamps the media type per alternative.
 
 ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
-Intention: intention_01ky42xb8mebsv979g07nrhwp9
+Intention: intention_01m0xaavwqeznrgzs3j67m0q21
 ```
 
 Milestone 2 — the conversion. Expect a long red build; work down GHC's list:
@@ -1469,7 +1528,7 @@ middleware installed inside app, so embedders get it too. ErrorEnvelopeWire is
 deleted. Every code string, status, and retryable flag is unchanged.
 
 ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
-Intention: intention_01ky42xb8mebsv979g07nrhwp9
+Intention: intention_01m0xaavwqeznrgzs3j67m0q21
 ```
 
 Milestone 3 — the 500 arm:
@@ -1492,7 +1551,7 @@ unparseable freshly-minted write token were both telling clients to retry foreve
 Grows EnResponses, EnResult, and the exhaustiveness witness by one.
 
 ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
-Intention: intention_01ky42xb8mebsv979g07nrhwp9
+Intention: intention_01m0xaavwqeznrgzs3j67m0q21
 ```
 
 Milestone 4 — grants:
@@ -1506,7 +1565,7 @@ of throwing. en-client's mintGrant now yields MintGrantResult, so a disabled min
 or a non-Allowed decision is a value rather than an opaque transport error.
 
 ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
-Intention: intention_01ky42xb8mebsv979g07nrhwp9
+Intention: intention_01m0xaavwqeznrgzs3j67m0q21
 ```
 
 Milestone 5 — `en-server`:
@@ -1525,7 +1584,7 @@ and the 503 from /readyz — speak the same dialect as everything servant serves
 /healthz and /metrics are exempt by name and unchanged.
 
 ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
-Intention: intention_01ky42xb8mebsv979g07nrhwp9
+Intention: intention_01m0xaavwqeznrgzs3j67m0q21
 ```
 
 Milestone 6 — the document:
@@ -1551,7 +1610,7 @@ code present in the catalog at the status it is sent with, and security on every
 operation.
 
 ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
-Intention: intention_01ky42xb8mebsv979g07nrhwp9
+Intention: intention_01m0xaavwqeznrgzs3j67m0q21
 ```
 
 Milestone 7 — the documents of record:
@@ -1560,7 +1619,7 @@ Milestone 7 — the documents of record:
 docs(en): update EP-35 and close EP-59's audit follow-ups
 
 ExecPlan: docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md
-Intention: intention_01ky42xb8mebsv979g07nrhwp9
+Intention: intention_01m0xaavwqeznrgzs3j67m0q21
 ```
 
 Finally, run the live transcripts in Validation and Acceptance against a real server, and record
@@ -1805,6 +1864,15 @@ servant / servant-server / servant-client / servant-client-core all 0.20.3.0, `h
 ("build(deps): consume openapi-hs and servant-openapi-hs from Hackage"), which is a change from
 what the 2026-07-22 draft of this plan described.
 
+The Milestone 1 implementation gate re-verified that exact cohort on 2026-08-25. Mori located
+the registered source for `mori://shinzui/openapi-hs`,
+`mori://shinzui/servant-openapi-hs`, and `mori://haskell-servant/servant`; those source trees
+match the resolved versions and the instances described in this plan. Hackage's authoritative
+package metadata and the upstream Git tags still list 5.0.0, 5.1.0, 0.20.3.0, and 0.8.1.1 as
+the latest releases of `openapi-hs`, `servant-openapi-hs`, Servant, and `http-media`
+respectively. `cabal build all` succeeded with the explicit cohort bounds before the new module
+was added and again after the full milestone.
+
 The `RespondAs` combinator this plan is built on ships in stock servant 0.20, which `en` already
 depends on. The two OpenAPI packages must stay as they are and must not be "simplified" to
 `openapi3` / `servant-openapi3`: those carry no `HasOpenApi` instance for `MultiVerb`, so an API
@@ -1972,3 +2040,15 @@ All four living sections were updated: Progress (two milestone bullets restated)
 Discoveries (three entries marked superseded or confirmed, two new dated entries added), the
 Decision Log (one entry amended, four new entries), and this note. Outcomes & Retrospective stays
 empty, because the plan remains unimplemented.
+
+
+## Revision Note — 2026-08-25 (MasterPlan implementation start)
+
+**What changed.** The child plan now carries MasterPlan 11's authoritative intention in its
+frontmatter and commit examples. Milestone 1's implementation also corrected the direct
+dependency inventory for the shared WAI renderer and the temporary real-client spike.
+
+**Why.** This plan was adopted after its standalone draft was written. Implementing it under
+MasterPlan 11 requires one intention across the initiative, and Cabal requires every imported
+package to be declared directly even when it is already present transitively. Neither change
+alters the wire-contract scope or milestone ordering.

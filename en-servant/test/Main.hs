@@ -15,6 +15,8 @@ import Data.List qualified as List
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.OpenApi (ToSchema, validateToJSON)
+import Data.Proxy (Proxy (..))
+import Data.SOP (I (..), NS (..))
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -110,7 +112,15 @@ import En.Servant.API
     watchHandler,
     writeTuplesHandler,
   )
-import En.Servant.OpenApi (enOpenApi)
+import En.Servant.OpenApi (enOpenApi, narrowSuccessContent)
+import En.Servant.Problem
+  ( ProblemDetails (..),
+    ProblemJSON,
+    ProblemSpec (..),
+    problem,
+    problemCatalog,
+    specInvalidRequest,
+  )
 import En.Servant.Seam
   ( ActiveSchema (..),
     EnFault (..),
@@ -121,13 +131,19 @@ import En.Servant.Seam
   )
 import En.Tuple (ObjectRef (..), Subject (..))
 import En.Watch (WatchBatch (..), WatchStart (..))
-import Network.HTTP.Types (methodPost, statusCode)
+import Network.HTTP.Client (defaultManagerSettings, newManager)
+import Network.HTTP.Types (StdMethod (GET), methodPost, statusCode)
 import Network.Wai (Application, Request (..), defaultRequest)
+import Network.Wai.Handler.Warp (testWithApplication)
 import Network.Wai.Test (SRequest (..), SResponse (..), runSession, setPath, srequest)
-import Servant (Handler, ServerError (..), runHandler)
+import Servant (Handler, JSON, QueryFlag, ServerError (..), runHandler, serve, type (:>))
+import Servant.API.MultiVerb (AsUnion (..), MultiVerb, Respond, RespondAs)
+import Servant.Client (BaseUrl (..), ClientM, Scheme (Http), client, mkClientEnv, runClientM)
+import Servant.OpenApi (toOpenApi)
 
 main :: IO ()
 main = do
+  problemMachineryTests
   wireContractTests
   errorModelTests
   openApiDocumentTests
@@ -365,6 +381,156 @@ main = do
   writePreconditionTests env
   mintGrantTests env
   routingTests env
+
+-- | The RFC 9457 machinery in isolation. This deliberately uses a throwaway API
+-- rather than changing a production route: the WAI response, generated client, and
+-- OpenAPI generator must all agree before the real response lists migrate.
+problemMachineryTests :: IO ()
+problemMachineryTests = do
+  let sample = problem specInvalidRequest "the request did not pass validation"
+  assertEqual
+    "problem details round-trip through their shared codec"
+    (Just sample)
+    (decode (encode sample))
+  assertEqual
+    "problem details use the six RFC-plus-extension wire keys"
+    ["code", "detail", "retryable", "status", "title", "type"]
+    (List.sort (valueObjectKeys (either error id (Aeson.eitherDecode (encode sample)))))
+
+  let catalogCodes = map (.code) problemCatalog
+      retryableCodes = List.sort [spec.code | spec <- problemCatalog, spec.retryable]
+  assertEqual
+    "the problem catalog has one stable specification per code"
+    (Set.size (Set.fromList catalogCodes))
+    (length catalogCodes)
+  assertEqual
+    "only dependency outages and rate limits are retryable"
+    ["rate_limited", "store_error"]
+    retryableCodes
+
+  problemSpikeWireTests
+  problemSpikeClientTest
+  problemSpikeDocumentTest
+
+data ProblemSpikeResult
+  = ProblemSpikeOk !Int
+  | ProblemSpikeBad !ProblemDetails
+  deriving stock (Eq, Show)
+
+type ProblemSpikeApi =
+  "problem-spike"
+    :> QueryFlag "fail"
+    :> MultiVerb
+         'GET
+         '[JSON, ProblemJSON]
+         '[ Respond 200 "ok" Int,
+            RespondAs ProblemJSON 400 "bad" ProblemDetails
+          ]
+         ProblemSpikeResult
+
+instance
+  AsUnion
+    '[ Respond 200 "ok" Int,
+       RespondAs ProblemJSON 400 "bad" ProblemDetails
+     ]
+    ProblemSpikeResult
+  where
+  toUnion = \case
+    ProblemSpikeOk value -> Z (I value)
+    ProblemSpikeBad details -> S (Z (I details))
+  fromUnion = \case
+    Z (I value) -> ProblemSpikeOk value
+    S (Z (I details)) -> ProblemSpikeBad details
+    S (S impossible) -> case impossible of {}
+
+problemSpikeApp :: Application
+problemSpikeApp =
+  serve (Proxy @ProblemSpikeApi) $ \shouldFail ->
+    pure
+      if shouldFail
+        then ProblemSpikeBad (problem specInvalidRequest "spike rejected the request")
+        else ProblemSpikeOk 42
+
+problemSpikeWireTests :: IO ()
+problemSpikeWireTests = do
+  success <- spikeRequest ""
+  assertEqual "the spike success is 200" 200 (statusCode success.simpleStatus)
+  assertEqual
+    "the spike success stays application/json"
+    (Just "application/json;charset=utf-8")
+    (lookup "Content-Type" success.simpleHeaders)
+
+  failure <- spikeRequest "?fail"
+  assertEqual "the spike failure is 400" 400 (statusCode failure.simpleStatus)
+  assertEqual
+    "RespondAs stamps application/problem+json on the wire"
+    (Just "application/problem+json")
+    (lookup "Content-Type" failure.simpleHeaders)
+  assertEqual
+    "the spike failure decodes as ProblemDetails"
+    (Just "invalid_request")
+    (fmap (.code) (decode failure.simpleBody :: Maybe ProblemDetails))
+  where
+    spikeRequest query =
+      runSession
+        ( srequest
+            SRequest
+              { simpleRequest =
+                  setPath defaultRequest ("/problem-spike" <> query),
+                simpleRequestBody = ""
+              }
+        )
+        problemSpikeApp
+
+problemSpikeClientTest :: IO ()
+problemSpikeClientTest =
+  -- Warp's test server uses the threaded RTS; the test component links with -threaded.
+  testWithApplication (pure problemSpikeApp) $ \port -> do
+    manager <- newManager defaultManagerSettings
+    result <-
+      runClientM
+        (problemSpikeClient True)
+        (mkClientEnv manager (BaseUrl Http "127.0.0.1" port ""))
+    assertEqual
+      "the generated client returns a typed problem value instead of UnsupportedContentType"
+      (Right (ProblemSpikeBad (problem specInvalidRequest "spike rejected the request")))
+      result
+  where
+    problemSpikeClient :: Bool -> ClientM ProblemSpikeResult
+    problemSpikeClient = client (Proxy @ProblemSpikeApi)
+
+problemSpikeDocumentTest :: IO ()
+problemSpikeDocumentTest = do
+  rawDocument <- either fail pure (Aeson.eitherDecode (encode (toOpenApi (Proxy @ProblemSpikeApi))))
+  let rawResponses = rawDocument `valueAt` "paths" `valueAt` "/problem-spike" `valueAt` "get" `valueAt` "responses"
+      rawSuccessContent = valueObjectKeys (rawResponses `valueAt` "200" `valueAt` "content")
+  assertBool
+    "widening the verb for servant-client exposes the known success-content pollution"
+    ("application/problem+json" `elem` rawSuccessContent)
+
+  document <-
+    either
+      fail
+      pure
+      (Aeson.eitherDecode (encode (narrowSuccessContent (toOpenApi (Proxy @ProblemSpikeApi)))))
+  let responses = document `valueAt` "paths" `valueAt` "/problem-spike" `valueAt` "get" `valueAt` "responses"
+      successContent = valueObjectKeys (responses `valueAt` "200" `valueAt` "content")
+      errorContent = valueObjectKeys (responses `valueAt` "400" `valueAt` "content")
+  assertEqual
+    "RespondAs gives the error alternative only application/problem+json in OpenAPI"
+    ["application/problem+json"]
+    errorContent
+  assertBool
+    "narrowSuccessContent removes problem+json from the success alternative"
+    ("application/problem+json" `notElem` successContent)
+
+valueAt :: Aeson.Value -> Key.Key -> Aeson.Value
+valueAt (Aeson.Object objectValue) key = maybe Aeson.Null id (KeyMap.lookup key objectValue)
+valueAt _ _ = Aeson.Null
+
+valueObjectKeys :: Aeson.Value -> [Text]
+valueObjectKeys (Aeson.Object objectValue) = Key.toText <$> KeyMap.keys objectValue
+valueObjectKeys _ = []
 
 -- | @\/v1\/lookup-subjects@ over the wire, against the in-memory store.
 --
