@@ -151,6 +151,7 @@ import En.Tuple
     Tuple (..),
     TupleCaveat (..),
   )
+import PreludeProbe qualified
 
 validatedKikanTH :: ValidSchema
 validatedKikanTH =
@@ -336,6 +337,7 @@ expectedKikanMermaid =
 
 main :: IO ()
 main = do
+  PreludeProbe.assertPreludeProbe
   let _ = sampleTuple
       _ = sampleUsersetQuery
       _ = sampleTuplePage

@@ -73,6 +73,8 @@ library
     , containers
     , effectful
     , effectful-core
+    , generic-lens          ^>=2.3
+    , lens                  ^>=5.3
     , template-haskell
     , text
     , time
@@ -83,12 +85,14 @@ test-suite en-core-interface-tests
   type:           exitcode-stdio-1.0
   hs-source-dirs: test
   main-is:        Main.hs
+  other-modules:  PreludeProbe
   build-depends:
     , base
     , containers
     , effectful
     , effectful-core
     , en-core
+    , generic-lens
     , text
     , time
 

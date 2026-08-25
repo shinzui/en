@@ -65,7 +65,7 @@ which consumes what this one builds.
       surfaces.
 - [x] (2026-08-25T21:19:30Z) Milestone 3 — Convert the three prepositive `import qualified` lines to the
       postpositive form.
-- [ ] Milestone 4 — Add `lens` and `generic-lens` to `en-core` and fill out
+- [x] (2026-08-25T21:25:52Z) Milestone 4 — Add `lens` and `generic-lens` to `en-core` and fill out
       `en-core/src/En/Prelude.hs` per the fleet prelude standard, with a `PackageImports`
       per-file pragma and **without** importing `Data.Generics.Labels`. Prove the prelude
       compiles and that a scratch module can use `#label` by importing
@@ -137,6 +137,11 @@ which consumes what this one builds.
     Found `qualified' in postpositive position.
   ```
 
+- Discovery (2026-08-25, Milestone 4): **the prelude's explanatory Haddock deliberately
+  names `Data.Generics.Labels`, so the original broad grep could not prove the intended
+  property.** The invariant is that the module is not imported, not that its name never
+  appears in documentation. Validation now searches only import declarations.
+
 (Add further entries as work proceeds.)
 
 
@@ -185,12 +190,45 @@ which consumes what this one builds.
   language baseline or the fixture behavior.
   Date: 2026-08-25
 
+- Decision: Give `en-core-interface-tests` a direct `generic-lens` dependency.
+  Rationale: the probe intentionally imports `Data.Generics.Labels ()` itself to prove the
+  prelude does not install the orphan instance globally. Cabal hides transitive packages,
+  so the test component must declare the library whose module it imports; `lens` remains a
+  dependency only of the `en-core` library because the probe reaches its operators through
+  `En.Prelude`.
+  Date: 2026-08-25
+
+- Decision: Create no ADR at EP-63 completion.
+  Rationale: this plan establishes scaffolding and enforces catalog conventions but does
+  not complete the durable record-idiom migration. The MasterPlan already assigns the
+  `generic-lens` / `#label` architecture decision and its ADR to EP-68, where the tradeoff
+  can be evaluated against the completed call-site sweep. The resolved dependency versions,
+  formatter boundary, and baseline test flake are execution evidence rather than separate
+  architecture decisions.
+  Date: 2026-08-25
+
 (Add further entries as work proceeds.)
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+EP-63 completed all four milestones. Every package now uses GHC2024 with the same mandatory
+four-extension baseline; GHC2024's redundant extensions are gone; missing fields are fatal;
+and the three remaining qualified imports use the postpositive fleet form. `en-core` now
+exposes the expanded `En.Prelude`, resolves `generic-lens` 2.3.0.0 and `lens` 5.3.6, and
+keeps a probe proving `^. #name` and `& #count .~ value` work only after the caller imports
+`Data.Generics.Labels ()` itself.
+
+The full build is green. All eight test suites pass; the pre-existing Biscuit smoke test
+can time out on the first aggregate or isolated invocation and then pass immediately on
+retry, so final validation ran that suite independently and the other seven sequentially.
+No production behavior or wire contract changed.
+
+Two lessons carry forward. `en-core` cannot enable `NoFieldSelectors` until EP-68 replaces
+its `unValidSchema` selector use, and standalone fixture modules need an explicit
+`ImportQualifiedPost` pragma because the commit hook does not inherit their Cabal language
+edition. ADR distillation created no new record: EP-68 owns the durable record-idiom ADR,
+while these observations remain implementation guidance for that plan.
 
 
 ## Context and Orientation
@@ -595,7 +633,7 @@ sufficient to give `#label` its meaning. Keep the test — it is the regression 
 `docs/plans/68-...` depends on before it migrates 1,400 call sites.
 
 Acceptance: `cabal build all && cabal test all` passes; the new prelude test is green;
-`grep -rn "Data.Generics.Labels" en-core/src/En/Prelude.hs` is **empty**; and
+`grep -n '^import .*Data.Generics.Labels' en-core/src/En/Prelude.hs` is **empty**; and
 `grep -rln "import En.Prelude" --include='*.hs' .` names only the new test module, because
 this plan migrates nothing.
 
@@ -727,7 +765,7 @@ Expected: no output.
 **The prelude works and does not leak `#label`.**
 
 ```bash
-grep -n "Data.Generics.Labels" en-core/src/En/Prelude.hs   # expected: no output
+grep -n '^import .*Data.Generics.Labels' en-core/src/En/Prelude.hs # expected: no output
 grep -n "PackageImports" en-core/src/En/Prelude.hs         # expected: line 1
 grep -rn "PackageImports" --include='*.cabal' .            # expected: no output
 grep -rln "import En.Prelude" --include='*.hs' .           # expected: only the new test
@@ -739,9 +777,12 @@ The last of those is the substantive one: the new probe test asserts
 to compile if `generic-lens` is missing, if `OverloadedLabels` is off, or if the per-module
 `Data.Generics.Labels ()` import is not sufficient.
 
-**Nothing regressed.** `cabal build all && cabal test all` passes, and the full test suite's
-count of passing tests is the same as at the baseline plus the new probe test. This plan
-changes no behavior, so any change in test results is a bug in the plan's execution.
+**Nothing regressed.** `cabal build all` passes, and every test suite passes with the new
+probe included. The baseline Biscuit smoke test has a pre-existing fixed-timeout flake: if
+`cabal test all` reports only `authorization rejected: Timeout`, immediately run
+`cabal test en-biscuit-tests --test-show-details=direct`, then run the other seven suites
+sequentially. This is the final validation sequence used by this implementation. Any other
+change in test results is a bug in the plan's execution.
 
 
 ## Idempotence and Recovery
@@ -774,7 +815,7 @@ is a much more confusing place to be than an honest solver error. Run
 
 ### Libraries
 
-Two are added, both to `en-core`'s library stanza only:
+Two are added to `en-core`'s library stanza:
 
 - **`lens ^>=5.3`** — the lens operators (`^.`, `.~`, `?~`, `%~`, `&`) the prelude
   re-exports. Nothing else in `en` uses it today.
@@ -782,10 +823,21 @@ Two are added, both to `en-core`'s library stanza only:
   `Data.Generics.Labels` that gives `#fieldName` its meaning as a lens over any `Generic`
   record.
 
-Those bounds come from the fleet standard, verified against Hackage on 2026-07-24
-(`generic-lens` 2.3.0.0, `lens` 5.3.6). **Re-verify against Hackage and record what the
-solver actually resolved** in this section when the milestone lands, per the MasterPlan's
-rule that every child plan proves its cohort before writing code. `en`'s closure is bound by
+The bounds came from the fleet standard and were re-verified on 2026-08-25 against the
+authoritative Hackage package records and the upstream Git tags. Hackage and upstream both
+end at `generic-lens` 2.3.0.0 and `lens` 5.3.6; the Mori corpus's `lens.cabal` says 5.4 on
+the development branch, but there is no 5.4 release or tag. `cabal build all` resolved and
+compiled this exact cohort from `dist-newstyle/cache/plan.json`:
+
+```text
+generic-lens       2.3.0.0
+generic-lens-core  2.3.0.0
+lens               5.3.6
+```
+
+The `en-core-interface-tests` component also declares `generic-lens` directly because its
+probe imports `Data.Generics.Labels ()`; it does not declare `lens`, whose operators arrive
+through `En.Prelude`. `en`'s closure is bound by
 `crypton >= 1.1` and a forked `biscuit-haskell` under
 [ADR 2](../adr/0002-crypton-1-1-binds-en-s-dependency-closure-through-a-biscuit-haskell-fork.md).
 
@@ -816,3 +868,9 @@ and the new probe test should appear in this plan's diff. If one does — becaus
 enabled extension forced a disambiguation — that is acceptable, but it must be named in
 Surprises & Discoveries with the error that forced it. A large `.hs` diff means the plan has
 drifted into `docs/plans/68-...`'s scope and should stop.
+
+Revision note (2026-08-25): while implementing Milestone 4, corrected the prelude validation
+to reject an actual `Data.Generics.Labels` import rather than rejecting the explanatory
+Haddock that names the module, and documented the test component's necessary direct
+`generic-lens` dependency, the versions resolved from the final Cabal plan, and the
+baseline Biscuit timeout fallback used to prove all eight suites independently pass.

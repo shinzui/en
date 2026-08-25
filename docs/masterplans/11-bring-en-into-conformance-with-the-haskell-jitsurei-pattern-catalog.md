@@ -185,7 +185,7 @@ searched for the catalog's own decisions; the catalog publishes standards, not A
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| 63 | Adopt the fleet Haskell core standards across every en package | docs/plans/63-adopt-the-fleet-haskell-core-standards-across-every-en-package.md | None | None | In Progress |
+| 63 | Adopt the fleet Haskell core standards across every en package | docs/plans/63-adopt-the-fleet-haskell-core-standards-across-every-en-package.md | None | None | Complete |
 | 61 | Adopt RFC 9457 problem details and close the API conformance audit | docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md | None | EP-63 | Not Started |
 | 64 | Serve Kubernetes health probes from servant-health | docs/plans/64-serve-kubernetes-health-probes-from-servant-health.md | EP-61 | EP-63 | Not Started |
 | 65 | Instrument en with OpenTelemetry and a conformant production request log | docs/plans/65-instrument-en-with-opentelemetry-and-a-conformant-production-request-log.md | EP-64 | EP-63 | Not Started |
@@ -342,7 +342,7 @@ checklist; this is the at-a-glance view of the initiative.
 
 - [x] EP-63: Uniform `common` stanzas and GHC2024 across all eight packages
 - [x] EP-63: `-Werror=missing-fields` and the postpositive-import cleanup
-- [ ] EP-63: `En.Prelude` and the `lens` / `generic-lens` dependencies, no call sites migrated
+- [x] EP-63: `En.Prelude` and the `lens` / `generic-lens` dependencies, no call sites migrated
 - [ ] EP-61: Problem-details machinery in isolation, proven by a three-legged spike
 - [ ] EP-61: The servant surface converted; `ErrorEnvelopeWire` deleted
 - [ ] EP-61: A 500 for genuine internal faults, distinguished from a 503 dependency outage
@@ -407,6 +407,13 @@ between child plans. Concise evidence.
   `servant-health` reverses that judgment — the probes become routes on the API record and
   therefore appear in the generated document. EP-64 owns arguing that reversal rather than
   performing it silently.
+
+- Discovery (2026-08-25, EP-63): **`en-core` cannot yet join the other record-heavy
+  packages in enabling `NoFieldSelectors`.** Its `En.Schema` module still imports the
+  generated `unValidSchema` selector, and enabling the extension suppresses that export.
+  EP-63 therefore delivered the mandatory four-extension baseline without this optional
+  addition. EP-68 must replace the selector during its record-idiom sweep before it decides
+  whether to remove generated selectors from `en-core` globally.
 
 
 ## Decision Log
