@@ -23,12 +23,10 @@ common shared
   default-language:   GHC2024
   default-extensions:
     BlockArguments
-    DataKinds
     DeriveAnyClass
-    DeriveGeneric
     DuplicateRecordFields
-    LambdaCase
     NoFieldSelectors
+    OverloadedLabels
     OverloadedRecordDot
     OverloadedStrings
     TypeFamilies

@@ -19,12 +19,10 @@ common warnings
 common shared
   default-language:   GHC2024
   default-extensions:
-    DataKinds
     DeriveAnyClass
-    DeriveGeneric
     DuplicateRecordFields
-    LambdaCase
     NoFieldSelectors
+    OverloadedLabels
     OverloadedRecordDot
     OverloadedStrings
     TypeFamilies

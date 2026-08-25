@@ -28,9 +28,7 @@ common shared
     BlockArguments
     DeriveAnyClass
     DeriveLift
-    DerivingStrategies
     DuplicateRecordFields
-    LambdaCase
     OverloadedLabels
     OverloadedRecordDot
     OverloadedStrings

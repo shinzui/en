@@ -24,8 +24,10 @@ common warnings
 common shared
   default-language:   GHC2024
   default-extensions:
+    DeriveAnyClass
     DuplicateRecordFields
     NoFieldSelectors
+    OverloadedLabels
     OverloadedRecordDot
     OverloadedStrings
 

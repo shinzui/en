@@ -56,7 +56,7 @@ which consumes what this one builds.
 
 ## Progress
 
-- [ ] Milestone 1 — Give all eight packages an identical baseline `common shared` stanza:
+- [x] (2026-08-25T21:16:04Z) Milestone 1 — Give all eight packages an identical baseline `common shared` stanza:
       `default-language: GHC2024` plus `DeriveAnyClass`, `DuplicateRecordFields`,
       `OverloadedLabels`, `OverloadedStrings`, keeping each package's justified additions
       and deleting the ones GHC2024 already provides. Build and test after each package.
@@ -92,6 +92,27 @@ which consumes what this one builds.
   is already declared per file, this plan leaves it alone rather than promoting it to a
   project-wide default. Recorded so the omission reads as a decision.
 
+- Discovery (2026-08-25, baseline validation): **the aggregate test runner can exhaust the
+  Biscuit smoke test's fixed authorization timeout while the suite is healthy in
+  isolation.** The first `cabal test all` run passed the other seven suites but reported
+  `en-biscuit test FAILED: smoke test: authorization rejected: Timeout`; immediately
+  running `cabal test en-biscuit-tests --test-show-details=direct` passed. Treat this as a
+  pre-existing concurrency-sensitive baseline flake and confirm the suite independently
+  whenever an aggregate run repeats it.
+
+- Discovery (2026-08-25, Milestone 1): **`en-core` still needs its generated record
+  selectors.** Adding the optional `NoFieldSelectors` extension made `cabal build all`
+  fail in `En.Schema` because `En.Schema.Internal` no longer exported the generated
+  `unValidSchema` selector. The four fleet-baseline extensions do not require
+  `NoFieldSelectors`, so `en-core` retains selector generation until EP-68 migrates that
+  call site with the rest of the record-idiom sweep.
+
+  ```text
+  src/En/Schema.hs:49:46: error: [GHC-61689]
+      Module ‘En.Schema.Internal’ does not export ‘unValidSchema’.
+      Notice that ‘unValidSchema’ is a field selector ... suppressed by NoFieldSelectors.
+  ```
+
 (Add further entries as work proceeds.)
 
 
@@ -124,6 +145,13 @@ which consumes what this one builds.
   package and already declared with per-file pragmas. The standard permits promotion but
   does not require it, and a project-wide default would invite multiline literals into
   modules where ordinary string literals are clearer.
+  Date: 2026-08-25
+
+- Decision: Keep `NoFieldSelectors` out of `en-core` during this baseline-only plan.
+  Rationale: the optional extension suppresses `unValidSchema`, which remains part of
+  `En.Schema`'s implementation. Rewriting that call site would start the record migration
+  owned by EP-68, while omitting the optional extension preserves behavior and still gives
+  `en-core` the mandatory GHC2024 baseline.
   Date: 2026-08-25
 
 (Add further entries as work proceeds.)

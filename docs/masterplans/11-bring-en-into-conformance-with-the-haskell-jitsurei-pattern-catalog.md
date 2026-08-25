@@ -185,7 +185,7 @@ searched for the catalog's own decisions; the catalog publishes standards, not A
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| 63 | Adopt the fleet Haskell core standards across every en package | docs/plans/63-adopt-the-fleet-haskell-core-standards-across-every-en-package.md | None | None | Not Started |
+| 63 | Adopt the fleet Haskell core standards across every en package | docs/plans/63-adopt-the-fleet-haskell-core-standards-across-every-en-package.md | None | None | In Progress |
 | 61 | Adopt RFC 9457 problem details and close the API conformance audit | docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md | None | EP-63 | Not Started |
 | 64 | Serve Kubernetes health probes from servant-health | docs/plans/64-serve-kubernetes-health-probes-from-servant-health.md | EP-61 | EP-63 | Not Started |
 | 65 | Instrument en with OpenTelemetry and a conformant production request log | docs/plans/65-instrument-en-with-opentelemetry-and-a-conformant-production-request-log.md | EP-64 | EP-63 | Not Started |
@@ -340,7 +340,7 @@ per the distillation rule in `.claude/skills/exec-plan/ADR.md`.
 Milestone-level progress across all child plans. Each child plan owns the granular
 checklist; this is the at-a-glance view of the initiative.
 
-- [ ] EP-63: Uniform `common` stanzas and GHC2024 across all eight packages
+- [x] EP-63: Uniform `common` stanzas and GHC2024 across all eight packages
 - [ ] EP-63: `-Werror=missing-fields` and the postpositive-import cleanup
 - [ ] EP-63: `En.Prelude` and the `lens` / `generic-lens` dependencies, no call sites migrated
 - [ ] EP-61: Problem-details machinery in isolation, proven by a three-legged spike
