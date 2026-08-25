@@ -122,6 +122,13 @@ operation. The exact commands and expected output are in Validation and Acceptan
       former error contract this plan replaces), and marked follow-ups (1) through (4) closed
       in `docs/plans/59-convert-en-servant-to-namedroutes-and-vertical-slices.md`; both plans now
       name the live `ProblemDetails` contract and canonical `mori://` catalog URIs.
+- [x] (2026-08-25 23:26Z) Final acceptance — `cabal build all` and `just openapi` passed;
+      seven unaffected test suites passed twice in the full run, while the pre-existing
+      `en-biscuit-tests` smoke timeout reproduced under full-suite concurrency and passed on its
+      immediate isolated retry. Live auth-disabled HTTP checks returned typed problem documents
+      for malformed input, an unmatched route, and disabled grant minting, while a successful
+      check remained JSON. The generated contract summary showed `bearerAuth` on all twelve
+      operations and problem-only media types on every error response.
 
 
 ## Surprises & Discoveries
@@ -622,6 +629,23 @@ checks a `MultiVerb` response Content-Type against the verb-wide content-type li
 affected verb must remain widened to `'[JSON, ProblemJSON]`. Structural matching against the
 resolved Hasql 1.10.3.7 constructors keeps genuine database failures at retryable `503` while
 decoder/schema mismatches become non-retryable `500`.
+
+Final observable validation used the standalone server on port 8897 with authentication
+disabled. A malformed `POST /v1/check` returned `400`, `application/problem+json`, and
+`malformed_request_body`; `POST /v1/no-such-path` returned the same media type with `404` and
+`not_found`; disabled `POST /v1/grants` returned the declared `404` with detail "grant minting is
+not enabled"; and a valid check returned `200`, `application/json;charset=utf-8`, and an
+`allowed` decision. The earlier authenticated run returned `401` with
+`WWW-Authenticate: Bearer` and `unauthenticated`, while healthy `/readyz` remained plain JSON.
+The generated-document summary reported OpenAPI 3.1.0, `securitySchemes: ['bearerAuth']`,
+`sec=True` on all twelve operations, only `application/problem+json` for every error, only JSON
+for every success, `403`/`404` on grants, and `500` on every `MultiVerb` operation.
+
+`cabal build all` and `just openapi` were clean. In both final `cabal test all` runs, the seven
+unaffected suites passed and only the already-recorded Biscuit authorization smoke test timed
+out under full-suite concurrency; `cabal test en-biscuit:en-biscuit-tests` passed immediately in
+isolation. This is the same baseline flake observed before the first implementation change, not
+a regression concealed as a green suite.
 
 Two follow-ups remain deliberately out of scope:
 
@@ -1692,7 +1716,7 @@ cabal test all
 just openapi        # regenerate + git diff --exit-code; must be clean
 ```
 
-Expected: all seven suites pass, and `just openapi` prints nothing and exits `0`. A non-empty
+Expected: all eight suites pass, and `just openapi` prints nothing and exits `0`. A non-empty
 diff means the checked-in artifact is stale — regenerate and commit it.
 
 ### The live service

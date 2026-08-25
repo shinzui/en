@@ -186,7 +186,7 @@ searched for the catalog's own decisions; the catalog publishes standards, not A
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | 63 | Adopt the fleet Haskell core standards across every en package | docs/plans/63-adopt-the-fleet-haskell-core-standards-across-every-en-package.md | None | None | Complete |
-| 61 | Adopt RFC 9457 problem details and close the API conformance audit | docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md | None | EP-63 | In Progress |
+| 61 | Adopt RFC 9457 problem details and close the API conformance audit | docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md | None | EP-63 | Complete |
 | 64 | Serve Kubernetes health probes from servant-health | docs/plans/64-serve-kubernetes-health-probes-from-servant-health.md | EP-61 | EP-63 | Not Started |
 | 65 | Instrument en with OpenTelemetry and a conformant production request log | docs/plans/65-instrument-en-with-opentelemetry-and-a-conformant-production-request-log.md | EP-64 | EP-63 | Not Started |
 | 66 | Add a Hurl black-box API suite for en-server | docs/plans/66-add-a-hurl-black-box-api-suite-for-en-server.md | EP-61, EP-64 | EP-65 | Not Started |
@@ -343,13 +343,13 @@ checklist; this is the at-a-glance view of the initiative.
 - [x] EP-63: Uniform `common` stanzas and GHC2024 across all eight packages
 - [x] EP-63: `-Werror=missing-fields` and the postpositive-import cleanup
 - [x] EP-63: `En.Prelude` and the `lens` / `generic-lens` dependencies, no call sites migrated
-- [ ] EP-61: Problem-details machinery in isolation, proven by a three-legged spike
-- [ ] EP-61: The servant surface converted; `ErrorEnvelopeWire` deleted
-- [ ] EP-61: A 500 for genuine internal faults, distinguished from a 503 dependency outage
-- [ ] EP-61: `POST /v1/grants` declares its statuses
-- [ ] EP-61: `en-server` middleware and readiness converted
-- [ ] EP-61: The OpenAPI half closed — media types, security scheme, conformance tests
-- [ ] EP-61: Documents of record updated
+- [x] EP-61: Problem-details machinery in isolation, proven by a three-legged spike
+- [x] EP-61: The servant surface converted; `ErrorEnvelopeWire` deleted
+- [x] EP-61: A 500 for genuine internal faults, distinguished from a 503 dependency outage
+- [x] EP-61: `POST /v1/grants` declares its statuses
+- [x] EP-61: `en-server` middleware and readiness converted
+- [x] EP-61: The OpenAPI half closed — media types, security scheme, conformance tests
+- [x] EP-61: Documents of record updated
 - [ ] EP-64: `servant-health` mounted; `/health/live` and `/health/ready` serving
 - [ ] EP-64: Probe checks wired (`safeCheck`, `withProbeTimeout`, `sequenceChecks`, failure trackers)
 - [ ] EP-64: Test-kit contract test passing; old `Health.hs` deleted; probes exempted from the problem-details test
@@ -371,6 +371,16 @@ checklist; this is the at-a-glance view of the initiative.
 
 Cross-plan insights, dependency changes, scope adjustments, and unexpected interactions
 between child plans. Concise evidence.
+
+- Discovery (2026-08-25, EP-61): **the released OpenAPI generator fixed its `RespondAs`
+  media-type bug, but the released Servant client did not fix its sibling bug.**
+  `servant-openapi-hs` 5.1.0 derives each problem alternative under
+  `application/problem+json` correctly. `servant-client-core` 0.20.3.0 still validates a
+  `MultiVerb` response Content-Type against the verb-wide list rather than its matching
+  alternative, forcing routes to say `'[JSON, ProblemJSON]`; that in turn makes successful
+  OpenAPI responses over-declare the problem media type until EP-61's
+  `narrowSuccessContent` pass removes it. EP-67 must preserve this paired workaround for any
+  changed `MultiVerb` route until the client defect is fixed upstream.
 
 - Discovery (2026-08-25, while decomposing): **`en`'s hand-written request logger already
   independently reached the standard's central conclusion.** The production request-logging
@@ -516,4 +526,22 @@ Compare the result against the original vision. Before marking the MasterPlan co
 distill durable project context from this MasterPlan and its child ExecPlans into
 `docs/adr/`. Keep task-local execution and coordination details here.
 
-(To be filled during and after implementation.)
+EP-63 and EP-61 are complete. EP-61 delivered the initiative's first externally visible
+conformance result: every HTTP error surface now uses RFC 9457 `ProblemDetails` under
+`application/problem+json`, true internal failures have a non-retryable `500`, grant minting's
+`403`/`404` outcomes are typed and documented, and all twelve OpenAPI operations require
+`bearerAuth`. Live standalone-server checks covered framework `400`, route `404`, typed grant
+`404`, authenticated middleware `401`, readiness success, and an ordinary `200`; the generated
+artifact cleanly separates problem and success media types.
+
+The child completed in seven milestone commits plus generated-artifact commits and one document
+closeout. `cabal build all` and `just openapi` are clean. The pre-existing
+`en-biscuit-tests` authorization timeout still reproduces under full-suite concurrency while
+passing immediately in isolation; all seven other suites pass. EP-61's ADR distillation found
+no project-local ADR to add: the durable API decisions are owned by the canonical catalog, while
+the two dependency workarounds are local, tested, and documented beside their code with removal
+conditions.
+
+With EP-61 complete, EP-64 is the next child in initiative order whose hard dependencies are all
+complete. EP-67 is also dependency-ready, but its soft dependency and the declared wave order
+keep it behind EP-64 through EP-66.
