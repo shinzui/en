@@ -20,7 +20,8 @@ where
 import Data.Aeson (encode, object, (.=))
 import Data.ByteString.Lazy qualified as Lazy
 import Data.Text (Text)
-import Network.HTTP.Types (Status, hContentType, methodGet, status200, status503)
+import En.Servant.Problem (problemResponse, specStoreError)
+import Network.HTTP.Types (Status, hContentType, methodGet, status200)
 import Network.Wai (Middleware, Request (..), Response, responseLBS)
 
 -- | Serve @GET \/healthz@ and @GET \/readyz@; pass everything else inward.
@@ -43,18 +44,11 @@ alive :: Response
 alive =
   jsonResponse status200 (encode (object ["status" .= ("ok" :: Text)]))
 
--- | The @{code, message, retryable}@ envelope every other en response uses, with
--- the same @store_error@ code a request would get while the store is unreachable.
+-- | The same retryable @store_error@ problem a request receives while the store is
+-- unreachable.
 notReady :: Response
 notReady =
-  jsonResponse status503 $
-    encode
-      ( object
-          [ "code" .= ("store_error" :: Text),
-            "message" .= ("database unreachable" :: Text),
-            "retryable" .= True
-          ]
-      )
+  problemResponse specStoreError "database unreachable"
 
 jsonResponse :: Status -> Lazy.ByteString -> Response
 jsonResponse status =

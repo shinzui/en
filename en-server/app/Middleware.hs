@@ -18,11 +18,9 @@ module Middleware
   )
 where
 
-import Data.Aeson (encode, object, (.=))
 import Data.ByteArray (constEq)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as Char8
-import Data.ByteString.Lazy qualified as Lazy
 import Data.Char (toLower)
 import Data.IORef (atomicModifyIORef', newIORef)
 import Data.List (find)
@@ -32,9 +30,15 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Word (Word64)
+import En.Servant.Problem
+  ( problemResponse,
+    specPermissionDenied,
+    specRateLimited,
+    specUnauthenticated,
+  )
 import GHC.Clock (getMonotonicTimeNSec)
-import Network.HTTP.Types (HeaderName, hAuthorization, hContentType, methodPost, status401, status403, status429)
-import Network.Wai (Middleware, Request (..), Response, responseLBS)
+import Network.HTTP.Types (HeaderName, hAuthorization, methodPost)
+import Network.Wai (Middleware, Request (..), Response)
 
 -- | What a key is allowed to do. 'ReadOnly' keys are rejected on write routes.
 data KeyRole = ReadOnly | ReadWrite
@@ -123,19 +127,11 @@ withCaller name request =
 
 unauthenticated :: Response
 unauthenticated =
-  responseLBS
-    status401
-    [ (hContentType, "application/json"),
-      ("WWW-Authenticate", "Bearer")
-    ]
-    (errorBody "unauthenticated" "missing or invalid API key" False)
+  problemResponse specUnauthenticated "missing or invalid API key"
 
 readOnlyKey :: Response
 readOnlyKey =
-  responseLBS
-    status403
-    [(hContentType, "application/json")]
-    (errorBody "permission_denied" "this API key is read-only" False)
+  problemResponse specPermissionDenied "this API key is read-only"
 
 -- * Rate limiting
 
@@ -203,22 +199,4 @@ callerOf request =
 
 rateLimited :: Response
 rateLimited =
-  responseLBS
-    status429
-    [ (hContentType, "application/json"),
-      ("Retry-After", "1")
-    ]
-    (errorBody "rate_limited" "rate limit exceeded" True)
-
--- | The same @{code, message, retryable}@ envelope that @en-servant@ emits.
---
--- Written out here rather than reused from 'En.Servant.Seam.ErrorEnvelopeWire' because
--- these responses are produced by WAI middleware, outside Servant: there is no
--- 'Servant.ServerError' to attach, and no handler to return from. The field order and
--- names must match, so a change to the envelope changes both.
---
--- A rate limit is the one middleware rejection worth retrying: the caller's bucket
--- refills. A missing key and a read-only key do not fix themselves.
-errorBody :: Text -> Text -> Bool -> Lazy.ByteString
-errorBody code message retryable =
-  encode (object ["code" .= code, "message" .= message, "retryable" .= retryable])
+  problemResponse specRateLimited "rate limit exceeded"

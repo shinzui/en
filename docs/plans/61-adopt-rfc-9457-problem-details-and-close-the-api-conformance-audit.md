@@ -106,7 +106,7 @@ operation. The exact commands and expected output are in Validation and Acceptan
 - [x] (2026-08-25 22:47Z) Milestone 4 — Made `POST /v1/grants` declare its statuses: a `MintGrantResponses` list
       (shared tail plus `403` and `404`), a result sum, a hand-written `AsUnion`, a handler that
       returns rather than throws, and an `en-client` field that surfaces the outcomes as values.
-- [ ] Milestone 5 — Convert `en-server`: the authentication, read-only-key, and rate-limit
+- [x] (2026-08-25 23:09Z) Milestone 5 — Converted `en-server`: the authentication, read-only-key, and rate-limit
       rejections in `en-server/app/Middleware.hs`, and the `/readyz` failure body in
       `en-server/app/Health.hs`. Delete the duplicated `errorBody` helper in favour of the shared
       renderer.
@@ -124,6 +124,11 @@ operation. The exact commands and expected output are in Validation and Acceptan
 
 
 ## Surprises & Discoveries
+
+- Discovery (2026-08-25, EP-61 Milestone 5 live validation): the standalone server returned
+  `401`, `Content-Type: application/problem+json`, `WWW-Authenticate: Bearer`, and the complete
+  `unauthenticated` problem document on an uncredentialed request. Its healthy `/readyz` success
+  remained byte-for-byte `application/json` with `{"status":"ok"}`.
 
 - Discovery (2026-08-25, EP-61 Milestone 3): Mori resolves `hasql/hasql` to a corpus checkout
   whose current worktree is ahead of en's dependency, so the implementation was verified against
