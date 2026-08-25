@@ -1,10 +1,11 @@
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
 
 module DuplicateName where
 
 import En.Schema (ValidSchema)
-import qualified En.Schema.Builder as Schema
+import En.Schema.Builder qualified as Schema
 import En.Schema.TH (mkValidSchemaEither)
 
 duplicateSchema :: ValidSchema

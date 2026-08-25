@@ -341,7 +341,7 @@ Milestone-level progress across all child plans. Each child plan owns the granul
 checklist; this is the at-a-glance view of the initiative.
 
 - [x] EP-63: Uniform `common` stanzas and GHC2024 across all eight packages
-- [ ] EP-63: `-Werror=missing-fields` and the postpositive-import cleanup
+- [x] EP-63: `-Werror=missing-fields` and the postpositive-import cleanup
 - [ ] EP-63: `En.Prelude` and the `lens` / `generic-lens` dependencies, no call sites migrated
 - [ ] EP-61: Problem-details machinery in isolation, proven by a three-legged spike
 - [ ] EP-61: The servant surface converted; `ErrorEnvelopeWire` deleted

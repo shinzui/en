@@ -63,7 +63,7 @@ which consumes what this one builds.
 - [x] (2026-08-25T21:18:41Z) Milestone 2 — Turn on `-Werror=missing-fields` in the shared `common warnings`
       stanza, prove it bites with a deliberate temporary deletion, and fix anything it
       surfaces.
-- [ ] Milestone 3 — Convert the three prepositive `import qualified` lines to the
+- [x] (2026-08-25T21:19:30Z) Milestone 3 — Convert the three prepositive `import qualified` lines to the
       postpositive form.
 - [ ] Milestone 4 — Add `lens` and `generic-lens` to `en-core` and fill out
       `en-core/src/En/Prelude.hs` per the fleet prelude standard, with a `PackageImports`
@@ -125,6 +125,18 @@ which consumes what this one builds.
           schema :: mode0 :- ("v1" :> NamedRoutes SchemaRoutes)
   ```
 
+- Discovery (2026-08-25, Milestone 3): **the commit hook parses fixture modules outside
+  their Cabal stanza.** Cabal correctly supplies GHC2024 and compiles postpositive
+  qualified imports, but the treefmt Fourmolu invocation only supplied three unrelated
+  parser flags and rejected `import En.Schema.Builder qualified as Schema`. The three
+  standalone fixtures therefore carry an explicit, redundant `ImportQualifiedPost`
+  pragma so both Cabal and repository tooling accept the fleet import form.
+
+  ```text
+  The GHC parser (in Haddock mode) failed:
+    Found `qualified' in postpositive position.
+  ```
+
 (Add further entries as work proceeds.)
 
 
@@ -164,6 +176,13 @@ which consumes what this one builds.
   `En.Schema`'s implementation. Rewriting that call site would start the record migration
   owned by EP-68, while omitting the optional extension preserves behavior and still gives
   `en-core` the mandatory GHC2024 baseline.
+  Date: 2026-08-25
+
+- Decision: Add `ImportQualifiedPost` pragmas only to the three standalone schema fixtures.
+  Rationale: they already receive the extension through GHC2024 in Cabal, but the formatter
+  hook parses staged files independently and does not inherit package defaults. A local
+  redundant pragma makes that tooling boundary explicit without changing the project's
+  language baseline or the fixture behavior.
   Date: 2026-08-25
 
 (Add further entries as work proceeds.)

@@ -1,8 +1,9 @@
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module BadPermissionThis where
 
-import qualified En.Schema.Builder as Schema
+import En.Schema.Builder qualified as Schema
 
 badPermission :: Schema.SchemaRelation
 badPermission =

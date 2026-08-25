@@ -1,10 +1,11 @@
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
 
 module BadSchema where
 
 import En.Schema (ValidSchema)
-import qualified En.Schema.Builder as Schema
+import En.Schema.Builder qualified as Schema
 import En.Schema.TH (mkValidSchema)
 
 badSchema :: ValidSchema
