@@ -129,10 +129,10 @@ import En.Servant.API
     WriteTuplesResponseWire,
     apiProxy,
     envelopeFormatters,
+    problemMiddleware,
     server,
   )
 import En.Servant.Problem (ProblemDetails, problemJsonOptions)
-import En.Servant.Seam (ErrorEnvelopeWire)
 import Servant
   ( Application,
     Context (..),
@@ -221,7 +221,8 @@ appWithOpenApi ::
   Env es ->
   Application
 appWithOpenApi env =
-  serveWithContext servedProxy (envelopeFormatters :. EmptyContext) (server env :<|> pure enOpenApi)
+  problemMiddleware
+    (serveWithContext servedProxy (envelopeFormatters :. EmptyContext) (server env :<|> pure enOpenApi))
 
 -- * Schema-construction helpers
 
@@ -791,16 +792,6 @@ instance ToSchema DeleteTuplesRequestWire where
 instance ToSchema WriteTuplesResponseWire where
   declareNamedSchema _ =
     pure (NamedSchema (Just "WriteTuplesResponseWire") (objectSchema [("token", textRef)]))
-
-instance ToSchema ErrorEnvelopeWire where
-  declareNamedSchema _ =
-    pure $
-      NamedSchema (Just "ErrorEnvelopeWire") $
-        objectSchema
-          [ ("code", textRef),
-            ("message", textRef),
-            ("retryable", primitive OpenApiBoolean)
-          ]
 
 -- | Lookup, lookup-subjects, and expand share one page-state grammar.
 pageStateVariants :: [Schema]

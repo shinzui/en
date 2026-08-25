@@ -82,6 +82,7 @@ import En.Effect.TupleStore
   )
 import En.Revision (Consistency (..), ConsistencyToken (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
+import En.Servant.Problem (ProblemJSON)
 import En.Servant.Response
   ( EnResponses,
     EnResult,
@@ -122,30 +123,30 @@ data TupleRoutes mode = TupleRoutes
       mode
         :- "relationships"
           :> ReqBody '[JSON] WriteTuplesRequestWire
-          :> MultiVerb 'POST '[JSON] (EnResponses "Consistency token for the write" WriteTuplesResponseWire) (EnResult WriteTuplesResponseWire),
+          :> MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses "Consistency token for the write" WriteTuplesResponseWire) (EnResult WriteTuplesResponseWire),
     deleteTuples ::
       mode
         :- "relationships"
           :> "delete"
           :> ReqBody '[JSON] DeleteTuplesRequestWire
-          :> MultiVerb 'POST '[JSON] (EnResponses "Consistency token for the deletion" WriteTuplesResponseWire) (EnResult WriteTuplesResponseWire),
+          :> MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses "Consistency token for the deletion" WriteTuplesResponseWire) (EnResult WriteTuplesResponseWire),
     readRelationships ::
       mode
         :- "relationships"
           :> "query"
           :> ReqBody '[JSON] ReadRelationshipsRequestWire
-          :> MultiVerb 'POST '[JSON] (EnResponses "A page of stored relationships" ReadRelationshipsResponseWire) (EnResult ReadRelationshipsResponseWire),
+          :> MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses "A page of stored relationships" ReadRelationshipsResponseWire) (EnResult ReadRelationshipsResponseWire),
     deleteRelationships ::
       mode
         :- "relationships"
           :> "delete-by-filter"
           :> ReqBody '[JSON] DeleteRelationshipsRequestWire
-          :> MultiVerb 'POST '[JSON] (EnResponses "How many relationships the filter matched" DeleteRelationshipsResponseWire) (EnResult DeleteRelationshipsResponseWire),
+          :> MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses "How many relationships the filter matched" DeleteRelationshipsResponseWire) (EnResult DeleteRelationshipsResponseWire),
     watch ::
       mode
         :- "watch"
           :> ReqBody '[JSON] WatchRequestWire
-          :> MultiVerb 'POST '[JSON] (EnResponses "A batch of tuple changes, and a cursor to resume from" WatchResponseWire) (EnResult WatchResponseWire)
+          :> MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses "A batch of tuple changes, and a cursor to resume from" WatchResponseWire) (EnResult WatchResponseWire)
   }
   deriving stock (Generic)
 

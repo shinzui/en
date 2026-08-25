@@ -6,7 +6,7 @@
 --
 -- Every operation answers with an 'EnResult'. Engine and validation failures arrive as
 -- 'EnClientError', 'EnUnprocessable', or 'EnUnavailable' — values to pattern-match, each
--- carrying an 'En.Servant.Seam.ErrorEnvelopeWire' whose @code@ is stable and whose
+-- carrying an 'En.Servant.Problem.ProblemDetails' whose @code@ is stable and whose
 -- @retryable@ says whether retrying can help. They are /not/ raised as
 -- 'Servant.Client.ClientError'; that is reserved for transport failures and for errors
 -- raised before a handler runs (an unmatched route, a malformed body, a rejected API

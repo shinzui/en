@@ -112,12 +112,23 @@ problem spec = problemAtStatus spec.status spec
 -- | Render a problem as a thrown Servant error.
 --
 -- The body status comes from the base 'ServerError', so the HTTP status line and the
--- copied @status@ member cannot disagree even if a caller supplies the wrong spec.
-problemError :: ServerError -> ProblemSpec -> Text -> ServerError
-problemError base spec requestDetail =
+-- copied @status@ member cannot disagree.
+problemError :: ServerError -> ProblemDetails -> ServerError
+problemError base details =
   base
-    { errBody = encode (problemAtStatus base.errHTTPCode spec requestDetail),
+    { errBody = encode (detailsAtStatus base.errHTTPCode details),
       errHeaders = problemHeaders base.errHTTPCode <> withoutContentType base.errHeaders
+    }
+
+detailsAtStatus :: Int -> ProblemDetails -> ProblemDetails
+detailsAtStatus responseStatus ProblemDetails {problemType = originalType, title = originalTitle, status = _, detail = originalDetail, code = originalCode, retryable = originalRetryable} =
+  ProblemDetails
+    { problemType = originalType,
+      title = originalTitle,
+      status = responseStatus,
+      detail = originalDetail,
+      code = originalCode,
+      retryable = originalRetryable
     }
 
 -- | Render a problem directly as a WAI response for middleware outside Servant.

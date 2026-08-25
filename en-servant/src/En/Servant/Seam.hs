@@ -7,7 +7,6 @@ module En.Servant.Seam
     Env (..),
     MintEnv (..),
     EnServer,
-    ErrorEnvelopeWire (..),
     EnFault (..),
     enErrorToFault,
     badRequest,
@@ -16,7 +15,6 @@ module En.Servant.Seam
     permissionDenied,
     notFound,
     faultToServerError,
-    envelopeError,
     runEngine,
     runEngineEither,
     enErrorToServerError,
@@ -25,11 +23,8 @@ where
 
 import Auth.Biscuit (SecretKey)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (FromJSON (..), ToJSON (..), encode, pairs, withObject, (.:), (.=))
-import Data.Aeson qualified as Aeson
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Text.Encoding qualified as Text
 import Data.Text.IO qualified as Text
 import Data.Time (NominalDiffTime, UTCTime)
 import Effectful (Eff, IOE)
@@ -46,6 +41,27 @@ import En.Postgres.Database (Database)
 import En.Reachability (ReachabilityGraph)
 import En.Revision (Consistency)
 import En.Schema (RelationName)
+import En.Servant.Problem
+  ( ProblemDetails,
+    ProblemSpec,
+    problem,
+    problemError,
+    specBatchTooLarge,
+    specConsistencyTokenExpired,
+    specCycleDetected,
+    specInvalidConsistencyToken,
+    specInvalidCursor,
+    specInvalidRequest,
+    specMalformedConsistencyToken,
+    specMissingCaveatContext,
+    specNotFound,
+    specPermissionDenied,
+    specResolutionLimitExceeded,
+    specSchemaViolation,
+    specStoreError,
+    specUnknownRelation,
+    specWritePreconditionFailed,
+  )
 import En.Tuple (CaveatContext, ObjectRef, Subject)
 import En.Watch qualified as Watch
 import Servant (Handler, ServerError (..), err400, err403, err404, err412, err422, err503, throwError)
@@ -137,41 +153,19 @@ data MintEnv = MintEnv
 
 type EnServer = Env AppEffects
 
--- | The single error shape of the en API.
---
--- @code@ is a stable machine-readable identifier; it is the contract, and never the
--- @Show@ output of an internal type. @retryable@ lets a client implement retry policy
--- without parsing prose: store outages are retryable, token and schema faults are not.
-data ErrorEnvelopeWire = ErrorEnvelopeWire
-  { code :: !Text,
-    message :: !Text,
-    retryable :: !Bool
-  }
-  deriving stock (Eq, Show)
-
-instance ToJSON ErrorEnvelopeWire where
-  toJSON wire =
-    Aeson.object ["code" .= wire.code, "message" .= wire.message, "retryable" .= wire.retryable]
-  toEncoding wire =
-    pairs ("code" .= wire.code <> "message" .= wire.message <> "retryable" .= wire.retryable)
-
-instance FromJSON ErrorEnvelopeWire where
-  parseJSON = withObject "ErrorEnvelopeWire" \o ->
-    ErrorEnvelopeWire <$> o .: "code" <*> o .: "message" <*> o .: "retryable"
-
 -- | A failure a handler can produce. The constructor selects the HTTP status, so the
 -- 'MultiVerb' response alternatives in "En.Servant.API" and the thrown 'ServerError's
 -- used by embedded hosts are built from one source of truth.
 data EnFault
   = -- | 400: the caller sent something en cannot act on.
-    BadRequestFault !ErrorEnvelopeWire
+    BadRequestFault !ProblemDetails
   | -- | 412: a write precondition did not hold, so the write was refused. The
     --       caller's request was well-formed; the world changed under it.
-    PreconditionFailedFault !ErrorEnvelopeWire
+    PreconditionFailedFault !ProblemDetails
   | -- | 422: the request was well-formed but exceeded an evaluation bound.
-    UnprocessableFault !ErrorEnvelopeWire
+    UnprocessableFault !ProblemDetails
   | -- | 503: a dependency of en failed. Retryable.
-    UnavailableFault !ErrorEnvelopeWire
+    UnavailableFault !ProblemDetails
   deriving stock (Eq, Show)
 
 -- | Map an engine error onto its status, stable code, and retryability.
@@ -182,80 +176,65 @@ data EnFault
 enErrorToFault :: EnError -> EnFault
 enErrorToFault = \case
   UnknownRelation relation ->
-    BadRequestFault (envelope "unknown_relation" ("unknown relation or permission: " <> relation))
+    BadRequestFault (problem specUnknownRelation ("unknown relation or permission: " <> relation))
   SchemaViolation detail ->
-    BadRequestFault (envelope "schema_violation" detail)
+    BadRequestFault (problem specSchemaViolation detail)
   MissingCaveatContext names ->
     BadRequestFault
-      (envelope "missing_caveat_context" ("missing caveat context: " <> Text.intercalate ", " names))
+      (problem specMissingCaveatContext ("missing caveat context: " <> Text.intercalate ", " names))
   MalformedConsistencyToken detail ->
-    BadRequestFault (envelope "malformed_consistency_token" detail)
+    BadRequestFault (problem specMalformedConsistencyToken detail)
   ConsistencyTokenExpired detail ->
-    BadRequestFault (envelope "consistency_token_expired" detail)
+    BadRequestFault (problem specConsistencyTokenExpired detail)
   InvalidConsistencyToken detail ->
-    BadRequestFault (envelope "invalid_consistency_token" detail)
+    BadRequestFault (problem specInvalidConsistencyToken detail)
   InvalidCursor cursor ->
-    BadRequestFault (envelope "invalid_cursor" ("malformed pagination cursor: " <> cursor))
+    BadRequestFault (problem specInvalidCursor ("malformed pagination cursor: " <> cursor))
   ResolutionLimitExceeded ->
     UnprocessableFault
-      (envelope "resolution_limit_exceeded" "the traversal exceeded its depth or breadth bound")
+      (problem specResolutionLimitExceeded "the traversal exceeded its depth or breadth bound")
   CycleDetected subproblem ->
     UnprocessableFault
-      (envelope "cycle_detected" ("the relationship data contains a cycle at " <> subproblem))
+      (problem specCycleDetected ("the relationship data contains a cycle at " <> subproblem))
   WritePreconditionFailed description ->
     PreconditionFailedFault
-      (envelope "write_precondition_failed" ("write precondition did not hold: " <> description))
+      (problem specWritePreconditionFailed ("write precondition did not hold: " <> description))
   StoreError _detail ->
-    UnavailableFault
-      ErrorEnvelopeWire
-        { code = "store_error",
-          message = "the tuple store failed; retry later",
-          retryable = True
-        }
-  where
-    envelope code message = ErrorEnvelopeWire {code, message, retryable = False}
+    UnavailableFault (problem specStoreError "the tuple store failed; retry later")
 
 -- | A 400 under an arbitrary stable code. No client fault is ever retryable.
-badRequest :: Text -> Text -> EnFault
-badRequest code message =
-  BadRequestFault ErrorEnvelopeWire {code, message, retryable = False}
+badRequest :: ProblemSpec -> Text -> EnFault
+badRequest spec message =
+  BadRequestFault (problem spec message)
 
 -- | A request en rejected before it reached the engine.
 invalidRequest :: Text -> EnFault
-invalidRequest = badRequest "invalid_request"
+invalidRequest = badRequest specInvalidRequest
 
 -- | A batch larger than the configured maximum.
 batchTooLarge :: Text -> EnFault
-batchTooLarge = badRequest "batch_too_large"
+batchTooLarge = badRequest specBatchTooLarge
 
 -- | A 404 for a path that matches no route. Not an 'EnFault': Servant raises it
 -- before any handler runs, so no operation can return it.
 notFound :: ServerError
 notFound =
-  envelopeError err404 ErrorEnvelopeWire {code = "not_found", message = "no such endpoint", retryable = False}
+  problemError err404 (problem specNotFound "no such endpoint")
 
 -- | A 403 for embedded host routes gated by 'En.Servant.Authorize.requirePermission'.
 -- Not an 'EnFault': no @EnAPI@ operation can produce it, so it has no response
 -- alternative to return into.
 permissionDenied :: Text -> ServerError
 permissionDenied message =
-  envelopeError err403 ErrorEnvelopeWire {code = "permission_denied", message, retryable = False}
+  problemError err403 (problem specPermissionDenied message)
 
 -- | Render a fault as the 'ServerError' that carries it at the status it names.
 faultToServerError :: EnFault -> ServerError
 faultToServerError = \case
-  BadRequestFault envelope -> envelopeError err400 envelope
-  PreconditionFailedFault envelope -> envelopeError err412 envelope
-  UnprocessableFault envelope -> envelopeError err422 envelope
-  UnavailableFault envelope -> envelopeError err503 envelope
-
--- | Attach an envelope to a 'ServerError', at that error's status.
-envelopeError :: ServerError -> ErrorEnvelopeWire -> ServerError
-envelopeError err envelope =
-  err
-    { errBody = encode envelope,
-      errHeaders = [("Content-Type", Text.encodeUtf8 "application/json")]
-    }
+  BadRequestFault details -> problemError err400 details
+  PreconditionFailedFault details -> problemError err412 details
+  UnprocessableFault details -> problemError err422 details
+  UnavailableFault details -> problemError err503 details
 
 -- | The detail an operator needs and a caller must not see.
 --

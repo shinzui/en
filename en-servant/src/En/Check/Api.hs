@@ -54,6 +54,14 @@ import En.Effect.TupleStore (TupleStore)
 import En.Reachability (ReachabilityGraph (..))
 import En.Revision (Consistency, ConsistencyToken (..))
 import En.Schema (RelationName (..))
+import En.Servant.Problem
+  ( ProblemJSON,
+    problem,
+    problemError,
+    specDecisionNotAllowed,
+    specGrantNotMintable,
+    specNotFound,
+  )
 import En.Servant.Response
   ( EnResponses,
     EnResult,
@@ -67,11 +75,9 @@ import En.Servant.Seam
   ( ActiveSchema (..),
     EnFault,
     Env (..),
-    ErrorEnvelopeWire (..),
     MintEnv (..),
     badRequest,
     batchTooLarge,
-    envelopeError,
     faultToServerError,
     invalidRequest,
     runEngineEither,
@@ -114,12 +120,12 @@ data CheckRoutes mode = CheckRoutes
       mode
         :- "check"
           :> ReqBody '[JSON] CheckRequestWire
-          :> MultiVerb 'POST '[JSON] (EnResponses "The authorization decision" CheckResponseWire) (EnResult CheckResponseWire),
+          :> MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses "The authorization decision" CheckResponseWire) (EnResult CheckResponseWire),
     batchCheck ::
       mode
         :- "batch-check"
           :> ReqBody '[JSON] BatchCheckRequestWire
-          :> MultiVerb 'POST '[JSON] (EnResponses "One decision per requested pair, in order" BatchCheckResponseWire) (EnResult BatchCheckResponseWire),
+          :> MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses "One decision per requested pair, in order" BatchCheckResponseWire) (EnResult BatchCheckResponseWire),
     mintGrant ::
       mode
         :- "grants"
@@ -441,7 +447,7 @@ data MintInputs = MintInputs
 -- 'Servant.ServerError's rather than returning an 'EnResult': its status set — 404
 -- when minting is disabled, 403 when the decision is not 'Allowed', 400 on a bad
 -- request — is not the shared 'EnResponses'. Each thrown error still carries the
--- 'ErrorEnvelopeWire' envelope with a stable @code@.
+-- RFC 9457 problem document with a stable @code@.
 --
 -- The flow is check-then-mint-at-that-token, and it never trusts a caller-asserted
 -- decision: it runs its own check through 'Env.checkOperation' and mints only on
@@ -494,7 +500,7 @@ mintGrantHandler env request =
           minted <- mintObjectGrantWithExpiry config expiry decision grant
           case minted of
             Left mintErr ->
-              throwError (faultToServerError (badRequest "grant_not_mintable" (Text.pack (show mintErr))))
+              throwError (faultToServerError (badRequest specGrantNotMintable (Text.pack (show mintErr))))
             Right MintedGrant {token, expiresAt, revocationIds} ->
               let ConsistencyToken checkedAtText = checkedAt
                in pure
@@ -508,14 +514,12 @@ mintGrantHandler env request =
 -- | 404 for @POST \/v1\/grants@ on a server that configured no issuer key.
 mintingDisabled :: ServerError
 mintingDisabled =
-  envelopeError
-    err404
-    ErrorEnvelopeWire {code = "not_found", message = "grant minting is not enabled", retryable = False}
+  problemError err404 (problem specNotFound "grant minting is not enabled")
 
 -- | 403 for a mint whose check was 'Denied' or 'Conditional'. Never retryable.
 decisionNotAllowed :: Text -> ServerError
 decisionNotAllowed message =
-  envelopeError err403 ErrorEnvelopeWire {code = "decision_not_allowed", message, retryable = False}
+  problemError err403 (problem specDecisionNotAllowed message)
 
 -- | Decode and validate a mint request, or a 400 'EnFault' naming the fault.
 --

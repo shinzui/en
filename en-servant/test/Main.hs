@@ -15,8 +15,6 @@ import Data.List qualified as List
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.OpenApi (ToSchema, validateToJSON)
-import Data.Proxy (Proxy (..))
-import Data.SOP (I (..), NS (..))
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -29,7 +27,7 @@ import En.Biscuit.Keys (parseSigningKeyText, singleKey)
 import En.Biscuit.Verify (VerifiedGrant (..), VerifyRequest (..), verifyGrant)
 import En.Budget (defaultEvaluationBudget)
 import En.Cache (Cache, CacheConfig (..), CacheStats (..), SubproblemKey, cacheStats, newCache)
-import En.Check (CheckCacheEnv (..), CheckDecision, check, checkCached)
+import En.Check (CheckCacheEnv (..), check, checkCached)
 import En.Conformance.Kikan
   ( fixtureTuples,
     inMemoryToken,
@@ -112,10 +110,9 @@ import En.Servant.API
     watchHandler,
     writeTuplesHandler,
   )
-import En.Servant.OpenApi (enOpenApi, narrowSuccessContent)
+import En.Servant.OpenApi (enOpenApi)
 import En.Servant.Problem
   ( ProblemDetails (..),
-    ProblemJSON,
     ProblemSpec (..),
     problem,
     problemCatalog,
@@ -124,22 +121,16 @@ import En.Servant.Problem
 import En.Servant.Seam
   ( ActiveSchema (..),
     EnFault (..),
-    ErrorEnvelopeWire (..),
     MintEnv (..),
     enErrorToFault,
     faultToServerError,
   )
 import En.Tuple (ObjectRef (..), Subject (..))
 import En.Watch (WatchBatch (..), WatchStart (..))
-import Network.HTTP.Client (defaultManagerSettings, newManager)
-import Network.HTTP.Types (StdMethod (GET), methodPost, statusCode)
+import Network.HTTP.Types (methodDelete, methodPost, statusCode)
 import Network.Wai (Application, Request (..), defaultRequest)
-import Network.Wai.Handler.Warp (testWithApplication)
 import Network.Wai.Test (SRequest (..), SResponse (..), runSession, setPath, srequest)
-import Servant (Handler, JSON, QueryFlag, ServerError (..), runHandler, serve, type (:>))
-import Servant.API.MultiVerb (AsUnion (..), MultiVerb, Respond, RespondAs)
-import Servant.Client (BaseUrl (..), ClientM, Scheme (Http), client, mkClientEnv, runClientM)
-import Servant.OpenApi (toOpenApi)
+import Servant (Handler, ServerError (..), runHandler)
 
 main :: IO ()
 main = do
@@ -407,126 +398,6 @@ problemMachineryTests = do
     "only dependency outages and rate limits are retryable"
     ["rate_limited", "store_error"]
     retryableCodes
-
-  problemSpikeWireTests
-  problemSpikeClientTest
-  problemSpikeDocumentTest
-
-data ProblemSpikeResult
-  = ProblemSpikeOk !Int
-  | ProblemSpikeBad !ProblemDetails
-  deriving stock (Eq, Show)
-
-type ProblemSpikeApi =
-  "problem-spike"
-    :> QueryFlag "fail"
-    :> MultiVerb
-         'GET
-         '[JSON, ProblemJSON]
-         '[ Respond 200 "ok" Int,
-            RespondAs ProblemJSON 400 "bad" ProblemDetails
-          ]
-         ProblemSpikeResult
-
-instance
-  AsUnion
-    '[ Respond 200 "ok" Int,
-       RespondAs ProblemJSON 400 "bad" ProblemDetails
-     ]
-    ProblemSpikeResult
-  where
-  toUnion = \case
-    ProblemSpikeOk value -> Z (I value)
-    ProblemSpikeBad details -> S (Z (I details))
-  fromUnion = \case
-    Z (I value) -> ProblemSpikeOk value
-    S (Z (I details)) -> ProblemSpikeBad details
-    S (S impossible) -> case impossible of {}
-
-problemSpikeApp :: Application
-problemSpikeApp =
-  serve (Proxy @ProblemSpikeApi) $ \shouldFail ->
-    pure
-      if shouldFail
-        then ProblemSpikeBad (problem specInvalidRequest "spike rejected the request")
-        else ProblemSpikeOk 42
-
-problemSpikeWireTests :: IO ()
-problemSpikeWireTests = do
-  success <- spikeRequest ""
-  assertEqual "the spike success is 200" 200 (statusCode success.simpleStatus)
-  assertEqual
-    "the spike success stays application/json"
-    (Just "application/json;charset=utf-8")
-    (lookup "Content-Type" success.simpleHeaders)
-
-  failure <- spikeRequest "?fail"
-  assertEqual "the spike failure is 400" 400 (statusCode failure.simpleStatus)
-  assertEqual
-    "RespondAs stamps application/problem+json on the wire"
-    (Just "application/problem+json")
-    (lookup "Content-Type" failure.simpleHeaders)
-  assertEqual
-    "the spike failure decodes as ProblemDetails"
-    (Just "invalid_request")
-    (fmap (.code) (decode failure.simpleBody :: Maybe ProblemDetails))
-  where
-    spikeRequest query =
-      runSession
-        ( srequest
-            SRequest
-              { simpleRequest =
-                  setPath defaultRequest ("/problem-spike" <> query),
-                simpleRequestBody = ""
-              }
-        )
-        problemSpikeApp
-
-problemSpikeClientTest :: IO ()
-problemSpikeClientTest =
-  -- Warp's test server uses the threaded RTS; the test component links with -threaded.
-  testWithApplication (pure problemSpikeApp) $ \port -> do
-    manager <- newManager defaultManagerSettings
-    result <-
-      runClientM
-        (problemSpikeClient True)
-        (mkClientEnv manager (BaseUrl Http "127.0.0.1" port ""))
-    assertEqual
-      "the generated client returns a typed problem value instead of UnsupportedContentType"
-      (Right (ProblemSpikeBad (problem specInvalidRequest "spike rejected the request")))
-      result
-  where
-    problemSpikeClient :: Bool -> ClientM ProblemSpikeResult
-    problemSpikeClient = client (Proxy @ProblemSpikeApi)
-
-problemSpikeDocumentTest :: IO ()
-problemSpikeDocumentTest = do
-  rawDocument <- either fail pure (Aeson.eitherDecode (encode (toOpenApi (Proxy @ProblemSpikeApi))))
-  let rawResponses = rawDocument `valueAt` "paths" `valueAt` "/problem-spike" `valueAt` "get" `valueAt` "responses"
-      rawSuccessContent = valueObjectKeys (rawResponses `valueAt` "200" `valueAt` "content")
-  assertBool
-    "widening the verb for servant-client exposes the known success-content pollution"
-    ("application/problem+json" `elem` rawSuccessContent)
-
-  document <-
-    either
-      fail
-      pure
-      (Aeson.eitherDecode (encode (narrowSuccessContent (toOpenApi (Proxy @ProblemSpikeApi)))))
-  let responses = document `valueAt` "paths" `valueAt` "/problem-spike" `valueAt` "get" `valueAt` "responses"
-      successContent = valueObjectKeys (responses `valueAt` "200" `valueAt` "content")
-      errorContent = valueObjectKeys (responses `valueAt` "400" `valueAt` "content")
-  assertEqual
-    "RespondAs gives the error alternative only application/problem+json in OpenAPI"
-    ["application/problem+json"]
-    errorContent
-  assertBool
-    "narrowSuccessContent removes problem+json from the success alternative"
-    ("application/problem+json" `notElem` successContent)
-
-valueAt :: Aeson.Value -> Key.Key -> Aeson.Value
-valueAt (Aeson.Object objectValue) key = maybe Aeson.Null id (KeyMap.lookup key objectValue)
-valueAt _ _ = Aeson.Null
 
 valueObjectKeys :: Aeson.Value -> [Text]
 valueObjectKeys (Aeson.Object objectValue) = Key.toText <$> KeyMap.keys objectValue
@@ -800,7 +671,7 @@ toJsonMatchesToSchema = do
   conforms "WriteTuplesRequestWire" WriteTuplesRequestWire {tuples = [tuple], deletes = Nothing, preconditions = Nothing}
   conforms "DeleteTuplesRequestWire" DeleteTuplesRequestWire {tuples = [tuple], preconditions = Nothing}
   conforms "WriteTuplesResponseWire" WriteTuplesResponseWire {token = "en.tok"}
-  conforms "ErrorEnvelopeWire" (ErrorEnvelopeWire "unknown_relation" "unknown relation" False)
+  conforms "ProblemDetails" (problem specInvalidRequest "unknown relation")
   where
     noon = UTCTime (fromGregorian 2026 7 7) (secondsToDiffTime (12 * 3600))
     objRef = ObjectRefWire {objectType = "space", objectId = "project-x"}
@@ -880,16 +751,16 @@ toJsonMatchesToSchema = do
       [] -> pure ()
       errs -> fail (label <> " does not match its schema: " <> show errs)
 
--- | End-to-end routing and the error-envelope hook, driven through the real WAI
+-- | End-to-end routing and the problem-document hook, driven through the real WAI
 -- 'Application' rather than by calling handlers directly.
 --
 -- The handler-level tests above call each handler as a function, so they never exercise
--- Servant's routing or the 'envelopeFormatters' installed by 'app'. This drives 'app env'
+-- Servant's routing or the problem formatters installed by 'app'. This drives 'app env'
 -- over the socket-facing surface: it proves each path reaches its own handler (a misroute
 -- would 404), that a well-formed request returns its typed 200 body, and — the point of the
--- milestone — that the two pre-handler error hooks still speak 'ErrorEnvelopeWire'. A
+-- milestone — that the two pre-handler error hooks still speak 'ProblemDetails'. A
 -- malformed body is rejected by servant's body parser before any handler runs, so only
--- 'bodyParserErrorFormatter' can turn it into the envelope; an unmatched path is rejected by
+-- 'bodyParserErrorFormatter' can turn it into a problem document; an unmatched path is rejected by
 -- routing, so only 'notFoundErrorFormatter' can. Neither is reachable from a handler test.
 --
 -- en has no live misordering hazard to guard here — every route carries a distinct request
@@ -916,6 +787,25 @@ routingTests env = do
     "POST /v1/check decodes to CheckResponseWire and alice may view project-x"
     (Just AllowedWire)
     (fmap (.decision) (decode checkResponse.simpleBody :: Maybe CheckResponseWire))
+
+  let unknownPermission =
+        CheckRequestWire
+          { consistency = MinimizeLatencyWire,
+            context = CaveatContextWire Map.empty,
+            subject = SubjectIdWire ObjectRefWire {objectType = "user", objectId = "alice"},
+            permission = "not_a_permission",
+            object = ObjectRefWire {objectType = "space", objectId = "project-x"}
+          }
+  typedFailure <- postJson application "/v1/check" (encode unknownPermission)
+  assertEqual "a typed check failure is a 400" 400 (statusCode typedFailure.simpleStatus)
+  assertEqual
+    "a real MultiVerb failure is served as application/problem+json"
+    (Just "application/problem+json")
+    (lookup "Content-Type" typedFailure.simpleHeaders)
+  assertEqual
+    "a real MultiVerb failure carries the typed stable code"
+    (Just "unknown_relation")
+    (fmap (.code) (decode typedFailure.simpleBody :: Maybe ProblemDetails))
 
   -- POST /v1/lookup routes and returns a page.
   let aliceViewSpaces =
@@ -975,22 +865,61 @@ routingTests env = do
   batchResponse <- postJson application "/v1/batch-check" (encode batchBody)
   assertEqual "POST /v1/batch-check returns 200" 200 (statusCode batchResponse.simpleStatus)
 
-  {- The point of the milestone: a malformed body comes back as the machine-readable
-  envelope, proving envelopeFormatters' bodyParserErrorFormatter survived the refactor. -}
+  {- The point of the milestone: a malformed body comes back as a machine-readable
+  problem, proving envelopeFormatters' bodyParserErrorFormatter survived the refactor. -}
   malformed <- postJson application "/v1/check" "not json at all"
   assertEqual "a malformed body is a 400" 400 (statusCode malformed.simpleStatus)
   assertEqual
-    "a malformed body returns the ErrorEnvelopeWire with code malformed_request_body"
+    "a malformed body returns ProblemDetails with code malformed_request_body"
     (Just "malformed_request_body")
-    (fmap (.code) (decode malformed.simpleBody :: Maybe ErrorEnvelopeWire))
+    (fmap (.code) (decode malformed.simpleBody :: Maybe ProblemDetails))
+  assertEqual
+    "a malformed body uses application/problem+json"
+    (Just "application/problem+json")
+    (lookup "Content-Type" malformed.simpleHeaders)
+  assertEqual
+    "a malformed body's status member matches its HTTP status"
+    (Just 400)
+    (fmap (.status) (decode malformed.simpleBody :: Maybe ProblemDetails))
 
-  -- An unmatched path comes back as the 404 envelope, proving notFoundErrorFormatter.
+  -- An unmatched path comes back as a 404 problem, proving notFoundErrorFormatter.
   notThere <- postJson application "/v1/no-such-path" "{}"
   assertEqual "an unknown path is a 404" 404 (statusCode notThere.simpleStatus)
   assertEqual
-    "an unknown path returns the ErrorEnvelopeWire with code not_found"
+    "an unknown path returns ProblemDetails with code not_found"
     (Just "not_found")
-    (fmap (.code) (decode notThere.simpleBody :: Maybe ErrorEnvelopeWire))
+    (fmap (.code) (decode notThere.simpleBody :: Maybe ProblemDetails))
+  assertEqual
+    "an unknown path uses application/problem+json"
+    (Just "application/problem+json")
+    (lookup "Content-Type" notThere.simpleHeaders)
+  assertEqual
+    "an unknown path's status member matches its HTTP status"
+    (Just 404)
+    (fmap (.status) (decode notThere.simpleBody :: Maybe ProblemDetails))
+
+  methodMismatch <-
+    runSession
+      ( srequest
+          SRequest
+            { simpleRequest = setPath defaultRequest {requestMethod = methodDelete} "/v1/relationships",
+              simpleRequestBody = ""
+            }
+      )
+      application
+  assertEqual "DELETE /v1/relationships is a 405" 405 (statusCode methodMismatch.simpleStatus)
+  assertEqual
+    "the method mismatch returns the stable problem code"
+    (Just "method_not_allowed")
+    (fmap (.code) (decode methodMismatch.simpleBody :: Maybe ProblemDetails))
+  assertEqual
+    "the method mismatch uses application/problem+json"
+    (Just "application/problem+json")
+    (lookup "Content-Type" methodMismatch.simpleHeaders)
+  assertEqual
+    "the method mismatch body's status member matches its HTTP status"
+    (Just 405)
+    (fmap (.status) (decode methodMismatch.simpleBody :: Maybe ProblemDetails))
 
 -- | @POST <path>@ with a JSON body, driven through the WAI 'Application'.
 postJson :: Application -> BS.ByteString -> ByteString -> IO SResponse
@@ -1041,7 +970,7 @@ openApiDocumentTests = do
     (List.sort (objectKeys (document `at` "paths" `at` "/v1/schema" `at` "get" `at` "responses")))
 
   -- POST /v1/grants throws its authorization outcomes (404 disabled, 403 not-allowed) and
-  -- its input faults as ServerErrors carrying the ErrorEnvelopeWire, rather than declaring
+  -- its input faults as ServerErrors carrying ProblemDetails, rather than declaring
   -- them as MultiVerb alternatives. The document therefore shows only the 200 and the 400
   -- that servant-openapi derives from the JSON request body itself — not the 412/422/503
   -- every EnResponses operation carries. See 'En.Servant.API.mintGrantHandler'.
@@ -1051,8 +980,8 @@ openApiDocumentTests = do
     (List.sort (objectKeys (document `at` "paths" `at` "/v1/grants" `at` "post" `at` "responses")))
 
   assertBool
-    "openapi document defines the error envelope"
-    ("ErrorEnvelopeWire" `elem` objectKeys (document `at` "components" `at` "schemas"))
+    "openapi document defines RFC 9457 problem details"
+    ("ProblemDetails" `elem` objectKeys (document `at` "components" `at` "schemas"))
 
   mapM_
     ( \name ->
@@ -1396,28 +1325,28 @@ errorModelTests = do
   assertEqual
     "write_precondition_failed names the precondition that did not hold"
     "write precondition did not hold: must-exist: space:project-x#member@user:alice"
-    (envelopeOf (enErrorToFault (WritePreconditionFailed "must-exist: space:project-x#member@user:alice"))).message
+    (problemOf (enErrorToFault (WritePreconditionFailed "must-exist: space:project-x#member@user:alice"))).detail
 
   -- The 503 message must never carry the SQL text and bound parameters that
   -- Hasql.toDetailedText puts in StoreError; the operator gets those on stderr.
   assertBool
-    "store_error envelope hides the store's detail"
-    (not (secretDetail `Text.isInfixOf` (envelopeOf (enErrorToFault (StoreError secretDetail))).message))
+    "store_error problem hides the store's detail"
+    (not (secretDetail `Text.isInfixOf` (problemOf (enErrorToFault (StoreError secretDetail))).detail))
 
   assertEqual
     "unknown_relation names the offending relation"
     "unknown relation or permission: audit"
-    (envelopeOf (enErrorToFault (UnknownRelation "audit"))).message
+    (problemOf (enErrorToFault (UnknownRelation "audit"))).detail
 
   golden
-    "ErrorEnvelopeWire"
-    "{\"code\":\"store_error\",\"message\":\"the tuple store failed; retry later\",\"retryable\":true}"
-    (envelopeOf (enErrorToFault (StoreError secretDetail)))
+    "ProblemDetails"
+    "{\"code\":\"store_error\",\"detail\":\"the tuple store failed; retry later\",\"retryable\":true,\"status\":503,\"title\":\"Store unavailable\",\"type\":\"about:blank\"}"
+    (problemOf (enErrorToFault (StoreError secretDetail)))
 
   {- The regression guard for docs/plans/60, M2: a malformed consistency token must reach
   the wire as prose, never as the name of the internal 'En.Postgres.Revision.TokenDecodeError'
   constructor that classified it. Each of these strings trips a different decode branch; every
-  resulting envelope must carry a stable code and a message free of any internal constructor
+  resulting problem must carry a stable code and detail free of any internal constructor
   name. `TokenBad` alone catches every decode constructor; the `EnError` token names catch a
   `show`-the-error regression at the mapping layer. -}
   Foldable.traverse_
@@ -1435,16 +1364,16 @@ errorModelTests = do
       case tokenMetadataFromPayload (ConsistencyToken tokenText) of
         Right _ -> assertBool ("expected " <> Text.unpack tokenText <> " to be rejected as malformed") False
         Left err -> do
-          let envelope = envelopeOf (enErrorToFault err)
+          let details = problemOf (enErrorToFault err)
           assertEqual
             ("a malformed token is a stable malformed_consistency_token: " <> Text.unpack tokenText)
             "malformed_consistency_token"
-            envelope.code
+            details.code
           Foldable.traverse_
             ( \forbidden ->
                 assertBool
-                  ("response body for " <> Text.unpack tokenText <> " must not leak the internal name " <> Text.unpack forbidden <> "; got: " <> Text.unpack envelope.message)
-                  (not (forbidden `Text.isInfixOf` envelope.message))
+                  ("response body for " <> Text.unpack tokenText <> " must not leak the internal name " <> Text.unpack forbidden <> "; got: " <> Text.unpack details.detail)
+                  (not (forbidden `Text.isInfixOf` details.detail))
             )
             ["TokenBad", "MalformedConsistencyToken", "ConsistencyTokenExpired", "InvalidConsistencyToken"]
 
@@ -1454,16 +1383,16 @@ errorModelTests = do
 
     statusCodeRetryable :: EnFault -> (Int, Text, Bool)
     statusCodeRetryable fault =
-      (errHTTPCode (faultToServerError fault), envelope.code, envelope.retryable)
+      (errHTTPCode (faultToServerError fault), details.code, details.retryable)
       where
-        envelope = envelopeOf fault
+        details = problemOf fault
 
-envelopeOf :: EnFault -> ErrorEnvelopeWire
-envelopeOf = \case
-  BadRequestFault envelope -> envelope
-  PreconditionFailedFault envelope -> envelope
-  UnprocessableFault envelope -> envelope
-  UnavailableFault envelope -> envelope
+problemOf :: EnFault -> ProblemDetails
+problemOf = \case
+  BadRequestFault details -> details
+  PreconditionFailedFault details -> details
+  UnprocessableFault details -> details
+  UnavailableFault details -> details
 
 -- | Freeze the JSON wire contract of every type in "En.Servant.API".
 --
@@ -2049,11 +1978,11 @@ testSigningKey = "1:a2c4ead323536b925f3488ee83e0888b79c2761405ca7c0c9a018c7c1905
 -- the handler returned a value instead of throwing. @POST \/v1\/grants@ signals its
 -- non-200 outcomes by throwing rather than through an 'EnResult', so this is how the
 -- mint tests pin both the status and the code at once.
-thrownEnvelope :: Either ServerError a -> Maybe (Int, Text)
-thrownEnvelope = \case
+thrownProblem :: Either ServerError a -> Maybe (Int, Text)
+thrownProblem = \case
   Left err -> do
-    envelope <- decode err.errBody :: Maybe ErrorEnvelopeWire
-    pure (err.errHTTPCode, envelope.code)
+    details <- decode err.errBody :: Maybe ProblemDetails
+    pure (err.errHTTPCode, details.code)
   Right _ -> Nothing
 
 -- | @POST \/v1\/grants@ over the wire, against the in-memory store.
@@ -2130,25 +2059,25 @@ mintGrantTests baseEnv = do
   assertEqual
     "mint: a Denied decision is 403 decision_not_allowed"
     (Just (403, "decision_not_allowed"))
-    (thrownEnvelope denied)
+    (thrownProblem denied)
 
   -- ttlSeconds above the configured maximum -> 400 (rejected, not clamped).
   tooLong <- runHandler (grantsFor mintEnv request {ttlSeconds = Just 999999})
   assertEqual
     "mint: ttlSeconds above the maximum is 400 invalid_request"
     (Just (400, "invalid_request"))
-    (thrownEnvelope tooLong)
+    (thrownProblem tooLong)
 
   -- A non-concrete subject -> 400.
   nonConcrete <- runHandler (grantsFor mintEnv request {subject = SubjectWildcardWire "user"})
   assertEqual
     "mint: a non-concrete subject is 400 invalid_request"
     (Just (400, "invalid_request"))
-    (thrownEnvelope nonConcrete)
+    (thrownProblem nonConcrete)
 
   -- mint = Nothing -> 404, and every other endpoint still works.
   disabled <- runHandler (grantsFor baseEnv request)
   assertEqual
     "mint: a server with no issuer key answers 404 not_found"
     (Just (404, "not_found"))
-    (thrownEnvelope disabled)
+    (thrownProblem disabled)

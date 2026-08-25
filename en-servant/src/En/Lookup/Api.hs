@@ -46,6 +46,7 @@ import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
 import En.Revision (ConsistencyToken (..))
 import En.Schema (ObjectType (..), RelationName (..))
+import En.Servant.Problem (ProblemJSON)
 import En.Servant.Response
   ( EnResponses,
     EnResult,
@@ -86,12 +87,12 @@ data LookupRoutes mode = LookupRoutes
       mode
         :- "lookup"
           :> ReqBody '[JSON] LookupRequestWire
-          :> MultiVerb 'POST '[JSON] (EnResponses "A page of authorized objects" LookupPageWire) (EnResult LookupPageWire),
+          :> MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses "A page of authorized objects" LookupPageWire) (EnResult LookupPageWire),
     lookupSubjects ::
       mode
         :- "lookup-subjects"
           :> ReqBody '[JSON] LookupSubjectsRequestWire
-          :> MultiVerb 'POST '[JSON] (EnResponses "A page of authorized subjects" LookupSubjectsPageWire) (EnResult LookupSubjectsPageWire)
+          :> MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses "A page of authorized subjects" LookupSubjectsPageWire) (EnResult LookupSubjectsPageWire)
   }
   deriving stock (Generic)
 

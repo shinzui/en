@@ -89,7 +89,6 @@ executable en-openapi
 test-suite en-servant-tests
   import:         warnings, shared
   type:           exitcode-stdio-1.0
-  ghc-options:    -threaded -rtsopts
   hs-source-dirs: test
   main-is:        Main.hs
   build-depends:
@@ -104,16 +103,11 @@ test-suite en-servant-tests
     , en-core
     , en-postgres
     , en-servant
-    , http-client
     , http-types
     , openapi-hs
     , servant
-    , servant-client
-    , servant-openapi-hs  >=5.1 && <5.2
     , servant-server
-    , sop-core
     , text
     , time
     , wai
     , wai-extra
-    , warp

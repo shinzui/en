@@ -92,7 +92,7 @@ instance FromJSON SchemaInfoWire where
 --
 -- Not an 'En.Servant.Response.EnResult': it reads one 'ActiveSchema' out of memory and cannot
 -- fail, so it has no fault to return into a response alternative. Everything on the API that
--- can fail speaks the error envelope; this operation cannot.
+-- can fail speaks the shared problem dialect; this operation cannot.
 schemaHandler :: Env es -> Handler SchemaInfoWire
 schemaHandler env = do
   active <- liftIO env.readActiveSchema

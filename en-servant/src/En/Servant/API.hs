@@ -7,7 +7,7 @@
 -- "En.Expand.Api", and "En.Schema.Api". Vocabulary shared by two or more slices lives in
 -- "En.Servant.Wire", and the @MultiVerb@ response machinery in "En.Servant.Response". This
 -- module is the umbrella: it mounts the slice route records into one 'EnApi' record, builds
--- the server and the WAI 'Application', installs the error-envelope hook, and re-exports every
+-- the server and the WAI 'Application', installs the problem-document hook, and re-exports every
 -- name it exported before the split, so external consumers (@nagare@, @kikan-en@) that import
 -- @En.Servant.API@ see an unchanged interface.
 module En.Servant.API
@@ -18,6 +18,7 @@ module En.Servant.API
     EnServer,
     server,
     app,
+    problemMiddleware,
     envelopeFormatters,
 
     -- * Re-exported seam
@@ -49,6 +50,7 @@ import En.Error (EnError)
 import En.Expand.Api
 import En.Lookup.Api
 import En.Schema.Api
+import En.Servant.Problem (problemResponse, specMalformedRequestBody, specMethodNotAllowed)
 import En.Servant.Response (EnResponses, EnResult (..))
 import En.Servant.Seam
   ( ActiveSchema (..),
@@ -61,6 +63,8 @@ import En.Servant.Seam qualified as Seam
 import En.Servant.Wire
 import En.Tuple.Api
 import GHC.Generics (Generic)
+import Network.HTTP.Types (status405)
+import Network.Wai (Middleware, responseStatus)
 import Servant
   ( Application,
     Context (..),
@@ -86,7 +90,7 @@ import Servant.Server (ErrorFormatter, ErrorFormatters (..), defaultErrorFormatt
 -- consume the request body). @GET \/v1\/schema@ is the one non-@POST@: it reads the server's
 -- configuration from memory and cannot fail. @POST \/v1\/grants@ is a @POST@ but, like schema,
 -- not a @MultiVerb@: its non-200 statuses are a different set from the shared 'EnResponses',
--- so its handler throws 'Servant.ServerError' carrying the same 'ErrorEnvelopeWire'.
+-- so its handler throws 'Servant.ServerError' carrying the same 'ProblemDetails'.
 data EnApi mode = EnApi
   { relationships :: mode :- "v1" :> NamedRoutes TupleRoutes,
     checks :: mode :- "v1" :> NamedRoutes CheckRoutes,
@@ -115,26 +119,39 @@ server env =
 
 app :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> Application
 app env =
-  serveWithContext apiProxy (envelopeFormatters :. EmptyContext) (server env)
+  problemMiddleware (serveWithContext apiProxy (envelopeFormatters :. EmptyContext) (server env))
 
--- | Make Servant's own errors speak the same envelope as en's.
+-- | Replace Servant's otherwise empty 405 with the same problem dialect as every
+-- other error. En has no handler-owned 405, so replacing it unconditionally is safe.
+problemMiddleware :: Middleware
+problemMiddleware application request respond =
+  application request $ \response ->
+    if responseStatus response == status405
+      then
+        respond
+          ( problemResponse
+              specMethodNotAllowed
+              "use POST /v1/relationships/delete; en models deletion as a POST so a method mismatch cannot leave an unread body on the wire"
+          )
+      else respond response
+
+-- | Make Servant's own errors speak the same problem dialect as en's.
 --
 -- A request that fails to parse, or that matches no route, is rejected before any
 -- handler runs, so it cannot be a 'MultiVerb' response alternative. Without this the
 -- caller would get Servant's plain-text body and an inconsistent error content type.
 --
--- Not covered: @405 Method Not Allowed@ and @415 Unsupported Media Type@, which Servant
--- raises outside 'ErrorFormatters'. Both currently return an empty body. A 405 is what
--- @DELETE \/v1\/relationships@ now yields, and it notably does not consume the request
--- body — which is the reason deletion moved to @POST@.
+-- A @405 Method Not Allowed@ is raised outside these hooks and rewritten by
+-- 'problemMiddleware'. @415 Unsupported Media Type@ remains Servant's empty response.
 envelopeFormatters :: ErrorFormatters
 envelopeFormatters =
   defaultErrorFormatters
     { bodyParserErrorFormatter = malformedBody,
       urlParseErrorFormatter = malformedBody,
+      headerParseErrorFormatter = malformedBody,
       notFoundErrorFormatter = const Seam.notFound
     }
   where
     malformedBody :: ErrorFormatter
     malformedBody _typeRep _request detail =
-      faultToServerError (badRequest "malformed_request_body" (Text.pack detail))
+      faultToServerError (badRequest specMalformedRequestBody (Text.pack detail))

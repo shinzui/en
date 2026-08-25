@@ -24,17 +24,17 @@ import Control.Monad.Trans.Except (ExceptT (..), runExceptT, throwE)
 import Data.SOP (I (..), NS (..))
 import Data.Text (Text)
 import Effectful (Eff)
+import En.Servant.Problem (ProblemDetails, ProblemJSON)
 import En.Servant.Seam
   ( ActiveSchema,
     EnFault (..),
     Env (..),
-    ErrorEnvelopeWire,
     invalidRequest,
     runEngineEither,
   )
 import GHC.TypeLits (Symbol)
 import Servant (Handler)
-import Servant.API.MultiVerb (AsUnion (..), Respond)
+import Servant.API.MultiVerb (AsUnion (..), Respond, RespondAs)
 
 -- | The statuses any en operation can answer with, as response alternatives of the
 -- API type. Making them part of the type is what puts them in the generated OpenAPI
@@ -51,26 +51,26 @@ import Servant.API.MultiVerb (AsUnion (..), Respond)
 -- Not covered here: errors raised before a handler runs. A malformed body or an unmatched
 -- route comes from Servant's routing layer ('En.Servant.API.envelopeFormatters'), and
 -- authentication/rate-limit rejections come from WAI middleware in @en-server@. All of
--- them still carry 'ErrorEnvelopeWire'.
+-- them still carry 'ProblemDetails'.
 type EnResponses (description :: Symbol) a =
   '[ Respond 200 description a,
-     Respond 400 "Invalid request" ErrorEnvelopeWire,
-     Respond 412 "Write precondition failed" ErrorEnvelopeWire,
-     Respond 422 "Resolution limit exceeded" ErrorEnvelopeWire,
-     Respond 503 "Tuple store unavailable" ErrorEnvelopeWire
+     RespondAs ProblemJSON 400 "Invalid request" ProblemDetails,
+     RespondAs ProblemJSON 412 "Write precondition failed" ProblemDetails,
+     RespondAs ProblemJSON 422 "Resolution limit exceeded" ProblemDetails,
+     RespondAs ProblemJSON 503 "Tuple store unavailable" ProblemDetails
    ]
 
 -- | What an en handler returns. 'AsUnion' maps it onto 'EnResponses' positionally.
 data EnResult a
   = EnOk a
   | -- | 400
-    EnClientError !ErrorEnvelopeWire
+    EnClientError !ProblemDetails
   | -- | 412
-    EnPreconditionFailed !ErrorEnvelopeWire
+    EnPreconditionFailed !ProblemDetails
   | -- | 422
-    EnUnprocessable !ErrorEnvelopeWire
+    EnUnprocessable !ProblemDetails
   | -- | 503
-    EnUnavailable !ErrorEnvelopeWire
+    EnUnavailable !ProblemDetails
   deriving stock (Eq, Show)
 
 -- | Written by hand rather than derived through 'GenericAsUnion': the correspondence
@@ -79,10 +79,10 @@ data EnResult a
 instance
   AsUnion
     '[ Respond 200 description a,
-       Respond 400 "Invalid request" ErrorEnvelopeWire,
-       Respond 412 "Write precondition failed" ErrorEnvelopeWire,
-       Respond 422 "Resolution limit exceeded" ErrorEnvelopeWire,
-       Respond 503 "Tuple store unavailable" ErrorEnvelopeWire
+       RespondAs ProblemJSON 400 "Invalid request" ProblemDetails,
+       RespondAs ProblemJSON 412 "Write precondition failed" ProblemDetails,
+       RespondAs ProblemJSON 422 "Resolution limit exceeded" ProblemDetails,
+       RespondAs ProblemJSON 503 "Tuple store unavailable" ProblemDetails
      ]
     (EnResult a)
   where

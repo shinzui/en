@@ -93,7 +93,7 @@ operation. The exact commands and expected output are in Validation and Acceptan
       generated document's content keys on *both* the error and the success alternative. Legs 2
       and 3 fail on en's resolved packages unless the workarounds recorded in the Decision Log
       are applied — watch them fail first. No production route changes.
-- [ ] Milestone 2 — Convert the whole servant surface: the shared `EnResponses` list, `EnResult`,
+- [x] (2026-08-25 22:35Z) Milestone 2 — Converted the whole servant surface: the shared `EnResponses` list, `EnResult`,
       the hand-written `AsUnion`, `EnFault`, `enErrorToFault`, every thrown `ServerError`, and
       `envelopeFormatters` (setting all four hooks, not three). Widen every `MultiVerb`'s
       content-type list to `'[JSON, ProblemJSON]`, without which `en-client` rejects every error
@@ -124,6 +124,18 @@ operation. The exact commands and expected output are in Validation and Acceptan
 
 
 ## Surprises & Discoveries
+
+- Discovery (2026-08-25, EP-61 Milestone 2): **the 405 rewrite must also wrap the OpenAPI-serving
+  application.** The standalone host serves `appWithOpenApi`, not `app`, so installing the
+  middleware only inside `En.Servant.API.app` would fix embedders while leaving the standalone
+  service's API paths with Servant's empty 405. `appWithOpenApi` now applies the same exported
+  middleware around its combined API and document server; the WAI regression test pins the
+  observable response.
+
+- Discovery (2026-08-25, EP-61 Milestone 2 validation): the pre-existing Biscuit authorization
+  timeout reproduced twice during the full-suite run and isolated retry, then passed on the
+  second isolated retry. All other suites, including the converted servant surface and PostgreSQL
+  integration tests, passed on the full run.
 
 - Discovery (2026-08-25, EP-61 Milestone 1 spike): **the resolved Servant client still has the
   exact runtime failure the plan predicts.** With the throwaway route's verb list temporarily

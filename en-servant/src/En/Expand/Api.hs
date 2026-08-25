@@ -39,6 +39,7 @@ import En.Error (EnError)
 import En.Expand qualified as Expand
 import En.Revision (ConsistencyToken (..))
 import En.Schema (CaveatName (..), RelationName (..))
+import En.Servant.Problem (ProblemJSON)
 import En.Servant.Response
   ( EnResponses,
     EnResult,
@@ -73,7 +74,7 @@ data ExpandRoutes mode = ExpandRoutes
       mode
         :- "expand"
           :> ReqBody '[JSON] ExpandRequestWire
-          :> MultiVerb 'POST '[JSON] (EnResponses "The permission's subject tree" ExpandTreeWire) (EnResult ExpandTreeWire)
+          :> MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses "The permission's subject tree" ExpandTreeWire) (EnResult ExpandTreeWire)
   }
   deriving stock (Generic)
 
