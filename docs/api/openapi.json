@@ -431,25 +431,6 @@
         ],
         "type": "object"
       },
-      "ErrorEnvelopeWire": {
-        "properties": {
-          "code": {
-            "type": "string"
-          },
-          "message": {
-            "type": "string"
-          },
-          "retryable": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "code",
-          "message",
-          "retryable"
-        ],
-        "type": "object"
-      },
       "ExpandNodeWire": {
         "oneOf": [
           {
@@ -1126,6 +1107,39 @@
           }
         ]
       },
+      "ProblemDetails": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "status": {
+            "maximum": 9223372036854775807,
+            "minimum": -9223372036854775808,
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code",
+          "retryable"
+        ],
+        "type": "object"
+      },
       "ReadRelationshipsRequestWire": {
         "properties": {
           "consistency": {
@@ -1611,20 +1625,20 @@
                 "schema": {
                   "$ref": "#/components/schemas/BatchCheckResponseWire"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchCheckResponseWire"
+                }
               }
             },
             "description": "One decision per requested pair, in order"
           },
           "400": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1632,14 +1646,9 @@
           },
           "412": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1647,14 +1656,9 @@
           },
           "422": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1662,14 +1666,9 @@
           },
           "503": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1702,20 +1701,20 @@
                 "schema": {
                   "$ref": "#/components/schemas/CheckResponseWire"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckResponseWire"
+                }
               }
             },
             "description": "The authorization decision"
           },
           "400": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1723,14 +1722,9 @@
           },
           "412": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1738,14 +1732,9 @@
           },
           "422": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1753,14 +1742,9 @@
           },
           "503": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1793,20 +1777,20 @@
                 "schema": {
                   "$ref": "#/components/schemas/ExpandTreeWire"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExpandTreeWire"
+                }
               }
             },
             "description": "The permission's subject tree"
           },
           "400": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1814,14 +1798,9 @@
           },
           "412": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1829,14 +1808,9 @@
           },
           "422": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1844,14 +1818,9 @@
           },
           "503": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1913,20 +1882,20 @@
                 "schema": {
                   "$ref": "#/components/schemas/LookupPageWire"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LookupPageWire"
+                }
               }
             },
             "description": "A page of authorized objects"
           },
           "400": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1934,14 +1903,9 @@
           },
           "412": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1949,14 +1913,9 @@
           },
           "422": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -1964,14 +1923,9 @@
           },
           "503": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2004,20 +1958,20 @@
                 "schema": {
                   "$ref": "#/components/schemas/LookupSubjectsPageWire"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LookupSubjectsPageWire"
+                }
               }
             },
             "description": "A page of authorized subjects"
           },
           "400": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2025,14 +1979,9 @@
           },
           "412": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2040,14 +1989,9 @@
           },
           "422": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2055,14 +1999,9 @@
           },
           "503": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2095,20 +2034,20 @@
                 "schema": {
                   "$ref": "#/components/schemas/WriteTuplesResponseWire"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteTuplesResponseWire"
+                }
               }
             },
             "description": "Consistency token for the write"
           },
           "400": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2116,14 +2055,9 @@
           },
           "412": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2131,14 +2065,9 @@
           },
           "422": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2146,14 +2075,9 @@
           },
           "503": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2186,20 +2110,20 @@
                 "schema": {
                   "$ref": "#/components/schemas/WriteTuplesResponseWire"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteTuplesResponseWire"
+                }
               }
             },
             "description": "Consistency token for the deletion"
           },
           "400": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2207,14 +2131,9 @@
           },
           "412": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2222,14 +2141,9 @@
           },
           "422": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2237,14 +2151,9 @@
           },
           "503": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2277,20 +2186,20 @@
                 "schema": {
                   "$ref": "#/components/schemas/DeleteRelationshipsResponseWire"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteRelationshipsResponseWire"
+                }
               }
             },
             "description": "How many relationships the filter matched"
           },
           "400": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2298,14 +2207,9 @@
           },
           "412": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2313,14 +2217,9 @@
           },
           "422": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2328,14 +2227,9 @@
           },
           "503": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2368,20 +2262,20 @@
                 "schema": {
                   "$ref": "#/components/schemas/ReadRelationshipsResponseWire"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadRelationshipsResponseWire"
+                }
               }
             },
             "description": "A page of stored relationships"
           },
           "400": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2389,14 +2283,9 @@
           },
           "412": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2404,14 +2293,9 @@
           },
           "422": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2419,14 +2303,9 @@
           },
           "503": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2476,20 +2355,20 @@
                 "schema": {
                   "$ref": "#/components/schemas/WatchResponseWire"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WatchResponseWire"
+                }
               }
             },
             "description": "A batch of tuple changes, and a cursor to resume from"
           },
           "400": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2497,14 +2376,9 @@
           },
           "412": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2512,14 +2386,9 @@
           },
           "422": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -2527,14 +2396,9 @@
           },
           "503": {
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
-                }
-              },
-              "application/json;charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelopeWire"
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
