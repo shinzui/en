@@ -89,3 +89,46 @@ This is the second reason en carries a `biscuit-haskell` fork rather than the Ha
 release; the first is the GHC 9.12 `template-haskell` bound. Both are recorded in the
 comment above the pin in `cabal.project`. The fork can be dropped only when an upstream
 release carries both widenings.
+
+## Amendment — 2026-08-25
+
+The reasoning above stands unchanged; the vehicle for it does not. Two corrections.
+
+**The patch moved out of the corpus mirror and into a real fork.** It was originally
+committed onto `shinzui/biscuit-haskell-project`, which is the corpus *mirror* of upstream
+(`mori://eclipse-biscuit/biscuit-haskell`) and carries `biscuit-haskell` as a vendored
+subtree. Editing the subtree in place broke the rule the corpus exists to uphold — that
+reading it tells you what upstream does — and left the patch on a subtree merge in a mirror
+repo, where it could not be offered upstream. It now lives on the `fix/crypton-1.1-ram`
+branch of `mori://shinzui/biscuit-haskell`, a GitHub fork of
+`eclipse-biscuit/biscuit-haskell`, as a single commit on top of upstream `main`. The mirror
+is pure upstream again and names the fork in its `mori.dhall`.
+
+Rebasing onto upstream `main` also picked up four commits the old pin predated, including a
+negative-index guard in `get()` and a fix making `runAuthorizerWithLimits` actually honour
+`maxTime`. The latter matters here: `en-biscuit` verifies tokens whose blocks an attenuating
+caller controls, and before that fix the authorizer's time limit did not bound them.
+
+**The bound in the diff above was wrong.** `crypton >= 1.0 && < 1.2` paired with `ram` is
+unsound in the same way the ADR warns about, just in the other direction: crypton 1.0.6
+still gets `ByteArrayAccess` from `memory`, so that range admits a plan that solves and then
+fails to compile on the missing instance. The range only happened to work because en also
+constrains `crypton >= 1.1`. The fork now says:
+
+```diff
+-    crypton              ^>= 1.0,
+-    memory               >= 0.15 && < 0.19,
++    crypton              ^>= 1.1,
++    ram                  >= 0.20.1 && < 0.23,
+```
+
+which is the only range that is true of this source. The `crypton >= 1.1` constraint in
+`cabal.project` is consequently redundant, and is kept only as a guard against the pin being
+dropped.
+
+**On dropping the fork.** Upstream `main` has carried the GHC 9.12 half
+(`template-haskell < 2.24`, `megaparsec < 9.8`, `crypton` rather than `cryptonite`) for some
+time but has never released it — Hackage still serves `biscuit-haskell-0.4.0.0` at revision
+0 from 2024-07-31 — and the open "Release 0.5.0.0" PR does not touch the crypton bound. So
+the fork cannot be dropped on that release either; it needs a release carrying the crypton
+1.1 change as well.
