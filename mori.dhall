@@ -92,13 +92,89 @@ in  Schema.Project::{
         }
       ]
     , dependencies =
-      [ "haskell-servant/servant"
-      , "hasql/hasql"
-      , "shinzui/pg-migrate"
-      , "haskell-hvr/uuid"
+      [ "haskell-servant/servant:servant"
+      , "haskell-servant/servant:servant-client"
+      , "haskell-servant/servant:servant-client-core"
+      , "haskell-servant/servant:servant-server"
+      , "hasql/hasql:hasql"
+      , "hasql/hasql:hasql-pool"
+      , "shinzui/pg-migrate:pg-migrate"
+      , "shinzui/pg-migrate:pg-migrate-embed"
+      , "shinzui/pg-migrate:pg-migrate-cli"
+      , "haskell-hvr/uuid:uuid"
       , "haskell/time"
       , "system-f/validation"
-      , "eclipse-biscuit/biscuit-haskell"
+      , "eclipse-biscuit/biscuit-haskell:biscuit-haskell"
+      ]
+    , dependencyRefs =
+      [ Schema.MoriRef::{
+        , namespace = "haskell-servant"
+        , name = "servant"
+        , kind = Some Schema.MoriArtifactKind.Package
+        , key = Some "servant"
+        }
+      , Schema.MoriRef::{
+        , namespace = "haskell-servant"
+        , name = "servant"
+        , kind = Some Schema.MoriArtifactKind.Package
+        , key = Some "servant-client"
+        }
+      , Schema.MoriRef::{
+        , namespace = "haskell-servant"
+        , name = "servant"
+        , kind = Some Schema.MoriArtifactKind.Package
+        , key = Some "servant-client-core"
+        }
+      , Schema.MoriRef::{
+        , namespace = "haskell-servant"
+        , name = "servant"
+        , kind = Some Schema.MoriArtifactKind.Package
+        , key = Some "servant-server"
+        }
+      , Schema.MoriRef::{
+        , namespace = "hasql"
+        , name = "hasql"
+        , kind = Some Schema.MoriArtifactKind.Package
+        , key = Some "hasql"
+        }
+      , Schema.MoriRef::{
+        , namespace = "hasql"
+        , name = "hasql"
+        , kind = Some Schema.MoriArtifactKind.Package
+        , key = Some "hasql-pool"
+        }
+      , Schema.MoriRef::{
+        , namespace = "shinzui"
+        , name = "pg-migrate"
+        , kind = Some Schema.MoriArtifactKind.Package
+        , key = Some "pg-migrate"
+        }
+      , Schema.MoriRef::{
+        , namespace = "shinzui"
+        , name = "pg-migrate"
+        , kind = Some Schema.MoriArtifactKind.Package
+        , key = Some "pg-migrate-embed"
+        }
+      , Schema.MoriRef::{
+        , namespace = "shinzui"
+        , name = "pg-migrate"
+        , kind = Some Schema.MoriArtifactKind.Package
+        , key = Some "pg-migrate-cli"
+        }
+      , Schema.MoriRef::{
+        , namespace = "haskell-hvr"
+        , name = "uuid"
+        , kind = Some Schema.MoriArtifactKind.Package
+        , key = Some "uuid"
+        }
+      , Schema.MoriRef::{ namespace = "haskell", name = "time" }
+      , Schema.MoriRef::{ namespace = "system-f", name = "validation" }
+      , Schema.MoriRef::{
+        , namespace = "eclipse-biscuit"
+        , name = "biscuit-haskell"
+        , kind = Some Schema.MoriArtifactKind.Package
+        , key = Some "biscuit-haskell"
+        }
       ]
     , okfBundles =
       [ Schema.OkfBundle::{
