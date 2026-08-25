@@ -1592,6 +1592,12 @@
         ],
         "type": "object"
       }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "scheme": "bearer",
+        "type": "http"
+      }
     }
   },
   "info": {
@@ -1625,11 +1631,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/BatchCheckResponseWire"
                 }
-              },
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BatchCheckResponseWire"
-                }
               }
             },
             "description": "One decision per requested pair, in order"
@@ -1638,7 +1639,29 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unknown_relation",
+                        "schema_violation",
+                        "missing_caveat_context",
+                        "malformed_consistency_token",
+                        "consistency_token_expired",
+                        "invalid_consistency_token",
+                        "invalid_cursor",
+                        "invalid_request",
+                        "batch_too_large",
+                        "malformed_request_body",
+                        "grant_not_mintable"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1648,7 +1671,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "write_precondition_failed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1658,7 +1693,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "resolution_limit_exceeded",
+                        "cycle_detected"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1668,7 +1716,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "internal_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1678,13 +1738,30 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "store_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
             "description": "Tuple store unavailable"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/v1/check": {
@@ -1711,11 +1788,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/CheckResponseWire"
                 }
-              },
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CheckResponseWire"
-                }
               }
             },
             "description": "The authorization decision"
@@ -1724,7 +1796,29 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unknown_relation",
+                        "schema_violation",
+                        "missing_caveat_context",
+                        "malformed_consistency_token",
+                        "consistency_token_expired",
+                        "invalid_consistency_token",
+                        "invalid_cursor",
+                        "invalid_request",
+                        "batch_too_large",
+                        "malformed_request_body",
+                        "grant_not_mintable"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1734,7 +1828,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "write_precondition_failed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1744,7 +1850,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "resolution_limit_exceeded",
+                        "cycle_detected"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1754,7 +1873,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "internal_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1764,13 +1895,30 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "store_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
             "description": "Tuple store unavailable"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/v1/expand": {
@@ -1797,11 +1945,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/ExpandTreeWire"
                 }
-              },
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ExpandTreeWire"
-                }
               }
             },
             "description": "The permission's subject tree"
@@ -1810,7 +1953,29 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unknown_relation",
+                        "schema_violation",
+                        "missing_caveat_context",
+                        "malformed_consistency_token",
+                        "consistency_token_expired",
+                        "invalid_consistency_token",
+                        "invalid_cursor",
+                        "invalid_request",
+                        "batch_too_large",
+                        "malformed_request_body",
+                        "grant_not_mintable"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1820,7 +1985,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "write_precondition_failed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1830,7 +2007,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "resolution_limit_exceeded",
+                        "cycle_detected"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1840,7 +2030,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "internal_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1850,13 +2052,30 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "store_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
             "description": "Tuple store unavailable"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/v1/grants": {
@@ -1883,11 +2102,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/MintGrantResponseWire"
                 }
-              },
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MintGrantResponseWire"
-                }
               }
             },
             "description": "The minted grant"
@@ -1896,7 +2110,29 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unknown_relation",
+                        "schema_violation",
+                        "missing_caveat_context",
+                        "malformed_consistency_token",
+                        "consistency_token_expired",
+                        "invalid_consistency_token",
+                        "invalid_cursor",
+                        "invalid_request",
+                        "batch_too_large",
+                        "malformed_request_body",
+                        "grant_not_mintable"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1906,7 +2142,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "permission_denied",
+                        "decision_not_allowed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1916,7 +2165,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "not_found"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1926,7 +2187,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "write_precondition_failed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1936,7 +2209,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "resolution_limit_exceeded",
+                        "cycle_detected"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1946,7 +2232,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "internal_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -1956,13 +2254,30 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "store_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
             "description": "Tuple store unavailable"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/v1/lookup": {
@@ -1989,11 +2304,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/LookupPageWire"
                 }
-              },
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LookupPageWire"
-                }
               }
             },
             "description": "A page of authorized objects"
@@ -2002,7 +2312,29 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unknown_relation",
+                        "schema_violation",
+                        "missing_caveat_context",
+                        "malformed_consistency_token",
+                        "consistency_token_expired",
+                        "invalid_consistency_token",
+                        "invalid_cursor",
+                        "invalid_request",
+                        "batch_too_large",
+                        "malformed_request_body",
+                        "grant_not_mintable"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2012,7 +2344,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "write_precondition_failed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2022,7 +2366,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "resolution_limit_exceeded",
+                        "cycle_detected"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2032,7 +2389,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "internal_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2042,13 +2411,30 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "store_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
             "description": "Tuple store unavailable"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/v1/lookup-subjects": {
@@ -2075,11 +2461,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/LookupSubjectsPageWire"
                 }
-              },
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LookupSubjectsPageWire"
-                }
               }
             },
             "description": "A page of authorized subjects"
@@ -2088,7 +2469,29 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unknown_relation",
+                        "schema_violation",
+                        "missing_caveat_context",
+                        "malformed_consistency_token",
+                        "consistency_token_expired",
+                        "invalid_consistency_token",
+                        "invalid_cursor",
+                        "invalid_request",
+                        "batch_too_large",
+                        "malformed_request_body",
+                        "grant_not_mintable"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2098,7 +2501,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "write_precondition_failed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2108,7 +2523,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "resolution_limit_exceeded",
+                        "cycle_detected"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2118,7 +2546,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "internal_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2128,13 +2568,30 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "store_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
             "description": "Tuple store unavailable"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/v1/relationships": {
@@ -2161,11 +2618,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/WriteTuplesResponseWire"
                 }
-              },
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WriteTuplesResponseWire"
-                }
               }
             },
             "description": "Consistency token for the write"
@@ -2174,7 +2626,29 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unknown_relation",
+                        "schema_violation",
+                        "missing_caveat_context",
+                        "malformed_consistency_token",
+                        "consistency_token_expired",
+                        "invalid_consistency_token",
+                        "invalid_cursor",
+                        "invalid_request",
+                        "batch_too_large",
+                        "malformed_request_body",
+                        "grant_not_mintable"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2184,7 +2658,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "write_precondition_failed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2194,7 +2680,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "resolution_limit_exceeded",
+                        "cycle_detected"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2204,7 +2703,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "internal_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2214,13 +2725,30 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "store_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
             "description": "Tuple store unavailable"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/v1/relationships/delete": {
@@ -2247,11 +2775,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/WriteTuplesResponseWire"
                 }
-              },
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WriteTuplesResponseWire"
-                }
               }
             },
             "description": "Consistency token for the deletion"
@@ -2260,7 +2783,29 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unknown_relation",
+                        "schema_violation",
+                        "missing_caveat_context",
+                        "malformed_consistency_token",
+                        "consistency_token_expired",
+                        "invalid_consistency_token",
+                        "invalid_cursor",
+                        "invalid_request",
+                        "batch_too_large",
+                        "malformed_request_body",
+                        "grant_not_mintable"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2270,7 +2815,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "write_precondition_failed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2280,7 +2837,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "resolution_limit_exceeded",
+                        "cycle_detected"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2290,7 +2860,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "internal_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2300,13 +2882,30 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "store_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
             "description": "Tuple store unavailable"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/v1/relationships/delete-by-filter": {
@@ -2333,11 +2932,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/DeleteRelationshipsResponseWire"
                 }
-              },
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeleteRelationshipsResponseWire"
-                }
               }
             },
             "description": "How many relationships the filter matched"
@@ -2346,7 +2940,29 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unknown_relation",
+                        "schema_violation",
+                        "missing_caveat_context",
+                        "malformed_consistency_token",
+                        "consistency_token_expired",
+                        "invalid_consistency_token",
+                        "invalid_cursor",
+                        "invalid_request",
+                        "batch_too_large",
+                        "malformed_request_body",
+                        "grant_not_mintable"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2356,7 +2972,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "write_precondition_failed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2366,7 +2994,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "resolution_limit_exceeded",
+                        "cycle_detected"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2376,7 +3017,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "internal_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2386,13 +3039,30 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "store_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
             "description": "Tuple store unavailable"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/v1/relationships/query": {
@@ -2419,11 +3089,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/ReadRelationshipsResponseWire"
                 }
-              },
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReadRelationshipsResponseWire"
-                }
               }
             },
             "description": "A page of stored relationships"
@@ -2432,7 +3097,29 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unknown_relation",
+                        "schema_violation",
+                        "missing_caveat_context",
+                        "malformed_consistency_token",
+                        "consistency_token_expired",
+                        "invalid_consistency_token",
+                        "invalid_cursor",
+                        "invalid_request",
+                        "batch_too_large",
+                        "malformed_request_body",
+                        "grant_not_mintable"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2442,7 +3129,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "write_precondition_failed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2452,7 +3151,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "resolution_limit_exceeded",
+                        "cycle_detected"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2462,7 +3174,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "internal_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2472,13 +3196,30 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "store_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
             "description": "Tuple store unavailable"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/v1/schema": {
@@ -2495,7 +3236,12 @@
             },
             "description": ""
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/v1/watch": {
@@ -2522,11 +3268,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/WatchResponseWire"
                 }
-              },
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WatchResponseWire"
-                }
               }
             },
             "description": "A batch of tuple changes, and a cursor to resume from"
@@ -2535,7 +3276,29 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unknown_relation",
+                        "schema_violation",
+                        "missing_caveat_context",
+                        "malformed_consistency_token",
+                        "consistency_token_expired",
+                        "invalid_consistency_token",
+                        "invalid_cursor",
+                        "invalid_request",
+                        "batch_too_large",
+                        "malformed_request_body",
+                        "grant_not_mintable"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2545,7 +3308,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "write_precondition_failed"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2555,7 +3330,20 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "resolution_limit_exceeded",
+                        "cycle_detected"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2565,7 +3353,19 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "internal_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
@@ -2575,13 +3375,30 @@
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "store_error"
+                      ],
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },
             "description": "Tuple store unavailable"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     }
   }
