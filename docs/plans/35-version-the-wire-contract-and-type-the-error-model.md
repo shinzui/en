@@ -80,9 +80,11 @@ This section must always reflect the actual current state of the work.
   (`test-server`) updated; `docs/user/service-and-operations.md` and
   `docs/user/production-deployment-and-performance.md` swept for old shapes; an "API
   versioning" section added documenting the discriminators and the one-time break.
-- [x] M3 (2026-07-08): typed error envelope (`ErrorEnvelopeWire`) in Seam.hs with the
+- [x] M3 (2026-07-08; revised by EP-61 on 2026-08-25): typed RFC 9457 problem document
+      (`ProblemDetails`) in `En.Servant.Problem` with the
   `EnError -> EnFault` mapping (`status`, `code`, `retryable`); `requirePermission` and
-  handler 400s migrated onto it. Table test pins all six `EnError` constructors.
+  handler 400s migrated onto it. The table test now pins every `EnError` constructor,
+  including the later `InternalError` arm.
 - [x] M3 (2026-07-08): uniform JSON errors for body-decode/404 via Servant
   `ErrorFormatters` and `serveWithContext`; 405 observed to return an empty body (see
   Surprises). Verified with PostgreSQL stopped: `503`, `store_error`,
@@ -104,8 +106,8 @@ This section must always reflect the actual current state of the work.
   Decision Log. A test decodes `enOpenApi` and asserts the path set and per-operation
   response statuses.
 - [x] Final (2026-07-08): reconciled EP-33's interim `{"error", "code"}` middleware
-  bodies onto the full envelope. `errorBody` in `en-server/app/Middleware.hs` now emits
-  `{code, message, retryable}`; `rate_limited` is `retryable: true` (the bucket refills),
+  bodies onto the shared error model. EP-61 later moved the body to
+  `ProblemDetails`; `rate_limited` remains `retryable: true` (the bucket refills),
   `unauthenticated` and `permission_denied` are not.
 - [x] Final (2026-07-08): full curl transcript reproduced; `cabal build all`,
   `cabal test en-servant`, and `just start-and-test` green; breaking change called out in
@@ -225,10 +227,9 @@ implementation. Provide concise evidence.
 - **`rate_limited` is the one retryable middleware rejection.** Reconciling EP-33's
   bodies forced the question its interim `{"error", "code"}` shape never had to answer.
   A token bucket refills, so a 429 is worth retrying; a missing key and a read-only key
-  do not fix themselves. `en-server/app/Middleware.hs` writes the envelope out by hand
-  rather than importing `ErrorEnvelopeWire`, because these responses are built by WAI
-  middleware with no `ServerError` to attach and no handler to return from — the comment
-  there notes that the two definitions must move together.
+  do not fix themselves. EP-61 replaced the middleware's hand-written duplicate with
+  `En.Servant.Problem.problemResponse`, a shared WAI renderer that does not require a
+  `ServerError` or handler.
 
 - **`.:?` already handles explicit `null`.** `TupleWire.caveat` encodes as
   `"caveat":null` and decodes from either an explicit `null` or an absent key, because
@@ -291,7 +292,7 @@ Record every decision made while working on the plan.
   errors are alternatives of the API type rather than thrown `ServerError`s. Added to
   this plan as milestone M3b rather than deferred to a follow-up.
   Rationale: `MultiVerb` changes the *Haskell* types, not a single JSON byte — the
-  statuses and `{code, message, retryable}` bodies are identical either way — so
+  statuses and problem bodies are identical either way — so
   adopting it is not a second break of the `/v1` wire contract, only of `en-client`'s
   Haskell shape. en currently has no API consumers, which makes that break free now and
   expensive later; that is the whole reason to do it before anyone depends on the
@@ -322,7 +323,7 @@ Record every decision made while working on the plan.
   so no response type on the endpoint can describe them. EP-33's `unauthenticated`,
   `permission_denied`, and `rate_limited` come from WAI middleware, outside Servant
   entirely. `MultiVerb` therefore complements the envelope rather than replacing it;
-  both paths emit `ErrorEnvelopeWire`.
+  both paths emit `ProblemDetails` under `application/problem+json`.
   Date: 2026-07-08
 - Decision: Retain the throwing `runEngine` and `enErrorToServerError` alongside the new
   value-returning `runEngineEither`.
@@ -410,8 +411,8 @@ golden tests; a client sends `{"kind":"id",…}` and reads `{"result":"allowed"}
 constructor name reaches the wire. The six operations answer under `/v1`, deletion is a
 `POST` rather than a `DELETE` carrying a body, and the old paths return `404` — inside the
 envelope. Every error in the service, from an engine fault to a rate-limit rejection to a
-truncated request body, is exactly `{code, message, retryable}` with
-`Content-Type: application/json`; `code` is stable, `retryable` is the entire retry
+truncated request body, is now `ProblemDetails` with
+`Content-Type: application/problem+json`; `code` remains stable, `retryable` is the retry
 policy, and `StoreError`'s SQL never crosses the trust boundary. `GET /v1/openapi.json`
 serves an OpenAPI 3.1 document whose six paths each declare `200`, `400`, `422`, and
 `503`.
@@ -662,30 +663,38 @@ Acceptance: `just start-and-test` passes against the new surface; hitting an old
 returns 404 (in the M3 envelope once M3 lands); `cabal build en-client` succeeds.
 
 
-### Milestone 3: The typed error envelope
+### Milestone 3: The typed RFC 9457 problem document
 
 Scope: one error shape everywhere, with correct status codes. At the end no handler
-path can produce a non-JSON or un-coded error.
+path can produce an un-coded or non-problem JSON error.
 
-In `en-servant/src/En/Servant/Seam.hs`, replace `ErrorWire` with:
+Define the shared body in `en-servant/src/En/Servant/Problem.hs`:
 
 ```haskell
-data ErrorEnvelopeWire = ErrorEnvelopeWire
-    { code :: !Text
-    , message :: !Text
+data ProblemDetails = ProblemDetails
+    { problemType :: !Text
+    , title :: !Text
+    , status :: !Int
+    , detail :: !Text
+    , code :: !Text
     , retryable :: !Bool
     }
 ```
 
-with hand-written instances (`{"code":…,"message":…,"retryable":…}`). Introduce the
-fault type that names the status without committing to a transport:
+with JSON instances bridged through one `problemJsonOptions` value so `problemType` is
+encoded as `type`. Add a `ProblemJSON` content-type marker for
+`application/problem+json`, a `ProblemSpec` catalog that owns each stable code's status,
+title, and retryability, and renderers shared by Servant and WAI. Introduce the fault type
+that names the status without committing to a transport:
 
 ```haskell
 -- | A handler-producible failure. The constructor selects the HTTP status.
 data EnFault
-    = BadRequestFault !ErrorEnvelopeWire     -- ^ 400
-    | UnprocessableFault !ErrorEnvelopeWire  -- ^ 422
-    | UnavailableFault !ErrorEnvelopeWire    -- ^ 503
+    = BadRequestFault !ProblemDetails          -- ^ 400
+    | PreconditionFailedFault !ProblemDetails  -- ^ 412
+    | UnprocessableFault !ProblemDetails       -- ^ 422
+    | InternalFault !ProblemDetails            -- ^ 500
+    | UnavailableFault !ProblemDetails         -- ^ 503
 ```
 
 `EnFault` exists so that M3b's `MultiVerb` alternatives and M3's thrown `ServerError`s
@@ -693,13 +702,14 @@ are built from one source of truth. Implement the mapping:
 
 ```haskell
 enErrorToFault :: EnError -> EnFault
--- UnknownRelation t          -> 400 "unknown_relation"           retryable=False, message names t
+-- UnknownRelation t          -> 400 "unknown_relation"           retryable=False, detail names t
 -- SchemaViolation t          -> 400 "schema_violation"           retryable=False
--- MissingCaveatContext names -> 400 "missing_caveat_context"     retryable=False, message lists names
+-- MissingCaveatContext names -> 400 "missing_caveat_context"     retryable=False, detail lists names
 -- InvalidConsistencyToken t  -> 400 "invalid_consistency_token"  retryable=False
 -- ResolutionLimitExceeded    -> 422 "resolution_limit_exceeded"  retryable=False
+-- InternalError _detail      -> 500 "internal_error"             retryable=False
 -- StoreError _detail         -> 503 "store_error"                retryable=True,
---                               message = "the tuple store failed; retry later"
+--                               detail = "the tuple store failed; retry later"
 ```
 
 plus `invalidRequest :: Text -> EnFault` (code `invalid_request`) and
@@ -723,10 +733,10 @@ enErrorToServerError :: EnError -> ServerError  -- faultToServerError . enErrorT
 runEngineEither :: Env es -> Eff es a -> Handler (Either EnFault a)
 ```
 
-`faultToServerError` attaches the envelope as the body and
-`Content-Type: application/json` at the status the constructor names, replacing the old
+`faultToServerError` attaches the problem document as the body and
+`Content-Type: application/problem+json` at the status the constructor names, replacing the old
 `jsonError`. Update `requirePermission` in `en-servant/src/En/Servant/Authorize.hs` to
-throw a 403 envelope with code `permission_denied` (retryable=false, distinct messages
+throw a 403 problem with code `permission_denied` (retryable=false, distinct details
 for `Denied` vs `Conditional`); it has no `MultiVerb` response list to return into, so
 it keeps throwing.
 
@@ -738,7 +748,7 @@ app env = serveWithContext apiProxy (customFormatters :. EmptyContext) (server e
 ```
 
 where `customFormatters` overrides `bodyParserErrorFormatter` and `urlParseErrorFormatter`
-(400, code `"malformed_request_body"`, message = the aeson/parse error text,
+(400, code `"malformed_request_body"`, detail = the aeson/parse error text,
 retryable=false) and `notFoundErrorFormatter` (404, code `"not_found"`,
 retryable=false). Content-type mismatches (415) and method errors (405) fall outside
 `ErrorFormatters`; verify their behavior with curl and record the result in Surprises &
@@ -746,8 +756,8 @@ Discoveries — if they emit non-JSON bodies, add a small outermost WAI middlewa
 `app` that rewrites bodyless 4xx responses into the envelope (keep it inside en-servant
 so embedded users get it too).
 
-Add tests to `en-servant/test/Main.hs`: assert `enErrorToFault` maps each of the six
-`EnError` constructors to the right status, `code`, and `retryable` (it is pure, so this
+Add tests to `en-servant/test/Main.hs`: assert `enErrorToFault` maps each `EnError`
+constructor to the right status, `code`, and `retryable` (it is pure, so this
 is a table test), and that an unknown permission through the real `check` handler
 produces `unknown_relation` (the in-memory conformance store yields it naturally).
 
@@ -769,34 +779,40 @@ operations, parameterized by the success description and payload:
 ```haskell
 type EnResponses (desc :: Symbol) a =
     '[ Respond 200 desc a
-     , Respond 400 "Invalid request" ErrorEnvelopeWire
-     , Respond 422 "Resolution limit exceeded" ErrorEnvelopeWire
-     , Respond 503 "Tuple store unavailable" ErrorEnvelopeWire
+     , RespondAs ProblemJSON 400 "Invalid request" ProblemDetails
+     , RespondAs ProblemJSON 412 "Write precondition failed" ProblemDetails
+     , RespondAs ProblemJSON 422 "Resolution limit exceeded" ProblemDetails
+     , RespondAs ProblemJSON 500 "Internal error" ProblemDetails
+     , RespondAs ProblemJSON 503 "Tuple store unavailable" ProblemDetails
      ]
 
 -- | What a handler returns. 'AsUnion' maps it onto 'EnResponses' positionally.
 data EnResult a
     = EnOk a
-    | EnClientError !ErrorEnvelopeWire     -- ^ 400
-    | EnUnprocessable !ErrorEnvelopeWire   -- ^ 422
-    | EnUnavailable !ErrorEnvelopeWire     -- ^ 503
+    | EnClientError !ProblemDetails          -- ^ 400
+    | EnPreconditionFailed !ProblemDetails   -- ^ 412
+    | EnUnprocessable !ProblemDetails        -- ^ 422
+    | EnInternal !ProblemDetails             -- ^ 500
+    | EnUnavailable !ProblemDetails          -- ^ 503
     deriving stock (Eq, Show)
 ```
 
 Write the `AsUnion` instance by hand rather than deriving it via `GenericAsUnion`: the
 generic route needs `Generics.SOP.Generic` and ties constructor order to the response
-list implicitly, whereas the hand-written instance states the correspondence in four
-lines and fails loudly if the list changes. The final `fromUnion` equation
-(`S (S (S (S x))) -> case x of {}`) satisfies the pattern checker; it needs `EmptyCase`,
+list implicitly, whereas the hand-written instance states the correspondence explicitly
+and fails loudly if the list changes. The final `fromUnion` equation
+(`S (S (S (S (S (S x)))))) -> case x of {}`) satisfies the pattern checker; it needs `EmptyCase`,
 which `GHC2024` already implies.
 
 ```haskell
 instance
     AsUnion
         '[ Respond 200 desc a
-         , Respond 400 "Invalid request" ErrorEnvelopeWire
-         , Respond 422 "Resolution limit exceeded" ErrorEnvelopeWire
-         , Respond 503 "Tuple store unavailable" ErrorEnvelopeWire
+         , RespondAs ProblemJSON 400 "Invalid request" ProblemDetails
+         , RespondAs ProblemJSON 412 "Write precondition failed" ProblemDetails
+         , RespondAs ProblemJSON 422 "Resolution limit exceeded" ProblemDetails
+         , RespondAs ProblemJSON 500 "Internal error" ProblemDetails
+         , RespondAs ProblemJSON 503 "Tuple store unavailable" ProblemDetails
          ]
         (EnResult a)
 ```
@@ -813,7 +829,7 @@ data EnApi mode = EnApi
     { writeTuples ::
         mode :- "v1" :> "relationships"
              :> ReqBody '[JSON] WriteTuplesRequestWire
-             :> MultiVerb 'POST '[JSON]
+             :> MultiVerb 'POST '[JSON, ProblemJSON]
                   (EnResponses "Consistency token for the write" WriteTuplesResponseWire)
                   (EnResult WriteTuplesResponseWire)
     , … -- one field per operation, each ending in its own MultiVerb
@@ -884,7 +900,7 @@ enOpenApi = toOpenApi (Proxy :: Proxy EnAPI)
 No hand-attached default error response is needed: because M3b made the error statuses
 `MultiVerb` alternatives, the fork's `IsSwaggerResponseList` instance emits a
 status-keyed `responses` map per operation, so 400/422/503 and their
-`ErrorEnvelopeWire` schema appear automatically. `ErrorEnvelopeWire` therefore needs a
+`ProblemDetails` schema appear automatically. `ProblemDetails` therefore needs a
 `ToSchema` instance alongside the request/response types.
 
 Extend the served API (server-only — keep `EnAPI` as the client-facing six operations so
@@ -978,8 +994,8 @@ Acceptance is observable behavior:
    stopping PostgreSQL (`pg_ctl stop -D "$PGDATA"`) and issuing a check yields 503 with
    code `store_error` and `"retryable":true`, with no SQL text in the body (restart
    PostgreSQL afterwards); truncated JSON yields 400 `malformed_request_body`. Every
-   one of these bodies has exactly the keys `code`, `message`, `retryable` and
-   `Content-Type: application/json`.
+   one of these bodies has exactly the RFC 9457 members `type`, `title`, `status`, and
+   `detail`, plus `code` and `retryable`, under `Content-Type: application/problem+json`.
 4. Typed errors: every handler-producible status is an alternative of the API type. In
    `en-servant/test/Main.hs`, an oversized batch returns `EnClientError` with code
    `batch_too_large` and an unknown permission returns `EnClientError` with code
@@ -1023,10 +1039,13 @@ Changed interfaces (all full module paths):
   `ExpandRequestWire`, `ExpandNodeWire`, `ExpandStateWire`, `ExpandTreeWire`,
   `WriteTuplesRequestWire`, `DeleteTuplesRequestWire`, `WriteTuplesResponseWire`;
   `app` switches to `serveWithContext` with `ErrorFormatters`; each route becomes a
-  `MultiVerb 'POST '[JSON] (EnResponses desc a) (EnResult a)` (M3b), and the module
+  `MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses desc a) (EnResult a)` (M3b), and the module
   gains `EnResponses`, `EnResult (..)`, and the hand-written `AsUnion` instance.
-- `En.Servant.Seam` (`en-servant/src/En/Servant/Seam.hs`): `ErrorWire` replaced by
-  `ErrorEnvelopeWire { code :: Text, message :: Text, retryable :: Bool }`; new
+- `En.Servant.Problem` (`en-servant/src/En/Servant/Problem.hs`): owns
+  `ProblemDetails { problemType :: Text, title :: Text, status :: Int, detail :: Text,
+  code :: Text, retryable :: Bool }`, the `ProblemJSON` media type, the error catalog, and
+  the shared Servant/WAI renderers.
+- `En.Servant.Seam` (`en-servant/src/En/Servant/Seam.hs`): uses `ProblemDetails`; new
   `EnFault` with `enErrorToFault :: EnError -> EnFault` implementing the M3 mapping
   table, plus `invalidRequest`, `batchTooLarge`, `faultToServerError`, and
   `logEnError`; `jsonError` removed in favor of `faultToServerError`;
@@ -1037,7 +1056,7 @@ Changed interfaces (all full module paths):
   the envelope with code `permission_denied`. Still throws — it is an embedded-host
   helper, not an `EnAPI` operation.
 - New module `En.Servant.OpenApi` (`en-servant/src/En/Servant/OpenApi.hs`):
-  `enOpenApi :: OpenApi` plus `ToSchema` instances (including `ErrorEnvelopeWire`);
+  `enOpenApi :: OpenApi` plus `ToSchema` instances (including `ProblemDetails`);
   `exposed-modules` updated in `en-servant/en-servant.cabal`.
 - `En.Client` (`en-client/src/En/Client.hs`): **breaking Haskell-API change** — each
   `EnClient` field is re-typed from `… -> ClientM X` to `… -> ClientM (EnResult X)`,
@@ -1053,7 +1072,7 @@ to `en-core`, `en-postgres`, or `en-biscuit`.
 
 Wire contract at the end (the artifact other plans and
 `docs/masterplans/9-complete-the-en-api-surface.md` build on): six operations under
-`/v1`, the M1 JSON grammar, the `{code, message, retryable}` envelope with codes
+`/v1`, the M1 JSON grammar, the RFC 9457 problem document with codes
 `unknown_relation`, `schema_violation`, `missing_caveat_context`,
 `invalid_consistency_token`, `resolution_limit_exceeded`, `store_error`,
 `invalid_request`, `batch_too_large`, `malformed_request_body`, `not_found`,
@@ -1120,3 +1139,24 @@ conversion unchanged.
 
 Sections revised: Milestone 2 (`EnAPI` block and positional-pattern comment), Milestone 3b
 (`EnAPI` block and positional-server comment), this Revision Note.
+
+
+## Revision Note — 2026-08-25 (external: EP-61)
+
+**What changed.** ExecPlan 61,
+`docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md`,
+moved the error body this plan established to RFC 9457 `ProblemDetails`. Milestones 3 and
+3b now show the live six-member body (`type`, `title`, `status`, `detail`, `code`, and
+`retryable`), `RespondAs ProblemJSON` error alternatives, and the added `412` and `500`
+arms. The success alternatives remain ordinary JSON.
+
+**What did not change.** The `MultiVerb` response model remains the one this plan
+introduced: statuses live in a type-level response list, handlers return a result sum, and
+the hand-written `AsUnion` plus its exhaustiveness witness make positional drift fail at
+compile time. Every machine-readable `code` string named by this plan survives verbatim;
+request-specific `message` prose moved to `detail`, while `title` and `status` were added.
+The media type changed from `application/json` to `application/problem+json` only for
+error responses.
+
+Sections revised: Progress, Decision Log, Outcomes & Retrospective, Milestones 3 and 3b,
+Validation and Acceptance, Interfaces and Dependencies, and this Revision Note.

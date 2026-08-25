@@ -117,10 +117,11 @@ operation. The exact commands and expected output are in Validation and Acceptan
       operation, add the conformance tests (errors keyed by `application/problem+json` and
       successes not; every documented code present in the catalog at the status it is sent with;
       security on every operation), regenerate and check in `docs/api/openapi.json`.
-- [ ] Milestone 7 — Update the documents of record: amend
+- [x] (2026-08-25 23:23Z) Milestone 7 — Updated the documents of record: amended
       `docs/plans/35-version-the-wire-contract-and-type-the-error-model.md` (which specifies the
-      `ErrorEnvelopeWire` contract this plan replaces), and mark follow-ups (1) through (4) closed
-      in `docs/plans/59-convert-en-servant-to-namedroutes-and-vertical-slices.md`.
+      former error contract this plan replaces), and marked follow-ups (1) through (4) closed
+      in `docs/plans/59-convert-en-servant-to-namedroutes-and-vertical-slices.md`; both plans now
+      name the live `ProblemDetails` contract and canonical `mori://` catalog URIs.
 
 
 ## Surprises & Discoveries
@@ -604,10 +605,40 @@ operation. The exact commands and expected output are in Validation and Acceptan
 
 ## Outcomes & Retrospective
 
-Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
-Compare the result against the original purpose.
+Implementation completed 2026-08-25. The HTTP contract now uses one RFC 9457
+`ProblemDetails` body and `application/problem+json` media type across typed `MultiVerb`
+alternatives, thrown Servant errors, framework routing errors, standalone authentication and
+rate-limit middleware, and readiness failures. Every prior machine `code` survives verbatim.
+The response model gained a truthful `500` path for internal faults, grant minting exposes its
+`403` and `404` outcomes as typed values, and the generated OpenAPI document declares both the
+problem media type and the standalone server's bearer requirement. The document remains derived
+from the route types; `narrowSuccessContent` only removes the client-workaround media type from
+successful responses.
 
-(To be filled during and after implementation.)
+The implementation validated two assumptions rather than copying them blindly. The released
+`servant-openapi-hs` already handles each `RespondAs` error alternative correctly, so repair is
+needed only for successful response content maps. The released `servant-client-core` still
+checks a `MultiVerb` response Content-Type against the verb-wide content-type list, so every
+affected verb must remain widened to `'[JSON, ProblemJSON]`. Structural matching against the
+resolved Hasql 1.10.3.7 constructors keeps genuine database failures at retryable `503` while
+decoder/schema mismatches become non-retryable `500`.
+
+Two follow-ups remain deliberately out of scope:
+
+1. **Health-endpoint conformance.** `en` still serves hand-written `/healthz` and `/readyz`.
+   The fleet standard at `mori://shinzui/haskell-jitsurei/docs/api-health-endpoints` requires
+   `/health/live` and `/health/ready` from the released `servant-health` package. That URL and
+   implementation migration needs its own ExecPlan.
+2. **Upstream Servant client report.** Report the `servant-client-core` `HasClient MultiVerb`
+   defect that validates the response Content-Type against the verb's full list instead of the
+   selected response alternative. It forces the `'[JSON, ProblemJSON]` widening on every service
+   adopting this pattern. The sibling `servant-openapi-hs` defect has already been fixed and
+   released; this client defect has not.
+
+ADR distillation: no new project ADR is warranted. RFC 9457, the route/error typing convention,
+and bearer-documentation rules are cross-fleet standards owned by the canonical Haskell catalog;
+the two local compatibility choices are narrow dependency workarounds documented beside the code,
+covered by conformance tests, and recorded above with their removal conditions.
 
 
 ## Context and Orientation
