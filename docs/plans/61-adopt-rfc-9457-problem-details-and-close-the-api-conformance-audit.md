@@ -5,6 +5,7 @@ title: "Adopt RFC 9457 problem details and close the API conformance audit"
 kind: exec-plan
 created_at: 2026-07-22T04:59:56Z
 intention: "intention_01ky42xb8mebsv979g07nrhwp9"
+master_plan: "docs/masterplans/11-bring-en-into-conformance-with-the-haskell-jitsurei-pattern-catalog.md"
 ---
 
 # Adopt RFC 9457 problem details and close the API conformance audit
