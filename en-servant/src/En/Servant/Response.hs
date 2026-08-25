@@ -57,6 +57,7 @@ type EnResponses (description :: Symbol) a =
      RespondAs ProblemJSON 400 "Invalid request" ProblemDetails,
      RespondAs ProblemJSON 412 "Write precondition failed" ProblemDetails,
      RespondAs ProblemJSON 422 "Resolution limit exceeded" ProblemDetails,
+     RespondAs ProblemJSON 500 "Internal error" ProblemDetails,
      RespondAs ProblemJSON 503 "Tuple store unavailable" ProblemDetails
    ]
 
@@ -69,6 +70,8 @@ data EnResult a
     EnPreconditionFailed !ProblemDetails
   | -- | 422
     EnUnprocessable !ProblemDetails
+  | -- | 500
+    EnInternal !ProblemDetails
   | -- | 503
     EnUnavailable !ProblemDetails
   deriving stock (Eq, Show)
@@ -82,6 +85,7 @@ instance
        RespondAs ProblemJSON 400 "Invalid request" ProblemDetails,
        RespondAs ProblemJSON 412 "Write precondition failed" ProblemDetails,
        RespondAs ProblemJSON 422 "Resolution limit exceeded" ProblemDetails,
+       RespondAs ProblemJSON 500 "Internal error" ProblemDetails,
        RespondAs ProblemJSON 503 "Tuple store unavailable" ProblemDetails
      ]
     (EnResult a)
@@ -91,14 +95,16 @@ instance
     EnClientError envelope -> S (Z (I envelope))
     EnPreconditionFailed envelope -> S (S (Z (I envelope)))
     EnUnprocessable envelope -> S (S (S (Z (I envelope))))
-    EnUnavailable envelope -> S (S (S (S (Z (I envelope)))))
+    EnInternal envelope -> S (S (S (S (Z (I envelope)))))
+    EnUnavailable envelope -> S (S (S (S (S (Z (I envelope))))))
   fromUnion = \case
     Z (I value) -> EnOk value
     S (Z (I envelope)) -> EnClientError envelope
     S (S (Z (I envelope))) -> EnPreconditionFailed envelope
     S (S (S (Z (I envelope)))) -> EnUnprocessable envelope
-    S (S (S (S (Z (I envelope))))) -> EnUnavailable envelope
-    S (S (S (S (S impossible)))) -> case impossible of {}
+    S (S (S (S (Z (I envelope))))) -> EnInternal envelope
+    S (S (S (S (S (Z (I envelope)))))) -> EnUnavailable envelope
+    S (S (S (S (S (S impossible))))) -> case impossible of {}
 
 -- | Every 'EnFault' has a home in 'EnResponses'. This totality is why the list is shared.
 faultToResult :: EnFault -> EnResult a
@@ -106,6 +112,7 @@ faultToResult = \case
   BadRequestFault envelope -> EnClientError envelope
   PreconditionFailedFault envelope -> EnPreconditionFailed envelope
   UnprocessableFault envelope -> EnUnprocessable envelope
+  InternalFault envelope -> EnInternal envelope
   UnavailableFault envelope -> EnUnavailable envelope
 
 -- | Run a handler body that may fail with an 'EnFault', turning either outcome into

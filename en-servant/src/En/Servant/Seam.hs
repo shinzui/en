@@ -49,6 +49,7 @@ import En.Servant.Problem
     specBatchTooLarge,
     specConsistencyTokenExpired,
     specCycleDetected,
+    specInternalError,
     specInvalidConsistencyToken,
     specInvalidCursor,
     specInvalidRequest,
@@ -64,7 +65,7 @@ import En.Servant.Problem
   )
 import En.Tuple (CaveatContext, ObjectRef, Subject)
 import En.Watch qualified as Watch
-import Servant (Handler, ServerError (..), err400, err403, err404, err412, err422, err503, throwError)
+import Servant (Handler, ServerError (..), err400, err403, err404, err412, err422, err500, err503, throwError)
 import System.IO (stderr)
 
 type AppEffects = '[ConsistencyStore, TupleStore, Error EnError, Database, IOE]
@@ -164,6 +165,8 @@ data EnFault
     PreconditionFailedFault !ProblemDetails
   | -- | 422: the request was well-formed but exceeded an evaluation bound.
     UnprocessableFault !ProblemDetails
+  | -- | 500: en itself failed. Retrying the same request cannot help.
+    InternalFault !ProblemDetails
   | -- | 503: a dependency of en failed. Retryable.
     UnavailableFault !ProblemDetails
   deriving stock (Eq, Show)
@@ -199,6 +202,8 @@ enErrorToFault = \case
   WritePreconditionFailed description ->
     PreconditionFailedFault
       (problem specWritePreconditionFailed ("write precondition did not hold: " <> description))
+  InternalError _detail ->
+    InternalFault (problem specInternalError "en failed to process the request")
   StoreError _detail ->
     UnavailableFault (problem specStoreError "the tuple store failed; retry later")
 
@@ -234,15 +239,17 @@ faultToServerError = \case
   BadRequestFault details -> problemError err400 details
   PreconditionFailedFault details -> problemError err412 details
   UnprocessableFault details -> problemError err422 details
+  InternalFault details -> problemError err500 details
   UnavailableFault details -> problemError err503 details
 
 -- | The detail an operator needs and a caller must not see.
 --
--- Only 'StoreError' carries such detail today. EP-36's structured logging formalizes
--- this; until then, stderr.
+-- Store and internal errors carry operator-only detail. EP-36's structured logging
+-- formalizes this; until then, stderr.
 logEnError :: EnError -> IO ()
 logEnError = \case
   StoreError detail -> Text.hPutStrLn stderr ("en: store error: " <> detail)
+  InternalError detail -> Text.hPutStrLn stderr ("en: internal error: " <> detail)
   _ -> pure ()
 
 -- | Run an engine action under a snapshot, throwing on failure.

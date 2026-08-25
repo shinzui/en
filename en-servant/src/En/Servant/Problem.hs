@@ -23,6 +23,7 @@ module En.Servant.Problem
     specResolutionLimitExceeded,
     specCycleDetected,
     specWritePreconditionFailed,
+    specInternalError,
     specStoreError,
     specInvalidRequest,
     specBatchTooLarge,
@@ -163,7 +164,7 @@ withoutContentType = filter ((/= "Content-Type") . fst)
 specUnknownRelation, specSchemaViolation, specMissingCaveatContext :: ProblemSpec
 specMalformedConsistencyToken, specConsistencyTokenExpired, specInvalidConsistencyToken :: ProblemSpec
 specInvalidCursor, specResolutionLimitExceeded, specCycleDetected :: ProblemSpec
-specWritePreconditionFailed, specStoreError, specInvalidRequest :: ProblemSpec
+specWritePreconditionFailed, specInternalError, specStoreError, specInvalidRequest :: ProblemSpec
 specBatchTooLarge, specMalformedRequestBody, specNotFound :: ProblemSpec
 specPermissionDenied, specDecisionNotAllowed, specGrantNotMintable :: ProblemSpec
 specUnauthenticated, specRateLimited, specMethodNotAllowed :: ProblemSpec
@@ -184,6 +185,8 @@ specResolutionLimitExceeded = fixed "resolution_limit_exceeded" 422 "Resolution 
 specCycleDetected = fixed "cycle_detected" 422 "Cycle detected"
 
 specWritePreconditionFailed = fixed "write_precondition_failed" 412 "Write precondition failed"
+
+specInternalError = fixed "internal_error" 500 "Internal error"
 
 specStoreError = retryable "store_error" 503 "Store unavailable"
 
@@ -228,6 +231,7 @@ problemCatalog =
     specResolutionLimitExceeded,
     specCycleDetected,
     specWritePreconditionFailed,
+    specInternalError,
     specStoreError,
     specInvalidRequest,
     specBatchTooLarge,

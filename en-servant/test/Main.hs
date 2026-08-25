@@ -957,7 +957,7 @@ openApiDocumentTests = do
     ( \path ->
         assertEqual
           ("operation " <> Text.unpack path <> " documents its error responses")
-          ["200", "400", "412", "422", "503"]
+          ["200", "400", "412", "422", "500", "503"]
           (List.sort (objectKeys (document `at` "paths" `at` Key.fromText path `at` "post" `at` "responses")))
     )
     postPaths
@@ -1317,6 +1317,7 @@ errorModelTests = do
     "WritePreconditionFailed"
     (WritePreconditionFailed "must-exist: space:project-x#member@user:alice")
     (412, "write_precondition_failed", False)
+  mapsTo "InternalError" (InternalError secretDetail) (500, "internal_error", False)
   mapsTo "StoreError" (StoreError secretDetail) (503, "store_error", True)
 
   {- A precondition failure is an arbitration loss, not an outage. Retrying the same
@@ -1332,6 +1333,9 @@ errorModelTests = do
   assertBool
     "store_error problem hides the store's detail"
     (not (secretDetail `Text.isInfixOf` (problemOf (enErrorToFault (StoreError secretDetail))).detail))
+  assertBool
+    "internal_error problem hides the implementation detail"
+    (not (secretDetail `Text.isInfixOf` (problemOf (enErrorToFault (InternalError secretDetail))).detail))
 
   assertEqual
     "unknown_relation names the offending relation"
@@ -1392,6 +1396,7 @@ problemOf = \case
   BadRequestFault details -> details
   PreconditionFailedFault details -> details
   UnprocessableFault details -> details
+  InternalFault details -> details
   UnavailableFault details -> details
 
 -- | Freeze the JSON wire contract of every type in "En.Servant.API".

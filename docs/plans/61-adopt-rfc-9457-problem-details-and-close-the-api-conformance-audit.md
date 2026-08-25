@@ -99,7 +99,7 @@ operation. The exact commands and expected output are in Validation and Acceptan
       content-type list to `'[JSON, ProblemJSON]`, without which `en-client` rejects every error
       response at runtime. Add the WAI middleware that rewrites servant's empty `405` and install
       it inside `En.Servant.API.app`. Delete `ErrorEnvelopeWire`.
-- [ ] Milestone 3 — Add the `500` arm and stop mislabelling internal faults as retryable `503`s.
+- [x] (2026-08-25 22:42Z) Milestone 3 — Added the `500` arm and stopped mislabelling internal faults as retryable `503`s.
       Split `En.Error.EnError`'s store failures into a dependency outage and an internal fault,
       classify hasql's `SessionError` structurally in `en-postgres`, and grow the response list,
       the result sum, and the exhaustiveness witness.
@@ -124,6 +124,12 @@ operation. The exact commands and expected output are in Validation and Acceptan
 
 
 ## Surprises & Discoveries
+
+- Discovery (2026-08-25, EP-61 Milestone 3): Mori resolves `hasql/hasql` to a corpus checkout
+  whose current worktree is ahead of en's dependency, so the implementation was verified against
+  the authoritative Hackage 1.10.3.7 tarball as well as the corpus source. En resolves 1.10.3.7;
+  Hackage and upstream tags currently reach 2.0.1.0. The `SessionError` and `StatementError`
+  constructors used by the structural classifier are identical in the resolved release.
 
 - Discovery (2026-08-25, EP-61 Milestone 2): **the 405 rewrite must also wrap the OpenAPI-serving
   application.** The standalone host serves `appWithOpenApi`, not `app`, so installing the

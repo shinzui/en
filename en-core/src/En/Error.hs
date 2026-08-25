@@ -64,6 +64,10 @@ data EnError
     --       on it, and by the time the write ran that state was gone. Retrying without
     --       re-reading will fail again.
     WritePreconditionFailed Text
-  | -- | The underlying tuple store failed.
+  | -- | A dependency of en failed. Retrying may succeed once it recovers.
     StoreError Text
+  | -- | En itself failed, rather than one of its dependencies. Retrying the same
+    --       request cannot help; the detail is for operators and must not cross the
+    --       HTTP trust boundary.
+    InternalError Text
   deriving stock (Eq, Show)

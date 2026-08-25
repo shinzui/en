@@ -28,6 +28,7 @@ import En.Postgres.Revision
     transactionVisible,
     validateTokenMetadata,
   )
+import En.Postgres.TupleStore (sessionErrorToEnError)
 import En.Postgres.Watch
   ( WatchCursorState (..),
     decodeWatchCursor,
@@ -42,9 +43,11 @@ import En.Revision
     RevisionOrder (..),
     SchemaHash (..),
   )
+import Hasql.Errors qualified as Hasql
 
 main :: IO ()
 main = do
+  testSessionErrorClassification
   testOptimizedRevisionReader
   testWatchCursorCodec
   assertEqual
@@ -284,6 +287,33 @@ main = do
 
     gettersRun optimized request =
       snd <$> runResolve optimized request
+
+-- | Hasql mixes dependency failures and decoder/schema mismatches in 'SessionError'.
+-- Pin every top-level arm plus both statement-error classes so a future constructor or
+-- "simplification" to 'Hasql.isTransient' cannot silently turn internal bugs into retries.
+testSessionErrorClassification :: IO ()
+testSessionErrorClassification = do
+  store "connection" (Hasql.ConnectionSessionError "connection lost")
+  store "server statement" (statement (Hasql.ServerStatementError serverError))
+  internal "decoder statement" (statement (Hasql.UnexpectedColumnCountStatementError 2 1))
+  store "script" (Hasql.ScriptSessionError "SELECT broken" serverError)
+  internal "missing types" (Hasql.MissingTypesSessionError mempty)
+  internal "driver" (Hasql.DriverSessionError "protocol invariant failed")
+  where
+    serverError = Hasql.ServerError "40P01" "deadlock detected" Nothing Nothing Nothing
+    statement = Hasql.StatementSessionError 1 0 "SELECT 1" [] True
+
+    store label sessionError =
+      assertEqual
+        (label <> " is a retryable dependency failure")
+        (StoreError (Hasql.toDetailedText sessionError))
+        (sessionErrorToEnError sessionError)
+
+    internal label sessionError =
+      assertEqual
+        (label <> " is a non-retryable internal failure")
+        (InternalError (Hasql.toDetailedText sessionError))
+        (sessionErrorToEnError sessionError)
 
 -- | The watch cursor's codec and its two fail-closed guards.
 --

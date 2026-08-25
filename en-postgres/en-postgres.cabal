@@ -66,6 +66,7 @@ test-suite en-postgres-revision-tests
     , effectful-core
     , en-core
     , en-postgres
+    , hasql
     , text
     , time
 

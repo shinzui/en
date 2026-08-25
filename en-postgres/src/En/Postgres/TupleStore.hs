@@ -11,6 +11,7 @@ module En.Postgres.TupleStore
     reapDeletedTuplesSession,
     reapDeletedTuplesBatchSession,
     pruneTransactionsBatchSession,
+    sessionErrorToEnError,
   )
 where
 
@@ -164,7 +165,22 @@ interpretTupleStorePostgres config readOptimizedRevision =
       orThrow =<< runSession (reapDeletedTuplesSession horizon)
   where
     orThrow =
-      either (throwError . StoreError . Hasql.toDetailedText) pure
+      either (throwError . sessionErrorToEnError) pure
+
+-- | Preserve dependency outages as retryable store failures while classifying
+-- decoder/schema/driver mismatches as bugs in en. 'Hasql.isTransient' is too coarse
+-- here: it marks every statement error non-transient, including PostgreSQL's
+-- @deadlock_detected@ and other server-side arbitration failures that callers may retry.
+sessionErrorToEnError :: Hasql.SessionError -> EnError
+sessionErrorToEnError sessionError =
+  let details = Hasql.toDetailedText sessionError
+   in case sessionError of
+        Hasql.ConnectionSessionError _ -> StoreError details
+        Hasql.StatementSessionError _ _ _ _ _ (Hasql.ServerStatementError _) -> StoreError details
+        Hasql.StatementSessionError {} -> InternalError details
+        Hasql.ScriptSessionError {} -> StoreError details
+        Hasql.MissingTypesSessionError _ -> InternalError details
+        Hasql.DriverSessionError _ -> InternalError details
 
 -- | Resolve a caller's cursor to the row id it names, rejecting a malformed one.
 --
@@ -184,7 +200,7 @@ resolveCursor =
 -- token that cannot see the write it was minted for.
 mintToken :: (Error EnError :> es) => ConsistencyConfig -> Anchor -> Eff es ConsistencyToken
 mintToken config anchor =
-  either (throwError . StoreError . ("could not mint write token: " <>)) pure (tokenFromAnchor config anchor)
+  either (throwError . InternalError . ("could not mint write token: " <>)) pure (tokenFromAnchor config anchor)
 
 uncachedOptimizedRevision ::
   (Database :> es, Error EnError :> es) =>
@@ -193,7 +209,7 @@ uncachedOptimizedRevision =
   orThrow =<< runSession headRevisionSession
   where
     orThrow =
-      either (throwError . StoreError . Hasql.toDetailedText) pure
+      either (throwError . sessionErrorToEnError) pure
 
 cachedOptimizedRevision ::
   (Database :> es, IOE :> es, Error EnError :> es) =>

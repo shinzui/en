@@ -5,7 +5,7 @@
 -- the host root (e.g. @http:\/\/localhost:8080@) and the client appends @\/v1@ itself.
 --
 -- Every operation answers with an 'EnResult'. Engine and validation failures arrive as
--- 'EnClientError', 'EnUnprocessable', or 'EnUnavailable' — values to pattern-match, each
+-- 'EnClientError', 'EnUnprocessable', 'EnInternal', or 'EnUnavailable' — values to pattern-match, each
 -- carrying an 'En.Servant.Problem.ProblemDetails' whose @code@ is stable and whose
 -- @retryable@ says whether retrying can help. They are /not/ raised as
 -- 'Servant.Client.ClientError'; that is reserved for transport failures and for errors

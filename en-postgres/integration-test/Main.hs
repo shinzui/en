@@ -1739,8 +1739,8 @@ runDecodeStrictnessScenario connection = do
   corruptRevision <- runPgOrFail connection config TupleStore.headRevision
   corrupt <- runPg connection config (TupleStore.readStartingWithUser corruptRevision corruptQuery)
   assertBool
-    ("malformed caveat payload is a StoreError; got " <> show (fmap (.rows) corrupt))
-    (isStoreError corrupt)
+    ("malformed caveat payload is an InternalError; got " <> show (fmap (.rows) corrupt))
+    (isInternalError corrupt)
 
   -- 3. A zero-limit page returns nothing and skips nothing.
   TuplePage {rows = emptyRows, state = emptyState} <-
@@ -1843,9 +1843,9 @@ isPreconditionFailure = \case
   Left (WritePreconditionFailed _) -> True
   _ -> False
 
-isStoreError :: Either EnError a -> Bool
-isStoreError = \case
-  Left (StoreError _) -> True
+isInternalError :: Either EnError a -> Bool
+isInternalError = \case
+  Left (InternalError _) -> True
   _ -> False
 
 -- | The 'ConsistencyConfig' every scenario shares.
