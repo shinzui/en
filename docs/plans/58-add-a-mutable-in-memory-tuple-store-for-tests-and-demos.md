@@ -64,7 +64,9 @@ independent application instances cannot agree on its state. Production deployme
 - [x] M3: complete full validation. (2026-08-25; `cabal build all` exits 0,
       `cabal test all -j1` passes all eight suites, and `cabal run en-example` reaches the
       database-free listening message before an intentional Ctrl-C.)
-- [ ] Complete ADR distillation and write Outcomes & Retrospective.
+- [x] Complete ADR distillation and write Outcomes & Retrospective. (2026-08-25; durable
+      interpreter scope and the production boundary recorded in
+      `docs/adr/0003-the-in-memory-store-is-for-tests-and-demos-only.md`.)
 
 
 ## Surprises & Discoveries
@@ -110,12 +112,16 @@ independent application instances cannot agree on its state. Production deployme
 - 2026-08-25: after the example test compiled and passed, parallel `cabal test all` failed
   only because `en-biscuit-tests` reported `authorization rejected: Timeout` while the
   PostgreSQL integration suite ran concurrently. All other suites, including `en-example`,
-  passed. Full validation is being repeated with `-j1` to remove suite contention.
+  passed. The `-j1` rerun removed suite contention and passed.
 
 - 2026-08-25: the serial rerun confirms contention rather than regression: all eight suites
   pass under `nix develop -c cabal test all -j1`, including `en-biscuit-tests` and the
   PostgreSQL integration suite. The example smoke run prints `en-example listening on :8080`
   and its Alice grant message without opening a database connection.
+
+- 2026-08-25: this repository has no `just check-adr` recipe and `docs/adr` is not a
+  profile-governed OKF bundle. ADR 3 therefore follows the frontmatter and section convention
+  of ADRs 1 and 2 and is checked by the repository's ordinary formatting/diff validation.
 
 
 ## Decision Log
@@ -187,10 +193,40 @@ independent application instances cannot agree on its state. Production deployme
   this plan does not change the production storage boundary.
   Date: 2026-08-25.
 
+- Decision: distill the public interpreter's durable scope and production exclusion into
+  `docs/adr/0003-the-in-memory-store-is-for-tests-and-demos-only.md`.
+  Rationale: the initial refresh did not alter production architecture, but the completed
+  implementation establishes a lasting public interpreter and a deliberate server boundary.
+  Future `TupleStore` changes must know which semantics this interpreter mirrors, and future
+  deployment work must preserve the prohibition on selecting it in `en-server`.
+  Date: 2026-08-25.
+
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+ExecPlan 58 achieved its user-visible purpose. `en-core` now exports an opaque
+`InMemoryWorld` and paired mutable interpreters that implement all fourteen current
+`TupleStore` operations with historical row visibility, per-world tokens, stable row-id
+cursors, atomic touch/precondition semantics, relationship filters, net changelog reads, and
+a retained-history horizon. The core test suite proves a grant written through `writeTuples`
+changes both `check` and `lookup`, deletion reverses the decision at head, and the earlier
+exact snapshot remains truthful until reaping.
+
+`en-example` no longer passes a prebuilt list into the Kikan fixture. Startup creates a world,
+seeds Alice's grant through the public write effect, and reaches its listener without
+PostgreSQL. `docs/user/getting-started.md` now shows the same current effectful API and states
+the test/demo-only boundary. `En.Conformance.Kikan` remains unchanged.
+
+Validation completed with `cabal build all`, `cabal haddock en-core`, serial
+`cabal test all -j1` across all eight suites, `git diff --check`, and a live example smoke
+start. Parallel `cabal test all` exposed an existing resource-sensitive `en-biscuit` timeout;
+the serial run proved it was contention and not a behavior regression.
+
+The main lesson was that the July draft could not safely be implemented literally after seven
+subsequent storage plans landed. Refreshing first changed the work from an obsolete
+eight-operation, plain-insert fake into a complete interpreter of today's contract. The
+remaining follow-up is external: the Shōmei integration plan can replace its bespoke store
+with this one, but that repository was intentionally not edited here.
 
 
 ## Context and Orientation
