@@ -34,6 +34,7 @@ import Data.HashMap.Strict.InsOrd.Compat qualified as InsOrdHashMap
 import Data.OpenApi
   ( AdditionalProperties (..),
     Definitions,
+    HttpSchemeType (..),
     HttpStatusCode,
     NamedSchema (..),
     OpenApi,
@@ -43,9 +44,15 @@ import Data.OpenApi
     Referenced (..),
     Response,
     Schema,
+    SecurityDefinitions (..),
+    SecurityRequirement (..),
+    SecurityScheme (..),
+    SecuritySchemeType (..),
     ToSchema (..),
     additionalProperties,
+    allOf,
     allOperations,
+    components,
     content,
     declareSchemaRef,
     description,
@@ -62,6 +69,9 @@ import Data.OpenApi
     properties,
     required,
     responses,
+    schema,
+    security,
+    securitySchemes,
     title,
     type_,
     version,
@@ -132,7 +142,7 @@ import En.Servant.API
     problemMiddleware,
     server,
   )
-import En.Servant.Problem (ProblemDetails, problemJsonOptions)
+import En.Servant.Problem (ProblemDetails, ProblemSpec (..), problemCatalog, problemJsonOptions)
 import Servant
   ( Application,
     Context (..),
@@ -162,6 +172,9 @@ enOpenApi =
     & info . version .~ "v1"
     & info . description ?~ "Relationship-based authorization: check, lookup, expand, and write."
     & withOperationIds
+    & narrowSuccessContent
+    & withProblemCodes
+    & withSecurityScheme
 
 -- | Drop @application/problem+json@ from non-error responses' content maps.
 --
@@ -178,6 +191,55 @@ narrowSuccessContent =
     narrow responseStatus
       | responseStatus < 400 = _Inline . content %~ InsOrdHashMap.delete "application/problem+json"
       | otherwise = id
+
+-- | Narrow each declared error's @code@ member to the runtime catalog entries for
+-- that status. The derived 'ProblemDetails' reference remains the base schema; this
+-- adds only the status-specific enum, so documentation and rendering share one source.
+withProblemCodes :: OpenApi -> OpenApi
+withProblemCodes =
+  allOperations . responses . responses %~ InsOrdHashMap.mapWithKey annotate
+  where
+    annotate :: HttpStatusCode -> Referenced Response -> Referenced Response
+    annotate responseStatus response =
+      case codesAt responseStatus of
+        [] -> response
+        codes ->
+          response
+            & _Inline . content
+              %~ InsOrdHashMap.adjust
+                (schema . _Just %~ constrainCode codes)
+                "application/problem+json"
+
+    codesAt responseStatus =
+      [spec.code | spec <- problemCatalog, responseStatus == fromInteger (fromIntegral spec.status)]
+
+    constrainCode codes original =
+      Inline
+        ( mempty
+            & allOf ?~ [original]
+            & properties
+              .~ InsOrdHashMap.singleton
+                "code"
+                ( Inline
+                    ( mempty
+                        & type_ ?~ OpenApiTypeSingle OpenApiString
+                        & enum_ ?~ (Aeson.String <$> codes)
+                    )
+                )
+        )
+
+-- | Declare the bearer authentication enforced by @en-server@ and require it on
+-- every operation. @EN_AUTH_DISABLED=true@ is a local-development-only override;
+-- the published production contract remains authenticated.
+withSecurityScheme :: OpenApi -> OpenApi
+withSecurityScheme document =
+  document
+    & components . securitySchemes
+      .~ SecurityDefinitions (InsOrdHashMap.singleton "bearerAuth" bearer)
+    & allOperations . security %~ (requirement :)
+  where
+    bearer = SecurityScheme (SecuritySchemeHttp (HttpSchemeBearer Nothing)) Nothing
+    requirement = SecurityRequirement (InsOrdHashMap.singleton "bearerAuth" [])
 
 -- | Assign a stable @operationId@ to every operation, derived deterministically from its
 -- method and path, so a code generator consuming the checked-in @docs/api/openapi.json@ emits

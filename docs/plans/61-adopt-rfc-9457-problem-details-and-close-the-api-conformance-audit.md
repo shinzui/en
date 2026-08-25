@@ -110,7 +110,7 @@ operation. The exact commands and expected output are in Validation and Acceptan
       rejections in `en-server/app/Middleware.hs`, and the `/readyz` failure body in
       `en-server/app/Health.hs`. Delete the duplicated `errorBody` helper in favour of the shared
       renderer.
-- [ ] Milestone 6 — Close the OpenAPI half: narrow each **success** response's content map to the
+- [x] (2026-08-25 23:14Z) Milestone 6 — Closed the OpenAPI half: narrowed each **success** response's content map to the
       media type actually served (the errors arrive keyed correctly; see the 2026-08-25 Decision
       Log entry), bridge `ToSchema ProblemDetails` through
       the codec's own aeson `Options`, declare the bearer security scheme and require it on every

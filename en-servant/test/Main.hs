@@ -992,6 +992,65 @@ openApiDocumentTests = do
     ["200"]
     (List.sort (objectKeys (document `at` "paths" `at` "/v1/schema" `at` "get" `at` "responses")))
 
+  mapM_
+    ( \(path, statuses) ->
+        mapM_
+          ( \responseStatus ->
+              let contentKeys =
+                    objectKeys
+                      ( document
+                          `at` "paths"
+                          `at` Key.fromText path
+                          `at` "post"
+                          `at` "responses"
+                          `at` Key.fromText responseStatus
+                          `at` "content"
+                      )
+               in if responseStatus == "200"
+                    then
+                      assertBool
+                        ("success response for " <> Text.unpack path <> " must not advertise application/problem+json")
+                        ("application/problem+json" `notElem` contentKeys)
+                    else do
+                      assertEqual
+                        ("error response " <> Text.unpack responseStatus <> " for " <> Text.unpack path <> " has one problem media type")
+                        ["application/problem+json"]
+                        contentKeys
+                      assertEqual
+                        ("documented codes for " <> Text.unpack responseStatus <> " on " <> Text.unpack path <> " come from the catalog")
+                        (catalogCodesAt responseStatus)
+                        ( documentedCodes
+                            document
+                            path
+                            responseStatus
+                        )
+          )
+          statuses
+    )
+    responseExpectations
+  assertBool
+    "the schema success does not advertise application/problem+json"
+    ( "application/problem+json"
+        `notElem` objectKeys (document `at` "paths" `at` "/v1/schema" `at` "get" `at` "responses" `at` "200" `at` "content")
+    )
+
+  assertEqual
+    "openapi defines exactly the bearerAuth security scheme"
+    ["bearerAuth"]
+    (objectKeys (document `at` "components" `at` "securitySchemes"))
+  mapM_
+    ( \(label, operation) ->
+        assertEqual
+          (Text.unpack label <> " requires bearerAuth")
+          expectedSecurity
+          (operation `at` "security")
+    )
+    ( ("GET /v1/schema", document `at` "paths" `at` "/v1/schema" `at` "get")
+        : [ ("POST " <> path, document `at` "paths" `at` Key.fromText path `at` "post")
+          | path <- postPaths
+          ]
+    )
+
   assertBool
     "openapi document defines RFC 9457 problem details"
     ("ProblemDetails" `elem` objectKeys (document `at` "components" `at` "schemas"))
@@ -1066,6 +1125,32 @@ openApiDocumentTests = do
       ("/v1/grants", ["200", "400", "403", "404", "412", "422", "500", "503"])
         : [(path, sharedStatuses) | path <- sharedPostPaths]
     postPaths = fst <$> responseExpectations
+    expectedSecurity = Aeson.toJSON [Map.singleton ("bearerAuth" :: Text) ([] :: [Text])]
+
+    catalogCodesAt responseStatus =
+      List.sort
+        [ spec.code
+        | spec <- problemCatalog,
+          Text.pack (show spec.status) == responseStatus
+        ]
+
+    documentedCodes document path responseStatus =
+      List.sort
+        ( asTextList
+            ( document
+                `at` "paths"
+                `at` Key.fromText path
+                `at` "post"
+                `at` "responses"
+                `at` Key.fromText responseStatus
+                `at` "content"
+                `at` "application/problem+json"
+                `at` "schema"
+                `at` "properties"
+                `at` "code"
+                `at` "enum"
+            )
+        )
 
     asText :: Aeson.Value -> Text
     asText (Aeson.String text) = text
