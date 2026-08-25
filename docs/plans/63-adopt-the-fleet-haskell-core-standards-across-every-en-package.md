@@ -60,7 +60,7 @@ which consumes what this one builds.
       `default-language: GHC2024` plus `DeriveAnyClass`, `DuplicateRecordFields`,
       `OverloadedLabels`, `OverloadedStrings`, keeping each package's justified additions
       and deleting the ones GHC2024 already provides. Build and test after each package.
-- [ ] Milestone 2 — Turn on `-Werror=missing-fields` in the shared `common warnings`
+- [x] (2026-08-25T21:18:41Z) Milestone 2 — Turn on `-Werror=missing-fields` in the shared `common warnings`
       stanza, prove it bites with a deliberate temporary deletion, and fix anything it
       surfaces.
 - [ ] Milestone 3 — Convert the three prepositive `import qualified` lines to the
@@ -111,6 +111,18 @@ which consumes what this one builds.
   src/En/Schema.hs:49:46: error: [GHC-61689]
       Module ‘En.Schema.Internal’ does not export ‘unValidSchema’.
       Notice that ‘unValidSchema’ is a field selector ... suppressed by NoFieldSelectors.
+  ```
+
+- Discovery (2026-08-25, Milestone 2): **the targeted missing-handler guard fires as a
+  build error.** Temporarily omitting the `schema` field from the `EnApi` server record
+  made `cabal build all` fail with the exact warning group promoted to an error; restoring
+  the field returned the tree to a successful build.
+
+  ```text
+  src/En/Servant/API.hs:108:3: error: [GHC-20125]
+      [-Wmissing-fields, Werror=missing-fields]
+      Fields of ‘EnApi’ not initialised:
+          schema :: mode0 :- ("v1" :> NamedRoutes SchemaRoutes)
   ```
 
 (Add further entries as work proceeds.)
