@@ -48,11 +48,13 @@ independent application instances cannot agree on its state. Production deployme
 - [x] M1: document the test/demo-only boundary and validate `cabal build en-core` plus
       `cabal haddock en-core`. (2026-08-25; both exit 0, Haddock reports 100% coverage for
       `En.Store.InMemory`.)
-- [ ] M2: add focused `en-core/test/Main.hs` assertions for mutation, exact snapshots,
+- [x] M2: add focused `en-core/test/Main.hs` assertions for mutation, exact snapshots,
       consistency resolution, stable cursors, touch/precondition/filter operations,
-      changelog, reaping, and malformed tokens/cursors.
-- [ ] M2: prove `check` and `lookup` end to end over tuples written through the mutable
-      interpreter; validate `cabal test en-core`.
+      changelog, reaping, and malformed tokens/cursors. (2026-08-25; assertions written,
+      compiler/test corrections remain below.)
+- [x] M2: correct build or behavioral failures exposed by the new assertions. (2026-08-25)
+- [x] M2: prove `check` and `lookup` end to end over tuples written through the mutable
+      interpreter; validate `cabal test en-core`. (2026-08-25; both core suites pass.)
 - [ ] M3: migrate `en-example` from fixed Kikan fixture lists to a shared mutable world and
       seed its demo grant through `writeTuples`.
 - [ ] M3: update `docs/user/getting-started.md` with the public interpreter and its
@@ -85,6 +87,11 @@ independent application instances cannot agree on its state. Production deployme
 - 2026-08-25: the first M1 build reached `En.Store.InMemory` and failed because the explicit
   `En.Effect.TupleStore` import list omitted `TupleChange` while the implementation referred
   to it qualified. This is an import-list correction, not a design change.
+
+- 2026-08-25: the first M2 compiler pass rejected two record updates of `Tuple.subject`
+  because this test module imports several records with a `subject` field. The pagination
+  fixture now constructs `Tuple` positionally, matching the module's existing ambiguity
+  avoidance for `RelationshipFilter`.
 
 
 ## Decision Log

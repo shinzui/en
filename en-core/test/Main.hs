@@ -41,28 +41,39 @@ import En.Conformance.Kikan
 import En.Decision (ResidualDecision (..), rExclusion, rIntersection, rUnion)
 import En.Decision qualified as Decision
 import En.Effect.CachedTupleStore (cachedTupleStore)
-import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata))
+import En.Effect.ConsistencyStore (ConsistencyStore (..), ResolvedConsistency (..), TokenMetadata (TokenMetadata), resolveConsistency)
 import En.Effect.TupleStore
-  ( PageState (..),
+  ( ChangeKind (..),
+    ChangePage (..),
+    PageState (..),
+    Precondition (..),
     RelationshipFilter (..),
     StoreCursor (..),
     SubjectRelationFilter (..),
+    TupleChange (..),
     TupleFilter (..),
     TuplePage (..),
     TupleRow (..),
     TupleRowId (..),
     TupleStore (..),
+    TupleWriteRequest (..),
     UsersetQuery (..),
+    advanceGcHorizon,
     anyRelationshipFilter,
+    applyTupleWrites,
     countRelationships,
     deleteRelationships,
+    deleteTuples,
+    exactTupleFilter,
     headRevision,
     optimizedRevision,
     probeTuples,
     readAllTuples,
+    readChanges,
     readObjectRelation,
     readRelationships,
     readStartingWithUser,
+    reapDeletedTuples,
     validateRelationshipFilter,
     widenTupleFilter,
     writeTuples,
@@ -130,6 +141,7 @@ import En.SchemaCheck
     renderTupleOrphan,
     validateTuplesAgainstSchema,
   )
+import En.Store.InMemory qualified as MutableStore
 import En.Tuple
   ( CaveatContext (..),
     CaveatPayload (..),
@@ -336,6 +348,7 @@ main = do
   testCacheOperations
   testCachedTupleStore
   testStorePaging
+  testMutableInMemoryStore
   testRelationshipFilterValidation
   testRelationshipFilterMatching
   testWidenTupleFilterAgrees
@@ -1135,6 +1148,296 @@ testStorePaging = do
     "the in-memory store drains every row of a relation spanning four pages"
     [SubjectId (pagedUser index) | index <- [1 .. pagedRowCount]]
     (fmap ((.subject) . (.tuple)) drained)
+
+-- | The public mutable store is a historical interpreter, not another fixture list.
+--
+-- These assertions drive only exported effects. Together they pin the behaviors that
+-- distinguish it from 'En.Conformance.Kikan': exact snapshots, stable row identities,
+-- strict token/cursor ownership, real garbage collection, and the complete current
+-- mutation surface.
+testMutableInMemoryStore :: IO ()
+testMutableInMemoryStore = do
+  world <- MutableStore.newInMemoryWorld
+  initialRevision <- expectMutable "read initial revision" =<< runMutable world headRevision
+  initialCheck <-
+    expectMutable "check before write"
+      =<< runMutable
+        world
+        (Check.check mutableGraph FullyConsistent mutableContext (SubjectId mutableAlice) mutableView mutableDocument)
+  assertEqual "mutable store: check is denied before write" Denied initialCheck.decision
+
+  writeToken <- expectMutable "write grant" =<< runMutable world (writeTuples [mutableGrant])
+  exactPage <-
+    expectMutable "read exact write snapshot"
+      =<< runMutable world (readMutableAt (AtExactSnapshot writeToken) mutableDocument mutableViewer 10 Nothing)
+  assertEqual "mutable store: a write is visible at its token" [mutableGrant] (fmap (.tuple) exactPage.rows)
+
+  allowedAfterWrite <-
+    expectMutable "check after write"
+      =<< runMutable
+        world
+        (Check.check mutableGraph (AtLeastAsFresh writeToken) mutableContext (SubjectId mutableAlice) mutableView mutableDocument)
+  assertEqual "mutable store: check becomes allowed after write" Allowed allowedAfterWrite.decision
+
+  lookupAfterWrite <-
+    expectMutable "lookup after write"
+      =<< runMutable
+        world
+        ( Lookup.lookup
+            mutableGraph
+            FullyConsistent
+            (lookupRequest (SubjectId mutableAlice) mutableView (ObjectType "document") mutableContext (LookupLimit 10) Nothing)
+        )
+  assertEqual "mutable store: lookup observes a written grant" [allowed mutableDocument] lookupAfterWrite.objects
+
+  _identicalToken <- expectMutable "touch identical grant" =<< runMutable world (writeTuples [mutableGrant])
+  identicalPage <-
+    expectMutable "read after identical touch"
+      =<< runMutable world (readMutableAt FullyConsistent mutableDocument mutableViewer 10 Nothing)
+  assertEqual "mutable store: an identical touch preserves one live row" [mutableGrant] (fmap (.tuple) identicalPage.rows)
+
+  headBeforeFailure <- expectMutable "head before precondition failure" =<< runMutable world headRevision
+  failedWrite <-
+    runMutable
+      world
+      ( applyTupleWrites
+          TupleWriteRequest
+            { preconditions = [TupleMustNotExist (exactTupleFilter mutableGrant)],
+              writes = [mutableOtherGrant],
+              deletes = []
+            }
+      )
+  assertEqual
+    "mutable store: a failed precondition is typed"
+    (Left (WritePreconditionFailed "must-not-exist: document:alpha#viewer@user:alice"))
+    failedWrite
+  headAfterFailure <- expectMutable "head after precondition failure" =<< runMutable world headRevision
+  assertEqual "mutable store: a failed precondition does not advance head" headBeforeFailure headAfterFailure
+
+  _replacementToken <-
+    expectMutable "replace grant caveat"
+      =<< runMutable world (writeTuples [Tuple mutableDocument mutableViewer (SubjectId mutableAlice) (Just mutableCaveat)])
+  replacementPage <-
+    expectMutable "read caveat replacement"
+      =<< runMutable world (readMutableAt FullyConsistent mutableDocument mutableViewer 10 Nothing)
+  assertEqual
+    "mutable store: a differing caveat replaces the live row"
+    [Just mutableCaveat]
+    (fmap ((.caveat) . (.tuple)) replacementPage.rows)
+
+  deleteToken <- expectMutable "delete grant" =<< runMutable world (deleteTuples [mutableGrant])
+  deletedPage <-
+    expectMutable "read after delete"
+      =<< runMutable world (readMutableAt FullyConsistent mutableDocument mutableViewer 10 Nothing)
+  assertEqual "mutable store: delete hides the live row" [] deletedPage.rows
+  oldPage <-
+    expectMutable "read pre-delete exact snapshot"
+      =<< runMutable world (readMutableAt (AtExactSnapshot writeToken) mutableDocument mutableViewer 10 Nothing)
+  assertEqual "mutable store: exact snapshot survives delete" [mutableGrant] (fmap (.tuple) oldPage.rows)
+
+  deniedAfterDelete <-
+    expectMutable "check after delete"
+      =<< runMutable
+        world
+        (Check.check mutableGraph FullyConsistent mutableContext (SubjectId mutableAlice) mutableView mutableDocument)
+  assertEqual "mutable store: check becomes denied after delete" Denied deniedAfterDelete.decision
+
+  writeRevision <-
+    (.revision) <$> (expectMutable "resolve write token" =<< runMutable world (resolveConsistency (AtExactSnapshot writeToken)))
+  deleteRevision <-
+    (.revision) <$> (expectMutable "resolve delete token" =<< runMutable world (resolveConsistency (AtExactSnapshot deleteToken)))
+  touchChanges <-
+    expectMutable "read touch changes"
+      =<< runMutable world (readChanges initialRevision writeRevision Nothing 10 Nothing)
+  assertEqual
+    "mutable store: changelog reports the entering row"
+    [TupleChange ChangeTouch mutableGrant (TupleRowId "mem-row:1")]
+    touchChanges.changes
+  netChanges <-
+    expectMutable "read net changes"
+      =<< runMutable world (readChanges initialRevision deleteRevision Nothing 10 Nothing)
+  assertEqual "mutable store: a created-then-deleted grant is a net no-op" [] netChanges.changes
+
+  newerToken <- expectMutable "write newer grant" =<< runMutable world (writeTuples [mutableOtherGrant])
+  resolvedFresh <-
+    expectMutable "resolve at least as fresh"
+      =<< runMutable world (resolveConsistency (AtLeastAsFresh deleteToken))
+  newerHead <- expectMutable "read newer head" =<< runMutable world headRevision
+  assertEqual "mutable store: at-least-as-fresh chooses current head" newerHead resolvedFresh.revision
+  assertBool "mutable store: the newer write minted another token" (newerToken /= deleteToken)
+
+  testMutablePagination
+  testMutableFilters
+  testMutableFailuresAndReaping
+
+testMutablePagination :: IO ()
+testMutablePagination = do
+  world <- MutableStore.newInMemoryWorld
+  let grants =
+        [ Tuple mutableDocument mutableViewer (SubjectId (ObjectRef (ObjectType "user") ("user-" <> showText index))) Nothing
+        | index <- [1 :: Int .. 5]
+        ]
+      interleaved =
+        Tuple mutableDocument mutableViewer (SubjectId (ObjectRef (ObjectType "user") "user-6")) Nothing
+  snapshotToken <- expectMutable "write pagination fixture" =<< runMutable world (writeTuples grants)
+  firstPage <-
+    expectMutable "read pagination first page"
+      =<< runMutable world (readMutableAt (AtExactSnapshot snapshotToken) mutableDocument mutableViewer 2 Nothing)
+  firstCursor <-
+    case firstPage.state of
+      HasMore cursor -> pure cursor
+      other -> fail ("mutable store: expected first page cursor, got " <> show other)
+  _ <- expectMutable "interleave pagination write" =<< runMutable world (writeTuples [interleaved])
+  secondPage <-
+    expectMutable "read pagination second page"
+      =<< runMutable world (readMutableAt (AtExactSnapshot snapshotToken) mutableDocument mutableViewer 2 (Just firstCursor))
+  secondCursor <-
+    case secondPage.state of
+      HasMore cursor -> pure cursor
+      other -> fail ("mutable store: expected second page cursor, got " <> show other)
+  thirdPage <-
+    expectMutable "read pagination third page"
+      =<< runMutable world (readMutableAt (AtExactSnapshot snapshotToken) mutableDocument mutableViewer 2 (Just secondCursor))
+  assertEqual
+    "mutable store: row-id cursors survive an interleaved write"
+    grants
+    (fmap (.tuple) (firstPage.rows <> secondPage.rows <> thirdPage.rows))
+  assertEqual "mutable store: fixed snapshot pagination exhausts" Exhausted thirdPage.state
+
+testMutableFilters :: IO ()
+testMutableFilters = do
+  world <- MutableStore.newInMemoryWorld
+  _ <-
+    expectMutable "write filter fixture"
+      =<< runMutable world (writeTuples [mutableGrant, mutableOtherGrant])
+  let aliceFilter = subjectFilter "user" "alice"
+  matchCount <-
+    expectMutable "count mutable relationships"
+      =<< runMutable world do
+        ResolvedConsistency {revision} <- resolveConsistency FullyConsistent
+        countRelationships revision aliceFilter
+  assertEqual "mutable store: relationship count sees both grants" 2 matchCount
+  listed <-
+    expectMutable "list mutable relationships"
+      =<< runMutable world do
+        ResolvedConsistency {revision} <- resolveConsistency FullyConsistent
+        readRelationships revision aliceFilter 10 Nothing
+  assertEqual "mutable store: relationship read returns both grants" 2 (length listed.rows)
+  (deletedCount, _) <-
+    expectMutable "delete mutable relationships"
+      =<< runMutable world (deleteRelationships (objectTypeFilter "document"))
+  assertEqual "mutable store: delete-by-filter reports both rows" 2 deletedCount
+  remaining <-
+    expectMutable "read after mutable filter delete"
+      =<< runMutable world do
+        ResolvedConsistency {revision} <- resolveConsistency FullyConsistent
+        readAllTuples revision 10 Nothing
+  assertEqual "mutable store: delete-by-filter retires matches" [] remaining.rows
+
+testMutableFailuresAndReaping :: IO ()
+testMutableFailuresAndReaping = do
+  world <- MutableStore.newInMemoryWorld
+  foreignWorld <- MutableStore.newInMemoryWorld
+  writeToken <- expectMutable "write reap fixture" =<< runMutable world (writeTuples [mutableGrant])
+  foreignToken <- expectMutable "write foreign fixture" =<< runMutable foreignWorld (writeTuples [mutableGrant])
+  assertEqual
+    "mutable store: a foreign-world token is rejected"
+    (Left (InvalidConsistencyToken "token datastore does not match this in-memory world"))
+    =<< runMutable world (resolveConsistency (AtExactSnapshot foreignToken))
+  assertEqual
+    "mutable store: a malformed token is rejected"
+    (Left (MalformedConsistencyToken "token is not an in-memory token"))
+    =<< runMutable world (resolveConsistency (AtExactSnapshot (ConsistencyToken "not-a-token")))
+  currentRevision <- expectMutable "read revision for bad cursor" =<< runMutable world headRevision
+  assertEqual
+    "mutable store: a malformed cursor is rejected"
+    (Left (InvalidCursor "not-a-cursor"))
+    =<< runMutable world (readObjectRelation currentRevision mutableDocument mutableViewer 10 (Just (StoreCursor "not-a-cursor")))
+
+  _ <- expectMutable "delete reap fixture" =<< runMutable world (deleteTuples [mutableGrant])
+  _ <- expectMutable "advance past delete" =<< runMutable world (writeTuples [])
+  horizon <- expectMutable "advance mutable gc horizon" =<< runMutable world advanceGcHorizon
+  reaped <- expectMutable "reap mutable history" =<< runMutable world (reapDeletedTuples horizon)
+  assertEqual "mutable store: reaping drops the deleted historical row" 1 reaped
+  assertEqual
+    "mutable store: reaping expires an older exact token"
+    (Left (ConsistencyTokenExpired "token is older than the in-memory garbage-collection horizon"))
+    =<< runMutable world (resolveConsistency (AtExactSnapshot writeToken))
+
+runMutable ::
+  MutableStore.InMemoryWorld ->
+  Eff TestEffects a ->
+  IO (Either EnError a)
+runMutable world =
+  runEff . runErrorNoCallStack . MutableStore.runInMemoryStores world
+
+expectMutable :: String -> Either EnError a -> IO a
+expectMutable label =
+  either (fail . ((label <> ": ") <>) . show) pure
+
+readMutableAt ::
+  (ConsistencyStore :> es, TupleStore :> es) =>
+  Consistency ->
+  ObjectRef ->
+  RelationName ->
+  Int ->
+  Maybe StoreCursor ->
+  Eff es TuplePage
+readMutableAt consistency object relation limit cursor = do
+  ResolvedConsistency {revision} <- resolveConsistency consistency
+  readObjectRelation revision object relation limit cursor
+
+mutableSchema :: Schema
+mutableSchema =
+  testSchemaOrError do
+    userObject <- Schema.object "user" []
+    documentObject <-
+      Schema.object
+        "document"
+        [ Schema.relation "viewer" [Schema.subject "user"] Schema.this,
+          Schema.permission "view" (Schema.computed "viewer")
+        ]
+    Schema.build [userObject, documentObject]
+
+mutableGraph :: ReachabilityGraph
+mutableGraph =
+  either (error . show) id (compileSchema mutableSchema)
+
+mutableContext :: CaveatContext
+mutableContext =
+  CaveatContext Map.empty
+
+mutableAlice :: ObjectRef
+mutableAlice =
+  ObjectRef (ObjectType "user") "alice"
+
+mutableDocument :: ObjectRef
+mutableDocument =
+  ObjectRef (ObjectType "document") "alpha"
+
+mutableOtherDocument :: ObjectRef
+mutableOtherDocument =
+  ObjectRef (ObjectType "document") "beta"
+
+mutableViewer :: RelationName
+mutableViewer =
+  RelationName "viewer"
+
+mutableView :: RelationName
+mutableView =
+  RelationName "view"
+
+mutableGrant :: Tuple
+mutableGrant =
+  Tuple mutableDocument mutableViewer (SubjectId mutableAlice) Nothing
+
+mutableOtherGrant :: Tuple
+mutableOtherGrant =
+  Tuple mutableOtherDocument mutableViewer (SubjectId mutableAlice) Nothing
+
+mutableCaveat :: TupleCaveat
+mutableCaveat =
+  TupleCaveat (CaveatName "test_only") (CaveatPayload Map.empty)
 
 -- | The filter fixture, chosen so every subject shape and the caveat constraint are
 -- each distinguished by at least one filter below: a concrete subject, a type wildcard
