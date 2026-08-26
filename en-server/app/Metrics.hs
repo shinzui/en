@@ -21,16 +21,15 @@ module Metrics
 where
 
 import Data.ByteString.Builder (Builder, byteString, intDec, string7, toLazyByteString)
+import Data.Generics.Labels ()
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
-import Data.Text (Text)
 import Data.Text.Encoding qualified as Text
 import Data.Word (Word64)
--- Fields imported, not just the type: @En.Cache@ sets NoFieldSelectors, so the
--- @HasField@ instances behind @stats.hits@ exist only where the names are in scope.
 import En.Cache (CacheStats (..))
+import En.Prelude
 import GHC.Clock (getMonotonicTimeNSec)
 import Network.HTTP.Types (Status (..), hContentType, methodGet, status200)
 import Network.Wai (Middleware, Request (..), responseLBS, responseStatus)
@@ -41,6 +40,7 @@ data RequestStats = RequestStats
   { count :: !Int,
     totalDurationNs :: !Word64
   }
+  deriving stock (Generic)
 
 -- | Counters keyed by (path group, status class). Both label values are drawn from
 -- fixed sets, so the series count is bounded no matter what a caller requests.
@@ -64,8 +64,8 @@ metricsMiddleware (Metrics ref) inner request respond = do
   where
     mergeStats new old =
       RequestStats
-        { count = old.count + new.count,
-          totalDurationNs = old.totalDurationNs + new.totalDurationNs
+        { count = (old ^. #count) + (new ^. #count),
+          totalDurationNs = (old ^. #totalDurationNs) + (new ^. #totalDurationNs)
         }
 
 -- | Serve @GET \/metrics@ in the Prometheus text exposition format.
@@ -114,7 +114,7 @@ knownPaths =
 
 statusClass :: Status -> Text
 statusClass status =
-  case status.statusCode `div` 100 of
+  case statusCode status `div` 100 of
     1 -> "1xx"
     2 -> "2xx"
     3 -> "3xx"
@@ -128,19 +128,19 @@ render requests caches =
     [ family
         "en_http_requests_total"
         "Total HTTP requests handled, by path group and status class."
-        [(requestLabels labels, intDec stats.count) | (labels, stats) <- observations],
+        [(requestLabels labels, intDec (stats ^. #count)) | (labels, stats) <- observations],
       family
         "en_http_request_duration_seconds_sum"
         "Total time spent handling HTTP requests, in seconds."
-        [(requestLabels labels, seconds stats.totalDurationNs) | (labels, stats) <- observations],
+        [(requestLabels labels, seconds (stats ^. #totalDurationNs)) | (labels, stats) <- observations],
       family
         "en_http_request_duration_seconds_count"
         "Number of HTTP request durations observed."
-        [(requestLabels labels, intDec stats.count) | (labels, stats) <- observations],
-      cacheFamily "en_cache_hits_total" "Cache lookups served from the cache." (.hits),
-      cacheFamily "en_cache_misses_total" "Cache lookups that fell through to the store." (.misses),
-      cacheFamily "en_cache_inserts_total" "Entries written into the cache." (.inserts),
-      cacheFamily "en_cache_evictions_total" "Entries evicted from the cache." (.evictions)
+        [(requestLabels labels, intDec (stats ^. #count)) | (labels, stats) <- observations],
+      cacheFamily "en_cache_hits_total" "Cache lookups served from the cache." (^. #hits),
+      cacheFamily "en_cache_misses_total" "Cache lookups that fell through to the store." (^. #misses),
+      cacheFamily "en_cache_inserts_total" "Entries written into the cache." (^. #inserts),
+      cacheFamily "en_cache_evictions_total" "Entries evicted from the cache." (^. #evictions)
     ]
   where
     observations = Map.toList requests

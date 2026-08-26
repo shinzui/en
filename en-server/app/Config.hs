@@ -32,16 +32,17 @@ import Auth.Biscuit (SecretKey)
 import Data.Bifunctor (first)
 import Data.ByteString qualified as ByteString
 import Data.Char (toLower)
+import Data.Generics.Labels ()
 import Data.List (isPrefixOf)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes)
 import Data.Set qualified as Set
-import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import En.Biscuit.Keys (IssuerKeyId, parseSigningKeyText)
 import En.Budget (EvaluationBudget (..))
+import En.Prelude
 import Hasql.Decoders qualified as Decoders
 import Hasql.Encoders qualified as Encoders
 import Hasql.Session (Session)
@@ -59,12 +60,14 @@ data PoolConfig = PoolConfig
     idlenessTimeoutMs :: !Int,
     maxLifetimeMs :: !Int
   }
+  deriving stock (Generic)
 
 -- | Both files or neither; exactly one is a configuration error.
 data TlsConfig = TlsConfig
   { certFile :: !FilePath,
     keyFile :: !FilePath
   }
+  deriving stock (Generic)
 
 -- | Issuer configuration for @POST \/v1\/grants@, present only when
 -- @EN_BISCUIT_ISSUER_SECRET_KEY@ is set.
@@ -81,6 +84,7 @@ data BiscuitConfig = BiscuitConfig
     defaultTtlSeconds :: !Int,
     maxTtlSeconds :: !Int
   }
+  deriving stock (Generic)
 
 -- | What it takes to open the store and speak to it correctly.
 --
@@ -97,6 +101,7 @@ data StoreConfig = StoreConfig
     schemaPath :: !(Maybe FilePath),
     pool :: !PoolConfig
   }
+  deriving stock (Generic)
 
 data ServerConfig = ServerConfig
   { store :: !StoreConfig,
@@ -131,6 +136,7 @@ data ServerConfig = ServerConfig
     --     they say so — explicitly, in the process environment, before the signal arrives.
     schemaReloadForce :: !Bool
   }
+  deriving stock (Generic)
 
 -- | Every variable the server reads. Kept exhaustive so the documented configuration
 -- reference can be checked against it.
@@ -509,8 +515,8 @@ rejectDuplicateNames keys =
   where
     duplicates = reverse (snd (foldl' step (Set.empty, []) keys))
     step (seen, dups) key
-      | Set.member key.keyName seen = (seen, key.keyName : dups)
-      | otherwise = (Set.insert key.keyName seen, dups)
+      | Set.member (key ^. #keyName) seen = (seen, (key ^. #keyName) : dups)
+      | otherwise = (Set.insert (key ^. #keyName) seen, dups)
 
 -- * Variable lookup and value parsers
 

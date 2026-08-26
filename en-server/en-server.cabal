@@ -55,6 +55,7 @@ executable en-server
     , en-core
     , en-postgres
     , en-servant
+    , generic-lens                              >=2.2  && <2.4
     , hasql
     , hasql-pool                                ^>=1.4
     , hs-opentelemetry-api                      >=1.0  && <1.1

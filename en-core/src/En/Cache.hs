@@ -22,12 +22,13 @@ import En.Effect.TupleStore (StoreCursor, UsersetQuery (..))
 import En.Revision (DatastoreId, Revision (..), SchemaHash)
 import En.Schema (ObjectType, RelationName)
 import En.Tuple (CaveatContext, ObjectRef, Subject)
+import GHC.Generics (Generic)
 
 data CacheConfig = CacheConfig
   { enabled :: !Bool,
     maxEntries :: !Int
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data CacheStats = CacheStats
   { hits :: !Int,
@@ -35,7 +36,7 @@ data CacheStats = CacheStats
     inserts :: !Int,
     evictions :: !Int
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data Cache key value = Cache
   { config :: !CacheConfig,

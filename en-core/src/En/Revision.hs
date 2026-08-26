@@ -10,6 +10,7 @@ module En.Revision
 where
 
 import Data.Text (Text)
+import GHC.Generics (Generic)
 
 -- | An opaque datastore revision. For the PostgreSQL datastore this wraps a
 -- @pg_snapshot@ (xmin:xmax:xip); see @En.Postgres.Revision@. Revisions form a
@@ -20,7 +21,7 @@ newtype Revision = Revision
   { -- | datastore-specific opaque encoding (placeholder)
     revisionEncoding :: Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 newtype DatastoreId = DatastoreId Text
   deriving stock (Eq, Ord, Show)

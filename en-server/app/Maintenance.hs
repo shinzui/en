@@ -29,8 +29,8 @@ where
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeAsyncException, SomeException, fromException, throwIO, try)
 import Control.Monad (forever)
+import Data.Generics.Labels ()
 import Data.Int (Int64)
-import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Effectful (Eff)
@@ -38,6 +38,7 @@ import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError)
 import En.Postgres.Database (runSession)
 import En.Postgres.TupleStore (pruneTransactionsBatchSession, reapDeletedTuplesBatchSession)
+import En.Prelude
 import En.Servant.Seam (AppEffects)
 import Hasql.Errors qualified as Hasql
 import Hasql.Session (Session)
@@ -48,6 +49,7 @@ data MaintenanceConfig = MaintenanceConfig
     -- | Rows deleted per statement. Each batch is its own transaction.
     batchSize :: !Int
   }
+  deriving stock (Generic)
 
 -- | The natural transformation @Main@ builds; the loop borrows a pooled connection
 -- per session through it, exactly as a request handler does.
@@ -55,12 +57,12 @@ type RunApp = forall a. Eff AppEffects a -> IO (Either EnError a)
 
 describeMaintenance :: MaintenanceConfig -> Text
 describeMaintenance config
-  | config.intervalSeconds <= 0 = "disabled"
+  | (config ^. #intervalSeconds) <= 0 = "disabled"
   | otherwise =
       "enabled, intervalSeconds="
-        <> Text.pack (show config.intervalSeconds)
+        <> Text.pack (show (config ^. #intervalSeconds))
         <> ", batchSize="
-        <> Text.pack (show config.batchSize)
+        <> Text.pack (show (config ^. #batchSize))
 
 -- | Sleep, run a pass, repeat. Never returns.
 --
@@ -73,9 +75,9 @@ describeMaintenance config
 -- cancellation would be swallowed and the thread would outlive the server.
 runMaintenanceLoop :: MaintenanceConfig -> RunApp -> IO ()
 runMaintenanceLoop config runApp
-  | config.intervalSeconds <= 0 = pure ()
+  | (config ^. #intervalSeconds) <= 0 = pure ()
   | otherwise = forever do
-      threadDelay (config.intervalSeconds * 1_000_000)
+      threadDelay ((config ^. #intervalSeconds) * 1_000_000)
       outcome <- try @SomeException (runPass config runApp)
       case outcome of
         Right () -> pure ()
@@ -129,10 +131,10 @@ runPass config runApp =
     drain session = go 0 0
       where
         go !removedSoFar !batches =
-          runBatch runApp (session config.batchSize) >>= \case
+          runBatch runApp (session (config ^. #batchSize)) >>= \case
             Left err -> pure (Left err)
             Right removed
-              | removed < fromIntegral config.batchSize ->
+              | removed < fromIntegral (config ^. #batchSize) ->
                   pure (Right (removedSoFar + removed, batches + 1))
               | otherwise ->
                   go (removedSoFar + removed) (batches + 1)

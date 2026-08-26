@@ -67,6 +67,7 @@ import En.Revision
     RevisionOrder (..),
     SchemaHash (..),
   )
+import GHC.Generics (Generic)
 import Numeric (readDec, showHex)
 
 -- | A PostgreSQL MVCC snapshot, rendered as @xmin:xmax:xip1,xip2,...@.
@@ -75,7 +76,7 @@ data PgSnapshot = PgSnapshot
     xmax :: !Word64,
     xip :: ![Word64]
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data TokenPayload = TokenPayload
   { datastoreId :: !DatastoreId,
@@ -83,20 +84,20 @@ data TokenPayload = TokenPayload
     revision :: !Revision,
     expiresAt :: !(Maybe UTCTime)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data ConsistencyConfig = ConsistencyConfig
   { datastoreId :: !DatastoreId,
     schemaHash :: !SchemaHash,
     gcWindow :: !Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data OptimizedRevisionConfig = OptimizedRevisionConfig
   { enabled :: !Bool,
     ttl :: !NominalDiffTime
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | A single-cell cache whose entry expires once older than the configured TTL.
 --

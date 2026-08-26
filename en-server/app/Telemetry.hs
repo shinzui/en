@@ -11,7 +11,7 @@ module Telemetry
 where
 
 import Control.Exception (bracket)
-import Control.Monad (void)
+import En.Prelude
 import Network.Wai (Middleware)
 import OpenTelemetry.Attributes qualified as Attributes
 import OpenTelemetry.Instrumentation.Wai (newOpenTelemetryWaiMiddleware)
@@ -22,7 +22,7 @@ import OpenTelemetry.Trace qualified as OTel
 data TelemetryConfig
   = TelemetryDisabled
   | TelemetryEnabled
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | Bracket both global providers for one server lifetime.
 --

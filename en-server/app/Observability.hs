@@ -122,7 +122,7 @@ logLine timestamp request status elapsedNs correlation =
     [ "time" .= timestamp,
       "method" .= decode (requestMethod request),
       "path" .= decode (rawPathInfo request),
-      "status" .= status.statusCode,
+      "status" .= statusCode status,
       "duration_ms" .= (fromIntegral elapsedNs / 1e6 :: Double),
       "user_agent" .= (decode <$> lookup hUserAgent (requestHeaders request))
     ]
@@ -141,7 +141,7 @@ correlationFields request =
       pure
         if OTel.isValid context
           then
-            [ "trace_id" .= traceIdBaseEncodedText Base16 context.traceId,
-              "span_id" .= spanIdBaseEncodedText Base16 context.spanId
+            [ "trace_id" .= traceIdBaseEncodedText Base16 (OTel.traceId context),
+              "span_id" .= spanIdBaseEncodedText Base16 (OTel.spanId context)
             ]
           else []

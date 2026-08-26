@@ -31,6 +31,7 @@ import En.Schema
     unValidSchema,
     validateSchema,
   )
+import GHC.Generics (Generic)
 
 -- | The compiled form of a 'Schema': everything @check@, @lookup@, and @expand@
 -- traverse, and nothing else.
@@ -44,7 +45,7 @@ data ReachabilityGraph = ReachabilityGraph
     caveats :: !(Map CaveatName CaveatDefinition),
     hash :: !SchemaHash
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data RelationRef = RelationRef
   { objectType :: !ObjectType,

@@ -1,30 +1,30 @@
 module Main (main) where
 
-import Config (BiscuitConfig (..), PoolConfig (..), ServerConfig (..), StoreConfig (..), TlsConfig (..), loadServerConfig, loadStoreConfig, validateGcWindow)
+import Config (BiscuitConfig (..), ServerConfig (..), StoreConfig (..), TlsConfig (..), loadServerConfig, loadStoreConfig, validateGcWindow)
 import Control.Concurrent.Async (withAsync)
 import Control.Concurrent.MVar (newMVar, withMVar)
 import Control.Exception (IOException, finally, try)
-import Control.Monad (foldM, guard)
+import Control.Monad (foldM)
 import Data.Aeson qualified as Aeson
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.ByteString.Lazy.Char8 qualified as LazyChar8
 import Data.Char (isSpace)
 import Data.Foldable (traverse_)
+import Data.Generics.Labels ()
 import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
-import Data.Proxy (Proxy (..))
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
-import Data.Time (DiffTime, getCurrentTime)
+import Data.Time (DiffTime)
 import Data.UUID qualified as UUID
 import Data.UUID.V4 qualified as UUID.V4
-import Effectful (Eff, IOE, liftIO, runEff, (:>))
+import Effectful (Eff, IOE, runEff, (:>))
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import En.Biscuit.Keys (IssuerKeyId (..))
 import En.Cache (Cache, CacheConfig (..), SubproblemKey, TupleReadKey, cacheStats, newCache)
 import En.Check (CheckCacheEnv (..), checkCachedWithBudget, checkWithBudget)
 import En.Decision (ResidualDecision)
 import En.Effect.CachedTupleStore (cachedTupleStore)
-import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore)
+import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleStore)
 import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError)
 import En.Lookup qualified as Lookup
@@ -34,13 +34,12 @@ import En.Postgres.Datastore (resolveDatastoreIdSession)
 import En.Postgres.Revision (ConsistencyConfig (..), OptimizedRevisionCache, OptimizedRevisionConfig (..), newOptimizedRevisionCache, runConsistencyStorePostgres)
 import En.Postgres.TupleStore (runTupleStorePostgres, runTupleStorePostgresWithOptimizedRevisionCacheHandle)
 import En.Postgres.Watch qualified as Watch
--- @ReachabilityGraph (..)@ brings its @hash@ field into scope, which is what lets GHC solve
--- the @HasField@ constraint behind @active.graph.hash@.
-import En.Reachability (ReachabilityGraph (..), compile)
+import En.Prelude
+import En.Reachability (compile)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (Schema, ValidSchema, schemaHash, validateSchema)
 import En.Schema.Parse (parseSchema)
-import En.SchemaCheck (OrphanReport (..), renderTupleOrphan, validateTuplesAgainstSchema)
+import En.SchemaCheck (renderTupleOrphan, validateTuplesAgainstSchema)
 import En.Servant.API (tupleFromWire, tupleToWire)
 import En.Servant.OpenApi (appWithOpenApiProbes, servedProxy)
 import En.Servant.Probes (mkProbes)
@@ -107,7 +106,7 @@ main = do
     Just Serve -> do
       (serverConfig, warnings) <- loadServerConfig >>= either configFailure pure
       traverse_ toStdout warnings
-      withStore toStdout serverConfig.store (runServe serverConfig)
+      withStore toStdout (serverConfig ^. #store) (runServe serverConfig)
     -- A subcommand's stdout carries data -- the export stream, the import's
     -- token line -- so every diagnostic the shared prologue emits goes to stderr.
     Just (Import path batchSize) -> withSubcommandStore (runImport path batchSize)
@@ -129,6 +128,7 @@ data LoadedSchema = LoadedSchema
     origin :: !Text.Text,
     validSchema :: !ValidSchema
   }
+  deriving stock (Generic)
 
 -- | The shared prologue of the bulk subcommands.
 --
@@ -187,23 +187,23 @@ toStderr = Text.hPutStrLn stderr
 -- whose stdout is a data stream can route them to stderr.
 withStore :: (Text.Text -> IO ()) -> StoreConfig -> (LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()) -> IO ()
 withStore say storeConfig action = do
-  (schemaSource, sourceText, rawSchema) <- loadSchema storeConfig.schemaPath
+  (schemaSource, sourceText, rawSchema) <- loadSchema (storeConfig ^. #schemaPath)
   validSchema <-
     either (configFailure . ("Invalid schema: " <>) . Text.pack . show) pure (validateSchema rawSchema)
   let loadedSchema =
         LoadedSchema {source = sourceText, origin = schemaOrigin schemaSource, validSchema}
   say (describeSchemaSource schemaSource)
   say ("Schema hash: " <> renderSchemaHash (schemaHash validSchema))
-  let poolConfig = storeConfig.pool
+  let poolConfig = (storeConfig ^. #pool)
   pool <-
     Pool.acquire $
       Pool.Config.settings
-        [ Pool.Config.size poolConfig.size,
-          Pool.Config.acquisitionTimeout (millisToDiffTime poolConfig.acquisitionTimeoutMs),
-          Pool.Config.idlenessTimeout (millisToDiffTime poolConfig.idlenessTimeoutMs),
-          Pool.Config.agingTimeout (millisToDiffTime poolConfig.maxLifetimeMs),
+        [ Pool.Config.size (poolConfig ^. #size),
+          Pool.Config.acquisitionTimeout (millisToDiffTime (poolConfig ^. #acquisitionTimeoutMs)),
+          Pool.Config.idlenessTimeout (millisToDiffTime (poolConfig ^. #idlenessTimeoutMs)),
+          Pool.Config.agingTimeout (millisToDiffTime (poolConfig ^. #maxLifetimeMs)),
           Pool.Config.staticConnectionSettings
-            (Settings.connectionString storeConfig.databaseUrl)
+            (Settings.connectionString (storeConfig ^. #databaseUrl))
         ]
   let runDbSession :: Session a -> IO (Either Text.Text a)
       runDbSession session =
@@ -220,20 +220,20 @@ withStore say storeConfig action = do
           <> migrationHint
   -- Only PostgreSQL can adjudicate its own interval grammar, so this waits for a
   -- reachable database -- but it still runs before the port binds.
-  validateGcWindow runDbSession storeConfig.gcWindow >>= either configFailure pure
+  validateGcWindow runDbSession (storeConfig ^. #gcWindow) >>= either configFailure pure
   datastoreIdText <- resolveDatastoreId runDbSession
   say ("Datastore id: " <> datastoreIdText)
   let config =
         ConsistencyConfig
           { datastoreId = DatastoreId datastoreIdText,
             schemaHash = schemaHash validSchema,
-            gcWindow = storeConfig.gcWindow
+            gcWindow = (storeConfig ^. #gcWindow)
           }
   action loadedSchema pool config `finally` Pool.release pool
 
 runServe :: ServerConfig -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
 runServe serverConfig loadedSchema pool config =
-  withTelemetry serverConfig.telemetry $
+  withTelemetry (serverConfig ^. #telemetry) $
     runServeApplication serverConfig loadedSchema pool config
 
 runServeApplication ::
@@ -248,15 +248,15 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
   activeSchemaRef <-
     newIORef
       ActiveSchema
-        { graph = compile loadedSchema.validSchema,
-          source = loadedSchema.source,
-          origin = loadedSchema.origin,
+        { graph = compile (loadedSchema ^. #validSchema),
+          source = (loadedSchema ^. #source),
+          origin = (loadedSchema ^. #origin),
           loadedAt
         }
-  let poolConfig = serverConfig.store.pool
-      optimizedRevisionTtlMs = serverConfig.optimizedRevisionTtlMs
-      tupleReadMaxEntries = serverConfig.tupleReadMaxEntries
-      decisionMaxEntries = serverConfig.decisionMaxEntries
+  let poolConfig = (serverConfig ^. #store . #pool)
+      optimizedRevisionTtlMs = (serverConfig ^. #optimizedRevisionTtlMs)
+      tupleReadMaxEntries = (serverConfig ^. #tupleReadMaxEntries)
+      decisionMaxEntries = (serverConfig ^. #decisionMaxEntries)
       optimizedRevisionConfig =
         OptimizedRevisionConfig
           { enabled = optimizedRevisionTtlMs > 0,
@@ -277,7 +277,7 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
   decisionCache <- newCache decisionConfig :: IO (Cache SubproblemKey ResidualDecision)
   let checkCacheEnv =
         CheckCacheEnv
-          { cacheDatastoreId = config.datastoreId,
+          { cacheDatastoreId = (config ^. #datastoreId),
             cacheDecisions = decisionCache
           }
       {- Both store interpreters are built from the snapshot the caller holds, so the
@@ -287,7 +287,7 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
       because there is only one snapshot and the handler is holding it. -}
       runAppIO :: ActiveSchema -> Eff AppEffects a -> IO (Either EnError a)
       runAppIO active action =
-        let activeConfig = config {schemaHash = active.graph.hash}
+        let activeConfig = config & #schemaHash .~ (active ^. #graph . #hash)
          in runEff
               ( runDatabasePool
                   pool
@@ -312,7 +312,7 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
         Eff (TupleStore : '[Error EnError, Database, IOE]) a ->
         Eff '[Error EnError, Database, IOE] a
       runTupleStoreLayer activeConfig cache action
-        | optimizedRevisionConfig.enabled =
+        | (optimizedRevisionConfig ^. #enabled) =
             runTupleStorePostgresWithOptimizedRevisionCacheHandle activeConfig cache action
         | otherwise =
             runTupleStorePostgres activeConfig action
@@ -321,23 +321,23 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
         Eff '[TupleStore, Error EnError, Database, IOE] a ->
         Eff '[TupleStore, Error EnError, Database, IOE] a
       tupleReadLayer cache action
-        | tupleReadConfig.enabled = cachedTupleStore cache action
+        | (tupleReadConfig ^. #enabled) = cachedTupleStore cache action
         | otherwise = action
       -- The engine's static bounds are applied here, once, so no handler and no
       -- request can choose them. See "En.Budget".
-      budget = serverConfig.budget
+      budget = (serverConfig ^. #budget)
       checkOperation graph' consistency context subject relation object
-        | decisionConfig.enabled =
+        | (decisionConfig ^. #enabled) =
             checkCachedWithBudget budget checkCacheEnv graph' consistency context subject relation object
         | otherwise =
             checkWithBudget budget graph' consistency context subject relation object
       lookupWithDeadlineOperation deadline graph' consistency request
-        | decisionConfig.enabled =
+        | (decisionConfig ^. #enabled) =
             Lookup.lookupWithDeadlineCachedAndBudget budget checkCacheEnv deadline graph' consistency request
         | otherwise =
             Lookup.lookupWithDeadlineAndBudget budget deadline graph' consistency request
       lookupSubjectsWithDeadlineOperation deadline graph' consistency request
-        | decisionConfig.enabled =
+        | (decisionConfig ^. #enabled) =
             LookupSubjects.lookupSubjectsWithDeadlineCachedAndBudget budget checkCacheEnv deadline graph' consistency request
         | otherwise =
             LookupSubjects.lookupSubjectsWithDeadlineAndBudget budget deadline graph' consistency request
@@ -360,13 +360,13 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
             -- request's snapshot.
             watchOperation = Watch.watch config,
             budget,
-            maxBatchSize = serverConfig.maxBatchSize,
-            deadlineDefaultMillis = serverConfig.deadlineDefaultMillis,
-            deadlineMaxMillis = serverConfig.deadlineMaxMillis,
+            maxBatchSize = (serverConfig ^. #maxBatchSize),
+            deadlineDefaultMillis = (serverConfig ^. #deadlineDefaultMillis),
+            deadlineMaxMillis = (serverConfig ^. #deadlineMaxMillis),
             -- The active schema hash a grant embeds is not captured here: the handler
             -- reads it from the request's `ActiveSchema` snapshot, so a SIGHUP reload
             -- cannot mint a grant under a hash its check did not evaluate under.
-            mint = mintEnvFromConfig <$> serverConfig.biscuit
+            mint = mintEnvFromConfig <$> (serverConfig ^. #biscuit)
           }
       ping :: IO Bool
       ping = do
@@ -389,32 +389,32 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
     mkProbes
       (readIORef activeSchemaRef >> pure True)
       checkReady
-  Text.putStrLn ("en-server listening on :" <> Text.pack (show serverConfig.port))
+  Text.putStrLn ("en-server listening on :" <> Text.pack (show (serverConfig ^. #port)))
   Text.putStrLn
     ( "Connection pool: size="
-        <> Text.pack (show poolConfig.size)
+        <> Text.pack (show (poolConfig ^. #size))
         <> ", acquisitionTimeoutMs="
-        <> Text.pack (show poolConfig.acquisitionTimeoutMs)
+        <> Text.pack (show (poolConfig ^. #acquisitionTimeoutMs))
         <> ", idlenessTimeoutMs="
-        <> Text.pack (show poolConfig.idlenessTimeoutMs)
+        <> Text.pack (show (poolConfig ^. #idlenessTimeoutMs))
         <> ", maxLifetimeMs="
-        <> Text.pack (show poolConfig.maxLifetimeMs)
+        <> Text.pack (show (poolConfig ^. #maxLifetimeMs))
     )
   Text.putStrLn ("Optimized revision cache: " <> describeMillisCache optimizedRevisionTtlMs)
   Text.putStrLn ("Tuple-read cache: " <> describeEntryCache tupleReadMaxEntries)
   Text.putStrLn ("Decision cache: " <> describeEntryCache decisionMaxEntries)
-  Text.putStrLn ("Rate limit: " <> describeRateLimit serverConfig.rateLimit)
-  Text.putStrLn ("Biscuit grant minting: " <> describeMinting serverConfig.biscuit)
-  Text.putStrLn ("Background maintenance: " <> describeMaintenance serverConfig.maintenance)
+  Text.putStrLn ("Rate limit: " <> describeRateLimit (serverConfig ^. #rateLimit))
+  Text.putStrLn ("Biscuit grant minting: " <> describeMinting (serverConfig ^. #biscuit))
+  Text.putStrLn ("Background maintenance: " <> describeMaintenance (serverConfig ^. #maintenance))
   Text.putStrLn
     ( "Lookup deadline: defaultMs="
-        <> Text.pack (show serverConfig.deadlineDefaultMillis)
+        <> Text.pack (show (serverConfig ^. #deadlineDefaultMillis))
         <> ", maxMs="
-        <> Text.pack (show serverConfig.deadlineMaxMillis)
+        <> Text.pack (show (serverConfig ^. #deadlineMaxMillis))
         <> "; max batch size: "
-        <> Text.pack (show serverConfig.maxBatchSize)
+        <> Text.pack (show (serverConfig ^. #maxBatchSize))
     )
-  Text.putStrLn ("Schema reload: SIGHUP" <> describeReloadSource serverConfig.store.schemaPath serverConfig.schemaReloadForce)
+  Text.putStrLn ("Schema reload: SIGHUP" <> describeReloadSource (serverConfig ^. #store . #schemaPath) (serverConfig ^. #schemaReloadForce))
   -- One writer, serialized. Two SIGHUPs in flight would otherwise race to
   -- `atomicWriteIORef`, and the loser's orphan report would describe a schema that is
   -- not the one now serving.
@@ -425,7 +425,7 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
       (Catch (withMVar reloadGuard \() -> reloadSchema serverConfig activeSchemaRef runAppNow))
       Nothing
 
-  rateLimit <- rateLimitMiddleware serverConfig.rateLimit
+  rateLimit <- rateLimitMiddleware (serverConfig ^. #rateLimit)
   requestLogger <- newRequestLogger
   metrics <- newMetrics
   let servantTelemetryMiddleware =
@@ -444,7 +444,7 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
   let wrappedApp =
         otelMiddleware
           . servantTelemetryMiddleware
-          . authMiddleware serverConfig.auth
+          . authMiddleware (serverConfig ^. #auth)
           . rateLimit
           . requestIdMiddleware
           . requestLogger
@@ -459,8 +459,8 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
   -- cancels the maintenance thread and `withStore`'s `finally` releases the pool.
   -- Every maintenance batch is its own committed transaction, so cancelling mid-pass
   -- loses only the batch in flight; the next start resumes from what was committed.
-  withAsync (runMaintenanceLoop serverConfig.maintenance runAppNow) \_maintenance ->
-    serve serverConfig.tls serverConfig.port wrappedApp
+  withAsync (runMaintenanceLoop (serverConfig ^. #maintenance) runAppNow) \_maintenance ->
+    serve (serverConfig ^. #tls) (serverConfig ^. #port) wrappedApp
 
 -- | Build the servant seam's 'MintEnv' from the parsed issuer configuration.
 --
@@ -469,10 +469,10 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
 mintEnvFromConfig :: BiscuitConfig -> MintEnv
 mintEnvFromConfig cfg =
   MintEnv
-    { issuerSecretKey = cfg.issuerSecretKey,
-      issuerKeyId = cfg.issuerKeyId,
-      defaultTtl = fromIntegral cfg.defaultTtlSeconds,
-      maxTtl = fromIntegral cfg.maxTtlSeconds
+    { issuerSecretKey = (cfg ^. #issuerSecretKey),
+      issuerKeyId = (cfg ^. #issuerKeyId),
+      defaultTtl = fromIntegral (cfg ^. #defaultTtlSeconds),
+      maxTtl = fromIntegral (cfg ^. #maxTtlSeconds)
     }
 
 -- | The @Biscuit grant minting:@ startup line.
@@ -483,13 +483,13 @@ describeMinting :: Maybe BiscuitConfig -> Text.Text
 describeMinting = \case
   Nothing -> "disabled"
   Just cfg ->
-    let IssuerKeyId keyId = cfg.issuerKeyId
+    let IssuerKeyId keyId = (cfg ^. #issuerKeyId)
      in "enabled (key id "
           <> showText keyId
           <> ", defaultTtl="
-          <> showText cfg.defaultTtlSeconds
+          <> showText (cfg ^. #defaultTtlSeconds)
           <> "s, maxTtl="
-          <> showText cfg.maxTtlSeconds
+          <> showText (cfg ^. #maxTtlSeconds)
           <> "s)"
 
 describeReloadSource :: Maybe FilePath -> Bool -> Text.Text
@@ -523,7 +523,7 @@ reloadSchema ::
   (forall a. Eff AppEffects a -> IO (Either EnError a)) ->
   IO ()
 reloadSchema serverConfig activeSchemaRef runAppNow =
-  case serverConfig.store.schemaPath of
+  case (serverConfig ^. #store . #schemaPath) of
     Nothing -> toStdout "SIGHUP received but no EN_SCHEMA_PATH is set; nothing to reload."
     Just path -> reloadFrom path
   where
@@ -532,13 +532,13 @@ reloadSchema serverConfig activeSchemaRef runAppNow =
         Left err -> refuse ("schema reload failed: " <> err)
         Right candidate -> do
           active <- readIORef activeSchemaRef
-          let graph = compile candidate.validSchema
-              oldHash = renderSchemaHash active.graph.hash
-              newHash = renderSchemaHash graph.hash
-          if graph.hash == active.graph.hash
+          let graph = compile (candidate ^. #validSchema)
+              oldHash = renderSchemaHash (active ^. #graph . #hash)
+              newHash = renderSchemaHash (graph ^. #hash)
+          if (graph ^. #hash) == (active ^. #graph . #hash)
             then toStdout ("Schema unchanged (" <> newHash <> "); not reloading.")
             else
-              runAppNow (validateCandidate candidate.validSchema) >>= \case
+              runAppNow (validateCandidate (candidate ^. #validSchema)) >>= \case
                 Left err -> refuse ("schema reload failed: could not scan the store: " <> showText err)
                 Right report -> activate candidate graph oldHash newHash report
 
@@ -550,9 +550,9 @@ reloadSchema serverConfig activeSchemaRef runAppNow =
       validateTuplesAgainstSchema candidate revision
 
     activate candidate graph oldHash newHash report
-      | not (null report.orphans) && not serverConfig.schemaReloadForce = do
+      | not (null (report ^. #orphans)) && not (serverConfig ^. #schemaReloadForce) = do
           toStdout ("Schema reload refused: " <> orphanSummary newHash report)
-          traverse_ (toStdout . renderTupleOrphan) report.orphans
+          traverse_ (toStdout . renderTupleOrphan) (report ^. #orphans)
           toStdout "reload refused; set EN_SCHEMA_RELOAD_FORCE=true to activate anyway."
       | otherwise = do
           loadedAt <- getCurrentTime
@@ -560,23 +560,23 @@ reloadSchema serverConfig activeSchemaRef runAppNow =
             activeSchemaRef
             ActiveSchema
               { graph,
-                source = candidate.source,
-                origin = candidate.origin,
+                source = (candidate ^. #source),
+                origin = (candidate ^. #origin),
                 loadedAt
               }
-          if null report.orphans
+          if null (report ^. #orphans)
             then pure ()
             else do
               toStdout ("Schema reload FORCED over " <> orphanSummary newHash report)
-              traverse_ (toStdout . renderTupleOrphan) report.orphans
-          toStdout ("Schema reloaded from " <> candidate.origin)
+              traverse_ (toStdout . renderTupleOrphan) (report ^. #orphans)
+          toStdout ("Schema reloaded from " <> (candidate ^. #origin))
           toStdout ("Schema hash: " <> newHash <> " (was " <> oldHash <> ")")
           toStdout "WARNING: all consistency tokens minted under the previous schema hash are now invalid."
 
     orphanSummary newHash report =
-      showText (length report.orphans)
+      showText (length (report ^. #orphans))
         <> " orphan(s) across "
-        <> showText report.scanned
+        <> showText (report ^. #scanned)
         <> " live tuple(s) under candidate "
         <> newHash
 
@@ -658,7 +658,7 @@ runExport _loadedSchema pool config = do
   hSetBuffering stdout (BlockBuffering Nothing)
   outcome <- runStoreIO pool config do
     revision <- TupleStore.headRevision
-    liftIO (toStderr ("exporting at revision " <> revision.revisionEncoding))
+    liftIO (toStderr ("exporting at revision " <> (revision ^. #revisionEncoding)))
     drainFrom revision Nothing 0
   exported <- either (storeFailure "export") pure outcome
   toStderr ("exported " <> showText exported <> " tuples")
@@ -666,7 +666,7 @@ runExport _loadedSchema pool config = do
     drainFrom :: (TupleStore :> es, IOE :> es) => Revision -> Maybe StoreCursor -> Int -> Eff es Int
     drainFrom revision cursor exported = do
       TuplePage {rows, state} <- TupleStore.readAllTuples revision exportPageSize cursor
-      liftIO (traverse_ (LazyChar8.putStrLn . Aeson.encode . tupleToWire . (.tuple)) rows)
+      liftIO (traverse_ (LazyChar8.putStrLn . Aeson.encode . tupleToWire . (^. #tuple)) rows)
       let exportedNow = exported + length rows
       case state of
         Exhausted -> pure exportedNow
@@ -692,18 +692,18 @@ runExport _loadedSchema pool config = do
 -- present.
 runCheckSchema :: LoadedSchema -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
 runCheckSchema candidate _activeSchema pool config = do
-  let candidateHash = renderSchemaHash (schemaHash candidate.validSchema)
+  let candidateHash = renderSchemaHash (schemaHash (candidate ^. #validSchema))
   outcome <- runStoreIO pool config do
     revision <- TupleStore.headRevision
-    liftIO (toStderr ("checking at revision " <> revision.revisionEncoding))
-    validateTuplesAgainstSchema candidate.validSchema revision
+    liftIO (toStderr ("checking at revision " <> (revision ^. #revisionEncoding)))
+    validateTuplesAgainstSchema (candidate ^. #validSchema) revision
   report <- either (storeFailure "check-schema") pure outcome
-  traverse_ (Text.putStrLn . renderTupleOrphan) report.orphans
-  let orphanCount = length report.orphans
+  traverse_ (Text.putStrLn . renderTupleOrphan) (report ^. #orphans)
+  let orphanCount = length (report ^. #orphans)
       summary =
         showText orphanCount
           <> " orphan(s) across "
-          <> showText report.scanned
+          <> showText (report ^. #scanned)
           <> " live tuple(s); candidate schema "
           <> candidateHash
   if orphanCount == 0
@@ -823,9 +823,9 @@ serve tlsConfig port wrappedApp = do
           $ Warp.defaultSettings
   case tlsConfig of
     Just tls -> do
-      Text.putStrLn ("Serving TLS directly (EN_TLS_CERT_FILE=" <> Text.pack tls.certFile <> ")")
+      Text.putStrLn ("Serving TLS directly (EN_TLS_CERT_FILE=" <> Text.pack (tls ^. #certFile) <> ")")
       WarpTLS.runTLS
-        (WarpTLS.tlsSettings tls.certFile tls.keyFile)
+        (WarpTLS.tlsSettings (tls ^. #certFile) (tls ^. #keyFile))
         settings
         wrappedApp
     Nothing -> do

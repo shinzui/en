@@ -22,14 +22,15 @@ import Data.ByteArray (constEq)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as Char8
 import Data.Char (toLower)
+import Data.Generics.Labels ()
 import Data.IORef (atomicModifyIORef', newIORef)
 import Data.List (find)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Word (Word64)
+import En.Prelude
 import En.Servant.Problem
   ( problemResponse,
     specPermissionDenied,
@@ -52,11 +53,13 @@ data ApiKey = ApiKey
     keySecret :: !ByteString,
     keyRole :: !KeyRole
   }
+  deriving stock (Generic)
 
 data AuthConfig
   = -- | Local development only; every caller may read and write.
     AuthDisabled
   | AuthKeys ![ApiKey]
+  deriving stock (Generic)
 
 -- | Header carrying the verified caller identity to inner middleware and
 -- handlers. Any client-supplied value is stripped before this is set.
@@ -99,17 +102,17 @@ authMiddleware (AuthKeys keys) = \application request respond ->
     else case authenticate keys request of
       Nothing -> respond unauthenticated
       Just key
-        | key.keyRole == ReadOnly && isWriteRequest request ->
+        | (key ^. #keyRole) == ReadOnly && isWriteRequest request ->
             respond readOnlyKey
         | otherwise ->
-            application (withCaller key.keyName request) respond
+            application (withCaller (key ^. #keyName) request) respond
 
 -- | Constant-time credential check. Returns the matching key, if any.
 authenticate :: [ApiKey] -> Request -> Maybe ApiKey
 authenticate keys request = do
   header <- lookup hAuthorization (requestHeaders request)
   presented <- bearerSecret header
-  find (\key -> constEq key.keySecret presented) keys
+  find (\key -> constEq (key ^. #keySecret) presented) keys
 
 -- | @Bearer \<secret\>@, with a case-insensitive scheme per RFC 7235.
 bearerSecret :: ByteString -> Maybe ByteString
@@ -142,6 +145,7 @@ data RateLimitConfig = RateLimitConfig
   { ratePerSecond :: !Double,
     burst :: !Double
   }
+  deriving stock (Generic)
 
 -- | Token count and the monotonic timestamp it was last computed at. Never a
 -- wall-clock time: wall clocks jump backwards and would mint free tokens.
@@ -149,15 +153,16 @@ data Bucket = Bucket
   { tokens :: !Double,
     lastRefillNs :: !Word64
   }
+  deriving stock (Generic)
 
 describeRateLimit :: RateLimitConfig -> Text
 describeRateLimit config
-  | config.ratePerSecond <= 0 = "disabled"
+  | (config ^. #ratePerSecond) <= 0 = "disabled"
   | otherwise =
       "enabled, rps="
-        <> Text.pack (show config.ratePerSecond)
+        <> Text.pack (show (config ^. #ratePerSecond))
         <> ", burst="
-        <> Text.pack (show config.burst)
+        <> Text.pack (show (config ^. #burst))
 
 -- | Throttle each caller independently. Runs inside 'authMiddleware' so it can
 -- read the verified identity from 'callerHeaderName'.
@@ -165,7 +170,7 @@ describeRateLimit config
 -- Allocates the shared bucket map, hence the 'IO' wrapper.
 rateLimitMiddleware :: RateLimitConfig -> IO Middleware
 rateLimitMiddleware config
-  | config.ratePerSecond <= 0 = pure id
+  | (config ^. #ratePerSecond) <= 0 = pure id
   | otherwise = do
       buckets <- newIORef Map.empty
       pure \application request respond ->
@@ -187,9 +192,9 @@ admit config caller now buckets =
     then (Map.insert caller (Bucket (refilled - 1) now) buckets, True)
     else (Map.insert caller (Bucket refilled now) buckets, False)
   where
-    bucket = Map.findWithDefault (Bucket config.burst now) caller buckets
-    elapsedSeconds = fromIntegral (now - bucket.lastRefillNs) / 1e9
-    refilled = min config.burst (bucket.tokens + elapsedSeconds * config.ratePerSecond)
+    bucket = Map.findWithDefault (Bucket (config ^. #burst) now) caller buckets
+    elapsedSeconds = fromIntegral (now - (bucket ^. #lastRefillNs)) / 1e9
+    refilled = min (config ^. #burst) ((bucket ^. #tokens) + elapsedSeconds * (config ^. #ratePerSecond))
 
 callerOf :: Request -> Text
 callerOf request =

@@ -57,6 +57,7 @@ import Effectful.Dispatch.Dynamic (send)
 import En.Revision (ConsistencyToken, Revision)
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
 import En.Tuple (ObjectRef (..), Subject (..), Tuple (..))
+import GHC.Generics (Generic)
 import Relay.Pagination (Connection, CursorError, PageRequest)
 
 newtype StoreCursor = StoreCursor
@@ -82,7 +83,7 @@ data TupleRow = TupleRow
     createdAt :: !Revision,
     deletedAt :: !(Maybe Revision)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data TuplePage = TuplePage
   { rows :: ![TupleRow],

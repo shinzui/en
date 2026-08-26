@@ -55,6 +55,7 @@ import En.Schema
     unValidSchema,
   )
 import En.Tuple (ObjectRef (..), Subject (..), Tuple (..), TupleCaveat (..))
+import GHC.Generics (Generic)
 
 -- | A live tuple the candidate schema cannot interpret, and why.
 data TupleOrphan = TupleOrphan
@@ -223,7 +224,7 @@ data OrphanReport = OrphanReport
   { scanned :: !Int,
     orphans :: ![TupleOrphan]
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | Every live tuple at @revision@ that the candidate schema cannot interpret.
 --
