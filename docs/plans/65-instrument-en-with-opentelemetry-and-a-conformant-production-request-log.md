@@ -68,9 +68,10 @@ trace correlation, and the removal of two fields that are not in the bounded set
       `openTelemetryServantMiddleware` directly inside it, using the same `servedProxy` passed
       to `serveWithContext`. A collector-backed request produced a server span named
       `POST v1/check`, preserving the caller's trace and parent span IDs.
-- [ ] Milestone 4 — Conform the request logger: the bounded field set, `trace_id` and
-      `span_id` read from the server span's context, and the probe-path exclusion built from
-      `Servant.Health.Paths.healthRawPaths`.
+- [x] (2026-08-26T01:08Z) Milestone 4 — Conformed the logger to the bounded field set,
+      reading valid `trace_id` and `span_id` values from the WAI server-span context and
+      excluding `Servant.Health.Paths.healthRawPaths`. Live enabled, disabled, secret-bearing,
+      and probe requests proved correlation, omission, boundedness, and silence respectively.
 - [ ] Milestone 5 — Document the telemetry environment variables, add them to the local
       development stack, and write the ADR recording that telemetry configuration lives
       outside the binary.
@@ -132,6 +133,15 @@ trace correlation, and the removal of two fields that are not in the bounded set
   `http.route=v1/check`, `http.request.method=POST`, and
   `http.response.status_code=400`. This proves route naming, propagation, and export together
   rather than merely proving that the types compose.
+
+- Discovery (2026-08-25, Milestone 4): **the active WAI server span is available when the
+  response logger runs and has the same ID the collector exports.** A request carrying trace
+  ID `11111111111111111111111111111111` and parent span ID `2222222222222222` produced one
+  log line with exactly `time`, `method`, `path`, `status`, `duration_ms`, `user_agent`,
+  `trace_id`, and `span_id`; the last was `bb5cc7882eaf83b7`, matching the collector's server
+  span. Query, authorization, cookie, private-header, and body secrets sent with that request
+  were absent. Four probe requests produced no log lines. With telemetry disabled, a request
+  carrying a valid `traceparent` produced the six base fields and no trace keys.
 
 (Add further entries as work proceeds.)
 
@@ -986,3 +996,7 @@ captured live enabled/disabled startup and shutdown evidence.
 Revision note (2026-08-25): Milestone 3 fixed the middleware order around the same
 `servedProxy` used by the application and recorded collector evidence for propagated context,
 Servant route naming, and OTLP export.
+
+Revision note (2026-08-25): Milestone 4 replaced the legacy request ID, caller, and camel-case
+duration fields with the catalog's bounded schema, omitted invalid telemetry contexts, and
+recorded enabled, disabled, secret-bearing, and probe-path runtime evidence.
