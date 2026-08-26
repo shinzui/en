@@ -107,6 +107,7 @@ import En.Reachability
     entryPoints,
   )
 import En.Reachability qualified as Reachability
+import En.RelationshipPagination (relationshipPageFromRows)
 import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema
   ( AllowedSubject (..),
@@ -2980,6 +2981,16 @@ interpretFixtureTupleStore countRef errorObject tuples =
     ReadRelationships _ relationshipFilter limit cursor -> do
       countRead
       pure (pageTuples limit cursor (filter (matchesRelationshipFilter relationshipFilter) tuples))
+    ReadRelationshipPage _ token relationshipFilter pageRequest -> do
+      countRead
+      pure $
+        relationshipPageFromRows
+          token
+          pageRequest
+          [ tupleRow index tuple
+          | (index, tuple) <- zip [1 ..] tuples,
+            matchesRelationshipFilter relationshipFilter tuple
+          ]
     CountRelationships _ relationshipFilter -> do
       countRead
       pure (fromIntegral (length (filter (matchesRelationshipFilter relationshipFilter) tuples)))

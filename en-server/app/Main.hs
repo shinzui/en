@@ -11,6 +11,7 @@ import Data.ByteString.Lazy.Char8 qualified as LazyChar8
 import Data.Char (isSpace)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
+import Data.Proxy (Proxy (..))
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Data.Time (DiffTime, getCurrentTime)
@@ -59,13 +60,21 @@ import Network.Wai.Handler.Warp qualified as Warp
 import Network.Wai.Handler.WarpTLS qualified as WarpTLS
 import Observability (newRequestLogger, requestIdMiddleware)
 import OpenTelemetry.Instrumentation.Servant (openTelemetryServantMiddleware)
+import OpenTelemetry.Instrumentation.Servant.Internal (HasEndpoint (..))
 import OpenTelemetry.Trace qualified as OTel
+import Relay.Pagination.Servant (RelayPage)
+import Servant.API qualified as Servant
 import System.Environment (getArgs)
 import System.Exit (ExitCode (ExitFailure), exitFailure, exitSuccess, exitWith)
 import System.IO (BufferMode (BlockBuffering, LineBuffering), hSetBuffering, stderr, stdout)
 import System.Posix.Signals (Handler (Catch), installHandler, sigHUP, sigINT, sigTERM)
 import Telemetry (withTelemetry)
 import Text.Read (readMaybe)
+
+-- RelayPage only parses query parameters before delegating to the terminal route, so
+-- OpenTelemetry discovers the same method and path as it does without the combinator.
+instance (HasEndpoint sub) => HasEndpoint (RelayPage defaultSize maxSize Servant.:> sub) where
+  getEndpoint _ = getEndpoint (Proxy @sub)
 
 -- | The four ways to run this binary.
 --

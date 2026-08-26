@@ -38,6 +38,18 @@ Content-Type: application/json
       "relation": "viewer",
       "subject": {"kind": "id", "objectType": "user", "objectId": "hurl-alice"},
       "caveat": null
+    },
+    {
+      "object": {"objectType": "space", "objectId": "hurl-write-flow-2"},
+      "relation": "viewer",
+      "subject": {"kind": "id", "objectType": "user", "objectId": "hurl-alice"},
+      "caveat": null
+    },
+    {
+      "object": {"objectType": "space", "objectId": "hurl-write-flow-3"},
+      "relation": "viewer",
+      "subject": {"kind": "id", "objectType": "user", "objectId": "hurl-alice"},
+      "caveat": null
     }
   ]
 }
@@ -54,6 +66,18 @@ Content-Type: application/json
   "tuples": [
     {
       "object": {"objectType": "space", "objectId": "hurl-write-flow"},
+      "relation": "viewer",
+      "subject": {"kind": "id", "objectType": "user", "objectId": "hurl-alice"},
+      "caveat": null
+    },
+    {
+      "object": {"objectType": "space", "objectId": "hurl-write-flow-2"},
+      "relation": "viewer",
+      "subject": {"kind": "id", "objectType": "user", "objectId": "hurl-alice"},
+      "caveat": null
+    },
+    {
+      "object": {"objectType": "space", "objectId": "hurl-write-flow-3"},
       "relation": "viewer",
       "subject": {"kind": "id", "objectType": "user", "objectId": "hurl-alice"},
       "caveat": null
@@ -83,3 +107,49 @@ HTTP 200
 header "Content-Type" contains "application/json"
 jsonpath "$.decision.result" == "allowed"
 jsonpath "$.checkedAt" isString
+
+# Relay pagination lives in the query string even though the filter remains a POST body.
+POST {{base_url}}/v1/relationships/query?first=2
+Authorization: Bearer {{api_key}}
+Content-Type: application/json
+{
+  "consistency": {"mode": "atLeastAsFresh", "token": "{{write_token}}"},
+  "filter": {"subjectType": "user", "subjectId": "hurl-alice"}
+}
+HTTP 200
+[Captures]
+relationship_cursor: jsonpath "$.pageInfo.endCursor"
+[Asserts]
+header "Content-Type" contains "application/json"
+jsonpath "$.edges" count == 2
+jsonpath "$.pageInfo.hasNextPage" == true
+jsonpath "$.pageInfo.hasPreviousPage" == false
+
+# Continuations are snapshot-pinned by the opaque cursor; the body consistency is ignored.
+POST {{base_url}}/v1/relationships/query?first=2&after={{relationship_cursor}}
+Authorization: Bearer {{api_key}}
+Content-Type: application/json
+{
+  "consistency": {"mode": "minimizeLatency"},
+  "filter": {"subjectType": "user", "subjectId": "hurl-alice"}
+}
+HTTP 200
+[Asserts]
+header "Content-Type" contains "application/json"
+jsonpath "$.edges" count == 1
+jsonpath "$.pageInfo.hasNextPage" == false
+jsonpath "$.pageInfo.hasPreviousPage" == true
+
+POST {{base_url}}/v1/relationships/query?first=2&after=broken
+Authorization: Bearer {{api_key}}
+Content-Type: application/json
+{
+  "consistency": {"mode": "minimizeLatency"},
+  "filter": {"subjectType": "user", "subjectId": "hurl-alice"}
+}
+HTTP 400
+[Asserts]
+header "Content-Type" contains "application/json"
+header "Content-Type" not contains "application/problem+json"
+jsonpath "$.code" == "invalid_cursor"
+jsonpath "$.retryable" == false

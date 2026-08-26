@@ -31,6 +31,7 @@ where
 
 import Data.Text (Text)
 import En.Servant.API
+import Relay.Pagination.Servant (ClientPage)
 import Servant.Client (ClientM)
 import Servant.Client.Generic (AsClientT, genericClient)
 import Prelude hiding (lookup)
@@ -38,7 +39,7 @@ import Prelude hiding (lookup)
 data EnClient = EnClient
   { writeTuples :: WriteTuplesRequestWire -> ClientM (EnResult WriteTuplesResponseWire),
     deleteTuples :: DeleteTuplesRequestWire -> ClientM (EnResult WriteTuplesResponseWire),
-    readRelationships :: ReadRelationshipsRequestWire -> ClientM (EnResult ReadRelationshipsResponseWire),
+    readRelationships :: ClientPage -> ReadRelationshipsRequestWire -> ClientM RelationshipPageResult,
     deleteRelationships :: DeleteRelationshipsRequestWire -> ClientM (EnResult DeleteRelationshipsResponseWire),
     check :: CheckRequestWire -> ClientM (EnResult CheckResponseWire),
     batchCheck :: BatchCheckRequestWire -> ClientM (EnResult BatchCheckResponseWire),

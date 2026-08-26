@@ -65,16 +65,32 @@ rather than forcing four endpoints into a shape that fits two of them.
 - [x] (2026-08-26T02:56:00Z) Milestone 3a — Add the transport-neutral relationship cursor
       contract, a total `pageKey` on tuple rows, backward-capable in-memory paging, and the
       `relay-pagination-hasql` PostgreSQL statement. Core and PostgreSQL suites pass.
-- [ ] Milestone 3b — Convert the route type, handler, client, and OpenAPI, then ship the live
-      forward/backward conformance test.
-- [ ] Milestone 4 — Convert the remaining endpoints Milestone 1 ruled in, each with its own
-      conformance test.
+- [x] (2026-08-26T03:13:43Z) Milestone 3b — Convert the route type, handler, client, and
+      OpenAPI, then ship the live forward/backward conformance test. The conformance callback
+      traverses the real WAI application, so it exercises `RelayPage`, JSON, `MultiVerb`, the
+      handler, and both directions rather than calling the paging helper directly.
+- [x] (2026-08-26T03:13:43Z) Milestone 4 — No remaining endpoints were ruled in by Milestone
+      1: both graph traversals and the forward-only watch feed retain their truthful existing
+      protocols.
 - [ ] Milestone 5 — Record the `RelayPageError` exemption in the problem-details conformance
       test, regenerate `docs/api/openapi.json`, update the Hurl suite's pagination
       assertions, notify consumers, and write the ADR.
 
 
 ## Surprises & Discoveries
+
+- Discovery (2026-08-26): **the OpenTelemetry Servant middleware needs a pass-through
+  `HasEndpoint` instance for every custom route combinator.** `RelayPage` changes only query
+  parsing and delegates method/path discovery to its sub-route, but
+  `mori://shinzui/hs-opentelemetry-instrumentation-servant` cannot know that type. `en-server`
+  therefore supplies the narrow orphan instance and keeps the route visible to tracing.
+
+- Discovery (2026-08-26): **the registered consumers do not use the relationship-query wire
+  types or client method.** Source searches under `mori://shinzui/nagare` and
+  `mori://shinzui/kikan-en` found no `readRelationships`, `ReadRelationships*`,
+  `RelationshipsStateWire`, or `/relationships/query` use. `kikan-en` mounts the application,
+  so the unchanged `En.Servant.API.app` and seam exports remain its compatibility boundary;
+  the breaking typed-client change has no in-tree consumer migration.
 
 - Discovery (2026-08-25, while planning): **every one of `en`'s paginated endpoints is
   `POST`-with-a-body, while `RelayPage` is a query-parameter combinator.** `RelayPage

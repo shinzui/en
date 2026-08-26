@@ -126,9 +126,7 @@ import En.Servant.API
     ObjectRefWire,
     PreconditionWire,
     ReadRelationshipsRequestWire,
-    ReadRelationshipsResponseWire,
     RelationshipFilterWire,
-    RelationshipsStateWire,
     SchemaInfoWire,
     SubjectRelationFilterWire,
     SubjectWire,
@@ -147,6 +145,7 @@ import En.Servant.API
     serverWithProbes,
   )
 import En.Servant.Problem (ProblemDetails, ProblemSpec (..), problemCatalog, problemJsonOptions)
+import Relay.Pagination.Servant.OpenApi ()
 import Servant
   ( Application,
     Context (..),
@@ -768,27 +767,8 @@ instance ToSchema ReadRelationshipsRequestWire where
       NamedSchema (Just "ReadRelationshipsRequestWire") $
         objectSchema
           [ ("consistency", consistency),
-            ("filter", relationshipFilter),
-            ("limit", primitive OpenApiInteger),
-            ("cursor", nullable textRef)
+            ("filter", relationshipFilter)
           ]
-
-instance ToSchema RelationshipsStateWire where
-  declareNamedSchema _ =
-    pure $
-      sumSchema
-        "RelationshipsStateWire"
-        [ objectSchema [("status", literal "exhausted")],
-          objectSchema [("status", literal "hasMore"), ("cursor", textRef)]
-        ]
-
-instance ToSchema ReadRelationshipsResponseWire where
-  declareNamedSchema _ = do
-    tuple <- declareSchemaRef (Proxy @TupleWire)
-    state <- declareSchemaRef (Proxy @RelationshipsStateWire)
-    pure $
-      NamedSchema (Just "ReadRelationshipsResponseWire") $
-        objectSchema [("relationships", arrayOf tuple), ("state", state), ("checkedAt", textRef)]
 
 instance ToSchema DeleteRelationshipsRequestWire where
   declareNamedSchema _ = do

@@ -21,8 +21,8 @@ module En.Tuple.Api
     WriteTuplesResponseWire (..),
     RelationshipFilterWire (..),
     ReadRelationshipsRequestWire (..),
-    RelationshipsStateWire (..),
-    ReadRelationshipsResponseWire (..),
+    RelationshipPageResponses,
+    RelationshipPageResult (..),
     DeleteRelationshipsRequestWire (..),
     DeleteRelationshipsResponseWire (..),
     WatchRequestWire (..),
@@ -45,6 +45,7 @@ module En.Tuple.Api
   )
 where
 
+import Control.Monad.Trans.Except (runExceptT)
 import Data.Aeson
   ( FromJSON (..),
     ToJSON (..),
@@ -55,34 +56,34 @@ import Data.Aeson
     (.=),
   )
 import Data.Aeson qualified as Aeson
+import Data.Bifunctor (first)
 import Data.Int (Int64)
 import Data.Maybe (fromMaybe)
+import Data.SOP (I (..), NS (..))
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Effectful qualified
 import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), mintToken, resolveConsistency)
 import En.Effect.TupleStore
   ( ChangeKind (..),
-    PageState (..),
     Precondition (..),
     RelationshipFilter (..),
-    StoreCursor (..),
     SubjectRelationFilter (..),
     TupleChange (..),
     TupleFilter (..),
-    TuplePage (..),
     TupleRow (..),
     TupleStore,
     TupleWriteRequest (..),
     applyTupleWrites,
     countRelationships,
     deleteRelationships,
-    readRelationships,
+    readRelationshipPage,
     validateRelationshipFilter,
   )
+import En.RelationshipPagination (relationshipCursorToken)
 import En.Revision (Consistency (..), ConsistencyToken (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
-import En.Servant.Problem (ProblemJSON)
+import En.Servant.Problem (ProblemDetails (..), ProblemJSON)
 import En.Servant.Response
   ( EnResponses,
     EnResult,
@@ -92,7 +93,7 @@ import En.Servant.Response
     orInvalid,
     traverseOrInvalid,
   )
-import En.Servant.Seam (Env (..))
+import En.Servant.Seam (EnFault (..), Env (..))
 import En.Servant.Wire
   ( CaveatPayloadWire,
     ConsistencyWire,
@@ -111,9 +112,11 @@ import En.Servant.Wire
 import En.Tuple (Tuple (..), TupleCaveat (..))
 import En.Watch qualified as Watch
 import GHC.Generics (Generic)
+import Relay.Pagination (Connection, CursorError, Direction (..), PageRequest (..))
+import Relay.Pagination.Servant (RelayPage, RelayPageError (..))
 import Servant (Handler, JSON, ReqBody, StdMethod (..), type (:>))
 import Servant.API.Generic (type (:-))
-import Servant.API.MultiVerb (MultiVerb)
+import Servant.API.MultiVerb (AsUnion (..), MultiVerb, Respond, RespondAs)
 import Servant.Server.Generic (AsServerT)
 
 -- * Routes
@@ -134,8 +137,9 @@ data TupleRoutes mode = TupleRoutes
       mode
         :- "relationships"
           :> "query"
+          :> RelayPage 20 100
           :> ReqBody '[JSON] ReadRelationshipsRequestWire
-          :> MultiVerb 'POST '[JSON, ProblemJSON] (EnResponses "A page of stored relationships" ReadRelationshipsResponseWire) (EnResult ReadRelationshipsResponseWire),
+          :> MultiVerb 'POST '[JSON, ProblemJSON] RelationshipPageResponses RelationshipPageResult,
     deleteRelationships ::
       mode
         :- "relationships"
@@ -413,9 +417,7 @@ instance FromJSON RelationshipFilterWire where
 
 data ReadRelationshipsRequestWire = ReadRelationshipsRequestWire
   { consistency :: !ConsistencyWire,
-    filter :: !RelationshipFilterWire,
-    limit :: !Int,
-    cursor :: !(Maybe Text)
+    filter :: !RelationshipFilterWire
   }
   deriving stock (Eq, Show)
 
@@ -423,16 +425,12 @@ instance ToJSON ReadRelationshipsRequestWire where
   toJSON wire =
     Aeson.object
       [ "consistency" .= wire.consistency,
-        "filter" .= wire.filter,
-        "limit" .= wire.limit,
-        "cursor" .= wire.cursor
+        "filter" .= wire.filter
       ]
   toEncoding wire =
     pairs
       ( "consistency" .= wire.consistency
           <> "filter" .= wire.filter
-          <> "limit" .= wire.limit
-          <> "cursor" .= wire.cursor
       )
 
 instance FromJSON ReadRelationshipsRequestWire where
@@ -440,60 +438,44 @@ instance FromJSON ReadRelationshipsRequestWire where
     ReadRelationshipsRequestWire
       <$> o .: "consistency"
       <*> o .: "filter"
-      <*> o .: "limit"
-      <*> o .:? "cursor"
 
--- | Whether a page of relationships is the last one.
---
--- Two statuses, not the three 'En.Lookup.Api.LookupStateWire' and 'En.Expand.Api.ExpandStateWire'
--- carry: @truncated@ means an evaluation budget ran out mid-page, and a stored-tuple read spends no
--- budget — it walks an index. A store that somehow reported truncation is reported as @hasMore@,
--- which resumes from the same cursor and is therefore correct either way.
-data RelationshipsStateWire
-  = RelationshipsExhaustedWire
-  | RelationshipsHasMoreWire !Text
+-- | Relay owns the 400 envelope. The remaining typed failures retain en's RFC 9457
+-- contract, because schema loading and tuple-store access can still fail after the
+-- pagination arguments have been accepted.
+type RelationshipPageResponses =
+  '[ Respond 200 "A page of stored relationships" (Connection TupleWire),
+     RespondAs JSON 400 "Invalid pagination or relationship query" RelayPageError,
+     RespondAs ProblemJSON 412 "Write precondition failed" ProblemDetails,
+     RespondAs ProblemJSON 422 "Resolution limit exceeded" ProblemDetails,
+     RespondAs ProblemJSON 500 "Internal error" ProblemDetails,
+     RespondAs ProblemJSON 503 "Tuple store unavailable" ProblemDetails
+   ]
+
+data RelationshipPageResult
+  = RelationshipPageOk !(Connection TupleWire)
+  | RelationshipPageBadRequest !RelayPageError
+  | RelationshipPagePreconditionFailed !ProblemDetails
+  | RelationshipPageUnprocessable !ProblemDetails
+  | RelationshipPageInternal !ProblemDetails
+  | RelationshipPageUnavailable !ProblemDetails
   deriving stock (Eq, Show)
 
-instance ToJSON RelationshipsStateWire where
-  toJSON = \case
-    RelationshipsExhaustedWire -> Aeson.object ["status" .= ("exhausted" :: Text)]
-    RelationshipsHasMoreWire cursor -> Aeson.object ["status" .= ("hasMore" :: Text), "cursor" .= cursor]
-  toEncoding = \case
-    RelationshipsExhaustedWire -> pairs ("status" .= ("exhausted" :: Text))
-    RelationshipsHasMoreWire cursor -> pairs ("status" .= ("hasMore" :: Text) <> "cursor" .= cursor)
-
-instance FromJSON RelationshipsStateWire where
-  parseJSON = withObject "RelationshipsStateWire" \o ->
-    o .: "status" >>= \case
-      "exhausted" -> pure RelationshipsExhaustedWire
-      "hasMore" -> RelationshipsHasMoreWire <$> o .: "cursor"
-      other -> unknownVariant "relationships status" other ["exhausted", "hasMore"]
-
--- | A page of stored relationships, and the snapshot they were read at.
-data ReadRelationshipsResponseWire = ReadRelationshipsResponseWire
-  { relationships :: ![TupleWire],
-    state :: !RelationshipsStateWire,
-    checkedAt :: !Text
-  }
-  deriving stock (Eq, Show)
-
-instance ToJSON ReadRelationshipsResponseWire where
-  toJSON wire =
-    Aeson.object
-      [ "relationships" .= wire.relationships,
-        "state" .= wire.state,
-        "checkedAt" .= wire.checkedAt
-      ]
-  toEncoding wire =
-    pairs
-      ( "relationships" .= wire.relationships
-          <> "state" .= wire.state
-          <> "checkedAt" .= wire.checkedAt
-      )
-
-instance FromJSON ReadRelationshipsResponseWire where
-  parseJSON = withObject "ReadRelationshipsResponseWire" \o ->
-    ReadRelationshipsResponseWire <$> o .: "relationships" <*> o .: "state" <*> o .: "checkedAt"
+instance AsUnion RelationshipPageResponses RelationshipPageResult where
+  toUnion = \case
+    RelationshipPageOk page -> Z (I page)
+    RelationshipPageBadRequest err -> S (Z (I err))
+    RelationshipPagePreconditionFailed envelope -> S (S (Z (I envelope)))
+    RelationshipPageUnprocessable envelope -> S (S (S (Z (I envelope))))
+    RelationshipPageInternal envelope -> S (S (S (S (Z (I envelope)))))
+    RelationshipPageUnavailable envelope -> S (S (S (S (S (Z (I envelope))))))
+  fromUnion = \case
+    Z (I page) -> RelationshipPageOk page
+    S (Z (I err)) -> RelationshipPageBadRequest err
+    S (S (Z (I envelope))) -> RelationshipPagePreconditionFailed envelope
+    S (S (S (Z (I envelope)))) -> RelationshipPageUnprocessable envelope
+    S (S (S (S (Z (I envelope))))) -> RelationshipPageInternal envelope
+    S (S (S (S (S (Z (I envelope)))))) -> RelationshipPageUnavailable envelope
+    S (S (S (S (S (S impossible))))) -> case impossible of {}
 
 -- | A delete-by-filter request. @dryRun@ is mandatory and has no default.
 --
@@ -692,20 +674,59 @@ deleteTuplesHandler env request = enHandler do
 readRelationshipsHandler ::
   (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) =>
   Env es ->
+  PageRequest ->
   ReadRelationshipsRequestWire ->
-  Handler (EnResult ReadRelationshipsResponseWire)
-readRelationshipsHandler env request = enHandler do
-  active <- activeSchema env
-  consistency <- orInvalid (consistencyFromWire request.consistency)
-  relationshipFilter <- orInvalid (relationshipFilterFromWire request.filter)
-  limit <- orInvalid (positiveLimit request.limit)
-  (checkedAt, page) <-
-    engine env active do
-      ResolvedConsistency {revision} <- resolveConsistency consistency
-      checkedAt <- mintToken revision
-      page <- readRelationships revision relationshipFilter limit (StoreCursor <$> request.cursor)
-      pure (checkedAt, page)
-  pure (relationshipsPageToWire checkedAt page)
+  Handler RelationshipPageResult
+readRelationshipsHandler env pageRequest request = do
+  result <- runExceptT do
+    active <- activeSchema env
+    relationshipFilter <- orInvalid (relationshipFilterFromWire request.filter)
+    pinned <-
+      case pageRequest.cursor of
+        Just cursor ->
+          case relationshipCursorToken cursor of
+            Left cursorError -> pure (Left (cursorRejected pageRequest cursorError))
+            Right token -> do
+              ResolvedConsistency {revision} <- engine env active (resolveConsistency (AtExactSnapshot token))
+              pure (Right (revision, token))
+        Nothing -> do
+          consistency <- orInvalid (consistencyFromWire request.consistency)
+          (revision, token) <-
+            engine env active do
+              ResolvedConsistency {revision} <- resolveConsistency consistency
+              token <- mintToken revision
+              pure (revision, token)
+          pure (Right (revision, token))
+    case pinned of
+      Left err -> pure (Left err)
+      Right (revision, token) -> do
+        page <- engine env active (readRelationshipPage revision token relationshipFilter pageRequest)
+        pure (first (cursorRejected pageRequest) (fmap (tupleToWire . (.tuple)) <$> page))
+  pure $ either relationshipFaultToResult (either RelationshipPageBadRequest RelationshipPageOk) result
+
+cursorRejected :: PageRequest -> CursorError -> RelayPageError
+cursorRejected PageRequest {direction} cursorError =
+  RelayPageError
+    { code = "invalid_cursor",
+      message = "cursor rejected: " <> Text.pack (show cursorError),
+      retryable = False,
+      parameter = Just (case direction of Forward -> "after"; Backward -> "before")
+    }
+
+relationshipFaultToResult :: EnFault -> RelationshipPageResult
+relationshipFaultToResult = \case
+  BadRequestFault details ->
+    RelationshipPageBadRequest
+      RelayPageError
+        { code = details.code,
+          message = details.detail,
+          retryable = details.retryable,
+          parameter = Nothing
+        }
+  PreconditionFailedFault details -> RelationshipPagePreconditionFailed details
+  UnprocessableFault details -> RelationshipPageUnprocessable details
+  InternalFault details -> RelationshipPageInternal details
+  UnavailableFault details -> RelationshipPageUnavailable details
 
 -- | Dry-run and deletion are one endpoint because they must ask the store the same
 -- question. Splitting them into @\/count@ and @\/delete@ would invite a caller to count
@@ -816,14 +837,6 @@ relationshipFilterFromWire wire = do
       | Text.null value = Left (label <> " must not be empty")
       | otherwise = Right value
 
-relationshipsPageToWire :: ConsistencyToken -> TuplePage -> ReadRelationshipsResponseWire
-relationshipsPageToWire (ConsistencyToken checkedAt) TuplePage {rows, state} =
-  ReadRelationshipsResponseWire
-    { relationships = tupleToWire . (.tuple) <$> rows,
-      state = relationshipsStateToWire state,
-      checkedAt
-    }
-
 -- | Exactly one start position, or a client fault naming which rule was broken.
 --
 -- An empty string is rejected rather than read as an absent field, as everywhere else in this
@@ -854,15 +867,6 @@ changeKindToWire :: ChangeKind -> ChangeKindWire
 changeKindToWire = \case
   ChangeTouch -> TouchWire
   ChangeDelete -> DeleteWire
-
-relationshipsStateToWire :: PageState -> RelationshipsStateWire
-relationshipsStateToWire =
-  \case
-    Exhausted -> RelationshipsExhaustedWire
-    HasMore (StoreCursor cursor) -> RelationshipsHasMoreWire cursor
-    -- See 'RelationshipsStateWire': a stored-tuple read spends no budget, so it
-    -- cannot truncate. Resuming from the cursor is right regardless.
-    Truncated (StoreCursor cursor) -> RelationshipsHasMoreWire cursor
 
 subjectRelationFromWire :: SubjectRelationFilterWire -> Either Text SubjectRelationFilter
 subjectRelationFromWire = \case

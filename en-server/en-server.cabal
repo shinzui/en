@@ -64,6 +64,8 @@ executable en-server
     , hs-opentelemetry-sdk                      >=1.0  && <1.1
     , http-types
     , ram
+    , relay-pagination-servant                  >=0.1  && <0.2
+    , servant
     , servant-health                            ^>=0.1
     , text
     , time

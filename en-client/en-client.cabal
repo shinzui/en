@@ -33,9 +33,10 @@ library
   hs-source-dirs:  src
   exposed-modules: En.Client
   build-depends:
-    , base                 >=4.19 && <5
+    , base                      >=4.19 && <5
     , en-core
     , en-servant
+    , relay-pagination-servant  >=0.1  && <0.2
     , servant
     , servant-client
     , servant-client-core

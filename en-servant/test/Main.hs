@@ -83,9 +83,8 @@ import En.Servant.API
     ObjectRefWire (..),
     PreconditionWire (..),
     ReadRelationshipsRequestWire (..),
-    ReadRelationshipsResponseWire (..),
     RelationshipFilterWire (..),
-    RelationshipsStateWire (..),
+    RelationshipPageResult (..),
     SchemaInfoWire (..),
     SubjectRelationFilterWire (..),
     SubjectWire (..),
@@ -132,6 +131,9 @@ import En.Watch (WatchBatch (..), WatchStart (..))
 import Network.HTTP.Types (methodDelete, methodPost, statusCode)
 import Network.Wai (Application, Request (..), defaultRequest)
 import Network.Wai.Test (SRequest (..), SResponse (..), runSession, setPath, srequest)
+import Relay.Pagination (Connection (..), Direction (..), Edge (..), PageInfo (..), PageRequest (..), cursorToText)
+import Relay.Pagination.Conformance.Check (checkConformance, conformancePassed, defaultConformanceConfig, renderConformanceReport)
+import Relay.Pagination.Servant (RelayPageError (..))
 import Servant (Handler, ServerError (errHTTPCode), runHandler)
 import Servant.Health.Paths qualified as Health
 import Servant.Health.TestKit (probeContractTests)
@@ -665,9 +667,15 @@ toJsonMatchesToSchema = do
   conforms "SubjectRelationFilterWire" NoSubjectRelationWire
   conforms "TupleFilterWire" tupleFilter
   conforms "RelationshipFilterWire" relFilter
-  conforms "ReadRelationshipsRequestWire" ReadRelationshipsRequestWire {consistency = MinimizeLatencyWire, filter = relFilter, limit = 100, cursor = Nothing}
-  conforms "RelationshipsStateWire" RelationshipsExhaustedWire
-  conforms "ReadRelationshipsResponseWire" ReadRelationshipsResponseWire {relationships = [tuple], state = RelationshipsExhaustedWire, checkedAt = "tok"}
+  conforms "ReadRelationshipsRequestWire" ReadRelationshipsRequestWire {consistency = MinimizeLatencyWire, filter = relFilter}
+  conforms
+    "Connection TupleWire"
+    ( Connection
+        { edges = [],
+          pageInfo = PageInfo {hasNextPage = False, hasPreviousPage = False, startCursor = Nothing, endCursor = Nothing}
+        } ::
+        Connection TupleWire
+    )
   conforms "DeleteRelationshipsRequestWire" DeleteRelationshipsRequestWire {filter = relFilter, dryRun = True}
   conforms "DeleteRelationshipsResponseWire" DeleteRelationshipsResponseWire {dryRun = True, count = 3, token = Nothing}
   conforms "WatchRequestWire" WatchRequestWire {cursor = Nothing, startToken = Nothing, filter = Just relFilter, limit = 100}
@@ -832,6 +840,56 @@ routingTests env = do
   assertBool
     "POST /v1/lookup decodes to LookupPageWire"
     (isJust (decode lookupResponse.simpleBody :: Maybe LookupPageWire))
+
+  let relationshipBody =
+        ReadRelationshipsRequestWire
+          { consistency = MinimizeLatencyWire,
+            filter = subjectFilterWire "user" "alice"
+          }
+      relationshipPath PageRequest {pageSize, direction, cursor} =
+        encodeUtf8 $
+          "/v1/relationships/query?"
+            <> case direction of
+              Forward -> "first=" <> Text.pack (show pageSize) <> foldMap ("&after=" <>) (cursorToText <$> cursor)
+              Backward -> "last=" <> Text.pack (show pageSize) <> foldMap ("&before=" <>) (cursorToText <$> cursor)
+      fetchRelationshipPage :: PageRequest -> IO (Connection TupleWire)
+      fetchRelationshipPage request = do
+        response <- postJson application (relationshipPath request) (encode relationshipBody)
+        case (statusCode response.simpleStatus, decode response.simpleBody) of
+          (200, Just page) -> pure page
+          _ -> fail ("relationship page request failed: " <> show response)
+
+  allRelationships <- fetchRelationshipPage PageRequest {pageSize = 100, direction = Forward, cursor = Nothing}
+  report <-
+    checkConformance
+      (defaultConformanceConfig 1)
+      encode
+      fetchRelationshipPage
+      [edge.node | edge <- allRelationships.edges]
+  assertBool (Text.unpack (renderConformanceReport report)) (conformancePassed report)
+
+  invalidCursor <- postJson application "/v1/relationships/query?first=1&after=broken" (encode relationshipBody)
+  assertEqual "a malformed Relay cursor is a 400" 400 (statusCode invalidCursor.simpleStatus)
+  assertEqual
+    "a malformed Relay cursor uses the released error envelope"
+    (Just "invalid_cursor")
+    (fmap (.code) (decode invalidCursor.simpleBody :: Maybe RelayPageError))
+  assertEqual
+    "a Relay 400 is JSON, not problem+json"
+    (Just "application/json")
+    (lookup "Content-Type" invalidCursor.simpleHeaders)
+
+  mixedDirections <- postJson application "/v1/relationships/query?first=1&last=1" (encode relationshipBody)
+  assertEqual
+    "mixed Relay directions are rejected before the handler"
+    (Just "mixed_pagination_directions")
+    (fmap (.code) (decode mixedDirections.simpleBody :: Maybe RelayPageError))
+
+  oversized <- postJson application "/v1/relationships/query?first=101" (encode relationshipBody)
+  assertEqual
+    "the route-level maximum is enforced without clamping"
+    (Just "page_size_too_large")
+    (fmap (.code) (decode oversized.simpleBody :: Maybe RelayPageError))
 
   -- POST /v1/relationships routes to the write handler (the in-memory store accepts writes).
   let writeBody =
@@ -1036,19 +1094,26 @@ openApiDocumentTests = do
                       assertBool
                         ("success response for " <> Text.unpack path <> " must not advertise application/problem+json")
                         ("application/problem+json" `notElem` contentKeys)
-                    else do
-                      assertEqual
-                        ("error response " <> Text.unpack responseStatus <> " for " <> Text.unpack path <> " has one problem media type")
-                        ["application/problem+json"]
-                        contentKeys
-                      assertEqual
-                        ("documented codes for " <> Text.unpack responseStatus <> " on " <> Text.unpack path <> " come from the catalog")
-                        (catalogCodesAt responseStatus)
-                        ( documentedCodes
-                            document
-                            path
-                            responseStatus
-                        )
+                    else
+                      if path == "/v1/relationships/query" && responseStatus == "400"
+                        then
+                          assertEqual
+                            "relationships/query records RelayPageError as its sole 400 media type"
+                            ["application/json", "application/json;charset=utf-8"]
+                            contentKeys
+                        else do
+                          assertEqual
+                            ("error response " <> Text.unpack responseStatus <> " for " <> Text.unpack path <> " has one problem media type")
+                            ["application/problem+json"]
+                            contentKeys
+                          assertEqual
+                            ("documented codes for " <> Text.unpack responseStatus <> " on " <> Text.unpack path <> " come from the catalog")
+                            (catalogCodesAt responseStatus)
+                            ( documentedCodes
+                                document
+                                path
+                                responseStatus
+                            )
           )
           statuses
     )
@@ -1097,8 +1162,8 @@ openApiDocumentTests = do
     )
     [ "RelationshipFilterWire",
       "ReadRelationshipsRequestWire",
-      "ReadRelationshipsResponseWire",
-      "RelationshipsStateWire",
+      "Connection_TupleWire",
+      "RelayPageError",
       "DeleteRelationshipsRequestWire",
       "DeleteRelationshipsResponseWire",
       "WatchRequestWire",
@@ -1336,15 +1401,16 @@ watchEndpointTests env = do
 -- whether the wire surface says the right things.
 relationshipEndpointTests :: Env TestEffects -> IO ()
 relationshipEndpointTests env = do
-  let query relationshipFilter limit cursor =
+  let query relationshipFilter pageRequest =
         readRelationshipsHandler
           env
+          pageRequest
           ReadRelationshipsRequestWire
             { consistency = MinimizeLatencyWire,
-              filter = relationshipFilter,
-              limit,
-              cursor
+              filter = relationshipFilter
             }
+
+      page size direction cursor = PageRequest {pageSize = size, direction, cursor}
 
       -- The fixture's two grants naming alice: space:project-x#owner and
       -- intention:42#delegate, in that row order.
@@ -1355,36 +1421,43 @@ relationshipEndpointTests env = do
 
       identify response =
         [ (wire.object.objectType, wire.object.objectId, wire.relation)
-        | wire <- response.relationships
+        | Edge {node = wire} <- response.edges
         ]
 
-      okQuery label relationshipFilter limit cursor =
-        runHandler (query relationshipFilter limit cursor) >>= \case
-          Right (EnOk response) -> pure response
-          other -> fail (label <> "\nexpected EnOk, got: " <> show other)
+      okQuery label relationshipFilter pageRequest =
+        runHandler (query relationshipFilter pageRequest) >>= \case
+          Right (RelationshipPageOk response) -> pure response
+          other -> fail (label <> "\nexpected RelationshipPageOk, got: " <> show other)
 
-  aliceAll <- okQuery "query alice" (subjectFilterWire "user" "alice") 100 Nothing
+  aliceAll <- okQuery "query alice" (subjectFilterWire "user" "alice") (page 100 Forward Nothing)
   assertEqual "query returns every grant naming the subject" aliceGrants (identify aliceAll)
-  assertEqual "a complete page is exhausted" RelationshipsExhaustedWire aliceAll.state
+  assertBool "a complete page has no continuation" (not aliceAll.pageInfo.hasNextPage)
 
   -- Keyset pagination: the cursor resumes, it does not restart.
-  firstPage <- okQuery "query alice, page 1" (subjectFilterWire "user" "alice") 1 Nothing
+  firstPage <- okQuery "query alice, page 1" (subjectFilterWire "user" "alice") (page 1 Forward Nothing)
   assertEqual "the first page carries the requested limit" (take 1 aliceGrants) (identify firstPage)
   cursor <-
-    case firstPage.state of
-      RelationshipsHasMoreWire next -> pure next
+    case firstPage.pageInfo.endCursor of
+      Just next | firstPage.pageInfo.hasNextPage -> pure next
       other -> fail ("expected the first page to have more, got " <> show other)
-  secondPage <- okQuery "query alice, page 2" (subjectFilterWire "user" "alice") 1 (Just cursor)
+  secondPage <- okQuery "query alice, page 2" (subjectFilterWire "user" "alice") (page 1 Forward (Just cursor))
   assertEqual "the second page resumes rather than restarts" (drop 1 aliceGrants) (identify secondPage)
-  assertEqual "the second page is exhausted" RelationshipsExhaustedWire secondPage.state
+  assertBool "the second page has no forward continuation" (not secondPage.pageInfo.hasNextPage)
+
+  report <-
+    checkConformance
+      (defaultConformanceConfig 1)
+      (\wire -> (wire.object.objectType, wire.object.objectId, wire.relation))
+      (\request -> okQuery "conformance walk" (subjectFilterWire "user" "alice") request)
+      [edge.node | edge <- aliceAll.edges]
+  assertBool (Text.unpack (renderConformanceReport report)) (conformancePassed report)
 
   -- A caveat name is a residual predicate, and it is anchored by the subject.
   caveated <-
     okQuery
       "query alice's caveated grants"
       (relationshipFilterWire Nothing Nothing Nothing (Just "user") (Just "alice") Nothing (Just "within_autonomy"))
-      100
-      Nothing
+      (page 100 Forward Nothing)
   assertEqual
     "a caveat-name constraint selects only the caveated grant"
     [("intention", "42", "delegate")]
@@ -1394,28 +1467,22 @@ relationshipEndpointTests env = do
   assertEqual
     "a filter anchored on neither end is a client error"
     (Just "invalid_request")
-    =<< clientErrorCodeOf (query emptyFilterWire 100 Nothing)
+    =<< relationshipClientErrorCodeOf (query emptyFilterWire (page 100 Forward Nothing))
   assertEqual
     "a filter whose objectId names no objectType is a client error"
     (Just "invalid_request")
-    =<< clientErrorCodeOf
-      (query (relationshipFilterWire Nothing (Just "project-x") Nothing (Just "user") Nothing Nothing Nothing) 100 Nothing)
+    =<< relationshipClientErrorCodeOf
+      (query (relationshipFilterWire Nothing (Just "project-x") Nothing (Just "user") Nothing Nothing Nothing) (page 100 Forward Nothing))
   assertEqual
     "a filter whose subjectId names no subjectType is a client error"
     (Just "invalid_request")
-    =<< clientErrorCodeOf
-      (query (relationshipFilterWire (Just "space") Nothing Nothing Nothing (Just "alice") Nothing Nothing) 100 Nothing)
+    =<< relationshipClientErrorCodeOf
+      (query (relationshipFilterWire (Just "space") Nothing Nothing Nothing (Just "alice") Nothing Nothing) (page 100 Forward Nothing))
   assertEqual
     "an empty-string constraint is a client error, not an absent one"
     (Just "invalid_request")
-    =<< clientErrorCodeOf
-      (query (relationshipFilterWire Nothing Nothing Nothing (Just "") Nothing Nothing Nothing) 100 Nothing)
-  -- A zero limit returns an empty page whose cursor is the caller's own, so a drain
-  -- loop over it would spin forever.
-  assertEqual
-    "a non-positive limit is a client error"
-    (Just "invalid_request")
-    =<< clientErrorCodeOf (query (subjectFilterWire "user" "alice") 0 Nothing)
+    =<< relationshipClientErrorCodeOf
+      (query (relationshipFilterWire Nothing Nothing Nothing (Just "") Nothing Nothing Nothing) (page 100 Forward Nothing))
 
   -- Delete-by-filter: a dry run counts and writes nothing; a real delete returns a token.
   runHandler (deleteRelationshipsHandler env DeleteRelationshipsRequestWire {filter = subjectFilterWire "user" "alice", dryRun = True}) >>= \case
@@ -1812,30 +1879,10 @@ wireContractTests = do
 
   golden
     "ReadRelationshipsRequestWire"
-    "{\"consistency\":{\"mode\":\"fullyConsistent\"},\"filter\":{\"subjectType\":\"user\",\"subjectId\":\"alice\"},\"limit\":100,\"cursor\":null}"
+    "{\"consistency\":{\"mode\":\"fullyConsistent\"},\"filter\":{\"subjectType\":\"user\",\"subjectId\":\"alice\"}}"
     ReadRelationshipsRequestWire
       { consistency = FullyConsistentWire,
-        filter = subjectFilterWire "user" "alice",
-        limit = 100,
-        cursor = Nothing
-      }
-
-  golden "RelationshipsStateWire/exhausted" "{\"status\":\"exhausted\"}" RelationshipsExhaustedWire
-  golden
-    "RelationshipsStateWire/hasMore"
-    "{\"status\":\"hasMore\",\"cursor\":\"42\"}"
-    (RelationshipsHasMoreWire "42")
-  rejects
-    "RelationshipsStateWire"
-    (decode "{\"status\":\"truncated\",\"cursor\":\"42\"}" :: Maybe RelationshipsStateWire)
-
-  golden
-    "ReadRelationshipsResponseWire"
-    "{\"relationships\":[{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"relation\":\"viewer\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"caveat\":null}],\"state\":{\"status\":\"exhausted\"},\"checkedAt\":\"tok\"}"
-    ReadRelationshipsResponseWire
-      { relationships = [viewerTuple],
-        state = RelationshipsExhaustedWire,
-        checkedAt = "tok"
+        filter = subjectFilterWire "user" "alice"
       }
 
   golden
@@ -2077,6 +2124,12 @@ clientErrorCodeOf :: Handler (EnResult a) -> IO (Maybe Text)
 clientErrorCodeOf handler =
   runHandler handler <&> \case
     Right (EnClientError envelope) -> Just envelope.code
+    _ -> Nothing
+
+relationshipClientErrorCodeOf :: Handler RelationshipPageResult -> IO (Maybe Text)
+relationshipClientErrorCodeOf handler =
+  runHandler handler <&> \case
+    Right (RelationshipPageBadRequest envelope) -> Just envelope.code
     _ -> Nothing
 
 -- | The stable code of a 412, or 'Nothing' if the handler answered anything else.
