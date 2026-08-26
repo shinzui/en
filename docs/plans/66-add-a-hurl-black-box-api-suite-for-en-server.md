@@ -68,9 +68,11 @@ point at any environment.
 - [x] (2026-08-25T19:20:08-07:00) Milestone 2 — Cover the read surface in resource-family files: `health.hurl`,
       `openapi.hurl`, `checks.hurl`, `lookups.hurl`, `expands.hurl`, `schema.hurl`. Every
       file independent; every block asserting status, media type, and stable fields.
-- [ ] Milestone 3 — Cover failures: malformed bodies, unknown routes, unknown relations,
-      resolution-limit and precondition failures. Assert `application/problem+json` and the
-      stable `code`, never prose.
+- [x] (2026-08-25T19:23:21-07:00) Milestone 3 — Cover failures reachable against the standard
+      demo host: malformed bodies, unknown routes and relations, invalid cursors, method
+      mismatches, and a transactionally rolled-back precondition failure. Assert
+      `application/problem+json` and the stable `code`, never prose; keep the alternate-schema
+      resolution-budget branch in the deterministic Haskell suite.
 - [ ] Milestone 4 — Add the opt-in `relationships.hurl` write flow (write, read back, delete)
       and the opt-in `perimeter/perimeter.hurl` suite covering authentication boundaries
       against a separately configured server.
@@ -113,6 +115,14 @@ point at any environment.
   and Hurl's command-line `base_url` override; the checked-in `127.0.0.1:8080` default remains
   correct for an ordinary checkout. Evidence: the overridden run executed six files and the
   live probe request, with `Succeeded files: 6 (100.0%)`.
+
+- Discovery (2026-08-25, Milestone 3): **expand silently normalizes invalid pagination input
+  instead of returning the errors its sibling list endpoints return.** A live request with
+  `limit: 0` answered 200 because `En.Expand.pageNodes` clamps the raw limit with `max 0`; a
+  request with `cursor: "not-a-cursor"` also answered 200 because `decodeCursor` falls back to
+  offset zero. `lookup` rejects the same invented cursor as `invalid_cursor`. EP-67 is already
+  responsible for replacing all three bespoke cursor contracts with typed Relay cursors, so
+  this suite records the asymmetry without changing Haskell under a test-only plan.
 
 (Add further entries as work proceeds.)
 
@@ -163,6 +173,17 @@ point at any environment.
   `--secret` preserves diagnostic redaction while keeping `just hurl` useful after
   `just process-up`. Environment overrides let the same read-only runner target an ephemeral
   CI service or a local alternate port without editing tracked files.
+  Date: 2026-08-25
+
+- Decision: Leave `resolution_limit_exceeded` in the deterministic engine and HTTP fault-map
+  tests rather than manufacture it in the default Hurl suite.
+  Rationale: the built-in demo schema has one direct `viewer` relation and cannot exhaust the
+  traversal depth budget. A live 422 case would require a second server with an alternate
+  recursive schema plus a seeded relationship chain, moving domain combinatorics into Hurl in
+  direct conflict with this plan's layer boundary. The safe suite instead covers framework,
+  schema, cursor, and transaction-precondition failures that only a real process can prove;
+  `en-core/test/Main.hs` retains the deep-chain behavior test and `en-servant/test/Main.hs`
+  retains the exact `(422, "resolution_limit_exceeded", false)` wire mapping.
   Date: 2026-08-25
 
 (Add further entries as work proceeds.)
@@ -877,3 +898,9 @@ public contract. Read it back through the API.
 behaves differently than expected, that is a finding: record it in Surprises & Discoveries and
 decide whether the contract or the expectation is wrong. Do not quietly adjust `en` to match a
 test written from a plan.
+
+
+Revision note (2026-08-25): Milestone 3 now names the live-process failures the standard demo
+host can exercise and explicitly leaves the alternate-schema resolution-budget case in the
+deterministic Haskell suite. Implementation showed that forcing the 422 in Hurl would violate
+the plan's own rule against moving domain combinatorics into the black-box layer.
