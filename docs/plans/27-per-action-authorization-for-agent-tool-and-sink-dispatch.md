@@ -63,8 +63,10 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   `51edaab17473f7b9310f8802ccffd23bac5e4a9e`. `cabal build all --enable-tests`, the unit
   suite, the 16-case conformance executable, `en-migrate up`/`verify`, the live `/v1` Hurl
   suite, and the stateful relationship-adoption flow all pass.
-- [ ] M2 — Add the closed action vocabulary, canonical capability-provider/tool targets, and
-  corresponding Kikan schema relations and conformance fixtures.
+- [x] 2026-08-26 — M2: added the public `kikan-en-contract` package, closed action JSON,
+  constructor-enforced canonical targets, capability provider/tool schema relations, Meibo-style
+  fixtures, and exact revision/tool/capability/agent denials. Both package test suites pass and
+  the conformance executable now reports 24 passing cases.
 - [ ] M3 — Add a Shomei-authenticated, proof-minting Kikan action endpoint plus small public
   `kikan-en-contract` and `kikan-en-client` packages.
 - [ ] M4 — Prove the public client, denial taxonomy, Biscuit verification, expiry, tamper
@@ -130,6 +132,12 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   `env -u EN_DATABASE_URL KIKAN_EN_CI_PORT=18080 nix develop -c just ci`; it completed with one
   applied migration, zero pending migrations, seven safe Hurl requests, and five stateful
   relationship requests passing.
+  Date: 2026-08-26.
+
+- Discovery: Kikan-En gained a plain-filesystem ADR corpus after this plan’s refresh. Its
+  `docs/adr/README.md` requires four-digit filenames and Status/Context/Decision/Consequences
+  headings without frontmatter, so M2 recorded the new durable contract boundary as ADR 0004
+  rather than introducing an OKF profile incidentally.
   Date: 2026-08-26.
 
 
@@ -200,6 +208,17 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   Rationale: Shikigami’s current pure catalog resolver cannot make a fresh network decision, and a
   server/provider can expose tools with materially different authority. Wrapping the two actual IO
   boundaries is both current and non-bypassable.
+  Date: 2026-08-26.
+
+- Decision: Keep the JSON action sum split by concrete sink operation (`dispatch_kawa`,
+  `dispatch_kizashi`, `attach_danwa`, and `dispatch_channel`) and require each tag’s matching
+  target kind. Principal construction mirrors Shikigami’s current edge hygiene—nonempty
+  `agent_` text plus bounded, tuple-safe characters—while Meibo remains responsible for existence
+  and lifecycle verification.
+  Rationale: the action-to-permission mapping in this plan is closed and sink-specific. Typed
+  constructors make mismatches unrepresentable in Haskell, explicit target-kind checks make them
+  fail JSON decoding, and duplicating Meibo’s directory lookup or minting rules in a transport
+  package would create a second identity authority.
   Date: 2026-08-26.
 
 
