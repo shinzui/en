@@ -25,14 +25,14 @@ module En.Postgres.Watch
   )
 where
 
-import Data.Text (Text)
+import Data.Generics.Labels ()
 import Data.Text qualified as Text
 import Data.Word (Word64)
 import Effectful (Eff, (:>))
 import Effectful.Error.Static (Error, throwError)
-import En.Effect.ConsistencyStore (ConsistencyStore, TokenMetadata (..))
+import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.ConsistencyStore qualified as ConsistencyStore
-import En.Effect.TupleStore (ChangePage (..), PageState (..), RelationshipFilter, StoreCursor (..), TupleStore)
+import En.Effect.TupleStore (PageState (..), RelationshipFilter, StoreCursor (..), TupleStore)
 import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError (..))
 import En.Postgres.Revision
@@ -43,6 +43,7 @@ import En.Postgres.Revision
     revisionToPgSnapshot,
     unescapeText,
   )
+import En.Prelude hiding (from)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), Revision (..))
 import En.Watch (WatchBatch (..), WatchStart (..))
 
@@ -79,9 +80,9 @@ encodeWatchCursor (DatastoreId datastoreId) cursorState =
     (tag, startText, endText, rowText) =
       case cursorState of
         WatchAt start ->
-          ("at", start.revisionEncoding, "", "")
+          ("at", start ^. #revisionEncoding, "", "")
         WatchDraining start end (StoreCursor rowId) ->
-          ("drain", start.revisionEncoding, end.revisionEncoding, rowId)
+          ("drain", start ^. #revisionEncoding, end ^. #revisionEncoding, rowId)
 
 watchCursorPrefix :: Text
 watchCursorPrefix = "enwatch1"
@@ -159,7 +160,7 @@ decodeWatchCursor cursorText =
 -- at exactly the moment an operator changes the model — the moment it is most needed.
 validateWatchCursor :: ConsistencyConfig -> Word64 -> DatastoreId -> WatchCursorState -> Either EnError WatchCursorState
 validateWatchCursor config oldestRetainedXid datastoreId cursorState
-  | datastoreId /= config.datastoreId =
+  | datastoreId /= (config ^. #datastoreId) =
       Left (InvalidConsistencyToken "watch cursor datastore does not match this en datastore")
   | otherwise =
       case revisionToPgSnapshot (windowStart cursorState) of
@@ -219,7 +220,7 @@ watch config start relationshipFilter limit =
       pure
         WatchBatch
           { changes = [],
-            cursor = encodeWatchCursor config.datastoreId (WatchAt revision),
+            cursor = encodeWatchCursor (config ^. #datastoreId) (WatchAt revision),
             checkedAt
           }
 
@@ -227,7 +228,7 @@ watch config start relationshipFilter limit =
       page <- TupleStore.readChanges from end relationshipFilter limit cursor
       checkedAt <- ConsistencyStore.mintToken end
       let next =
-            case page.state of
+            case (page ^. #state) of
               Exhausted -> WatchAt end
               HasMore resume -> WatchDraining from end resume
               -- A store read spends no evaluation budget, so it cannot truncate.
@@ -235,8 +236,8 @@ watch config start relationshipFilter limit =
               Truncated resume -> WatchDraining from end resume
       pure
         WatchBatch
-          { changes = page.changes,
-            cursor = encodeWatchCursor config.datastoreId next,
+          { changes = (page ^. #changes),
+            cursor = encodeWatchCursor (config ^. #datastoreId) next,
             checkedAt
           }
 
@@ -256,4 +257,4 @@ watch config start relationshipFilter limit =
         StartFromToken tokenText -> do
           metadata <- ConsistencyStore.decodeToken (ConsistencyToken tokenText)
           ConsistencyStore.validateToken metadata
-          pure (Just (WatchAt metadata.revision))
+          pure (Just (WatchAt (metadata ^. #revision)))
