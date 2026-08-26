@@ -118,6 +118,11 @@ test-server:
     test "$decision" = "allowed"; \
     echo "server smoke test passed: $decision"
 
+# Run the safe black-box API suite against an already-running en-server
+[group("testing")]
+hurl:
+  en-servant/test/hurl/run.sh
+
 # The document is derived (never hand-written) by `cabal run en-openapi`. A red result
 # means someone changed the API type and did not regenerate the checked-in artifact.
 #

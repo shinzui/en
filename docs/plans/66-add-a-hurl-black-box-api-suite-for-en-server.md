@@ -62,7 +62,7 @@ point at any environment.
 
 ## Progress
 
-- [ ] Milestone 1 — Make Hurl available as a project tool (`pkgs.hurl` in the dev shell) and
+- [x] (2026-08-25T19:17:14-07:00) Milestone 1 — Make Hurl available as a project tool (`pkgs.hurl` in the dev shell) and
       create the suite skeleton: directory, `README.md`, `vars.env`, `run.sh`, and a `just
       hurl` target. One trivial `health.hurl` proves the runner works end to end.
 - [ ] Milestone 2 — Cover the read surface in resource-family files: `health.hurl`,
@@ -105,6 +105,14 @@ point at any environment.
   `nix/haskell.nix:3` documents that extra dev packages should be set through
   `haskellProject.extraDevPackages` from `./flake.module.nix` rather than by editing that file
   — so Milestone 1 follows that instruction rather than appending to the list directly.
+
+- Discovery (2026-08-25, Milestone 1): **the workstation has an unrelated container bound
+  specifically to `127.0.0.1:8080`, while the supervised `en-server` binds the wildcard
+  address on the same port.** A request to the suite's standard localhost default therefore
+  reached Redpanda Console rather than en. Validation used a second `en-server` on port 18080
+  and Hurl's command-line `base_url` override; the checked-in `127.0.0.1:8080` default remains
+  correct for an ordinary checkout. Evidence: the overridden run executed six files and the
+  live probe request, with `Succeeded files: 6 (100.0%)`.
 
 (Add further entries as work proceeds.)
 
@@ -810,12 +818,11 @@ genuinely unavoidable shared state. Find the dependency and remove it.
 
 ### Tools
 
-**Hurl and hurlfmt**, from the nix development shell. Added via
+**Hurl and hurlfmt 8.0.1**, from the nix development shell. Added via
 `haskellProject.extraDevPackages` in `./flake.module.nix` per `nix/haskell.nix`'s own
 instruction, not by editing that file's list directly. The standard's examples were checked
-with 8.0.1 on 2026-07-30; **record the version this shell actually provides here** when
-Milestone 1 lands, and re-check the upstream release before using syntax from a newer
-version.
+with 8.0.1 on 2026-07-30; the shell resolves that same version, and upstream still marks
+8.0.1 as the latest release as of 2026-08-25. The suite uses no syntax newer than 8.0.1.
 
 **No Haskell dependency is added.** Hurl is an external test executable; no module imports
 it, and ordinary consumers of `en`'s libraries do not need a test client. This is the only
