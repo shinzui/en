@@ -28,6 +28,7 @@ module En.Effect.TupleStore
     widenTupleFilter,
     validateRelationshipFilter,
     readRelationships,
+    readRelationshipPage,
     countRelationships,
     deleteRelationships,
     ChangeKind (..),
@@ -56,6 +57,7 @@ import Effectful.Dispatch.Dynamic (send)
 import En.Revision (ConsistencyToken, Revision)
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
 import En.Tuple (ObjectRef (..), Subject (..), Tuple (..))
+import Relay.Pagination (Connection, CursorError, PageRequest)
 
 newtype StoreCursor = StoreCursor
   { cursorEncoding :: Text
@@ -74,7 +76,8 @@ data PageState
   deriving stock (Eq, Ord, Show)
 
 data TupleRow = TupleRow
-  { rowId :: !TupleRowId,
+  { pageKey :: !Int64,
+    rowId :: !TupleRowId,
     tuple :: !Tuple,
     createdAt :: !Revision,
     deletedAt :: !(Maybe Revision)
@@ -398,6 +401,10 @@ data TupleStore :: Effect where
   --     put. Anchoring every page to one caller-held 'Revision' makes a paged listing a
   --     consistent snapshot, exactly as it does for 'ReadAllTuples'.
   ReadRelationships :: Revision -> RelationshipFilter -> Int -> Maybe StoreCursor -> TupleStore m TuplePage
+  -- | Relay keyset page over the relationship listing. The consistency token is
+  --     included in every minted cursor so continuation pages reuse the exact
+  --     snapshot rather than re-resolving the request body.
+  ReadRelationshipPage :: Revision -> ConsistencyToken -> RelationshipFilter -> PageRequest -> TupleStore m (Either CursorError (Connection TupleRow))
   -- | How many tuples live at @revision@ match the filter.
   --
   --     The dry-run primitive of 'DeleteRelationships'. It is a separate operation rather
@@ -466,6 +473,16 @@ applyTupleWrites =
 readRelationships :: (TupleStore :> es) => Revision -> RelationshipFilter -> Int -> Maybe StoreCursor -> Eff es TuplePage
 readRelationships revision relationshipFilter limit cursor =
   send (ReadRelationships revision relationshipFilter limit cursor)
+
+readRelationshipPage ::
+  (TupleStore :> es) =>
+  Revision ->
+  ConsistencyToken ->
+  RelationshipFilter ->
+  PageRequest ->
+  Eff es (Either CursorError (Connection TupleRow))
+readRelationshipPage revision token relationshipFilter pageRequest =
+  send (ReadRelationshipPage revision token relationshipFilter pageRequest)
 
 -- | How many tuples live at the revision match the filter. See 'readRelationships'.
 countRelationships :: (TupleStore :> es) => Revision -> RelationshipFilter -> Eff es Int64

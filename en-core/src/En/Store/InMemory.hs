@@ -59,6 +59,7 @@ import En.Effect.TupleStore
     widenTupleFilter,
   )
 import En.Error (EnError (..))
+import En.RelationshipPagination (relationshipPageFromRows)
 import En.Revision
   ( Consistency (..),
     ConsistencyToken (..),
@@ -185,6 +186,18 @@ runTupleStoreInMemory world =
               (matchesRelationshipFilter relationshipFilter . (.memoryTuple))
               (visibleRows revisionNumber state)
           )
+    ReadRelationshipPage revision token relationshipFilter pageRequest -> do
+      revisionNumber <- requireRevision world revision
+      state <- liftIO (readIORef world.memoryState)
+      pure
+        ( relationshipPageFromRows
+            token
+            pageRequest
+            [ toTupleRow world row
+            | row <- visibleRows revisionNumber state,
+              matchesRelationshipFilter relationshipFilter row.memoryTuple
+            ]
+        )
     CountRelationships revision relationshipFilter -> do
       revisionNumber <- requireRevision world revision
       state <- liftIO (readIORef world.memoryState)
@@ -498,7 +511,8 @@ visibleAt revisionNumber row =
 toTupleRow :: InMemoryWorld -> InMemoryRow -> TupleRow
 toTupleRow world row =
   TupleRow
-    { rowId = rowIdAt row.memoryRowId,
+    { pageKey = fromIntegral row.memoryRowId,
+      rowId = rowIdAt row.memoryRowId,
       tuple = row.memoryTuple,
       createdAt = revisionAt world row.memoryCreatedAt,
       deletedAt = revisionAt world <$> row.memoryDeletedAt

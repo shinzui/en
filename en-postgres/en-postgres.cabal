@@ -42,7 +42,7 @@ library
 
   build-depends:
     , aeson
-    , base                    >=4.19 && <5
+    , base                      >=4.19 && <5
     , bytestring
     , containers
     , effectful
@@ -50,9 +50,10 @@ library
     , en-core
     , en-migrations
     , hasql
-    , hasql-pool              ^>=1.4
-    , relay-pagination        >=0.1  && <0.2
-    , relay-pagination-hasql  >=0.1  && <0.2
+    , hasql-dynamic-statements
+    , hasql-pool                ^>=1.4
+    , relay-pagination          >=0.1  && <0.2
+    , relay-pagination-hasql    >=0.1  && <0.2
     , scientific
     , text
     , time

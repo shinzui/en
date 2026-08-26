@@ -22,6 +22,7 @@ import Data.Aeson.Types qualified as Aeson
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.Functor.Contravariant ((>$<))
 import Data.Int (Int64)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust)
 import Data.Scientific (floatingOrInteger)
@@ -67,8 +68,9 @@ import En.Postgres.Revision
     revisionToPgSnapshot,
     storeOptimizedRevisionCache,
   )
+import En.RelationshipPagination (relationshipSortFingerprint)
 import En.Revision
-  ( ConsistencyToken,
+  ( ConsistencyToken (..),
     Revision (..),
     SchemaHash (..),
   )
@@ -82,6 +84,8 @@ import En.Tuple
     TupleCaveat (..),
   )
 import Hasql.Decoders qualified as Decoders
+import Hasql.DynamicStatements.Snippet (Snippet)
+import Hasql.DynamicStatements.Snippet qualified as Snippet
 import Hasql.Encoders qualified as Encoders
 import Hasql.Errors qualified as Hasql
 import Hasql.Session (Session)
@@ -89,6 +93,16 @@ import Hasql.Session qualified as Session
 import Hasql.Statement (Statement)
 import Hasql.Statement qualified as Statement
 import Numeric (readDec)
+import Relay.Pagination (Connection, CursorError (..), PageRequest)
+import Relay.Pagination.Hasql
+  ( KeyColumn (..),
+    SortDirection (..),
+    SortSpec (..),
+    int8Key,
+    paginate,
+    sortSpecFingerprint,
+    textKey,
+  )
 
 runTupleStorePostgres ::
   (Database :> es, Error EnError :> es) =>
@@ -139,6 +153,8 @@ interpretTupleStorePostgres config readOptimizedRevision =
     ReadRelationships revision relationshipFilter limit cursor -> do
       cursorId <- resolveCursor cursor
       orThrow =<< runSession (readRelationshipsSession revision relationshipFilter limit cursorId)
+    ReadRelationshipPage revision token relationshipFilter pageRequest ->
+      orThrow =<< runSession (relationshipPageSession revision token relationshipFilter pageRequest)
     CountRelationships revision relationshipFilter ->
       orThrow =<< runSession (countRelationshipsSession revision relationshipFilter)
     DeleteRelationships relationshipFilter -> do
@@ -482,6 +498,91 @@ readRelationshipsSession revision relationshipFilter limit cursorId = do
   let limitPlusOne = fromIntegral (max 0 limit + 1)
   rows <- Session.statement () (readRelationshipsStatement revision relationshipFilter limitPlusOne cursorId)
   pure (pageFromRows cursorId limit rows)
+
+data RelationshipPageRow = RelationshipPageRow
+  { snapshotToken :: !Text,
+    tupleRow :: !TupleRow
+  }
+
+relationshipSortSpec :: SortSpec RelationshipPageRow
+relationshipSortSpec =
+  SortSpec
+    ( KeyColumn
+        { columnExpr = "snapshot_token",
+          sortDir = Asc,
+          extract = (.snapshotToken),
+          codec = textKey
+        }
+        :| [ KeyColumn
+               { columnExpr = "id",
+                 sortDir = Asc,
+                 extract = (.tupleRow.pageKey),
+                 codec = int8Key
+               }
+           ]
+    )
+
+relationshipPageSession ::
+  Revision ->
+  ConsistencyToken ->
+  RelationshipFilter ->
+  PageRequest ->
+  Session (Either CursorError (Connection TupleRow))
+relationshipPageSession revision token relationshipFilter pageRequest
+  | actualFingerprint /= relationshipSortFingerprint =
+      pure
+        ( Left
+            FingerprintMismatch
+              { expected = relationshipSortFingerprint,
+                actual = actualFingerprint
+              }
+        )
+  | otherwise =
+      case paginate relationshipSortSpec pageRequest baseQuery relationshipPageRowDecoder of
+        Left cursorError -> pure (Left cursorError)
+        Right statement -> Right . fmap (.tupleRow) <$> Session.statement () statement
+  where
+    actualFingerprint = sortSpecFingerprint relationshipSortSpec
+    baseQuery = relationshipPageBase revision token relationshipFilter
+
+relationshipPageBase :: Revision -> ConsistencyToken -> RelationshipFilter -> Snippet
+relationshipPageBase revision (ConsistencyToken token) relationshipFilter =
+  "SELECT "
+    <> Snippet.param token
+    <> "::text AS snapshot_token, id, object_type, object_id, relation, subject_type, subject_id, subject_relation, caveat_name, caveat_payload, created_xid::text, deleted_xid::text "
+    <> "FROM relation_tuple WHERE pg_visible_in_snapshot(created_xid, "
+    <> Snippet.param revision.revisionEncoding
+    <> "::text::pg_snapshot) AND (deleted_xid IS NULL OR NOT pg_visible_in_snapshot(deleted_xid, "
+    <> Snippet.param revision.revisionEncoding
+    <> "::text::pg_snapshot))"
+    <> foldMap (" AND " <>) (relationshipFilterSnippets relationshipFilter)
+
+relationshipFilterSnippets :: RelationshipFilter -> [Snippet]
+relationshipFilterSnippets relationshipFilter =
+  concat
+    [ column "object_type" (unObjectType <$> relationshipFilter.objectType),
+      column "object_id" relationshipFilter.objectId,
+      column "relation" (unRelationName <$> relationshipFilter.relation),
+      column "subject_type" (unObjectType <$> relationshipFilter.subjectType),
+      column "subject_id" relationshipFilter.subjectId,
+      subjectRelation relationshipFilter.subjectRelation,
+      column "caveat_name" (unCaveatName <$> relationshipFilter.caveatName)
+    ]
+  where
+    column name =
+      foldMap (\value -> [Snippet.sql name <> " = " <> Snippet.param value])
+
+    subjectRelation = \case
+      AnySubjectRelation -> []
+      NoSubjectRelation -> ["coalesce(subject_relation, '') = ''"]
+      ExactSubjectRelation relationName ->
+        ["coalesce(subject_relation, '') = " <> Snippet.param (unRelationName relationName)]
+
+relationshipPageRowDecoder :: Decoders.Row RelationshipPageRow
+relationshipPageRowDecoder =
+  RelationshipPageRow
+    <$> Decoders.column (Decoders.nonNullable Decoders.text)
+    <*> tupleRowDecoder
 
 countRelationshipsSession :: Revision -> RelationshipFilter -> Session Int64
 countRelationshipsSession revision relationshipFilter =
@@ -1778,7 +1879,8 @@ rowFromColumns ::
   TupleRow
 rowFromColumns idValue objectType objectId relation subjectType subjectId subjectRelation caveatName caveatPayload createdXid deletedXid =
   TupleRow
-    { rowId = TupleRowId (Text.pack (show idValue)),
+    { pageKey = idValue,
+      rowId = TupleRowId (Text.pack (show idValue)),
       tuple =
         Tuple
           { object = ObjectRef {objectType = ObjectType objectType, objectId = objectId},

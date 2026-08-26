@@ -784,7 +784,8 @@ sampleTuplePage =
   TuplePage
     { rows =
         [ TupleRow
-            { rowId = TupleRowId "tuple-1",
+            { pageKey = 1,
+              rowId = TupleRowId "tuple-1",
               tuple = sampleTuple,
               createdAt = Revision "snapshot-created",
               deletedAt = Nothing

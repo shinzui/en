@@ -75,6 +75,7 @@ import En.Effect.TupleStore
   )
 import En.Error (EnError (..))
 import En.Reachability (ReachabilityGraph, compileSchema)
+import En.RelationshipPagination (relationshipPageFromRows)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (CaveatName (..), CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
 import En.Schema.Builder qualified as Schema
@@ -201,6 +202,17 @@ runTupleStoreInMemory initialTuples =
     ReadRelationships _ relationshipFilter limit cursor -> do
       tuples <- get
       pure (pageTuples limit cursor (filter (matchesRelationshipFilter relationshipFilter) tuples))
+    ReadRelationshipPage _ token relationshipFilter pageRequest -> do
+      tuples <- get
+      pure
+        ( relationshipPageFromRows
+            token
+            pageRequest
+            [ tupleRow index tuple
+            | (index, tuple) <- zip [1 ..] tuples,
+              matchesRelationshipFilter relationshipFilter tuple
+            ]
+        )
     CountRelationships _ relationshipFilter -> do
       tuples <- get
       pure (fromIntegral (length (filter (matchesRelationshipFilter relationshipFilter) tuples)))
@@ -363,7 +375,8 @@ pageTuples limit cursor tuples =
 tupleRow :: Int -> Tuple -> TupleRow
 tupleRow index tuple =
   TupleRow
-    { rowId = TupleRowId (showText index),
+    { pageKey = fromIntegral index,
+      rowId = TupleRowId (showText index),
       tuple = tuple,
       createdAt = testRevision,
       deletedAt = Nothing

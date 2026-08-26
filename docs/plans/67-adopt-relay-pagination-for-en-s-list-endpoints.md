@@ -62,9 +62,11 @@ rather than forcing four endpoints into a shape that fits two of them.
 - [x] (2026-08-26T02:49:42Z) Milestone 2 — Prove the database order for `POST /v1/relationships/query` is total and
       served by the existing `relation_tuple` primary-key index; add no migration unless
       `EXPLAIN` disproves that index contract.
-- [ ] Milestone 3 — Convert the first endpoint end to end — route type, handler, hasql keyset
-      query, client, OpenAPI — and ship its conformance test. One endpoint, fully done, before
-      the others start.
+- [x] (2026-08-26T02:56:00Z) Milestone 3a — Add the transport-neutral relationship cursor
+      contract, a total `pageKey` on tuple rows, backward-capable in-memory paging, and the
+      `relay-pagination-hasql` PostgreSQL statement. Core and PostgreSQL suites pass.
+- [ ] Milestone 3b — Convert the route type, handler, client, and OpenAPI, then ship the live
+      forward/backward conformance test.
 - [ ] Milestone 4 — Convert the remaining endpoints Milestone 1 ruled in, each with its own
       conformance test.
 - [ ] Milestone 5 — Record the `RelayPageError` exemption in the problem-details conformance
@@ -156,6 +158,14 @@ rather than forcing four endpoints into a shape that fits two of them.
 
   The probe used the least selective legal filter shape and still avoided a sort; the
   transaction was rolled back, leaving no fixture rows. No append-only migration is needed.
+
+- Discovery (2026-08-26, Milestone 3a): **the consistency token can be a real Relay sort key
+  without changing the database order.** The PostgreSQL base query selects the already-minted
+  token as a constant `snapshot_token` column, followed by `relation_tuple.id`. The released
+  hasql engine therefore validates and parameterizes both cursor keys while the expanded
+  lexicographic predicate simplifies operationally to the `id` seek for every valid
+  continuation. A shared fingerprint and `pageKey` let the PostgreSQL and both in-memory
+  interpreters mint byte-compatible cursors without importing HTTP types into `en-core`.
 
 (Add further entries as work proceeds.)
 

@@ -54,6 +54,7 @@ library
     En.LookupSubjects
     En.Prelude
     En.Reachability
+    En.RelationshipPagination
     En.Revision
     En.Schema
     En.Schema.Builder
@@ -75,6 +76,7 @@ library
     , effectful-core
     , generic-lens          ^>=2.3
     , lens                  ^>=5.3
+    , relay-pagination      >=0.1  && <0.2
     , template-haskell
     , text
     , time
