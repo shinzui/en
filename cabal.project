@@ -56,3 +56,18 @@ source-repository-package
     location: https://github.com/shinzui/biscuit-haskell.git
     tag:      8c0b3c5a13ce4a310737c0336f2ae167a1597588
     subdir:   biscuit
+
+-- ------------------------------------------------------------
+-- Servant route naming for OpenTelemetry.
+--
+-- Upstream has no released 0.3.0.0 package. Its HasEndpoint instances do not
+-- cover MultiVerb or AuthProtect, so en's NamedRoutes API fails to type-check
+-- at the middleware call site, and its hs-opentelemetry-api ==0.3.* bound
+-- excludes the 1.0 cohort. mori://shinzui/hs-opentelemetry-instrumentation-servant
+-- fixes those two constraints only. Keep this commit pin load-bearing and
+-- deliberate until upstream releases both changes.
+-- ------------------------------------------------------------
+source-repository-package
+    type:     git
+    location: https://github.com/shinzui/hs-opentelemetry-instrumentation-servant.git
+    tag:      5e99a7857032484abc669076704dee4335e7d0ad

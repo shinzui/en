@@ -44,7 +44,7 @@ executable en-server
   build-depends:
     , aeson
     , async
-    , base             >=4.19 && <5
+    , base                                      >=4.19 && <5
     , biscuit-haskell
     , bytestring
     , containers
@@ -55,10 +55,15 @@ executable en-server
     , en-postgres
     , en-servant
     , hasql
-    , hasql-pool       ^>=1.4
+    , hasql-pool                                ^>=1.4
+    , hs-opentelemetry-api                      >=1.0  && <1.1
+    , hs-opentelemetry-exporter-otlp            >=1.0  && <1.1
+    , hs-opentelemetry-instrumentation-servant  >=0.3  && <0.4
+    , hs-opentelemetry-instrumentation-wai      >=1.0  && <1.1
+    , hs-opentelemetry-sdk                      >=1.0  && <1.1
     , http-types
     , ram
-    , servant-health   ^>=0.1
+    , servant-health                            ^>=0.1
     , text
     , time
     , unix

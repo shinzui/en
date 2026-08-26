@@ -53,10 +53,12 @@ trace correlation, and the removal of two fields that are not in the bounded set
 
 ## Progress
 
-- [ ] Milestone 1 — Prove the OpenTelemetry cohort resolves against `en`'s pinned dependency
-      closure: five released packages plus the forked Servant instrumentation pinned in
-      `cabal.project`. `cabal build all` with the dependencies added and no code using them.
-      Record every resolved version.
+- [x] (2026-08-26T00:51Z) Milestone 1 — Proved the OpenTelemetry cohort resolves against
+      `en`'s pinned dependency closure: four released direct packages plus the forked Servant
+      instrumentation pinned in `cabal.project`. `cabal build all` passes with the dependencies
+      added and no code using them; every resolved version is recorded below. The full-suite
+      baseline still reproduces the pre-existing concurrent `en-biscuit-tests` timeout, while
+      that suite passes in isolation and the other seven suites pass.
 - [ ] Milestone 2 — Own the provider lifetimes in `en-server/app/Main.hs`: a tracer provider
       and a meter provider, both initialized globally inside `bracket`s that flush and shut
       down on exit, with an explicit disabled mode for local development.
@@ -97,6 +99,20 @@ trace correlation, and the removal of two fields that are not in the bounded set
   standard's own reason: "Probes fire every few seconds and would drown the log. They are
   also the two paths with nothing to correlate." Milestone 4 changes where the path constants
   come from, not whether the exclusion exists.
+
+- Discovery (2026-08-25, Milestone 1): **the plan's prose counted six direct dependencies,
+  but its concrete cabal stanza and the governing catalog standard name five.** The actual
+  direct additions are four released packages (`api`, `sdk`, `exporter-otlp`, and
+  `instrumentation-wai`) plus the commit-pinned Servant fork. Cabal then resolves nine more
+  OpenTelemetry packages transitively. The implementation follows the concrete catalog
+  stanza; this plan's counts were corrected so a future contributor does not add an unused
+  direct dependency merely to satisfy an editorial number.
+
+- Discovery (2026-08-25, Milestone 1): **the known `en-biscuit-tests` timeout is present in
+  the untouched baseline and is independent of the OpenTelemetry cohort.** Both the baseline
+  and post-dependency `cabal test all` runs failed only that suite with `authorization
+  rejected: Timeout`; `cabal test en-biscuit` passed immediately in isolation, and the other
+  seven suites passed in the full run.
 
 (Add further entries as work proceeds.)
 
@@ -357,8 +373,8 @@ declares one OKF bundle, `docs/capabilities`, and **none** at `docs/adr`, so the
 filesystem convention is authoritative; no OKF frontmatter belongs on an ADR written here.
 
 [ADR 2 — crypton 1.1 binds en's dependency closure through a biscuit-haskell fork](../adr/0002-crypton-1-1-binds-en-s-dependency-closure-through-a-biscuit-haskell-fork.md)
-constrains this plan more than any other in its initiative, because this plan adds **six**
-packages to `en`'s closure — five released and one forked — and a second
+constrains this plan more than any other in its initiative, because this plan adds **five**
+direct packages to `en`'s closure — four released and one forked — and a second
 `source-repository-package` stanza to a `cabal.project` that already carries one. The ADR's
 substance: cabal resolves exactly one version of a package for the whole project, `en`'s
 closure is already bound by `pg-migrate`'s `crypton >= 1.1` and the forked
@@ -408,7 +424,7 @@ just process-up && just run-migrations && just start-server
 
 ## Plan of Work
 
-### Milestone 1 — Prove six new packages resolve
+### Milestone 1 — Prove five new direct packages resolve
 
 Scope: `en-server/en-server.cabal` and `cabal.project`. No `.hs` file changes.
 
@@ -455,9 +471,11 @@ packages on **one compatible cohort**. If the solver fails, stop and diagnose wi
 `cabal build all -v2` — do not add `allow-newer` as a first move, for the reason ADR 2
 records.
 
-Acceptance: `cabal build all && cabal test all` passes with all six dependencies present and
-no code using them; every resolved OpenTelemetry version is recorded in Interfaces and
-Dependencies.
+Acceptance: `cabal build all` passes with all five direct dependencies present and no code
+using them; every resolved OpenTelemetry version is recorded in Interfaces and Dependencies.
+`cabal test all` must introduce no regression relative to the baseline; while the known
+concurrent `en-biscuit-tests` timeout remains, prove it passes in isolation and that the other
+seven suites pass.
 
 ### Milestone 2 — Own the provider lifetimes
 
@@ -837,7 +855,7 @@ production incident never needs a rollback of this whole plan.
 
 ### Libraries
 
-Six packages are added to `en-server`'s executable stanza. Five are released and pinned by
+Five packages are added to `en-server`'s executable stanza. Four are released and pinned by
 version; one is a fork pinned by commit in `cabal.project`.
 
 - **`hs-opentelemetry-api ==1.0.*`** — the tracer, span, and context types.
@@ -851,6 +869,16 @@ version; one is a fork pinned by commit in `cabal.project`.
   spans as errors. Its attach/detach bracket is what stops Warp keep-alive threads leaking
   one request's context into the next.
 - **`hs-opentelemetry-instrumentation-servant ==0.3.*`**, from the fork — see below.
+
+Milestone 1 resolved the following exact cohort from `dist-newstyle/cache/plan.json`.
+`hs-opentelemetry-instrumentation-servant` is 0.3.0.0 and
+`hs-opentelemetry-semantic-conventions` is 1.40.0.0. Every other named package is 1.0.0.0:
+`hs-opentelemetry-api`, `hs-opentelemetry-api-types`,
+`hs-opentelemetry-exporter-handle`, `hs-opentelemetry-exporter-otlp`,
+`hs-opentelemetry-instrumentation-wai`, `hs-opentelemetry-otlp`,
+`hs-opentelemetry-propagator-b3`, `hs-opentelemetry-propagator-datadog`,
+`hs-opentelemetry-propagator-jaeger`, `hs-opentelemetry-propagator-w3c`,
+`hs-opentelemetry-propagator-xray`, and `hs-opentelemetry-sdk`.
 
 Keep the API, SDK, exporter, propagator, semantic-conventions, and WAI instrumentation on one
 compatible cohort. The Servant instrumentation is versioned independently.
@@ -915,3 +943,8 @@ umbrella — `nagare` and `kikan-en` import those directly. Note that embedded h
 `en-server`'s stack rather than inside `app`. That is the right boundary — an embedding host
 owns its own provider lifetime and would not want `en` initializing a global provider behind
 its back — but it should be stated in the ADR so it is a decision rather than an omission.
+
+Revision note (2026-08-25): Milestone 1 corrected the dependency count from six to the five
+direct packages actually prescribed by the catalog, recorded the exact resolved cohort, and
+captured the pre-existing concurrent Biscuit timeout so later validation can distinguish it
+from an observability regression.
