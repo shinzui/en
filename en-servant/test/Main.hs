@@ -98,6 +98,7 @@ import En.Servant.API
     WriteTuplesRequestWire (..),
     WriteTuplesResponseWire (..),
     app,
+    appWithProbes,
     batchCheckHandler,
     checkHandler,
     deleteRelationshipsHandler,
@@ -132,6 +133,8 @@ import Network.HTTP.Types (methodDelete, methodPost, statusCode)
 import Network.Wai (Application, Request (..), defaultRequest)
 import Network.Wai.Test (SRequest (..), SResponse (..), runSession, setPath, srequest)
 import Servant (Handler, ServerError (errHTTPCode), runHandler)
+import Servant.Health.TestKit (probeContractTests)
+import Test.Tasty (defaultMain)
 
 main :: IO ()
 main = do
@@ -373,6 +376,9 @@ main = do
   writePreconditionTests env
   mintGrantTests env
   routingTests env
+  defaultMain $
+    probeContractTests "en probes" $ \liveness readiness ->
+      pure (appWithProbes env liveness readiness)
 
 -- | The RFC 9457 machinery in isolation. This deliberately uses a throwaway API
 -- rather than changing a production route: the WAI response, generated client, and

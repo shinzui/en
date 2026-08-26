@@ -93,6 +93,7 @@ test-suite en-servant-tests
   type:           exitcode-stdio-1.0
   hs-source-dirs: test
   main-is:        Main.hs
+  ghc-options:    -threaded -rtsopts -with-rtsopts=-N
   build-depends:
     , aeson
     , base
@@ -110,6 +111,7 @@ test-suite en-servant-tests
     , servant
     , servant-health:testkit  ^>=0.1
     , servant-server
+    , tasty
     , text
     , time
     , wai

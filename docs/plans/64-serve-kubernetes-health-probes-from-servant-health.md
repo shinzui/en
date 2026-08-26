@@ -72,8 +72,9 @@ the failure the shared body type otherwise makes invisible.
       them. `/healthz` and `/readyz` still answer during this milestone. A live database
       stop proved readiness returns 503 with a stable `failingSince` while liveness remains
       200.
-- [ ] Milestone 3 — Add the `servant-health:testkit` contract test and watch it fail against
-      a deliberately swapped wiring before making it pass.
+- [x] (2026-08-26 00:23Z) Milestone 3 — Added the `servant-health:testkit` contract test,
+      watched it fail against a deliberately swapped wiring, then restored the correct
+      order and passed all four cases under the threaded runtime.
 - [ ] Milestone 4 — Delete `en-server/app/Health.hs` and every reference to `/healthz` and
       `/readyz`: the middleware layer in `en-server/app/Main.hs`, the auth and rate-limit
       exemptions in `en-server/app/Middleware.hs`, the metrics path list in
@@ -137,6 +138,25 @@ the failure the shared body type otherwise makes invisible.
   GET /health/live  -> 200 {"check":"all","failingSince":null,"status":"ok"}
   GET /health/ready -> 503 {"check":"postgres","failingSince":"2026-08-26T00:19:23.413931Z","status":"failed"}
   GET /health/ready -> 503 {"check":"postgres","failingSince":"2026-08-26T00:19:23.413931Z","status":"failed"}
+  ```
+
+- Discovery (2026-08-26, Milestone 3): **the shared contract test catches exactly the
+  compile-clean dispatch error it was designed for.** Passing readiness as liveness and
+  liveness as readiness compiled, but both asymmetric cases failed at the expected route;
+  restoring `(liveness, readiness)` made the full matrix pass.
+
+  ```text
+  readiness failing: ready answers 503, live still 200: FAIL
+    GET /health/ready: status code
+    expected: 503
+     but got: 200
+  liveness failing: live answers 503, ready still 200: FAIL
+    GET /health/live: status code
+    expected: 503
+     but got: 200
+
+  # Correct wiring
+  All 4 tests passed (0.00s)
   ```
 
 (Add further entries as work proceeds.)
