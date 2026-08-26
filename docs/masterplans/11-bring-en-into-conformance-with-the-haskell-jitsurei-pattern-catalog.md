@@ -154,7 +154,7 @@ profile-governed ADR workflow does not apply here and the established filesystem
 convention is authoritative. New ADRs from this initiative follow that convention and
 continue the `ADR-N` numbering from 3.
 
-Three ADRs exist and two bear on this work:
+Seven ADRs now exist. At planning time three existed and two bore on this work:
 
 - [ADR 2 — crypton 1.1 binds en's dependency closure through a biscuit-haskell fork](../adr/0002-crypton-1-1-binds-en-s-dependency-closure-through-a-biscuit-haskell-fork.md)
   is the one every child plan must respect. Cabal resolves exactly one version of a package
@@ -192,7 +192,7 @@ searched for the catalog's own decisions; the catalog publishes standards, not A
 | 65 | Instrument en with OpenTelemetry and a conformant production request log | docs/plans/65-instrument-en-with-opentelemetry-and-a-conformant-production-request-log.md | EP-64 | EP-63 | Complete |
 | 66 | Add a Hurl black-box API suite for en-server | docs/plans/66-add-a-hurl-black-box-api-suite-for-en-server.md | EP-61, EP-64 | EP-65 | Complete |
 | 67 | Adopt Relay pagination for en's list endpoints | docs/plans/67-adopt-relay-pagination-for-en-s-list-endpoints.md | EP-61 | EP-66 | Complete |
-| 68 | Migrate en's records to generic-lens label syntax and a custom prelude | docs/plans/68-migrate-en-s-records-to-generic-lens-label-syntax-and-a-custom-prelude.md | EP-63 | EP-61, EP-64, EP-65, EP-66, EP-67 | In Progress |
+| 68 | Migrate en's records to generic-lens label syntax and a custom prelude | docs/plans/68-migrate-en-s-records-to-generic-lens-label-syntax-and-a-custom-prelude.md | EP-63 | EP-61, EP-64, EP-65, EP-66, EP-67 | Complete |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
 Hard Deps and Soft Deps reference other rows by their `#` prefix (e.g., EP-63).
@@ -325,7 +325,8 @@ per the distillation rule in `.claude/skills/exec-plan/ADR.md`.
   never re-implemented in a service. Worth an ADR because the tempting future change —
   "just inline the two routes, it is three lines" — is precisely the one the standard
   forbids, and the reason is not obvious from the call site.
-- **Telemetry configuration lives outside the binary** (EP-65). `en` gains a dependency on
+- **Telemetry configuration lives outside the binary** (EP-65; recorded in
+  [ADR 5](../adr/0005-telemetry-configuration-and-provider-lifetimes-belong-to-the-standalone-host.md)). `en` gains a dependency on
   environment-variable configuration (`OTEL_EXPORTER_OTLP_ENDPOINT`,
   `OTEL_SEMCONV_STABILITY_OPT_IN=http`) that its own config validation does not own. That
   boundary, and the forked Servant instrumentation pin it requires, are durable.
@@ -333,8 +334,9 @@ per the distillation rule in `.claude/skills/exec-plan/ADR.md`.
   [ADR 6](../adr/0006-only-stored-relationship-listings-use-relay-keyset-pagination.md)),
   including the deliberate breaking change, snapshot pinning, and semantic exemptions for
   traversal and feed cursors.
-- **`en`'s record idiom is generic-lens `#label`** (EP-68), superseding the
-  `NoFieldSelectors` / `OverloadedRecordDot` idiom the tree uses today. Durable because it
+- **`en`'s record idiom is generic-lens `#label`** (EP-68; recorded in
+  [ADR 7](../adr/0007-generic-lens-labels-are-en-s-record-access-idiom.md)), superseding the
+  package-wide `NoFieldSelectors` / `OverloadedRecordDot` idiom. Durable because it
   governs every module written from then on, and because the two idioms are individually
   coherent — a future contributor needs to know which one won and why.
 
@@ -366,9 +368,9 @@ checklist; this is the at-a-glance view of the initiative.
 - [x] EP-67: Relay 0.1.1.0 cohort resolving; existing primary-key order proved total
 - [x] EP-67: Relationship query converted to `Connection` / `RelayPageError`; traversal and feed exemptions recorded
 - [x] EP-67: Real-WAI and PostgreSQL-backed Hurl walks prove page boundaries; consumers audited
-- [ ] EP-68: `en-core` and `en-postgres` migrated to `#label` and lens operators
-- [ ] EP-68: `en-servant`, `en-client`, and `en-biscuit` migrated
-- [ ] EP-68: `en-server`, `en-example`, `en-migrations`, and every test suite migrated
+- [x] EP-68: `en-core` and `en-postgres` migrated to `#label` and lens operators
+- [x] EP-68: `en-servant`, `en-client`, and `en-biscuit` migrated
+- [x] EP-68: `en-server`, `en-example`, `en-migrations`, and every test suite migrated
 
 
 ## Surprises & Discoveries
@@ -470,6 +472,13 @@ between child plans. Concise evidence.
   consistency token is constant within a walk and `relation_tuple.id` is the unique varying
   key. No append-only migration or duplicate index was needed.
 
+- Discovery (2026-08-25, EP-68): **the compiler, not source grep, supplied the trustworthy
+  record-idiom boundary.** Disabling record dot found sixteen source lines missed by guarded
+  conversion: ten in core and six in PostgreSQL and Servant components. Removing package-wide
+  `NoFieldSelectors` also exposed real selector collisions in three Servant modules, which now
+  retain the extension locally. The orphan-instance and exception rules are recorded in
+  [ADR 7](../adr/0007-generic-lens-labels-are-en-s-record-access-idiom.md).
+
 
 ## Decision Log
 
@@ -484,7 +493,9 @@ between child plans. Concise evidence.
   adoption, so the tree ends in one idiom that matches the fleet rather than two idioms that
   each read well locally. The cost is contained by splitting the work in two — scaffolding
   in EP-63, the sweep in EP-68 — and by sequencing the sweep last, so it converts the code
-  the other six plans add instead of racing them.
+  the other six plans add instead of racing them. The completed idiom and its narrow
+  exceptions are recorded in
+  [ADR 7](../adr/0007-generic-lens-labels-are-en-s-record-access-idiom.md).
   Date: 2026-08-25
 
 - Decision: Adopt the existing
@@ -654,4 +665,23 @@ truthfully by Relay `PageInfo`; watch is a forward-only changelog window. Their 
 the relationship listing's durable boundary are recorded in
 [ADR 6](../adr/0006-only-stored-relationship-listings-use-relay-keyset-pagination.md).
 Source audits found no affected use under `mori://shinzui/nagare` or
-`mori://shinzui/kikan-en`. EP-68 is now the next eligible child.
+`mori://shinzui/kikan-en`.
+
+EP-68 is complete. Every package now uses `En.Prelude`, generic-lens labels, and lens update
+operators as its default record vocabulary. No Cabal stanza enables `OverloadedRecordDot` or
+`NoFieldSelectors`; three Servant modules retain local `NoFieldSelectors` only where generated
+selectors collide with existing APIs, and foreign or rank-polymorphic records use their
+exported access surfaces. The generic-lens orphan stays out of `En.Prelude`, as required by
+[ADR 7](../adr/0007-generic-lens-labels-are-en-s-record-access-idiom.md). All eight test suites,
+the core benchmark build, the strict no-record-dot core build, and the 15-request safe Hurl
+suite passed. The generated OpenAPI artifact remains byte-identical at
+`4db31037c3d823d9c0f5e19b968165e2d7364bf9f8a971cb4a7fc2b65ec0a183`.
+
+The MasterPlan is complete. En now conforms to the catalog across the scoped service concerns:
+uniform Haskell package defaults and project prelude; RFC 9457 errors; released health probes;
+correlated OpenTelemetry spans and bounded access logs; a black-box Hurl acceptance suite;
+truthful Relay pagination for stored relationship listings; and the fleet record idiom. The
+explicit exclusions remain exclusions: CLI conformance is deferred, and keiro/outbox guidance
+does not apply because en has neither subsystem. The seven child ExecPlans are complete, their
+durable architecture boundaries are recorded in ADRs 4 through 7, and no additional gap from
+the original scoped vision remains.

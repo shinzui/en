@@ -8,10 +8,10 @@
 -- extension project-wide would encourage them elsewhere, where they add noise
 -- without benefit.
 --
--- NOTE: do not import @Data.Generics.Labels@ here. Its orphan @IsLabel@ instance
--- is what gives @#field@ its generic-lens meaning, and re-exporting it from the
--- prelude forces that meaning on every module in the project. Import it in each
--- module that uses @#label@ over a @Generic@ record.
+-- NOTE: do not import the generic-lens label orphan here. Its @IsLabel@ instance
+-- is what gives @#field@ its record-lens meaning, and re-exporting it from the
+-- prelude forces that meaning on every module in the project. Import the orphan
+-- module directly in each module that uses @#label@ over a @Generic@ record.
 module En.Prelude
   ( module X,
     module Control.Lens,
