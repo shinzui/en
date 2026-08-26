@@ -10,19 +10,19 @@ import Control.Exception (finally)
 import Data.Either (isRight)
 import Data.Foldable (traverse_)
 import Data.Functor.Contravariant ((>$<))
+import Data.Generics.Labels ()
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.List (nub, sort, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
-import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Word (Word64)
 import Database.PostgreSQL.Migrate (defaultRunOptions, runMigrationPlan)
-import Effectful (Eff, IOE, liftIO, runEff, (:>))
+import Effectful (Eff, IOE, runEff, (:>))
 import Effectful.Dispatch.Dynamic (interpose, passthrough)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
-import En.Check (CheckDecision (..), CheckOutcome (..), check)
+import En.Check (CheckDecision (..), check)
 import En.Conformance.Kikan (matchesRelationshipFilter)
 import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), TokenMetadata (..))
 import En.Effect.ConsistencyStore qualified as ConsistencyStore
@@ -34,9 +34,7 @@ import En.Effect.TupleStore
     RelationshipFilter (..),
     StoreCursor (..),
     SubjectRelationFilter (..),
-    TupleChange (..),
     TuplePage (..),
-    TupleRow (..),
     TupleStore (..),
     TupleWriteRequest (..),
     UsersetQuery (..),
@@ -51,14 +49,15 @@ import En.Postgres.Database (Database, runDatabaseConnection)
 import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgSnapshot, parsePgSnapshot, renderPgSnapshot, retainedHistoryVisible, runConsistencyStorePostgres, tokenMetadataFromPayload, transactionVisible)
 import En.Postgres.TupleStore (pruneTransactionsBatchSession, reapDeletedTuplesBatchSession, runTupleStorePostgres)
 import En.Postgres.Watch qualified as Watch
+import En.Prelude hiding (filtered, from, index, indexed, rewrite)
 import En.Reachability (ReachabilityGraph, compile)
 import En.Revision (Consistency (..), ConsistencyToken (..), DatastoreId (..), Revision (..), RevisionOrder (..))
 import En.Schema (AllowedSubject (..), CaveatName (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..), Schema (..), ValidSchema, validateSchema)
 import En.Schema qualified as Schema
 import En.Schema.Parse (parseSchema)
-import En.SchemaCheck (OrphanReason (..), OrphanReport (..), TupleOrphan (..), renderTupleOrphan, validateTuplesAgainstSchema)
+import En.SchemaCheck (OrphanReason (..), TupleOrphan (..), renderTupleOrphan, validateTuplesAgainstSchema)
 import En.Tuple (CaveatContext (..), CaveatPayload (..), CaveatValue (..), ObjectRef (..), Subject (..), Tuple (..), TupleCaveat (..))
-import En.Watch (WatchBatch (..), WatchStart (..))
+import En.Watch (WatchStart (..))
 import EphemeralPg qualified as Pg
 import Hasql.Connection qualified as Connection
 import Hasql.Decoders qualified as Decoders
@@ -162,7 +161,7 @@ runTupleStoreScenario connection = do
         Tuple
           { object = projectY,
             relation = RelationName "viewer",
-            subject = tuple.subject,
+            subject = (tuple ^. #subject),
             caveat = Nothing
           }
       query =
@@ -175,7 +174,7 @@ runTupleStoreScenario connection = do
           }
       lookupRequest cursor =
         LookupRequest
-          { subject = tuple.subject,
+          { subject = (tuple ^. #subject),
             permission = RelationName "view",
             objectType = ObjectType "space",
             context = CaveatContext Map.empty,
@@ -185,9 +184,9 @@ runTupleStoreScenario connection = do
   writeToken <- runPgOrFail connection config (TupleStore.writeTuples [tuple, tuple2])
   TokenMetadata {revision = writeRevision} <- either (fail . show) pure (tokenMetadataFromPayload writeToken)
   headAfterWrite <- runPgOrFail connection config TupleStore.headRevision
-  writeSnapshot <- either (fail . Text.unpack) pure (parsePgSnapshot writeRevision.revisionEncoding)
-  headAfterWriteSnapshot <- either (fail . Text.unpack) pure (parsePgSnapshot headAfterWrite.revisionEncoding)
-  assertEqual "write token is not fresher than immediate head revision" True (writeSnapshot.xmax <= headAfterWriteSnapshot.xmax)
+  writeSnapshot <- either (fail . Text.unpack) pure (parsePgSnapshot (writeRevision ^. #revisionEncoding))
+  headAfterWriteSnapshot <- either (fail . Text.unpack) pure (parsePgSnapshot (headAfterWrite ^. #revisionEncoding))
+  assertEqual "write token is not fresher than immediate head revision" True ((writeSnapshot ^. #xmax) <= (headAfterWriteSnapshot ^. #xmax))
   TuplePage {rows = rowsAtWrite, state = stateAtWrite} <- runPgOrFail connection config (TupleStore.readStartingWithUser writeRevision query)
   assertEqual "write token read sees tuple count" 2 (length rowsAtWrite)
   assertEqual "write token read is exhausted" Exhausted stateAtWrite
@@ -204,29 +203,29 @@ runTupleStoreScenario connection = do
     minted <- ConsistencyStore.mintToken revision
     metadata <- ConsistencyStore.decodeToken minted
     ConsistencyStore.validateToken metadata
-    pure (revision, metadata.revision)
+    pure (revision, (metadata ^. #revision))
   case mintRoundTrip of
     Right (resolved, decoded) ->
       assertEqual "a minted token decodes and validates back to its revision" resolved decoded
     other -> fail ("minting a token for a resolved revision failed: " <> show other)
 
   let graph = compile validCheckSchema
-  checkOutcome <- runPg connection config (check graph (AtLeastAsFresh writeToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX)
-  assertEqual "postgres-backed check sees written tuple" (Right Allowed) (fmap (.decision) checkOutcome)
+  checkOutcome <- runPg connection config (check graph (AtLeastAsFresh writeToken) (CaveatContext Map.empty) (tuple ^. #subject) (RelationName "view") projectX)
+  assertEqual "postgres-backed check sees written tuple" (Right Allowed) (fmap (view (#decision)) checkOutcome)
   {- E3, end to end against PostgreSQL: the token a check reports is a token a later
   read accepts as its freshness bound. This is the write -> check -> lookup chain a
   client builds "read your own reads" out of, and the one an @EnGrant@ needs in order
   to record the snapshot its decision was made at. -}
-  checkedAtToken <- either (\err -> fail ("check failed: " <> show err)) (pure . (.checkedAt)) checkOutcome
+  checkedAtToken <- either (\err -> fail ("check failed: " <> show err)) (pure . (view (#checkedAt))) checkOutcome
   assertEqual
     "a check's checkedAt token is accepted as a later read's freshness bound"
     (Right Allowed)
-    . fmap (.decision)
-    =<< runPg connection config (check graph (AtLeastAsFresh checkedAtToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX)
+    . fmap (view (#decision))
+    =<< runPg connection config (check graph (AtLeastAsFresh checkedAtToken) (CaveatContext Map.empty) (tuple ^. #subject) (RelationName "view") projectX)
 
   lookupFirstPage <- runPg connection config (Lookup.lookup graph (AtLeastAsFresh writeToken) (lookupRequest Nothing))
   projectXCursor <- expectLookupHasMore "postgres-backed lookup returns first cursor page" [LookupObject {object = projectX, decision = Allowed}] lookupFirstPage
-  firstPageToken <- either (\err -> fail ("lookup failed: " <> show err)) (pure . (.checkedAt)) lookupFirstPage
+  firstPageToken <- either (\err -> fail ("lookup failed: " <> show err)) (pure . (view (#checkedAt))) lookupFirstPage
   lookupSecondPage <- runPg connection config (Lookup.lookup graph (AtLeastAsFresh writeToken) (lookupRequest (Just projectXCursor)))
   assertEqual
     "postgres-backed lookup resumes from cursor"
@@ -244,13 +243,13 @@ runTupleStoreScenario connection = do
   assertEqual
     "a resumed lookup page reports the first page's token"
     (Right firstPageToken)
-    (fmap (.checkedAt) lookupSecondPage)
+    (fmap (view (#checkedAt)) lookupSecondPage)
   -- And a lookup's own token is spendable, exactly as a check's is.
   assertEqual
     "a lookup page's checkedAt token is accepted as a later read's freshness bound"
     (Right Allowed)
-    . fmap (.decision)
-    =<< runPg connection config (check graph (AtLeastAsFresh firstPageToken) (CaveatContext Map.empty) tuple.subject (RelationName "view") projectX)
+    . fmap (view (#decision))
+    =<< runPg connection config (check graph (AtLeastAsFresh firstPageToken) (CaveatContext Map.empty) (tuple ^. #subject) (RelationName "view") projectX)
   {- Cursor validation against the real PostgreSQL validator, not a test double.
   Flipping one character inside the cursor's token field preserves the field's
   length prefix, so the cursor still parses -- and its embedded token is then refused
@@ -274,13 +273,13 @@ runTupleStoreScenario connection = do
   TuplePage {rows = rowsAtDelete} <- runPgOrFail connection config (TupleStore.readStartingWithUser deleteRevision query)
   assertEqual "old revision still sees deleted tuple" 2 (length rowsAtOldRevision)
   assertEqual "delete revision hides tuple" 0 (length rowsAtDelete)
-  let deletedXids = traverse (parseTupleDeletedXid . (.deletedAt)) rowsAtOldRevision
+  let deletedXids = traverse (parseTupleDeletedXid . (view (#deletedAt))) rowsAtOldRevision
   deletedHorizon <- maybe (fail "deleted tuple rows did not carry deleted_xid") (pure . (+ 1) . maximum) deletedXids
   reaped <- runPgOrFail connection config (TupleStore.reapDeletedTuples deletedHorizon)
   assertEqual "reaper removes safely old soft-deleted tuples" 2 reaped
   reapedAgain <- runPgOrFail connection config (TupleStore.reapDeletedTuples deletedHorizon)
   assertEqual "reaper is idempotent" 0 reapedAgain
-  let staleConfig = config {gcWindow = "0 seconds"}
+  let staleConfig = config & #gcWindow .~ "0 seconds"
   staleResult <- runPg connection staleConfig (ConsistencyStore.resolveConsistency (AtExactSnapshot writeToken))
   assertEqual
     "stale snapshot token is rejected after GC horizon advances"
@@ -321,7 +320,7 @@ runTupleStoreScenario connection = do
   publicToken <- runPgOrFail connection config (TupleStore.writeTuples [publicTuple])
   TokenMetadata {revision = publicRevision} <- either (fail . show) pure (tokenMetadataFromPayload publicToken)
   TuplePage {rows = publicRows, state = publicState} <- runPgOrFail connection config (TupleStore.readStartingWithUser publicRevision publicQuery)
-  assertEqual "postgres tuple store round-trips wildcard rows" [publicTuple] ((.tuple) <$> publicRows)
+  assertEqual "postgres tuple store round-trips wildcard rows" [publicTuple] ((view (#tuple)) <$> publicRows)
   assertEqual "postgres wildcard read is exhausted" Exhausted publicState
   let caveatedTuple =
         Tuple
@@ -348,14 +347,14 @@ runTupleStoreScenario connection = do
         UsersetQuery
           { queryType = ObjectType "space",
             queryRelation = RelationName "viewer",
-            querySubjects = [caveatedTuple.subject],
+            querySubjects = [(caveatedTuple ^. #subject)],
             queryLimit = 10,
             queryCursor = Nothing
           }
   caveatedToken <- runPgOrFail connection config (TupleStore.writeTuples [caveatedTuple])
   TokenMetadata {revision = caveatedRevision} <- either (fail . show) pure (tokenMetadataFromPayload caveatedToken)
   TuplePage {rows = caveatedRows, state = caveatedState} <- runPgOrFail connection config (TupleStore.readStartingWithUser caveatedRevision caveatedQuery)
-  assertEqual "postgres tuple store round-trips typed caveat payloads" [caveatedTuple] ((.tuple) <$> caveatedRows)
+  assertEqual "postgres tuple store round-trips typed caveat payloads" [caveatedTuple] ((view (#tuple)) <$> caveatedRows)
   assertEqual "postgres caveated read is exhausted" Exhausted caveatedState
   let pgFolders =
         [ ObjectRef
@@ -432,26 +431,26 @@ runProbeScenario connection = do
   TokenMetadata {revision = seedRevision} <- either (fail . show) pure (tokenMetadataFromPayload seedToken)
 
   presentRows <- runPgOrFail connection config (TupleStore.probeTuples seedRevision wideFolder viewer [member])
-  assertEqual "probe finds a member of a relation wider than one page" [memberTuple] ((.tuple) <$> presentRows)
+  assertEqual "probe finds a member of a relation wider than one page" [memberTuple] ((view (#tuple)) <$> presentRows)
 
   absentRows <- runPgOrFail connection config (TupleStore.probeTuples seedRevision wideFolder viewer [absent])
-  assertEqual "probe returns nothing for an absent subject" [] ((.tuple) <$> absentRows)
+  assertEqual "probe returns nothing for an absent subject" [] ((view (#tuple)) <$> absentRows)
 
   emptyCandidates <- runPgOrFail connection config (TupleStore.probeTuples seedRevision wideFolder viewer [])
-  assertEqual "probe with no candidates returns nothing" [] ((.tuple) <$> emptyCandidates)
+  assertEqual "probe with no candidates returns nothing" [] ((view (#tuple)) <$> emptyCandidates)
 
   caveatedRows <- runPgOrFail connection config (TupleStore.probeTuples seedRevision wideFolder viewer [caveatedSubject])
-  assertEqual "probe carries the caveat name and payload" [Just probeCaveat] ((.tuple.caveat) <$> caveatedRows)
+  assertEqual "probe carries the caveat name and payload" [Just probeCaveat] ((view (#tuple . #caveat)) <$> caveatedRows)
 
   wildcardRows <- runPgOrFail connection config (TupleStore.probeTuples seedRevision publicSpace viewer [member, SubjectWildcard (ObjectType "user")])
-  assertEqual "probe matches a subject and its type wildcard in one call" (sort [concreteTuple, wildcardTuple]) (sort ((.tuple) <$> wildcardRows))
+  assertEqual "probe matches a subject and its type wildcard in one call" (sort [concreteTuple, wildcardTuple]) (sort ((view (#tuple)) <$> wildcardRows))
 
   deleteToken <- runPgOrFail connection config (TupleStore.deleteTuples [memberTuple])
   TokenMetadata {revision = deleteRevision} <- either (fail . show) pure (tokenMetadataFromPayload deleteToken)
   rowsBeforeDelete <- runPgOrFail connection config (TupleStore.probeTuples seedRevision wideFolder viewer [member])
   rowsAfterDelete <- runPgOrFail connection config (TupleStore.probeTuples deleteRevision wideFolder viewer [member])
-  assertEqual "probe at the pre-delete revision still sees the grant" [memberTuple] ((.tuple) <$> rowsBeforeDelete)
-  assertEqual "probe at the post-delete revision hides the grant" [] ((.tuple) <$> rowsAfterDelete)
+  assertEqual "probe at the pre-delete revision still sees the grant" [memberTuple] ((view (#tuple)) <$> rowsBeforeDelete)
+  assertEqual "probe at the post-delete revision hides the grant" [] ((view (#tuple)) <$> rowsAfterDelete)
 
   runSessionOrFail connection (Session.script "ANALYZE relation_tuple")
   planLines <- runSessionOrFail connection (Session.statement () explainProbeStatement)
@@ -505,7 +504,7 @@ runTouchSemanticsScenario connection = do
       july = read "2026-07-01 00:00:00 UTC"
       december = read "2026-12-31 00:00:00 UTC"
       readAt revision object =
-        (.rows) <$> runPgOrFail connection config (TupleStore.readObjectRelation revision object viewer 10 Nothing)
+        (view (#rows)) <$> runPgOrFail connection config (TupleStore.readObjectRelation revision object viewer 10 Nothing)
       writeAt tuples = do
         token <- runPgOrFail connection config (TupleStore.writeTuples tuples)
         TokenMetadata {revision} <- either (fail . show) pure (tokenMetadataFromPayload token)
@@ -521,12 +520,12 @@ runTouchSemanticsScenario connection = do
   assertEqual
     "payload update takes effect at the write's token"
     [Just (untilCaveat december)]
-    ((.tuple.caveat) <$> rowsAtDecember)
+    ((view (#tuple . #caveat)) <$> rowsAtDecember)
   rowsAtJuly <- readAt julyRevision payloadSpace
   assertEqual
     "the pre-rewrite token still sees the pre-rewrite payload"
     [Just (untilCaveat july)]
-    ((.tuple.caveat) <$> rowsAtJuly)
+    ((view (#tuple . #caveat)) <$> rowsAtJuly)
 
   -- 2. Adding a caveat to an unconditional grant replaces it rather than
   --    coexisting with it.
@@ -538,7 +537,7 @@ runTouchSemanticsScenario connection = do
   assertEqual
     "caveat tightening retires the unconditional grant"
     [Just (untilCaveat july)]
-    ((.tuple.caveat) <$> rowsAtTightened)
+    ((view (#tuple . #caveat)) <$> rowsAtTightened)
 
   -- 3. An identical rewrite is a no-op that does not churn the row.
   let idempotentSpace = spaceRef "touch-idempotent"
@@ -550,8 +549,8 @@ runTouchSemanticsScenario connection = do
   assertEqual "identical rewrite leaves one live row" 1 (length rowsAtSecond)
   assertEqual
     "identical rewrite does not replace the row"
-    ((.rowId) <$> rowsAtFirst)
-    ((.rowId) <$> rowsAtSecond)
+    ((view (#rowId)) <$> rowsAtFirst)
+    ((view (#rowId)) <$> rowsAtSecond)
 
   -- 4. The same identity written twice in one call resolves last-wins.
   let lastWinsSpace = spaceRef "touch-last-wins"
@@ -565,7 +564,7 @@ runTouchSemanticsScenario connection = do
   assertEqual
     "same key twice in one call keeps the last write"
     [Just (untilCaveat december)]
-    ((.tuple.caveat) <$> rowsAtLastWins)
+    ((view (#tuple . #caveat)) <$> rowsAtLastWins)
 
   -- 5. A delete targets the identity, ignoring the caveat the caller supplies.
   let deleteSpace = spaceRef "touch-delete"
@@ -609,7 +608,7 @@ runBatchWriteScenario connection = do
       july = read "2026-07-01 00:00:00 UTC"
       december = read "2026-12-31 00:00:00 UTC"
       readAt revision object =
-        (.rows) <$> runPgOrFail connection config (TupleStore.readObjectRelation revision object viewer 10 Nothing)
+        (view (#rows)) <$> runPgOrFail connection config (TupleStore.readObjectRelation revision object viewer 10 Nothing)
       writeAt tuples = do
         token <- runPgOrFail connection config (TupleStore.writeTuples tuples)
         TokenMetadata {revision} <- either (fail . show) pure (tokenMetadataFromPayload token)
@@ -635,8 +634,8 @@ runBatchWriteScenario connection = do
   assertEqual "a hundred-tuple batch writes a hundred live rows" 100 (length volumePage.rows)
   assertEqual
     "every tuple in the batch survives its columns' transposition"
-    (sort ((.object.objectId) <$> hundred))
-    (sort ((.tuple.object.objectId) <$> volumePage.rows))
+    (sort ((view (#object . #objectId)) <$> hundred))
+    (sort ((view (#tuple . #object . #objectId)) <$> (volumePage ^. #rows)))
 
   -- 2. One batch whose entries need three different touch outcomes.
   let identicalSpace = spaceRef "batch-mixed-identical"
@@ -659,17 +658,17 @@ runBatchWriteScenario connection = do
   createdRows <- readAt mixedRevision createdSpace
   assertEqual
     "an identical entry in a mixed batch does not churn its row"
-    ((.rowId) <$> seededIdenticalRows)
-    ((.rowId) <$> identicalRows)
+    ((view (#rowId)) <$> seededIdenticalRows)
+    ((view (#rowId)) <$> identicalRows)
   assertEqual "a replaced entry in a mixed batch leaves one live row" 1 (length replacedRows)
   assertEqual
     "a replaced entry in a mixed batch takes the new caveat"
     [Just (untilCaveat december)]
-    ((.tuple.caveat) <$> replacedRows)
+    ((view (#tuple . #caveat)) <$> replacedRows)
   assertEqual
     "a new entry in a mixed batch is created"
     [Nothing]
-    ((.tuple.caveat) <$> createdRows)
+    ((view (#tuple . #caveat)) <$> createdRows)
 
   -- 3. A duplicate identity inside a larger batch still resolves last-wins.
   let duplicateSpace = spaceRef "batch-duplicate"
@@ -686,7 +685,7 @@ runBatchWriteScenario connection = do
   assertEqual
     "a duplicate identity in one batch keeps the last write"
     [Just (untilCaveat december)]
-    ((.tuple.caveat) <$> duplicateRows)
+    ((view (#tuple . #caveat)) <$> duplicateRows)
   assertEqual "deduplication does not drop the batch's other entries" 1 (length bystanderRows)
 
   -- 4. Four copies of one identity. Three would survive without deduplication:
@@ -711,7 +710,7 @@ runBatchWriteScenario connection = do
   assertEqual
     "four copies of one identity keep the last write"
     [Just (untilCaveat december)]
-    ((.tuple.caveat) <$> quadrupleRows)
+    ((view (#tuple . #caveat)) <$> quadrupleRows)
 
 -- | Preconditions, sequentially: what a guarded write means on its own.
 --
@@ -729,7 +728,7 @@ runPreconditionScenario connection = do
       spaceRef name = ObjectRef (ObjectType "space") name
       grant object caveat = Tuple {object, relation = viewer, subject = alice, caveat}
       readAt revision object =
-        (.rows) <$> runPgOrFail connection config (TupleStore.readObjectRelation revision object viewer 10 Nothing)
+        (view (#rows)) <$> runPgOrFail connection config (TupleStore.readObjectRelation revision object viewer 10 Nothing)
       headRows object = do
         revision <- runPgOrFail connection config TupleStore.headRevision
         readAt revision object
@@ -958,11 +957,11 @@ runSchemaValidationScenario connection = do
   TokenMetadata {revision} <- either (fail . show) pure (tokenMetadataFromPayload writeToken)
 
   supersetReport <- runPgOrFail connection config (validateTuplesAgainstSchema superset revision)
-  assertEqual "a superset schema strands nothing" [] supersetReport.orphans
-  assertEqual "the pass scans every live tuple" 1203 supersetReport.scanned
+  assertEqual "a superset schema strands nothing" [] (supersetReport ^. #orphans)
+  assertEqual "the pass scans every live tuple" 1203 (supersetReport ^. #scanned)
 
   candidateReport <- runPgOrFail connection config (validateTuplesAgainstSchema candidate revision)
-  assertEqual "the pass scans every live tuple under the candidate too" 1203 candidateReport.scanned
+  assertEqual "the pass scans every live tuple under the candidate too" 1203 (candidateReport ^. #scanned)
   assertEqual
     "the candidate strands exactly the three unfitting grants"
     ( sortOn
@@ -972,13 +971,13 @@ runSchemaValidationScenario connection = do
           TupleOrphan {tuple = disallowedWildcard, reason = OrphanDisallowedSubject (SubjectWildcard (ObjectType "user"))}
         ]
     )
-    (sortOn renderTupleOrphan candidateReport.orphans)
+    (sortOn renderTupleOrphan (candidateReport ^. #orphans))
 
   -- A grant retired before the pass runs is not stranded by anything: it is already gone.
   deleteToken <- runPgOrFail connection config (TupleStore.deleteTuples [unknownType])
   TokenMetadata {revision = afterDelete} <- either (fail . show) pure (tokenMetadataFromPayload deleteToken)
   afterReport <- runPgOrFail connection config (validateTuplesAgainstSchema candidate afterDelete)
-  assertEqual "a retired grant is owed no orphan" 1202 afterReport.scanned
+  assertEqual "a retired grant is owed no orphan" 1202 (afterReport ^. #scanned)
   assertEqual
     "the retired grant's orphan is gone, the others remain"
     ( sortOn
@@ -987,7 +986,7 @@ runSchemaValidationScenario connection = do
           TupleOrphan {tuple = disallowedWildcard, reason = OrphanDisallowedSubject (SubjectWildcard (ObjectType "user"))}
         ]
     )
-    (sortOn renderTupleOrphan afterReport.orphans)
+    (sortOn renderTupleOrphan (afterReport ^. #orphans))
   where
     candidateSchemaText =
       "object user {}\n\
@@ -1032,7 +1031,7 @@ runReadAllTuplesScenario connection = do
       drainFrom revision =
         let step cursor seen = do
               TuplePage {rows, state} <- runPgOrFail connection config (TupleStore.readAllTuples revision 400 cursor)
-              let seenNow = seen <> ((.tuple) <$> rows)
+              let seenNow = seen <> ((view (#tuple)) <$> rows)
               case state of
                 Exhausted -> pure seenNow
                 HasMore next -> step (Just next) seenNow
@@ -1169,7 +1168,7 @@ runRelationshipFilterScenario connection = do
         let step cursor seen = do
               TuplePage {rows, state} <-
                 runPgOrFail connection config (TupleStore.readRelationships revision requested 100 cursor)
-              let seenNow = seen <> ((.tuple) <$> rows)
+              let seenNow = seen <> ((view (#tuple)) <$> rows)
               case state of
                 Exhausted -> pure seenNow
                 HasMore next -> step (Just next) seenNow
@@ -1214,18 +1213,18 @@ runRelationshipFilterScenario connection = do
   -- Keyset pagination across the four grants naming alice.
   let aliceFilter = relationshipFilter Nothing Nothing Nothing (Just "user") (Just "alice") AnySubjectRelation Nothing
   firstPage <- runPgOrFail connection config (TupleStore.readRelationships seeded aliceFilter 2 Nothing)
-  assertEqual "the first page carries the requested limit" 2 (length firstPage.rows)
+  assertEqual "the first page carries the requested limit" 2 (length (firstPage ^. #rows))
   nextCursor <-
-    case firstPage.state of
+    case (firstPage ^. #state) of
       HasMore cursor -> pure cursor
       other -> fail ("expected the first page to have more, got " <> show other)
   secondPage <- runPgOrFail connection config (TupleStore.readRelationships seeded aliceFilter 2 (Just nextCursor))
-  assertEqual "the second page carries the remaining rows" 2 (length secondPage.rows)
-  assertEqual "the second page is exhausted" Exhausted secondPage.state
+  assertEqual "the second page carries the remaining rows" 2 (length (secondPage ^. #rows))
+  assertEqual "the second page is exhausted" Exhausted (secondPage ^. #state)
   assertEqual
     "the two pages together are the whole match set, without repetition"
     (sort (expectedFor aliceFilter))
-    (sort (((.tuple) <$> firstPage.rows) <> ((.tuple) <$> secondPage.rows)))
+    (sort (((view (#tuple)) <$> (firstPage ^. #rows)) <> ((view (#tuple)) <$> (secondPage ^. #rows))))
 
   -- Offboard alice: the count and the token describe the same set of rows.
   (deletedCount, deleteToken) <- runPgOrFail connection config (TupleStore.deleteRelationships aliceFilter)
@@ -1245,7 +1244,7 @@ runRelationshipFilterScenario connection = do
   assertEqual
     "the grants the filter did not name survive"
     (sort [tuple | tuple <- relationshipFixture, not (matchesRelationshipFilter aliceFilter tuple)])
-    (sort ((.tuple) <$> survivors.rows))
+    (sort ((view (#tuple)) <$> (survivors ^. #rows)))
 
   -- Idempotent in effect: nothing is left live for the filter to retire.
   (again, _) <- runPgOrFail connection config (TupleStore.deleteRelationships aliceFilter)
@@ -1284,7 +1283,7 @@ runWatchWindowScenario connection = do
          in step Nothing []
 
       event kind tuple = (kind, tuple)
-      eventsOf = fmap (\change -> event change.kind change.tuple)
+      eventsOf = fmap (\change -> event (change ^. #kind) (change ^. #tuple))
 
   before <- runPgOrFail connection config TupleStore.headRevision
   _ <- runPgOrFail connection config (TupleStore.writeTuples [kept, retired])
@@ -1353,7 +1352,7 @@ runWatchWindowScenario connection = do
   assertEqual
     "a filtered window reports only the grants the filter names"
     [event ChangeTouch (grant "late-a")]
-    (eventsOf filtered.changes)
+    (eventsOf (filtered ^. #changes))
 
   {- The sargability claim, which no assertion above can reach: on a table of three rows
   every plan is a sequential scan, so the fixture is grown until the planner has a choice
@@ -1395,23 +1394,23 @@ runWatchFeedScenario connection = do
       other = grant "other"
 
       poll cursorText = runPgOrFail connection config (Watch.watch config (StartFromCursor cursorText) Nothing 100)
-      eventsOf batch = [(change.kind, change.tuple) | change <- batch.changes]
+      eventsOf batch = [((change ^. #kind), (change ^. #tuple)) | change <- (batch ^. #changes)]
 
   subscribed <- runPgOrFail connection config (Watch.watch config StartFromNow Nothing 100)
   assertEqual "subscribing from now reports no changes" [] (eventsOf subscribed)
 
   _ <- runPgOrFail connection config (TupleStore.writeTuples [watched, other])
-  afterWrite <- poll subscribed.cursor
+  afterWrite <- poll (subscribed ^. #cursor)
   assertEqual
     "the first poll after a write reports both grants as touches"
     (sort [(ChangeTouch, watched), (ChangeTouch, other)])
     (sort (eventsOf afterWrite))
 
-  caughtUp <- poll afterWrite.cursor
+  caughtUp <- poll (afterWrite ^. #cursor)
   assertEqual "polling a caught-up feed reports nothing" [] (eventsOf caughtUp)
 
   _ <- runPgOrFail connection config (TupleStore.deleteTuples [watched])
-  afterDelete <- poll caughtUp.cursor
+  afterDelete <- poll (caughtUp ^. #cursor)
   assertEqual
     "the poll after a delete reports exactly that revocation"
     [(ChangeDelete, watched)]
@@ -1420,7 +1419,7 @@ runWatchFeedScenario connection = do
   {- Idempotence: re-presenting a cursor re-reads the same window. A consumer that
   crashed after processing a batch and before persisting its cursor replays it, which is
   the at-least-once delivery this feed promises. -}
-  replayed <- poll caughtUp.cursor
+  replayed <- poll (caughtUp ^. #cursor)
   assertEqual "re-presenting a cursor replays the same batch" (eventsOf afterDelete) (eventsOf replayed)
 
   {- The window's end is minted as @checkedAt@, so a consumer can read a store that has
@@ -1428,18 +1427,18 @@ runWatchFeedScenario connection = do
   assertEqual
     "a batch's checkedAt token is accepted as a later read's freshness bound"
     (Right 1)
-    . fmap (length . (.rows))
+    . fmap (length . (view (#rows)))
     =<< runPg
       connection
       config
       ( do
-          ResolvedConsistency {revision} <- ConsistencyStore.resolveConsistency (AtLeastAsFresh afterDelete.checkedAt)
+          ResolvedConsistency {revision} <- ConsistencyStore.resolveConsistency (AtLeastAsFresh (afterDelete ^. #checkedAt))
           TupleStore.readAllTuples revision 100 Nothing
       )
 
   -- A drain across a window wider than one page visits every change exactly once.
   _ <- runPgOrFail connection config (TupleStore.writeTuples [grant "drain-a", grant "drain-b", grant "drain-c"])
-  drained <- drainWatch connection config afterDelete.cursor
+  drained <- drainWatch connection config (afterDelete ^. #cursor)
   assertEqual
     "draining a multi-page window at limit 1 reports every change exactly once"
     (sort [(ChangeTouch, grant "drain-a"), (ChangeTouch, grant "drain-b"), (ChangeTouch, grant "drain-c")])
@@ -1458,14 +1457,14 @@ runWatchFeedScenario connection = do
   -- A subscription filter narrows the feed without changing what the cursor means.
   _ <- runPgOrFail connection config (TupleStore.writeTuples [grant "filtered-in", grant "filtered-out"])
   let onlyFilteredIn = relationshipFilter (Just "space") (Just "filtered-in") Nothing Nothing Nothing AnySubjectRelation Nothing
-  scoped <- runPgOrFail connection config (Watch.watch config (StartFromCursor sinceWrite.cursor) (Just onlyFilteredIn) 100)
+  scoped <- runPgOrFail connection config (Watch.watch config (StartFromCursor (sinceWrite ^. #cursor)) (Just onlyFilteredIn) 100)
   assertEqual
     "a filtered subscription reports only the grants its filter names"
     [(ChangeTouch, grant "filtered-in")]
     (eventsOf scoped)
 
   -- The two fail-closed guards, against the real store's real horizon.
-  let expired = Watch.encodeWatchCursor config.datastoreId (Watch.WatchAt (Revision "1:1:"))
+  let expired = Watch.encodeWatchCursor (config ^. #datastoreId) (Watch.WatchAt (Revision "1:1:"))
   assertEqual
     "a cursor whose window predates the garbage-collection horizon is refused"
     (Left (ConsistencyTokenExpired "watch cursor is older than the garbage-collection window"))
@@ -1491,9 +1490,9 @@ drainWatch connection config = step []
   where
     step seen cursorText = do
       batch <- runPgOrFail connection config (Watch.watch config (StartFromCursor cursorText) Nothing 1)
-      case batch.changes of
+      case (batch ^. #changes) of
         [] -> pure seen
-        changes -> step (seen <> [(change.kind, change.tuple) | change <- changes]) batch.cursor
+        changes -> step (seen <> [((change ^. #kind), (change ^. #tuple)) | change <- changes]) (batch ^. #cursor)
 
 -- | Fill @relation_tuple@ with history, so the planner has a reason to prefer an index.
 --
@@ -1543,10 +1542,10 @@ explainWatchWindowStatement start end =
     Encoders.noParams
     (Decoders.rowList (Decoders.column (Decoders.nonNullable Decoders.text)))
   where
-    snapshotLiteral revision = "'" <> revision.revisionEncoding <> "'::pg_snapshot"
+    snapshotLiteral revision = "'" <> (revision ^. #revisionEncoding) <> "'::pg_snapshot"
     startXmin =
-      case parsePgSnapshot start.revisionEncoding of
-        Right snapshot -> snapshot.xmin
+      case parsePgSnapshot (start ^. #revisionEncoding) of
+        Right snapshot -> (snapshot ^. #xmin)
         Left _ -> 0
 
 -- | The batched touch protocol's retry ladder, which only a race can reach.
@@ -1624,7 +1623,7 @@ runBatchTouchRaceScenario database connection = do
   assertEqual
     "the writer's caveat replaces the racer's rather than being silently dropped"
     [Just december]
-    ((.tuple.caveat) <$> contendedRows)
+    ((view (#tuple . #caveat)) <$> contendedRows)
   assertEqual "the batch's uncontended entry is written too" 1 (length bystanderRows)
 
   traverse_ Connection.release [writerConnection, racer]
@@ -1732,14 +1731,14 @@ runDecodeStrictnessScenario connection = do
   assertEqual
     "malformed cursor is rejected"
     (Left (InvalidCursor "not-a-number"))
-    (fmap (.rows) malformed)
+    (fmap (view (#rows)) malformed)
 
   -- 2. A payload that cannot decode fails the read instead of reading as empty.
   runSessionOrFail connection (Session.script corruptPayloadSql)
   corruptRevision <- runPgOrFail connection config TupleStore.headRevision
   corrupt <- runPg connection config (TupleStore.readStartingWithUser corruptRevision corruptQuery)
   assertBool
-    ("malformed caveat payload is an InternalError; got " <> show (fmap (.rows) corrupt))
+    ("malformed caveat payload is an InternalError; got " <> show (fmap (view (#rows)) corrupt))
     (isInternalError corrupt)
 
   -- 3. A zero-limit page returns nothing and skips nothing.
@@ -1815,7 +1814,7 @@ runSnapshotRepeatabilityScenario database connection = do
     TokenMetadata {revision = writeRevision} <- either (fail . show) pure (tokenMetadataFromPayload writeToken)
 
     TuplePage {rows = beforeCommit} <- runPgOrFail connection config (TupleStore.readStartingWithUser writeRevision query)
-    assertEqual "the write token sees its own write" [ownTuple] ((.tuple) <$> beforeCommit)
+    assertEqual "the write token sees its own write" [ownTuple] ((view (#tuple)) <$> beforeCommit)
 
     runSessionOrFail holder (Session.script "COMMIT")
 
@@ -1826,8 +1825,8 @@ runSnapshotRepeatabilityScenario database connection = do
       (length afterCommit)
     assertEqual
       "the concurrent commit is invisible at the write token"
-      ((.tuple) <$> beforeCommit)
-      ((.tuple) <$> afterCommit)
+      ((view (#tuple)) <$> beforeCommit)
+      ((view (#tuple)) <$> afterCommit)
 
 -- | The concurrent writer's grant. The @INSERT@ is what assigns it an xid.
 concurrentGrantSql :: Text
@@ -2085,7 +2084,7 @@ collectLookupObjects connection config graph consistency mkRequest cursor = do
   case page of
     Left err -> fail ("lookup failed while collecting postgres pages: " <> show err)
     Right LookupPage {objects, state} -> do
-      let current = (.object) <$> objects
+      let current = (view (#object)) <$> objects
       case state of
         LookupExhausted -> pure current
         LookupHasMore next -> (current <>) <$> collectLookupObjects connection config graph consistency mkRequest (Just next)
@@ -2119,7 +2118,7 @@ runSnapshotOracleScenario connection =
 runHorizonMonotonicityScenario :: Pg.Database -> Connection.Connection -> IO ()
 runHorizonMonotonicityScenario database connection = do
   config <- testConfig
-  let shortWindow = config {gcWindow = "1 seconds"}
+  let shortWindow = config & #gcWindow .~ "1 seconds"
       anchorTuple =
         Tuple
           { object = ObjectRef (ObjectType "space") "monotonicity",
@@ -2134,10 +2133,10 @@ runHorizonMonotonicityScenario database connection = do
   -- The anchor row is inside the window: min(xid) governs. Publish it as the reaper's pass
   -- would, advancing the durable high-water mark.
   servedBefore <- runPgOrFail connection shortWindow TupleStore.advanceGcHorizon
-  rawBefore <- runSessionOrFail connection (Session.statement shortWindow.gcWindow rawHorizonStatement)
+  rawBefore <- runSessionOrFail connection (Session.statement (shortWindow ^. #gcWindow) rawHorizonStatement)
   -- Age the anchor row out of the one-second window, holder still open.
   threadDelay 1_200_000
-  rawAfter <- runSessionOrFail connection (Session.statement shortWindow.gcWindow rawHorizonStatement)
+  rawAfter <- runSessionOrFail connection (Session.statement (shortWindow ^. #gcWindow) rawHorizonStatement)
   servedAfter <- runPgOrFail connection shortWindow TupleStore.oldestRetainedXid
   runSessionOrFail holder (Session.script "ROLLBACK")
   Connection.release holder
@@ -2196,8 +2195,8 @@ runRetainedHistoryOracleScenario connection =
   traverse_ assertSnapshot (take 120 (fst <$> generatedSnapshotPairs))
   where
     assertSnapshot snapshot = do
-      visibility <- visibleRows connection snapshot (fromIntegral (snapshot.xmax + 2))
-      traverse_ (assertHorizon snapshot visibility) [0 .. snapshot.xmax + 2]
+      visibility <- visibleRows connection snapshot (fromIntegral ((snapshot ^. #xmax) + 2))
+      traverse_ (assertHorizon snapshot visibility) [0 .. (snapshot ^. #xmax) + 2]
     assertHorizon snapshot visibility horizon =
       assertEqual
         ( "retainedHistoryVisible agrees with PostgreSQL for horizon "
@@ -2210,7 +2209,7 @@ runRetainedHistoryOracleScenario connection =
 
 oracleCompare :: Connection.Connection -> PgSnapshot -> PgSnapshot -> IO RevisionOrder
 oracleCompare connection left right = do
-  let maxTxid = fromIntegral (max left.xmax right.xmax + 2)
+  let maxTxid = fromIntegral (max (left ^. #xmax) (right ^. #xmax) + 2)
   leftVisibility <- visibleRows connection left maxTxid
   rightVisibility <- visibleRows connection right maxTxid
   traverse_
@@ -2298,7 +2297,7 @@ parseTupleDeletedXid :: Maybe Revision -> Maybe Word64
 parseTupleDeletedXid =
   \case
     Nothing -> Nothing
-    Just revision -> parseWord64 revision.revisionEncoding
+    Just revision -> parseWord64 (revision ^. #revisionEncoding)
 
 parseWord64 :: Text -> Maybe Word64
 parseWord64 text =

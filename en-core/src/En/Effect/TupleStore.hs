@@ -89,7 +89,7 @@ data TuplePage = TuplePage
   { rows :: ![TupleRow],
     state :: !PageState
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | The reverse-lookup query the engine issues against storage: "objects of
 -- @queryType@ on @queryRelation@ whose subject is one of @querySubjects@."

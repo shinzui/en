@@ -94,6 +94,7 @@ test-suite en-postgres-integration-tests
     , en-migrations
     , en-postgres
     , ephemeral-pg
+    , generic-lens    >=2.2      && <2.4
     , hasql
     , pg-migrate      ^>=1.1.0.0
     , text
