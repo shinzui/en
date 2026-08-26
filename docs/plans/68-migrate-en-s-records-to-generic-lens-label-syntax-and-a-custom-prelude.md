@@ -65,8 +65,10 @@ artifact is identical" is the only acceptance criterion that means anything.
       the integration test and lookup spike. The real ephemeral-PostgreSQL integration suite,
       all eight repository suites, and the full build passed; embedded SQL remained outside
       rewrite ranges and OpenAPI retained the baseline SHA-256.
-- [ ] Milestone 5 — `en-core` (36 modules), the largest package and the one every other
-      depends on.
+- [x] (2026-08-25 21:52-0700) Milestone 5 — Migrated `en-core` production, tests,
+      conformance runner, and benchmark. A build with `-XNoOverloadedRecordDot` passed for
+      every core component; the schema/TH negative fixtures retained their expected failures,
+      all eight repository suites passed, and OpenAPI retained the baseline SHA-256.
 - [ ] Milestone 6 — Remove `OverloadedRecordDot` and `NoFieldSelectors` from every cabal
       stanza, confirm the tree still builds, and write the ADR recording the idiom change.
 
@@ -155,6 +157,23 @@ artifact is identical" is the only acceptance criterion that means anything.
   `UsersetQuery`, `TupleFilter`, `RelationshipFilter`, `TupleWriteRequest`, and `ObjectRef`
   gained stock `Generic` instances when their migrated consumers first needed them. As in
   Milestone 2, these instances change neither representation nor behavior.
+
+- Discovery (2026-08-25, Milestone 5): **the strict compiler check found ten source lines
+  containing fourteen old field reads that the guarded mechanical pass missed.** Three were
+  production expressions next to string literals, and seven were dense test assertions or
+  comprehensions. Building every core component with `-XNoOverloadedRecordDot` and following
+  its failures with the narrower source grep caught all of them; the same check now passes.
+
+- Discovery (2026-08-25, Milestone 5): **`relay-pagination` is another foreign-record
+  exception.** Its `PageRequest`, `CursorPayload`, and `Edge` records export selectors but do
+  not derive `Generic`, so `En.RelationshipPagination` uses those exported selectors through
+  qualified imports rather than inventing wrapper types solely for lens access.
+
+- Discovery (2026-08-25, Milestone 5): **the benchmark's fixture assertions had drifted from
+  the token-bearing check API even though ordinary `cabal build all` did not compile that
+  component.** Bringing the benchmark into the milestone exposed the stale expectation;
+  its assertions now inspect `CheckOutcome.decision` and `BatchOutcome.decisions` through
+  labels, and the benchmark target compiles.
 
 (Add further entries as work proceeds.)
 
