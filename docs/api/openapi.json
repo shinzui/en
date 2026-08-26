@@ -302,6 +302,24 @@
         ],
         "type": "object"
       },
+      "Connection_TupleWire": {
+        "properties": {
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/Edge_TupleWire"
+            },
+            "type": "array"
+          },
+          "pageInfo": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "edges",
+          "pageInfo"
+        ],
+        "type": "object"
+      },
       "ConsistencyWire": {
         "oneOf": [
           {
@@ -370,6 +388,11 @@
           }
         ]
       },
+      "Cursor": {
+        "description": "opaque pagination cursor",
+        "format": "base64url",
+        "type": "string"
+      },
       "DeleteRelationshipsRequestWire": {
         "description": "dryRun has no default. A dry run reports how many relationships the filter matches and deletes nothing; dryRun=false retires every match and returns a consistency token that sees the revocation.",
         "properties": {
@@ -428,6 +451,21 @@
         },
         "required": [
           "tuples"
+        ],
+        "type": "object"
+      },
+      "Edge_TupleWire": {
+        "properties": {
+          "cursor": {
+            "$ref": "#/components/schemas/Cursor"
+          },
+          "node": {
+            "$ref": "#/components/schemas/TupleWire"
+          }
+        },
+        "required": [
+          "node",
+          "cursor"
         ],
         "type": "object"
       },
@@ -1067,6 +1105,27 @@
         ],
         "type": "object"
       },
+      "PageInfo": {
+        "properties": {
+          "endCursor": {
+            "$ref": "#/components/schemas/Cursor"
+          },
+          "hasNextPage": {
+            "type": "boolean"
+          },
+          "hasPreviousPage": {
+            "type": "boolean"
+          },
+          "startCursor": {
+            "$ref": "#/components/schemas/Cursor"
+          }
+        },
+        "required": [
+          "hasNextPage",
+          "hasPreviousPage"
+        ],
+        "type": "object"
+      },
       "PreconditionWire": {
         "oneOf": [
           {
@@ -1163,50 +1222,13 @@
           "consistency": {
             "$ref": "#/components/schemas/ConsistencyWire"
           },
-          "cursor": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "filter": {
             "$ref": "#/components/schemas/RelationshipFilterWire"
-          },
-          "limit": {
-            "type": "integer"
           }
         },
         "required": [
           "consistency",
-          "filter",
-          "limit",
-          "cursor"
-        ],
-        "type": "object"
-      },
-      "ReadRelationshipsResponseWire": {
-        "properties": {
-          "checkedAt": {
-            "type": "string"
-          },
-          "relationships": {
-            "items": {
-              "$ref": "#/components/schemas/TupleWire"
-            },
-            "type": "array"
-          },
-          "state": {
-            "$ref": "#/components/schemas/RelationshipsStateWire"
-          }
-        },
-        "required": [
-          "relationships",
-          "state",
-          "checkedAt"
+          "filter"
         ],
         "type": "object"
       },
@@ -1237,41 +1259,27 @@
         },
         "type": "object"
       },
-      "RelationshipsStateWire": {
-        "oneOf": [
-          {
-            "properties": {
-              "status": {
-                "enum": [
-                  "exhausted"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "status"
-            ],
-            "type": "object"
+      "RelayPageError": {
+        "properties": {
+          "code": {
+            "type": "string"
           },
-          {
-            "properties": {
-              "cursor": {
-                "type": "string"
-              },
-              "status": {
-                "enum": [
-                  "hasMore"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "status",
-              "cursor"
-            ],
-            "type": "object"
+          "message": {
+            "type": "string"
+          },
+          "parameter": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
           }
-        ]
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "type": "object"
       },
       "SchemaInfoWire": {
         "description": "source is the verbatim schema text the server loaded, not a rendering of the compiled model. origin is the file it came from, or builtin-demo. hash is the fingerprint every consistency token is stamped with: when it changes, every token minted under the old one is refused. There is no checkedAt — this reads no tuples.",
@@ -3140,6 +3148,51 @@
     "/v1/relationships/query": {
       "post": {
         "operationId": "createV1RelationshipsQuery",
+        "parameters": [
+          {
+            "description": "Forward page size (0..100). Defaults to 20 when neither 'first' nor 'last' is given. Cannot be combined with 'last' or 'before'.",
+            "in": "query",
+            "name": "first",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque cursor: return items after this position (forward pagination).",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "format": "base64url",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Backward page size (0..100). Cannot be combined with 'first' or 'after'.",
+            "in": "query",
+            "name": "last",
+            "required": false,
+            "schema": {
+              "maximum": 100,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque cursor: return items before this position (backward pagination).",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "format": "base64url",
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json;charset=utf-8": {
@@ -3154,12 +3207,12 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ReadRelationshipsResponseWire"
+                  "$ref": "#/components/schemas/Connection_TupleWire"
                 }
               },
               "application/json;charset=utf-8": {
                 "schema": {
-                  "$ref": "#/components/schemas/ReadRelationshipsResponseWire"
+                  "$ref": "#/components/schemas/Connection_TupleWire"
                 }
               }
             },
@@ -3167,35 +3220,18 @@
           },
           "400": {
             "content": {
-              "application/problem+json": {
+              "application/json": {
                 "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/ProblemDetails"
-                    }
-                  ],
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "unknown_relation",
-                        "schema_violation",
-                        "missing_caveat_context",
-                        "malformed_consistency_token",
-                        "consistency_token_expired",
-                        "invalid_consistency_token",
-                        "invalid_cursor",
-                        "invalid_request",
-                        "batch_too_large",
-                        "malformed_request_body",
-                        "grant_not_mintable"
-                      ],
-                      "type": "string"
-                    }
-                  }
+                  "$ref": "#/components/schemas/RelayPageError"
+                }
+              },
+              "application/json;charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayPageError"
                 }
               }
             },
-            "description": "Invalid request or `body`"
+            "description": "Invalid pagination or relationship query or `body`"
           },
           "412": {
             "content": {
