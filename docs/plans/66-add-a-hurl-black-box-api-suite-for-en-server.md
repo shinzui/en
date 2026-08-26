@@ -73,7 +73,7 @@ point at any environment.
       mismatches, and a transactionally rolled-back precondition failure. Assert
       `application/problem+json` and the stable `code`, never prose; keep the alternate-schema
       resolution-budget branch in the deterministic Haskell suite.
-- [ ] Milestone 4 — Add the opt-in `relationships.hurl` write flow (write, read back, delete)
+- [x] (2026-08-25T19:26:41-07:00) Milestone 4 — Add the opt-in `relationships.hurl` write flow (write, read back, delete)
       and the opt-in `perimeter/perimeter.hurl` suite covering authentication boundaries
       against a separately configured server.
 - [ ] Milestone 5 — Wire the suite into the repository's normal task interface and into CI
@@ -184,6 +184,15 @@ point at any environment.
   schema, cursor, and transaction-precondition failures that only a real process can prove;
   `en-core/test/Main.hs` retains the deep-chain behavior test and `en-servant/test/Main.hs`
   retains the exact `(422, "resolution_limit_exceeded", false)` wire mapping.
+  Date: 2026-08-25
+
+- Decision: Give the Hurl write flow its own `space:hurl-write-flow#viewer@user:hurl-alice`
+  fixture identity rather than reusing `just test-server`'s `space:project-x` tuple.
+  Rationale: Hurl executes files in parallel and contributors may also run the legacy smoke
+  target independently. A distinct identity prevents one flow's delete-first setup from
+  revoking the other flow's grant between write and read-back. The Hurl flow remains
+  idempotent: two consecutive four-request runs both passed, and the captured write token was
+  supplied to the public check instead of hiding consistency with a retry.
   Date: 2026-08-25
 
 (Add further entries as work proceeds.)
