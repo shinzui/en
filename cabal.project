@@ -64,10 +64,11 @@ source-repository-package
 -- cover MultiVerb or AuthProtect, so en's NamedRoutes API fails to type-check
 -- at the middleware call site, and its hs-opentelemetry-api ==0.3.* bound
 -- excludes the 1.0 cohort. mori://shinzui/hs-opentelemetry-instrumentation-servant
--- fixes those two constraints only. Keep this commit pin load-bearing and
--- deliberate until upstream releases both changes.
+-- supplies those instances, admits the 1.0 API, and keeps the example's
+-- shutdown call compatible with that API. Keep this commit pin load-bearing
+-- and deliberate until upstream releases the route and API changes.
 -- ------------------------------------------------------------
 source-repository-package
     type:     git
     location: https://github.com/shinzui/hs-opentelemetry-instrumentation-servant.git
-    tag:      5e99a7857032484abc669076704dee4335e7d0ad
+    tag:      7a6f692e85295f965cd1827f9354c28af9e62742
