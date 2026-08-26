@@ -187,7 +187,7 @@ searched for the catalog's own decisions; the catalog publishes standards, not A
 |---|-------|------|-----------|-----------|--------|
 | 63 | Adopt the fleet Haskell core standards across every en package | docs/plans/63-adopt-the-fleet-haskell-core-standards-across-every-en-package.md | None | None | Complete |
 | 61 | Adopt RFC 9457 problem details and close the API conformance audit | docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md | None | EP-63 | Complete |
-| 64 | Serve Kubernetes health probes from servant-health | docs/plans/64-serve-kubernetes-health-probes-from-servant-health.md | EP-61 | EP-63 | In Progress |
+| 64 | Serve Kubernetes health probes from servant-health | docs/plans/64-serve-kubernetes-health-probes-from-servant-health.md | EP-61 | EP-63 | Complete |
 | 65 | Instrument en with OpenTelemetry and a conformant production request log | docs/plans/65-instrument-en-with-opentelemetry-and-a-conformant-production-request-log.md | EP-64 | EP-63 | Not Started |
 | 66 | Add a Hurl black-box API suite for en-server | docs/plans/66-add-a-hurl-black-box-api-suite-for-en-server.md | EP-61, EP-64 | EP-65 | Not Started |
 | 67 | Adopt Relay pagination for en's list endpoints | docs/plans/67-adopt-relay-pagination-for-en-s-list-endpoints.md | EP-61 | EP-66 | Not Started |
@@ -318,7 +318,8 @@ than inheriting EP-61's answer.
 Four are anticipated. Each is recorded here so the responsible plan knows it owes an ADR,
 per the distillation rule in `.claude/skills/exec-plan/ADR.md`.
 
-- **The health-probe surface is `servant-health`'s, not en's** (EP-64). A durable
+- **The health-probe surface is `servant-health`'s, not en's** (EP-64; recorded in
+  [ADR 4](../adr/0004-en-s-health-probe-surface-is-owned-by-servant-health.md)). A durable
   architecture boundary: the 200/503 `AsUnion` mapping lives in one tested package and is
   never re-implemented in a service. Worth an ADR because the tempting future change —
   "just inline the two routes, it is three lines" — is precisely the one the standard
@@ -350,9 +351,9 @@ checklist; this is the at-a-glance view of the initiative.
 - [x] EP-61: `en-server` middleware and readiness converted
 - [x] EP-61: The OpenAPI half closed — media types, security scheme, conformance tests
 - [x] EP-61: Documents of record updated
-- [ ] EP-64: `servant-health` mounted; `/health/live` and `/health/ready` serving
-- [ ] EP-64: Probe checks wired (`safeCheck`, `withProbeTimeout`, `sequenceChecks`, failure trackers)
-- [ ] EP-64: Test-kit contract test passing; old `Health.hs` deleted; probes exempted from the problem-details test
+- [x] EP-64: `servant-health` mounted; `/health/live` and `/health/ready` serving
+- [x] EP-64: Probe checks wired (`safeCheck`, `withProbeTimeout`, `sequenceChecks`, failure trackers)
+- [x] EP-64: Test-kit contract test passing; old `Health.hs` deleted; probes exempted from the problem-details test
 - [ ] EP-65: OpenTelemetry provider lifetimes owned in `main`, exporting over OTLP
 - [ ] EP-65: Servant route naming, with the middleware stack in the required order
 - [ ] EP-65: The request logger conformed — bounded fields, trace correlation, probe exclusion
@@ -424,6 +425,20 @@ between child plans. Concise evidence.
   EP-63 therefore delivered the mandatory four-extension baseline without this optional
   addition. EP-68 must replace the selector during its record-idiom sweep before it decides
   whether to remove generated selectors from `en-core` globally.
+
+- Discovery (2026-08-25, EP-64): **the released probe wire vocabulary is `ok` / `failed`,
+  with `check: "all"` on success, and the failure tracker preserves one onset across a
+  consecutive failure run.** EP-66's Hurl suite should assert these released values when it
+  pins the live wire contract. The probe 503 remains an exact, named exemption from RFC 9457
+  and is published only as `application/json`.
+
+- Discovery (2026-08-25, EP-64): **embedded consumers require the original `app env`
+  builder shape.** `mori://shinzui/kikan-en`, `mori://shinzui/nagare`, and
+  `mori://shinzui/meibo` use it directly, so EP-64 preserved it and added explicit
+  probe-aware sibling builders. The standalone binary always uses the explicit builder;
+  embedded hosts that expose operational probes must do the same with checks for their own
+  dependencies. This boundary is recorded in
+  [ADR 4](../adr/0004-en-s-health-probe-surface-is-owned-by-servant-health.md).
 
 
 ## Decision Log
@@ -542,6 +557,12 @@ no project-local ADR to add: the durable API decisions are owned by the canonica
 the two dependency workarounds are local, tested, and documented beside their code with removal
 conditions.
 
-With EP-61 complete, EP-64 is the next child in initiative order whose hard dependencies are all
-complete. EP-67 is also dependency-ready, but its soft dependency and the declared wave order
-keep it behind EP-64 through EP-66.
+EP-64 is complete. The standalone service now serves typed, unauthenticated probes at the
+fleet-standard paths from `servant-health`; PostgreSQL outages leave liveness at 200 and move
+readiness to 503 with a stable failure onset. The legacy WAI middleware and old paths are gone,
+the generated OpenAPI document carries both probe operations, and the package contract test
+proves the checks cannot be transposed. The durable ownership boundary is recorded in
+[ADR 4](../adr/0004-en-s-health-probe-surface-is-owned-by-servant-health.md).
+
+EP-65 is now the next child in initiative order whose hard dependencies are all complete. EP-67
+also remains dependency-ready, but the declared wave order keeps the observability work next.

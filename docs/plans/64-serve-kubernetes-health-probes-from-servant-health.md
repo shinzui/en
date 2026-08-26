@@ -84,8 +84,9 @@ the failure the shared body type otherwise makes invisible.
       routes from the problem-details conformance test by name, documented them as
       unauthenticated, and normalized their OpenAPI responses to one canonical JSON media
       type.
-- [ ] Milestone 5b — Regenerate `docs/api/openapi.json`, write the ADR recording that the
-      probe surface is `servant-health`'s, and run final validation.
+- [x] (2026-08-26 00:32Z) Milestone 5b — Regenerated `docs/api/openapi.json`, wrote
+      [ADR 4](../adr/0004-en-s-health-probe-surface-is-owned-by-servant-health.md), and
+      completed build, test, artifact-drift, live-server, and stale-path validation.
 
 
 ## Surprises & Discoveries
@@ -176,9 +177,6 @@ the failure the shared body type otherwise makes invisible.
   where the wire has one. `normalizeProbeContent` removes only the charset spelling from
   the two exact paths sourced from `Servant.Health.Paths.healthRawPaths`.
 
-(Add further entries as work proceeds.)
-
-
 ## Decision Log
 
 - Decision: Move the probes onto the servant API record and into the OpenAPI document,
@@ -239,12 +237,38 @@ the failure the shared body type otherwise makes invisible.
   future route cannot become exempt accidentally.
   Date: 2026-08-26
 
-(Add further entries as work proceeds.)
-
+- Decision: Record the package ownership boundary in
+  [ADR 4](../adr/0004-en-s-health-probe-surface-is-owned-by-servant-health.md).
+  Rationale: the reason not to inline the apparently small probe surface is invisible at
+  en's call site: both status alternatives carry the same body type, so the dangerous
+  200/503 mapping compiles even when reversed. That constraint and the explicit-builder
+  obligation for embedded hosts must outlive this execution plan.
+  Date: 2026-08-26
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Completed all five milestones. `en-server` now serves package-owned, typed probes at
+`/health/live` and `/health/ready`; liveness stays dependency-free, readiness preserves the
+PostgreSQL double ping, and independent failure trackers retain the original onset of a
+consecutive failure run. The WAI-level `Health.hs` surface and every `/healthz` / `/readyz`
+reference outside planning history are gone. Authentication, rate limiting, metrics,
+request logging, local orchestration, and OpenAPI all consume the new surface.
+
+The strongest proofs were behavioral. Deliberately swapping the checks made the shared
+contract test fail both asymmetric cases before the correct wiring passed all four. Against
+the packaged executable, stopping PostgreSQL left liveness at 200, changed readiness to 503
+naming `postgres`, and preserved the exact `failingSince` timestamp across repeated calls.
+After recovery, both probes returned 200 without credentials; the server smoke test passed,
+and process-compose used `/health/ready` successfully.
+
+`cabal build all`, `just openapi`, `en-servant-tests`, the seven unaffected full-suite test
+suites, and the isolated `en-biscuit-tests` run are green. The full concurrent
+`cabal test all` command still reproduces the pre-existing Biscuit authorization timeout;
+the same test passes immediately in isolation, matching the baseline recorded before any
+EP-64 code. The ADR distillation pass promoted the durable probe-ownership boundary and
+embedded-builder obligation into
+[ADR 4](../adr/0004-en-s-health-probe-surface-is-owned-by-servant-health.md); the remaining
+discoveries are implementation-local and stay in this plan.
 
 
 ## Context and Orientation
@@ -986,8 +1010,8 @@ At the end of **Milestone 4**, `en-server/app/Health.hs` does not exist, and
 `Servant.Health.Paths.healthRawPaths` rather than string literals.
 
 At the end of **Milestone 5**, `en-servant/test/Main.hs` carries the exemption list naming
-exactly `Servant.Health.Paths.liveRawPath` and `readyRawPath`, and `docs/adr/` has one new
-record.
+exactly the two entries from `Servant.Health.Paths.healthRawPaths`, and `docs/adr/` has one
+new record.
 
 ### Modules that must not change
 
@@ -998,7 +1022,15 @@ reorder rather than rebuild.
 `En.Servant.Seam`'s exports (`Env`, `AppEffects`, `MintEnv`, `ActiveSchema`, `EnServer`,
 `runEngine`, `runEngineEither`) and `En.Servant.API`'s exports of `app` and the re-export
 umbrella: `nagare` and `kikan-en` import those modules directly. Adding a field to the API
-record changes `EnApi`'s shape, which is exported — so if either consumer constructs an
-`EnApi` value rather than only calling `app`, it will need the new field. `kikan-en` is known
-to import only `app`, `Env`, and `AppEffects`, so it is safe; confirm before assuming the
-same of `nagare`, and record what you find.
+record changed `EnApi`'s shape, but the Mori-located consumers in
+`mori://shinzui/kikan-en`, `mori://shinzui/nagare`, and `mori://shinzui/meibo` call the
+application builder rather than constructing `EnApi`. EP-64 kept that builder source-compatible
+and added the explicit probe-aware siblings used by the standalone server and contract test.
+
+
+Revision note (2026-08-26): implementation corrected the plan's example wire vocabulary to
+the released `ok` / `failed` contract, preserved source-compatible embedded application
+builders through explicit probe-aware siblings, documented authenticated verification of
+obsolete-path 404s, and split the final milestone into its completed contract and artifact
+halves. These changes reflect behavior proved against the released dependency and live
+packaged server.
