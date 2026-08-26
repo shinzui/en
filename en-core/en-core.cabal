@@ -31,7 +31,6 @@ common shared
     DeriveLift
     DuplicateRecordFields
     OverloadedLabels
-    OverloadedRecordDot
     OverloadedStrings
 
 library

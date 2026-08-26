@@ -1,4 +1,5 @@
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE NoFieldSelectors #-}
 
 -- | The check HTTP slice: the single check, the batch check, and grant minting. The mint
 -- is a check-then-issue — it runs its own check and mints a Biscuit only on 'Allowed' — so

@@ -1,3 +1,5 @@
+{-# LANGUAGE NoFieldSelectors #-}
+
 -- | RFC 9457 problem details and en's stable error catalog.
 --
 -- The catalog owns the status, title, machine code, and retryability of each error

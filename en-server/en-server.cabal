@@ -24,9 +24,7 @@ common shared
     BlockArguments
     DeriveAnyClass
     DuplicateRecordFields
-    NoFieldSelectors
     OverloadedLabels
-    OverloadedRecordDot
     OverloadedStrings
 
 executable en-server

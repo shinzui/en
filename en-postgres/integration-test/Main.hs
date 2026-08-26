@@ -631,7 +631,7 @@ runBatchWriteScenario connection = do
             queryLimit = 200,
             queryCursor = Nothing
           }
-  assertEqual "a hundred-tuple batch writes a hundred live rows" 100 (length volumePage.rows)
+  assertEqual "a hundred-tuple batch writes a hundred live rows" 100 (length (volumePage ^. #rows))
   assertEqual
     "every tuple in the batch survives its columns' transposition"
     (sort ((view (#object . #objectId)) <$> hundred))

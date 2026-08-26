@@ -126,8 +126,8 @@ measureScenario connection scenario = do
   lookupRuns <- measuredRuns sampleRuns \_ -> run connection (lookupLabelsStatement (scenario ^. #shape)) ()
   readRuns <- measuredRuns sampleRuns \_ -> run connection (readPathStatement (scenario ^. #shape)) ()
   antiRuns <- measuredRuns antiSampleRuns \_ -> run connection (antiPatternStatement (scenario ^. #shape)) ()
-  let labelStats = (last lookupRuns).value
-      antiPatternStats = (last antiRuns).value
+  let labelStats = last lookupRuns ^. #value
+      antiPatternStats = last antiRuns ^. #value
       Percentiles {p50 = lookupP50Ms, p95 = lookupP95Ms} = percentiles ((view #elapsedMs) <$> lookupRuns)
       Percentiles {p50 = readP50Ms, p95 = readP95Ms} = percentiles ((view #elapsedMs) <$> readRuns)
       Percentiles {p50 = antiP50Ms, p95 = antiP95Ms} = percentiles ((view #elapsedMs) <$> antiRuns)

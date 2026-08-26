@@ -27,7 +27,6 @@ common shared
     DeriveAnyClass
     DuplicateRecordFields
     OverloadedLabels
-    OverloadedRecordDot
     OverloadedStrings
 
 library

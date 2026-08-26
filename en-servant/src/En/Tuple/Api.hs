@@ -1,4 +1,5 @@
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE NoFieldSelectors #-}
 
 -- | The tuple-store HTTP slice: writing, deleting, reading, filtered deletion, and the
 -- changelog feed. Every operation here acts on the relationship tuples 'En.Tuple.Tuple'

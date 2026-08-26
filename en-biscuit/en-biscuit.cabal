@@ -27,9 +27,7 @@ common shared
   default-extensions:
     DeriveAnyClass
     DuplicateRecordFields
-    NoFieldSelectors
     OverloadedLabels
-    OverloadedRecordDot
     OverloadedStrings
 
 library
