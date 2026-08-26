@@ -46,8 +46,9 @@ What it adds beyond the API:
 - **Authentication and rate limiting.** Bearer API keys compared in constant time, with
   read-only keys rejected on write routes, and a per-caller token bucket.
 - **Probes.** Liveness always answers; readiness reflects store reachability.
-- **Observability.** Prometheus metrics including cache stats, and JSON request logs carrying a
-  correlation id accepted from an upstream proxy or minted locally. Probe paths are excluded.
+- **Observability.** Prometheus metrics including cache stats, optional OpenTelemetry spans
+  named by Servant route and exported over OTLP, and bounded JSON request logs carrying the
+  active trace and span identifiers. Probe paths are excluded.
 - **Graceful shutdown** on signal, and a **background maintenance loop** that reclaims
   tombstoned rows in bounded batches and advances the GC horizon.
 

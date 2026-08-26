@@ -33,6 +33,10 @@ processes:
     environment:
       - "EN_API_KEYS_READ_WRITE=dev:dev-secret-0123456789"
       - "EN_DECISION_CACHE_MAX_ENTRIES=1000"
+      - "EN_TELEMETRY_ENABLED=false"
+      - "OTEL_SERVICE_NAME=en"
+      - "OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318"
+      - "OTEL_SEMCONV_STABILITY_OPT_IN=http"
     availability:
       restart: on_failure
     depends_on:

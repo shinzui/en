@@ -72,9 +72,10 @@ trace correlation, and the removal of two fields that are not in the bounded set
       reading valid `trace_id` and `span_id` values from the WAI server-span context and
       excluding `Servant.Health.Paths.healthRawPaths`. Live enabled, disabled, secret-bearing,
       and probe requests proved correlation, omission, boundedness, and silence respectively.
-- [ ] Milestone 5 — Document the telemetry environment variables, add them to the local
-      development stack, and write the ADR recording that telemetry configuration lives
-      outside the binary.
+- [x] (2026-08-26T01:13Z) Milestone 5 — Documented the service switch, standard SDK
+      variables, OTLP base-URL behavior, bounded log schema, and current probe surface; added
+      disabled telemetry defaults to the local stack; and accepted ADR 5 for configuration,
+      provider-lifetime, embedding, and Servant-fork ownership.
 
 
 ## Surprises & Discoveries
@@ -143,6 +144,13 @@ trace correlation, and the removal of two fields that are not in the bounded set
   were absent. Four probe requests produced no log lines. With telemetry disabled, a request
   carrying a valid `traceparent` produced the six base fields and no trace keys.
 
+- Discovery (2026-08-25, Milestone 5): **the operator guide still described the probe
+  surface that EP-64 replaced.** Its health section, exemptions, OpenAPI description, and
+  operational checklist named `/healthz` and `/readyz`, and the logging section inherited
+  those names. The documentation closeout corrected all of them to `/health/live` and
+  `/health/ready` and documented the released `servant-health` body. This was documentation
+  drift, not a remaining route alias.
+
 (Add further entries as work proceeds.)
 
 
@@ -201,12 +209,40 @@ trace correlation, and the removal of two fields that are not in the bounded set
   and another for instrumentation would create an avoidable naming gap.
   Date: 2026-08-25
 
+- Decision: Record the durable telemetry boundary and fork-removal conditions in
+  [ADR 5](../adr/0005-telemetry-configuration-and-provider-lifetimes-belong-to-the-standalone-host.md).
+  Rationale: provider ownership affects every embedded host, and the commit-pinned Servant
+  fork is load-bearing at the type level. Neither belongs only in an execution transcript.
+  The ADR fixes the standalone host as lifecycle owner, leaves standard `OTEL_*`
+  configuration outside en's validated namespace, and requires a released upstream package
+  to carry both fork patches before the pin can be removed.
+  Date: 2026-08-25
+
 (Add further entries as work proceeds.)
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+EP-65 is complete. `en-server` now owns optional tracer and meter providers through their
+full process lifetimes, force-flushes traces on shutdown, creates WAI server spans, and names
+them by the Servant route actually served. The request logger emits only the catalog's bounded
+field set and joins to the active server span when one is valid; it never logs probes, query
+strings, arbitrary headers, or bodies. Disabled mode initializes no provider and emits no
+fabricated trace identifiers.
+
+Collector-backed checks proved propagation and route naming, then proved that the log's span
+ID exactly matches the exported server span. Enabled and disabled startup and graceful
+shutdown both succeeded, including an unreachable-collector run. Operator documentation and
+the local process stack now make the opt-in boundary and OTLP endpoint behavior explicit.
+The durable ownership and commit-pin decisions are distilled into
+[ADR 5](../adr/0005-telemetry-configuration-and-provider-lifetimes-belong-to-the-standalone-host.md).
+
+`cabal build all`, `just openapi`, YAML parsing, tree formatting, and the Nix pre-commit check
+pass. As at baseline, `cabal test all` passes seven suites and times out only the Biscuit suite
+under concurrent load; `cabal test en-biscuit` passes in isolation. The broader
+`nix flake check` still fails in the untouched default-package wiring because `cabal2nix` is
+pointed at the multi-package repository root, which has no root `.cabal` file; its dedicated
+pre-commit check passes.
 
 
 ## Context and Orientation
@@ -1000,3 +1036,7 @@ Servant route naming, and OTLP export.
 Revision note (2026-08-25): Milestone 4 replaced the legacy request ID, caller, and camel-case
 duration fields with the catalog's bounded schema, omitted invalid telemetry contexts, and
 recorded enabled, disabled, secret-bearing, and probe-path runtime evidence.
+
+Revision note (2026-08-25): Milestone 5 completed operator and local-stack configuration,
+corrected stale probe documentation, accepted ADR 5, and closed the plan with final validation
+results and the unchanged known failures.

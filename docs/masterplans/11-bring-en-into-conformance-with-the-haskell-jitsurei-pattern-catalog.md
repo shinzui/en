@@ -188,7 +188,7 @@ searched for the catalog's own decisions; the catalog publishes standards, not A
 | 63 | Adopt the fleet Haskell core standards across every en package | docs/plans/63-adopt-the-fleet-haskell-core-standards-across-every-en-package.md | None | None | Complete |
 | 61 | Adopt RFC 9457 problem details and close the API conformance audit | docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md | None | EP-63 | Complete |
 | 64 | Serve Kubernetes health probes from servant-health | docs/plans/64-serve-kubernetes-health-probes-from-servant-health.md | EP-61 | EP-63 | Complete |
-| 65 | Instrument en with OpenTelemetry and a conformant production request log | docs/plans/65-instrument-en-with-opentelemetry-and-a-conformant-production-request-log.md | EP-64 | EP-63 | In Progress |
+| 65 | Instrument en with OpenTelemetry and a conformant production request log | docs/plans/65-instrument-en-with-opentelemetry-and-a-conformant-production-request-log.md | EP-64 | EP-63 | Complete |
 | 66 | Add a Hurl black-box API suite for en-server | docs/plans/66-add-a-hurl-black-box-api-suite-for-en-server.md | EP-61, EP-64 | EP-65 | Not Started |
 | 67 | Adopt Relay pagination for en's list endpoints | docs/plans/67-adopt-relay-pagination-for-en-s-list-endpoints.md | EP-61 | EP-66 | Not Started |
 | 68 | Migrate en's records to generic-lens label syntax and a custom prelude | docs/plans/68-migrate-en-s-records-to-generic-lens-label-syntax-and-a-custom-prelude.md | EP-63 | EP-61, EP-64, EP-65, EP-66, EP-67 | Not Started |
@@ -440,6 +440,14 @@ between child plans. Concise evidence.
   dependencies. This boundary is recorded in
   [ADR 4](../adr/0004-en-s-health-probe-surface-is-owned-by-servant-health.md).
 
+- Discovery (2026-08-25, EP-65): **one live request proves the middleware order, context
+  propagation, route naming, and log correlation together.** A caller-supplied trace context
+  exported a `POST v1/check` server span, and the bounded request log carried the same trace
+  and server span IDs while excluding query, authorization, cookie, private-header, and body
+  secrets. Disabled telemetry omitted both identifiers rather than logging zeros. The
+  standalone-versus-embedded ownership boundary and the load-bearing Servant fork are recorded
+  in [ADR 5](../adr/0005-telemetry-configuration-and-provider-lifetimes-belong-to-the-standalone-host.md).
+
 
 ## Decision Log
 
@@ -533,6 +541,17 @@ between child plans. Concise evidence.
   says so.
   Date: 2026-08-25
 
+- Decision: Keep OpenTelemetry provider lifetime and configuration ownership in the standalone
+  host, with only `EN_TELEMETRY_ENABLED` in en's validated namespace and the remaining SDK
+  behavior in standard `OTEL_*` variables.
+  Rationale: embedded `en-servant` consumers own their process globals and middleware stack,
+  while the packaged server must flush and shut down its providers deterministically. The
+  independently versioned Servant integration also requires a commit-pinned fork until a
+  release carries both the API-1.0 bound and the `MultiVerb`/`AuthProtect` instances. The full
+  decision and removal conditions are in
+  [ADR 5](../adr/0005-telemetry-configuration-and-provider-lifetimes-belong-to-the-standalone-host.md).
+  Date: 2026-08-25
+
 
 ## Outcomes & Retrospective
 
@@ -564,5 +583,13 @@ the generated OpenAPI document carries both probe operations, and the package co
 proves the checks cannot be transposed. The durable ownership boundary is recorded in
 [ADR 4](../adr/0004-en-s-health-probe-surface-is-owned-by-servant-health.md).
 
-EP-65 is now the next child in initiative order whose hard dependencies are all complete. EP-67
-also remains dependency-ready, but the declared wave order keeps the observability work next.
+EP-65 is complete. The standalone server now optionally exports WAI server spans named by their
+Servant routes, and its bounded JSON request log correlates to the exported span without logging
+queries, secrets, arbitrary headers, or bodies. Telemetry-disabled local development remains the
+default; provider ownership and the commit-pinned Servant integration are recorded in
+[ADR 5](../adr/0005-telemetry-configuration-and-provider-lifetimes-belong-to-the-standalone-host.md).
+Collector-backed checks proved route naming and exact span/log correlation. The generated
+OpenAPI artifact is unchanged, seven full-suite tests pass, and the known concurrent Biscuit
+timeout still passes in isolation.
+
+EP-66 is now the next child in initiative order whose hard dependencies are all complete.

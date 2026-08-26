@@ -62,6 +62,7 @@ Environment variables:
 | `EN_DATABASE_URL` | yes | PostgreSQL connection string passed to Hasql |
 | `EN_SCHEMA_PATH` | no | Path to a text schema file. When set, the server loads, parses, validates, hashes, and compiles this schema at startup. When unset, the server warns and serves the built-in demo schema. |
 | `EN_PORT` | no | HTTP port, default `8080`. Must be `1..65535` |
+| `EN_TELEMETRY_ENABLED` | no | Initialize OpenTelemetry tracer and meter providers and instrument the HTTP stack, default `false`. Must be `true` or `false` |
 | `EN_GC_WINDOW` | no | Consistency-token garbage-collection window, default `24 hours`. Must be a positive PostgreSQL interval, and must exceed the longest request or pagination session by orders of magnitude — see [The GC window bounds token lifetime](production-deployment-and-performance.md#the-gc-window-bounds-token-lifetime--keep-it-much-longer-than-any-request) |
 | `EN_OPTIMIZED_REVISION_CACHE_TTL_MS` | no | Positive TTL in milliseconds for the optimized-revision cache; missing or `0` disables it |
 | `EN_TUPLE_READ_CACHE_MAX_ENTRIES` | no | Positive maximum tuple-read cache entries; missing or `0` disables it |
@@ -487,22 +488,26 @@ Two unauthenticated endpoints, for orchestrators:
 
 | Path | Meaning | Responses |
 | --- | --- | --- |
-| `GET /healthz` | Liveness: the process can serve HTTP | Always `200 {"status":"ok"}` |
-| `GET /readyz` | Readiness: the process should receive traffic | `200 {"status":"ok"}`, or `503` with the error envelope |
+| `GET /health/live` | Liveness: in-process state can serve HTTP | `200` when healthy, `503` when the in-process check fails |
+| `GET /health/ready` | Readiness: the process should receive traffic | `200` when healthy, `503` while the PostgreSQL check fails |
 
 They are the only paths exempt from authentication and rate limiting, since a
 probe cannot conveniently carry credentials.
 
-`/healthz` never consults PostgreSQL. Liveness means "restart me if this stops
+`/health/live` never consults PostgreSQL. Liveness means "restart me if this stops
 answering", and restarting every replica during a database outage helps nothing.
 It answers `200` while the database is down.
 
-`/readyz` runs a `SELECT 1` through the connection pool. While PostgreSQL is
-unreachable it returns the same envelope a request would get:
+`/health/ready` runs a `SELECT 1` through the connection pool. Both routes return the
+`servant-health` probe body, including the onset of a consecutive failure run:
 
 ```json
-{"code": "store_error", "message": "database unreachable", "retryable": true}
+{"check":"postgres","failingSince":"2026-08-26T01:20:00Z","status":"failed"}
 ```
+
+A healthy body is
+`{"check":"all","failingSince":null,"status":"ok"}`. Probe failures describe current
+system state and deliberately remain `application/json`, not RFC 9457 problem details.
 
 The probe pings twice before reporting unready. As described under "Connection
 pooling", the first session on a connection left stale by a restart fails at the
@@ -527,27 +532,52 @@ throws to the main thread and aborts in-flight requests.
 
 ### Request logging
 
-Every request that reaches a handler produces exactly one JSON object on stdout:
+Every non-probe request that reaches the logger produces exactly one bounded JSON object on
+stdout:
 
 ```json
-{"time":"2026-07-09T01:29:12.087595Z","requestId":"test-123","caller":"dev","method":"POST","path":"/v1/check","status":200,"durationMs":2.399}
+{"time":"2026-08-26T01:07:21.632248Z","method":"POST","path":"/v1/check","status":400,"duration_ms":0.312,"user_agent":"en/1.0","trace_id":"11111111111111111111111111111111","span_id":"bb5cc7882eaf83b7"}
 ```
 
-`caller` is the authenticated key name, or `null` when `EN_AUTH_DISABLED=true`.
-Durations come from the monotonic clock, so a clock step cannot produce a negative
-latency. Neither headers nor bodies are logged: en's request bodies name subjects
-and objects, and its `Authorization` header carries a bearer secret.
+`trace_id` and `span_id` identify the OpenTelemetry server span and are omitted entirely when
+telemetry is disabled or no valid span exists. Durations come from the monotonic clock, so a
+clock step cannot produce a negative latency. The field set is fixed: en logs the path but not
+the query string, reads only `User-Agent` from the request headers, and never reads request or
+response bodies. In particular, `Authorization`, `Cookie`, private headers, and authorization
+subjects and objects do not enter the line.
 
-Probe requests to `/healthz` and `/readyz` are not logged — they fire every few
+Probe requests to `/health/live` and `/health/ready` are not logged — they fire every few
 seconds and have nothing to correlate. The `401`, `403`, and `429` responses that
 authentication and rate limiting short-circuit are also not logged, because those
 middlewares run outside the logger; count them at your proxy.
 
-Each response carries an `X-Request-Id` header. An inbound `X-Request-Id` is
-reused so a trace survives a reverse proxy, provided it is at most 128 bytes of
-printable non-space ASCII; anything else is replaced with a fresh UUID. **If
-`en-server` is reachable by untrusted clients, strip the header at the edge** —
-a caller that chooses its own request id can make two requests look like one.
+Each response that passes authentication and rate limiting carries an `X-Request-Id` header.
+An inbound `X-Request-Id` is reused as a client-facing diagnostic token, provided it is at
+most 128 bytes of printable non-space ASCII; anything else is replaced with a fresh UUID. It
+is not a request-log field; distributed correlation uses the standard W3C `traceparent`
+header and the trace identifiers above.
+
+### OpenTelemetry
+
+Telemetry is opt-in. The following is the minimal production configuration for the OTLP HTTP
+exporter used by `en-server`:
+
+```shell
+EN_TELEMETRY_ENABLED=true
+OTEL_SERVICE_NAME=en
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+OTEL_SEMCONV_STABILITY_OPT_IN=http
+```
+
+`OTEL_EXPORTER_OTLP_ENDPOINT` must be a **base URL**, without `/v1/traces` or `/v1/metrics`.
+The 1.0.0.0 exporter appends those paths itself; including a signal path makes it append the
+path twice and export to a nonexistent endpoint.
+
+`EN_TELEMETRY_ENABLED` is parsed and validated by en. Exporter, sampler, propagation,
+resource, metric, and SDK-disable behavior remains standard OpenTelemetry SDK configuration
+through `OTEL_*` variables; en deliberately does not duplicate or validate that namespace.
+When no metric OTLP pipeline is wanted, set `OTEL_METRICS_EXPORTER=none` while leaving the
+existing Prometheus `/metrics` endpoint enabled.
 
 ### Metrics
 
@@ -699,7 +729,7 @@ missing or read-only key does not fix itself.
 Rate limiting is a per-caller token bucket, keyed by the key *name*, so one
 noisy caller cannot exhaust another's budget. It is a per-process limiter:
 running several `en-server` replicas multiplies the effective limit by the
-replica count. Requests to `/healthz` and `/readyz` are exempt from both
+replica count. Requests to `/health/live` and `/health/ready` are exempt from both
 authentication and rate limiting so orchestrator probes need no credentials.
 
 Keys are read once at startup. **Rotating or revoking a key requires a restart.**
@@ -798,8 +828,8 @@ curl -sS -X POST localhost:8080/v1/check \
 
 `GET /v1/openapi.json` serves an OpenAPI 3.1 document describing every operation, its
 request and response schemas, and its error responses. It requires a bearer key like
-any other endpoint (only `/healthz` and `/readyz` are exempt), and it does not describe
-itself — `paths` contains exactly the six authorization operations.
+any other endpoint (only `/health/live` and `/health/ready` are exempt), and it does not
+describe itself. `paths` contains the authorization operations plus both probe routes.
 
 ```shell
 curl -sS -H "Authorization: Bearer $EN_API_KEY" localhost:8080/v1/openapi.json \
@@ -962,7 +992,7 @@ that the en endpoints return them with — `400`, `422`, or `503` — not as a b
   existing consistency tokens.
 - Changing the schema changes `schemaHash`; old tokens from another schema hash
   are rejected.
-- Point liveness at `/healthz` and readiness at `/readyz`; never point liveness at
+- Point liveness at `/health/live` and readiness at `/health/ready`; never point liveness at
   a database-dependent probe.
 - Send `SIGTERM` to deploy. Give the process at least 30 seconds to drain before
   `SIGKILL`, matching the shutdown cap.
@@ -970,7 +1000,7 @@ that the en endpoints return them with — `400`, `422`, or `503` — not as a b
   log line: a `reaped` that stays at the batch size every pass means the backlog is
   growing faster than the interval drains it, so shorten the interval or raise the
   batch size.
-- Monitor `check` and `lookup` latency, from `/metrics` or from the `durationMs`
+- Monitor `check` and `lookup` latency, from `/metrics` or from the `duration_ms`
   field of the request log. Once adopted, `en` is on the read path for protected
   list and object endpoints.
 - Prefer `MinimizeLatency` and `AtLeastAsFresh` for request traffic; use
