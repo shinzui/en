@@ -153,3 +153,42 @@ header "Content-Type" contains "application/json"
 header "Content-Type" not contains "application/problem+json"
 jsonpath "$.code" == "invalid_cursor"
 jsonpath "$.retryable" == false
+
+POST {{base_url}}/v1/relationships/query?first=-1
+Authorization: Bearer {{api_key}}
+Content-Type: application/json
+{
+  "consistency": {"mode": "minimizeLatency"},
+  "filter": {"subjectType": "user", "subjectId": "hurl-alice"}
+}
+HTTP 400
+[Asserts]
+header "Content-Type" contains "application/json"
+header "Content-Type" not contains "application/problem+json"
+jsonpath "$.code" == "negative_page_size"
+
+POST {{base_url}}/v1/relationships/query?first=101
+Authorization: Bearer {{api_key}}
+Content-Type: application/json
+{
+  "consistency": {"mode": "minimizeLatency"},
+  "filter": {"subjectType": "user", "subjectId": "hurl-alice"}
+}
+HTTP 400
+[Asserts]
+header "Content-Type" contains "application/json"
+header "Content-Type" not contains "application/problem+json"
+jsonpath "$.code" == "page_size_too_large"
+
+POST {{base_url}}/v1/relationships/query?first=2&last=2
+Authorization: Bearer {{api_key}}
+Content-Type: application/json
+{
+  "consistency": {"mode": "minimizeLatency"},
+  "filter": {"subjectType": "user", "subjectId": "hurl-alice"}
+}
+HTTP 400
+[Asserts]
+header "Content-Type" contains "application/json"
+header "Content-Type" not contains "application/problem+json"
+jsonpath "$.code" == "mixed_pagination_directions"

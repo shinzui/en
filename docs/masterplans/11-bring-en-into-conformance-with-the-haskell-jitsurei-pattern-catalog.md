@@ -33,9 +33,9 @@ stanza to an entire absent subsystem.
 After this initiative, an operator or a client integrating with `en` gets these
 concretely observable things that they cannot get today:
 
-- **One error decoder for the whole fleet.** Every failure `en` returns is an RFC 9457
-  problem document under `application/problem+json`, not the bespoke
-  `{code, message, retryable}` object under `application/json` it invented for itself.
+- **One default error decoder for the whole fleet.** Every failure `en` returns is an RFC
+  9457 problem document under `application/problem+json`, except the exact Relay-pagination
+  400 contract recorded for `POST /v1/relationships/query`.
 - **Probes an orchestrator can actually rely on.** `GET /health/live` and
   `GET /health/ready` at the fleet-standard paths, served from the released
   `servant-health` package, with a typed probe body naming the failing check and when it
@@ -48,10 +48,11 @@ concretely observable things that they cannot get today:
   listening `en-server` — proving the packaged executable binds its socket, applies its
   production middleware stack, authenticates, and serializes correctly, which no
   in-process `Wai.Test` request can prove.
-- **Pagination a generated client understands.** `en`'s four unbounded list endpoints
-  return a Relay `Connection` with typed opaque cursors, replacing the bespoke
-  `{status: "hasMore" | "truncated", cursor}` envelope, and each ships a conformance test
-  proving that walking the pages skips no row and duplicates none.
+- **Pagination a generated client understands where the abstraction is truthful.** The
+  stored relationship listing returns a Relay `Connection` with typed opaque cursors and a
+  conformance test proving that walking pages skips no row and duplicates none. Graph
+  traversals retain their frontier/truncation cursors, and watch retains its forward-only
+  changelog cursor.
 
 And one thing that is invisible from outside but is the reason a fleet has conventions at
 all: **`en`'s Haskell reads like the rest of the fleet's Haskell.** Every package uses the
@@ -190,7 +191,7 @@ searched for the catalog's own decisions; the catalog publishes standards, not A
 | 64 | Serve Kubernetes health probes from servant-health | docs/plans/64-serve-kubernetes-health-probes-from-servant-health.md | EP-61 | EP-63 | Complete |
 | 65 | Instrument en with OpenTelemetry and a conformant production request log | docs/plans/65-instrument-en-with-opentelemetry-and-a-conformant-production-request-log.md | EP-64 | EP-63 | Complete |
 | 66 | Add a Hurl black-box API suite for en-server | docs/plans/66-add-a-hurl-black-box-api-suite-for-en-server.md | EP-61, EP-64 | EP-65 | Complete |
-| 67 | Adopt Relay pagination for en's list endpoints | docs/plans/67-adopt-relay-pagination-for-en-s-list-endpoints.md | EP-61 | EP-66 | In Progress |
+| 67 | Adopt Relay pagination for en's list endpoints | docs/plans/67-adopt-relay-pagination-for-en-s-list-endpoints.md | EP-61 | EP-66 | Complete |
 | 68 | Migrate en's records to generic-lens label syntax and a custom prelude | docs/plans/68-migrate-en-s-records-to-generic-lens-label-syntax-and-a-custom-prelude.md | EP-63 | EP-61, EP-64, EP-65, EP-66, EP-67 | Not Started |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
@@ -235,7 +236,7 @@ would be rewritten twice.
 
 **EP-67 hard-depends on EP-61.** The Relay standard defines `RelayPageError` as a
 *recorded exemption* from the RFC 9457 default — a paginated endpoint answers 400 with
-`RelayPageError`, not a problem document, and exempts those routes by name in the
+`RelayPageError`, not a problem document, and exempts the converted route's 400 by name in the
 problem-details conformance test. That exemption mechanism is EP-61's. EP-67's soft
 dependency on EP-66 is about proof rather than compilation: EP-67 is the initiative's one
 breaking wire change, and having the Hurl suite already in place means the migration can be
@@ -275,7 +276,7 @@ composition verbatim.
 `en-servant/test/Main.hs` as part of its Milestone 6. Two later plans **add entries** and
 neither may weaken the test: EP-64 exempts the two `servant-health` probe routes (a probe
 report describes current state and is not an error document), and EP-67 exempts the
-paginated routes (which answer 400 with `RelayPageError`, a released wire contract that
+relationship-query 400 (which answers with `RelayPageError`, a released wire contract that
 predates and outranks the fleet default). Each exemption must name routes explicitly —
 never a predicate that could silently grow — and each must be justified in its own plan's
 Decision Log. EP-64 additionally supplies the route names from
@@ -308,10 +309,10 @@ skimming it — it is the artifact a non-Haskell client generator consumes.
 **`en`'s external consumers.** `kikan-en` imports `app`, `Env`, and `AppEffects` from
 `En.Servant.API` and `En.Servant.Seam` directly; `nagare` pins `en` by a
 `source-repository-package` git tag. EP-61 already records that neither names an error
-type, so the error-body change cannot break them. EP-67 is different in kind: it changes
-response *shapes* on four endpoints, which is exactly what a consumer decodes. EP-67 owns
-the compatibility question and must answer it explicitly in its own Decision Log rather
-than inheriting EP-61's answer.
+type, so the error-body change cannot break them. EP-67 changed one response shape, then
+searched both registered source trees: neither consumer calls `/relationships/query` or
+names its client and wire types. The mounted `app` and seam exports stayed unchanged, so no
+cross-repository migration was required.
 
 ### Cross-plan decisions that should become ADRs
 
@@ -328,8 +329,10 @@ per the distillation rule in `.claude/skills/exec-plan/ADR.md`.
   environment-variable configuration (`OTEL_EXPORTER_OTLP_ENDPOINT`,
   `OTEL_SEMCONV_STABILITY_OPT_IN=http`) that its own config validation does not own. That
   boundary, and the forked Servant instrumentation pin it requires, are durable.
-- **`en`'s list endpoints paginate the Relay way** (EP-67), including the deliberate
-  breaking change and what it costs `nagare`.
+- **Only stored relationship listings paginate the Relay way** (EP-67; recorded in
+  [ADR 6](../adr/0006-only-stored-relationship-listings-use-relay-keyset-pagination.md)),
+  including the deliberate breaking change, snapshot pinning, and semantic exemptions for
+  traversal and feed cursors.
 - **`en`'s record idiom is generic-lens `#label`** (EP-68), superseding the
   `NoFieldSelectors` / `OverloadedRecordDot` idiom the tree uses today. Durable because it
   governs every module written from then on, and because the two idioms are individually
@@ -360,9 +363,9 @@ checklist; this is the at-a-glance view of the initiative.
 - [x] EP-66: Hurl available as a project tool and the suite skeleton runnable
 - [x] EP-66: Resource-family files covering health, OpenAPI, and the read surface
 - [x] EP-66: Opt-in mutating and perimeter scenarios, wired into CI without hiding failures
-- [ ] EP-67: Relay cohort resolving; the total database order and its migration
-- [ ] EP-67: The four list endpoints converted to `Connection` / `RelayPageError`
-- [ ] EP-67: Conformance tests proving no row is skipped or duplicated; consumers notified
+- [x] EP-67: Relay 0.1.1.0 cohort resolving; existing primary-key order proved total
+- [x] EP-67: Relationship query converted to `Connection` / `RelayPageError`; traversal and feed exemptions recorded
+- [x] EP-67: Real-WAI and PostgreSQL-backed Hurl walks prove page boundaries; consumers audited
 - [ ] EP-68: `en-core` and `en-postgres` migrated to `#label` and lens operators
 - [ ] EP-68: `en-servant`, `en-client`, and `en-biscuit` migrated
 - [ ] EP-68: `en-server`, `en-example`, `en-migrations`, and every test suite migrated
@@ -455,6 +458,18 @@ between child plans. Concise evidence.
   contracts with typed Relay cursors; EP-67 must include zero-size and malformed-cursor Hurl
   cases in its cutover.
 
+- Discovery (2026-08-26, EP-67): **unbounded does not imply Relay-keyset.** The stored-row
+  relationship query has a total reversible order, but lookup cursors are suspended graph
+  traversals with a meaningful `truncated` state, and watch cursors drain forward-only
+  revision windows. Only relationship query was converted; the other three retain their
+  truthful protocols. [ADR 6](../adr/0006-only-stored-relationship-listings-use-relay-keyset-pagination.md)
+  records the boundary.
+
+- Discovery (2026-08-26, EP-67): **the existing primary key already serves the keyset
+  order.** A transactional 50,000-row `EXPLAIN` selected `relation_tuple_pkey`; the cursor's
+  consistency token is constant within a walk and `relation_tuple.id` is the unique varying
+  key. No append-only migration or duplicate index was needed.
+
 
 ## Decision Log
 
@@ -490,10 +505,13 @@ between child plans. Concise evidence.
   full child plan, rather than folding it into the error-body work or deferring it.
   Rationale: this was the owner's choice on 2026-08-25 among three options — a full plan
   sequenced last, an audit-only plan that stops before implementing, and a recorded
-  exemption. It is the initiative's only deliberately breaking wire change, affecting four
-  endpoints that `nagare` decodes, so it wants to land once, deliberately, on a tree that is
+  exemption. It is the initiative's only deliberately breaking wire change and was initially
+  expected to affect four endpoints plus nagare decoders, so it wants to land once,
+  deliberately, on a tree that is
   otherwise already conformant, with the Hurl suite from EP-66 available to demonstrate it
-  against a live server. Sequencing it last also means that if the `Experimental` lifecycle
+  against a live server. The initial risk assessment assumed four endpoints and affected
+  nagare decoders; EP-67's applicability and source audits narrowed that to one endpoint and
+  no registered source use. Sequencing it last also means that if the `Experimental` lifecycle
   of `shinzui/relay-pagination` turns out to be a real obstacle, the discovery costs the
   initiative nothing already delivered.
   Date: 2026-08-25
@@ -559,6 +577,17 @@ between child plans. Concise evidence.
   [ADR 5](../adr/0005-telemetry-configuration-and-provider-lifetimes-belong-to-the-standalone-host.md).
   Date: 2026-08-25
 
+- Decision: Apply Relay pagination only to `POST /v1/relationships/query`; exempt lookup,
+  lookup-subjects, and watch for semantic—not temporary—reasons.
+  Rationale: the catalog's keyset model requires a reversible total order and represents
+  continuation only through `PageInfo`. Relationship rows satisfy that model and preserve
+  snapshot consistency by placing the consistency token before the row id in every cursor.
+  The graph endpoints' frontier state and truncation, and watch's forward-only window, do
+  not. Registered consumers name none of the breaking relationship-query types. The complete
+  decision and future adoption test are in
+  [ADR 6](../adr/0006-only-stored-relationship-listings-use-relay-keyset-pagination.md).
+  Date: 2026-08-26
+
 
 ## Outcomes & Retrospective
 
@@ -609,4 +638,20 @@ parsing, and the Nix formatting gates pass; the existing concurrent Biscuit time
 default-package `nix flake check` failure reproduce exactly as recorded by EP-65, with Biscuit
 passing in isolation.
 
-EP-67 is now the next child in initiative order whose hard dependencies are all complete.
+EP-67 is complete. `POST /v1/relationships/query` now accepts Relay query arguments and
+returns `Connection TupleWire`, with a single `RelayPageError` 400 contract and the existing
+typed RFC 9457 tail for non-client failures. Its cursor pins the consistency token and seeks
+on the unique relationship row id; the existing primary key passed the 50,000-row plan proof,
+so no migration was added. A released conformance walker crossed page boundaries forward and
+backward through the real WAI application, while a 10-request PostgreSQL-backed Hurl flow
+proved two live pages plus malformed, negative, oversized, and mixed-direction failures.
+All eight suites passed together under `cabal test all`, including the Biscuit suite that had
+timed out under earlier full-suite runs.
+
+The original vision's four-endpoint wording was corrected on implementation evidence. Lookup
+and lookup-subjects are graph-traversal protocols whose `truncated` state cannot be represented
+truthfully by Relay `PageInfo`; watch is a forward-only changelog window. Their exemptions and
+the relationship listing's durable boundary are recorded in
+[ADR 6](../adr/0006-only-stored-relationship-listings-use-relay-keyset-pagination.md).
+Source audits found no affected use under `mori://shinzui/nagare` or
+`mori://shinzui/kikan-en`. EP-68 is now the next eligible child.

@@ -41,9 +41,10 @@ the pages skips no row and duplicates none. After this plan a client pages `en` 
 it pages every other service in the fleet, and the OpenAPI document says so in a shape
 client generators already understand.
 
-**This is the one deliberately breaking wire change in its initiative.** Response shapes on up
-to four endpoints change, `nagare` decodes some of them, and this plan owns answering that
-rather than inheriting an answer from elsewhere.
+**This is the one deliberately breaking wire change in its initiative.** Response shapes on
+every converted endpoint change, and this plan owns auditing registered consumers rather than
+inheriting an answer from elsewhere. The audit ultimately found no relationship-query use in
+`mori://shinzui/nagare` or `mori://shinzui/kikan-en`.
 
 It is also the plan most likely to need rescoping on contact, for two reasons recorded below:
 `en`'s endpoints are POST-with-body rather than GET-with-query, and `en`'s cursors carry a
@@ -72,9 +73,10 @@ rather than forcing four endpoints into a shape that fits two of them.
 - [x] (2026-08-26T03:13:43Z) Milestone 4 — No remaining endpoints were ruled in by Milestone
       1: both graph traversals and the forward-only watch feed retain their truthful existing
       protocols.
-- [ ] Milestone 5 — Record the `RelayPageError` exemption in the problem-details conformance
-      test, regenerate `docs/api/openapi.json`, update the Hurl suite's pagination
-      assertions, notify consumers, and write the ADR.
+- [x] (2026-08-26T03:17:20Z) Milestone 5 — Record the exact `RelayPageError` exemption,
+      regenerate `docs/api/openapi.json`, update the Hurl pagination flow, audit registered
+      consumers, and record the durable boundary in ADR 6. The PostgreSQL-backed Hurl flow
+      passed all 10 requests, including two pages and the four released rejection codes.
 
 
 ## Surprises & Discoveries
@@ -271,12 +273,47 @@ rather than forcing four endpoints into a shape that fits two of them.
   order. Adding another `(id)` index would duplicate the primary key without changing a plan.
   Date: 2026-08-26
 
+- Decision: Keep the converted route's typed RFC 9457 tail rather than narrowing its
+  `MultiVerb` result to only 200 and 400.
+  Rationale: `RelayPageError` must be the operation's only 400 body, but schema loading and
+  tuple-store access can still produce 500 and 503 after page arguments validate. Dropping
+  those alternatives would make real failures disappear from the route type and OpenAPI.
+  `RelationshipPageResponses` therefore uses `RespondAs JSON` for the Relay 400 and retains
+  the existing problem-document alternatives for 412, 422, 500, and 503. The conformance
+  test proves that the exception is exact to 400.
+  Date: 2026-08-26
+
 (Add further entries as work proceeds; Milestone 1's four verdicts belong here.)
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+EP-67 converted the one endpoint that is truthfully a reversible keyset collection:
+`POST /v1/relationships/query`. Its body now carries only consistency plus the relationship
+filter, `RelayPage 20 100` owns the four query parameters, success is a
+`Connection TupleWire`, and every 400 is a `RelayPageError`. The old
+`RelationshipsStateWire` and `ReadRelationshipsResponseWire` contracts were removed.
+
+The consistency token is the cursor's constant first key and `relation_tuple.id` is its
+unique second key. Continuations validate and reuse the pinned token, ignoring body
+consistency, so a walk cannot straddle a write. A 50,000-row rolled-back `EXPLAIN` used
+`relation_tuple_pkey`; no migration was warranted. The in-memory and PostgreSQL interpreters
+share the same fingerprint and pass the released bidirectional conformance walker through the
+actual WAI application.
+
+Milestone 1 made the result intentionally smaller than the original four-endpoint wording.
+Lookup and lookup-subjects remain resumable graph traversals because Relay cannot represent
+their `truncated` outcome or frontier cursors. Watch remains a forward-only changelog window.
+Those are semantic exemptions, not unfinished conversions, and are recorded in
+[ADR 6](../adr/0006-only-stored-relationship-listings-use-relay-keyset-pagination.md).
+
+The PostgreSQL-backed Hurl flow seeded three rows sharing the constant primary sort key,
+crossed a two-row page boundary without overlap, and passed malformed-cursor, negative-size,
+oversize, and mixed-direction rejections. `cabal build all`, the focused core, PostgreSQL,
+and Servant suites, all eight suites under `cabal test all`, and OpenAPI drift checking pass.
+Registered source audits found no use of
+the breaking client or wire types under `mori://shinzui/nagare` or
+`mori://shinzui/kikan-en`, so no cross-repository edit was necessary.
 
 
 ## Context and Orientation
@@ -456,8 +493,9 @@ filesystem convention is authoritative; no OKF frontmatter belongs on an ADR wri
 Two ADRs constrain this plan, and this is the only plan in its initiative constrained by both.
 
 [ADR 1 — en's schema is an append-only pg-migrate component](../adr/0001-en-s-schema-is-an-append-only-pg-migrate-component.md).
-Milestone 2 adds indexes so the keyset queries have a total order to seek within. Under ADR 1
-that is a **new migration file** in `en-migrations`, never an edit to an existing one:
+Milestone 2 proves whether existing indexes serve the total order and adds one only if the
+evidence requires it. The primary-key proof made a migration unnecessary; if a later sort
+change requires one, it is a **new migration file** in `en-migrations`, never an edit:
 `pg-migrate` keys applied migrations by file, so editing a file that has already run in any
 environment leaves that environment silently divergent. Add `CREATE INDEX` statements as their
 own forward migration, and consider `CONCURRENTLY` if the target tables are large enough that
@@ -704,8 +742,8 @@ mixed directions (`mixed_pagination_directions`).
 Then handle consumers, which is this plan's distinctive obligation. `kikan-en` imports only
 `app`, `Env`, and `AppEffects` from `En.Servant.API` and `En.Servant.Seam`, so it never names
 a page type and cannot break. **`nagare` is different**: it pins `en` by a
-`source-repository-package` git tag and decodes responses. Find out which of the converted
-endpoints it calls, and say so here — with evidence, not assumption. Whether `nagare` is
+`source-repository-package` git tag. Find out whether it decodes a converted response and say
+so here — with evidence, not assumption. Whether `nagare` is
 updated in the same change, pinned to the pre-migration tag until it can be, or already stale
 for unrelated reasons is a decision this plan owns and must record.
 
@@ -758,7 +796,9 @@ grep -rn "data RelayPage\|instance HasServer" \
   /Users/shinzui/Keikaku/bokuno/relay-pagination/relay-pagination-servant/src
 ```
 
-Milestone 2 adds a migration. Under ADR 1 that is a **new file**, never an edit:
+Milestone 2 proved that no migration is needed. The existing primary key is the exact varying
+sort key; the recorded 50,000-row `EXPLAIN` is the evidence. If a later sort change disproves
+that contract, ADR 1 requires a **new file**, never an edit:
 
 ```bash
 ls en-migrations/migrations/            # see the existing naming convention first
@@ -781,7 +821,9 @@ For the live checks, a running server with enough seeded data to span pages:
 just process-up && just run-migrations && just start-server &
 curl -s -X POST "http://127.0.0.1:8080/v1/relationships/query?first=2" \
   -H "Authorization: Bearer ${EN_API_KEY:-dev-secret-0123456789}" \
-  -H 'content-type: application/json' -d '{"filter":{}}' | jq '{n:(.edges|length),pageInfo}'
+  -H 'content-type: application/json' \
+  -d '{"consistency":{"mode":"minimizeLatency"},"filter":{"subjectType":"user","subjectId":"alice"}}' \
+  | jq '{n:(.edges|length),pageInfo}'
 ```
 
 Every commit carries all three trailers:
@@ -895,18 +937,16 @@ Most of this plan is ordinary source edits, which are safe to repeat: `cabal bui
 `cabal test all` are pure functions of the tree, and `cabal run en-openapi` overwrites the
 document deterministically.
 
-**Milestone 2 is the exception, and the only place in this initiative that touches the
-database.** It adds a migration. Under
+**Milestone 2 was the only point where this initiative might have changed the database.**
+The primary-key proof made that unnecessary. If a later order change requires an index, under
 [ADR 1](../adr/0001-en-s-schema-is-an-append-only-pg-migrate-component.md), migrations are
 append-only and keyed by filename: `just run-migrations` is idempotent — already-applied files
 are skipped — but **editing a migration file after it has run anywhere is not recoverable by
 re-running**. If you need to change an index after its migration has been applied, add a new
 migration that drops and recreates it. Never edit the original.
 
-Adding an index is otherwise a safe, reversible operation: it changes no row and can be
-dropped. If `CREATE INDEX` without `CONCURRENTLY` holds a lock longer than acceptable on a
-real database, that is a deployment-timing question rather than a correctness one, and it
-belongs in the ADR.
+No index was added. If a later implementation does add one, it changes no row and can be
+dropped; lock duration and `CONCURRENTLY` remain deployment-timing questions.
 
 Commit at each milestone boundary. Three recovery notes.
 
@@ -965,19 +1005,24 @@ exact commit. Mori's project and package lifecycle remains `Experimental`.
 -- in the endpoint's slice module (En/Tuple/Api.hs or En/Lookup/Api.hs)
 type <Name>PageResponses =
   '[ Respond 200 "<description>" (Connection <NodeWire>),
-     Respond 400 "Invalid pagination" RelayPageError
+     RespondAs JSON 400 "Invalid pagination" RelayPageError,
+     -- retain en's RespondAs ProblemJSON alternatives for 412/422/500/503
    ]
 
 data <Name>PageResult
   = <Name>PageOk !(Connection <NodeWire>)
   | <Name>PageBadRequest !RelayPageError
+  | <Name>PagePreconditionFailed !ProblemDetails
+  | <Name>PageUnprocessable !ProblemDetails
+  | <Name>PageInternal !ProblemDetails
+  | <Name>PageUnavailable !ProblemDetails
 
 instance AsUnion <Name>PageResponses <Name>PageResult   -- hand-written, with the
                                                         -- exhaustiveness witness clause
 ```
 
-and in `en-postgres`, a `SortSpec` whose columns and directions match the index added in
-Milestone 2, plus the corresponding in-memory implementation.
+and in `en-postgres`, a `SortSpec` whose columns and directions match the primary-key order
+proved in Milestone 2, plus the corresponding in-memory implementation.
 
 ### Modules that must not change
 
@@ -989,4 +1034,5 @@ The non-paginated endpoints. `check`, `batch-check`, `expand`, the write endpoin
 lifecycle endpoints, and the grant-minting endpoint are untouched by this plan; a diff
 reaching them means the conversion has leaked past its scope.
 
-Existing migration files in `en-migrations`. Milestone 2 adds one; it edits none.
+Existing migration files in `en-migrations`. Milestone 2 proved the primary key sufficient,
+so it added and edited none.
