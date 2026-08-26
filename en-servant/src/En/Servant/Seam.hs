@@ -65,6 +65,7 @@ import En.Servant.Problem
   )
 import En.Tuple (CaveatContext, ObjectRef, Subject)
 import En.Watch qualified as Watch
+import GHC.Generics (Generic)
 import Servant (Handler, ServerError (..), err400, err403, err404, err412, err422, err500, err503, throwError)
 import System.IO (stderr)
 
@@ -90,7 +91,7 @@ data ActiveSchema = ActiveSchema
     origin :: !Text,
     loadedAt :: !UTCTime
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 data Env es = Env
   { -- | Run an engine action under one schema snapshot. The snapshot is an argument rather

@@ -36,6 +36,7 @@ library
     , base                      >=4.19 && <5
     , en-core
     , en-servant
+    , generic-lens              >=2.2  && <2.4
     , relay-pagination-servant  >=0.1  && <0.2
     , servant
     , servant-client

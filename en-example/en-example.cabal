@@ -40,6 +40,7 @@ library
     , effectful-core
     , en-core
     , en-servant
+    , generic-lens    >=2.2  && <2.4
     , servant
     , servant-server
     , text

@@ -48,6 +48,7 @@ import En.Tuple
     Tuple (..),
     TupleCaveat (..),
   )
+import GHC.Generics (Generic)
 
 -- | One (subject, permission, object) question in a batch.
 --
@@ -71,7 +72,7 @@ data CheckOutcome = CheckOutcome
   { decision :: !CheckDecision,
     checkedAt :: !ConsistencyToken
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | A batch's decisions, and the one snapshot all of them were decided at.
 --

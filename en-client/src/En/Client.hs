@@ -13,12 +13,12 @@
 -- key), which are not part of the API type.
 --
 -- @
--- result <- runClientM (enClient.check request) clientEnv
+-- result <- runClientM ((enClient ^. #check) request) clientEnv
 -- case result of
 --     Left transportError -> …
 --     Right (EnOk response) -> …
---     Right (EnUnavailable envelope) | envelope.retryable -> retryLater
---     Right (EnClientError envelope) -> reportBug envelope.code
+--     Right (EnUnavailable envelope) | envelope ^. #retryable -> retryLater
+--     Right (EnClientError envelope) -> reportBug (envelope ^. #code)
 --     …
 -- @
 module En.Client
@@ -29,7 +29,8 @@ module En.Client
   )
 where
 
-import Data.Text (Text)
+import Data.Generics.Labels ()
+import En.Prelude
 import En.Servant.API
 import Relay.Pagination.Servant (ClientPage)
 import Servant.Client (ClientM)
@@ -62,8 +63,8 @@ data EnClient = EnClient
 --
 -- 'EnApi' mounts one sub-record per concept slice, so the derived client is nested: the
 -- umbrella yields the five slice clients, and each slice client yields its operations. This
--- flat 'EnClient' is projected from them, one field at a time, so callers keep the flat
--- @client.check@ surface.
+-- flat 'EnClient' is projected from them, one field at a time, so callers keep one flat
+-- client record and read its operations with generic-lens labels.
 enClient :: EnClient
 enClient =
   EnClient
@@ -81,12 +82,24 @@ enClient =
       readSchema
     }
   where
-    EnApi {relationships, checks, lookups, expands, schema} = genericClient :: EnApi (AsClientT ClientM)
-    TupleRoutes {writeTuples, deleteTuples, readRelationships, deleteRelationships, watch} = relationships
-    CheckRoutes {check, batchCheck, mintGrant} = checks
-    LookupRoutes {lookup, lookupSubjects} = lookups
-    ExpandRoutes {expand} = expands
-    SchemaRoutes {readSchema} = schema
+    api = genericClient :: EnApi (AsClientT ClientM)
+    relationships = api ^. #relationships
+    checks = api ^. #checks
+    lookups = api ^. #lookups
+    expands = api ^. #expands
+    schema = api ^. #schema
+    writeTuples = relationships ^. #writeTuples
+    deleteTuples = relationships ^. #deleteTuples
+    readRelationships = relationships ^. #readRelationships
+    deleteRelationships = relationships ^. #deleteRelationships
+    watch = relationships ^. #watch
+    check = checks ^. #check
+    batchCheck = checks ^. #batchCheck
+    mintGrant = checks ^. #mintGrant
+    lookup = lookups ^. #lookup
+    lookupSubjects = lookups ^. #lookupSubjects
+    expand = expands ^. #expand
+    readSchema = schema ^. #readSchema
 
 -- | Ask for a read at least as fresh as a previous response's @checkedAt@.
 --
@@ -94,8 +107,9 @@ enClient =
 -- the next read chains the two: the second observes everything the first observed.
 --
 -- @
--- EnOk decided <- runClientM (enClient.check request) clientEnv
--- EnOk page <- runClientM (enClient.lookup followUp{consistency = chainFrom decided.checkedAt}) clientEnv
+-- EnOk decided <- runClientM ((enClient ^. #check) request) clientEnv
+-- let chained = followUp & #consistency .~ chainFrom (decided ^. #checkedAt)
+-- EnOk page <- runClientM ((enClient ^. #lookup) chained) clientEnv
 -- @
 chainFrom :: Text -> ConsistencyWire
 chainFrom =

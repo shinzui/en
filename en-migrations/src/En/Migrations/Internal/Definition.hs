@@ -15,7 +15,6 @@ module En.Migrations.Internal.Definition
 where
 
 import Data.ByteString (ByteString)
-import Data.List.NonEmpty (NonEmpty)
 import Data.Set qualified as Set
 import Database.PostgreSQL.Migrate
   ( DefinitionError,
@@ -23,6 +22,7 @@ import Database.PostgreSQL.Migrate
     migrationComponentFromEmbeddedSql,
   )
 import Database.PostgreSQL.Migrate.Embed (embedMigrationManifest)
+import En.Prelude
 
 -- | The manifest's files and their exact bytes, embedded at compile time.
 --

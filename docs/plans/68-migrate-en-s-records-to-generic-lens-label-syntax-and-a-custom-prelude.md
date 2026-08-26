@@ -49,7 +49,7 @@ artifact is identical" is the only acceptance criterion that means anything.
 
 ## Progress
 
-- [ ] Milestone 1 — Establish the mechanical recipe on the smallest packages first
+- [x] (2026-08-25 20:36-0700) Milestone 1 — Established the mechanical recipe on the smallest packages first
       (`en-migrations`, `en-example`, `en-client` — 8 modules, 677 lines between them), and
       write down the recipe that emerges: what a read becomes, what an update becomes, where
       `Data.Generics.Labels ()` goes, and what `En.Prelude` needs to gain.
@@ -72,6 +72,21 @@ artifact is identical" is the only acceptance criterion that means anything.
   Timeout`. The same suite passed immediately in isolation. `just openapi` was clean and the
   immutable contract baseline is
   `4db31037c3d823d9c0f5e19b968165e2d7364bf9f8a971cb4a7fc2b65ec0a183`.
+
+- Discovery (2026-08-25, Milestone 1): **EP-63 made the packages resolvable but did not make
+  the generic-lens orphan visible to every Cabal component.** GHC builds components with only
+  their direct `build-depends` exposed, so a module importing `Data.Generics.Labels ()` needs
+  `generic-lens` directly even when it already depends on `en-core`. `en-migrations` also had
+  no dependency on `en-core`, so its library and CLI could not import `En.Prelude` until that
+  internal workspace dependency was declared. The already-resolved cohort did not change;
+  these are component visibility edges omitted from the original plan.
+
+- Discovery (2026-08-25, Milestone 1): **not every record can derive `Generic`.**
+  `En.Servant.Seam.Env` contains the rank-polymorphic field `runPorts :: forall a. ...`; GHC
+  rejects a stock `Generic (Env es)` instance because the constructor has a polymorphic
+  argument. Its record-pattern destructuring remains the narrow exception to `#label` reads.
+  Ordinary records encountered in the same conversion, including `ActiveSchema` and
+  `CheckOutcome`, gained behavior-neutral stock `Generic` derivations.
 
 - Discovery (2026-08-25, while planning): **the work is very unevenly distributed, which
   decides the milestone order.** Counting field-access sites and record-update sites per
@@ -143,6 +158,24 @@ artifact is identical" is the only acceptance criterion that means anything.
   enormous one. Removing them at the end turns "is anything still using the old idiom?" from a
   grep into a compile error — which is a far better guarantee than a grep, because a grep for
   `x.field` cannot distinguish a record access from a qualified name.
+  Date: 2026-08-25
+
+- Decision: Add `generic-lens` to each Cabal component that imports
+  `Data.Generics.Labels ()`, and add `en-core` only where a component imports `En.Prelude`
+  without already depending on it.
+  Rationale: Cabal hides transitive packages, so the per-module import discipline prescribed
+  by the catalog necessarily has a matching per-component dependency discipline. These edits
+  expose the dependency cohort EP-63 already resolved; they do not introduce a new library or
+  version into the project closure.
+  Date: 2026-08-25
+
+- Decision: Preserve record-pattern access for records that cannot have a lawful generic-lens
+  representation, beginning with the rank-polymorphic `En.Servant.Seam.Env`.
+  Rationale: GHC cannot derive `Generic` for a constructor with a polymorphic field, and
+  wrapping `runPorts` would break the public `Env` construction surface used by embedded
+  consumers. Fleet consistency does not justify a source-level API break in a plan whose
+  acceptance criterion is no behavior or interface change. All fields of ordinary `Generic`
+  records still use `#label`.
   Date: 2026-08-25
 
 (Add further entries as work proceeds.)
@@ -347,6 +380,31 @@ Then **write the recipe down**, in this section, as the thing Milestones 2 throu
 Include the transformations that turned out to be non-obvious — nested updates, `Maybe`
 fields, map fields, and any place where the mechanical rewrite produced something worse than
 the original and you chose differently.
+
+The recipe established by the first three packages is:
+
+- Import `En.Prelude` when its re-exports replace vocabulary the module uses. Import
+  `Data.Generics.Labels ()` separately in every module containing `#label`; add
+  `generic-lens` to that module's Cabal component because Cabal does not expose the transitive
+  package through `en-core`. Do not add either import to a definition-only leaf merely to hit
+  an import count: an unused prelude import is compiler-confirmed boilerplate.
+- A field read becomes `value ^. #field`; a nested read composes labels as
+  `value ^. #outer . #inner`. A read of a function-valued field is parenthesized before
+  application: `(client ^. #check) request`.
+- A true record update becomes a left-to-right lens chain: `value & #field .~ replacement`,
+  `?~` when supplying the contents of `Just`, and `%~` when computing from the field's old
+  value. Record *construction* remains constructor syntax; it is not an update and lens
+  construction would be less total and less readable.
+- Use `at key ?~ value` for map insertion, `at key .~ Nothing` for deletion, and `ix key %~ f`
+  only when deliberately modifying an existing key. These operators differ on an absent key,
+  so a mechanical `Map.insert` rewrite must preserve the original behavior.
+- Add `deriving stock (Generic, ...)` to an ordinary record before using its labels. When GHC
+  rejects `Generic` because a field is rank-polymorphic, preserve record-pattern access for
+  that record and document the exception; do not redesign a public type during this
+  behavior-preserving sweep.
+- Resolve names newly exported by `Control.Lens` by hiding them from `En.Prelude`, as in
+  `import En.Prelude hiding (List)`, rather than qualifying an operator or weakening the
+  prelude. Keep hand-written codecs and middleware order untouched.
 
 Acceptance: `cabal build all && cabal test all` passes; `just openapi` clean; the three
 packages contain no `.field` record access (verified by removing `OverloadedRecordDot` from
@@ -636,10 +694,18 @@ the Decision Log is where to record it.
 
 ### Libraries
 
-**None are added by this plan.** `lens` and `generic-lens` arrive in
+**No new external library enters the project closure.** `lens` and `generic-lens` arrive in
 `docs/plans/63-adopt-the-fleet-haskell-core-standards-across-every-en-package.md`, along with
-`OverloadedLabels` in every package's stanza and the filled-out `En.Prelude`. If a milestone
-here appears to need a new dependency, that is a signal the work belongs in EP-63 instead.
+`OverloadedLabels` in every package's stanza and the filled-out `En.Prelude`. This plan does
+add direct `generic-lens` `build-depends` edges to each Cabal component that imports
+`Data.Generics.Labels ()`, because Cabal hides transitive packages, and adds the internal
+`en-core` edge where a component newly imports `En.Prelude`. These expose the versions already
+resolved by EP-63 rather than selecting a new dependency cohort.
+
+The 2026-08-25 verification found `generic-lens` 2.3.0.0 as Hackage's newest normal
+release and the matching upstream tag `2.3.0.0`; `dist-newstyle/cache/plan.json` resolves
+`generic-lens` 2.3.0.0 and `lens` 5.3.6. The existing `>=2.2 && <2.4` direct bound therefore
+admits the authoritative current release without widening EP-63's tested major-version cohort.
 
 Two extensions are **removed**, in Milestone 6: `OverloadedRecordDot` from seven packages and
 `NoFieldSelectors` from six — the latter subject to the ambiguity caveat above.

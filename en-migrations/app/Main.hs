@@ -8,23 +8,14 @@ module Main (main) where
 
 import Data.Aeson qualified as Aeson
 import Data.ByteString.Lazy.Char8 qualified as LazyByteString
+import Data.Generics.Labels ()
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text.IO
 import Database.PostgreSQL.Migrate (defaultRunOptions)
 import Database.PostgreSQL.Migrate.CLI
-  ( CheckOptions (..),
-    CliOutcome (..),
-    ExitClass (..),
-    ListOptions (..),
+  ( ExitClass (..),
     MigrationCommand (..),
-    NewOptions (..),
     OutputFormat (..),
-    OutputOptions (..),
-    PlanOptions (..),
-    RepairOptions (..),
-    StatusOptions (..),
-    UpOptions (..),
-    VerifyOptions (..),
     cliEnvironment,
     migrationCommandParser,
     renderMigrationCommandJson,
@@ -32,6 +23,7 @@ import Database.PostgreSQL.Migrate.CLI
     runMigrationCommand,
   )
 import En.Migrations (enMigrationPlan)
+import En.Prelude hiding (List)
 import Hasql.Connection.Settings qualified as Settings
 import Options.Applicative
   ( execParser,
@@ -66,7 +58,7 @@ main = do
   case commandOutputFormat parsedCommand of
     TextOutput -> Text.IO.putStrLn (renderMigrationCommandText outcome)
     JsonOutput -> LazyByteString.putStrLn (Aeson.encode (renderMigrationCommandJson outcome))
-  Exit.exitWith (exitCodeFor (exitClass outcome))
+  Exit.exitWith (exitCodeFor (outcome ^. #exitClass))
 
 -- | Distinguish success, a verification report with issues, bad input, and a
 -- runtime failure, so deployment automation can branch on the exit code rather than
@@ -82,11 +74,11 @@ exitCodeFor =
 commandOutputFormat :: MigrationCommand -> OutputFormat
 commandOutputFormat =
   \case
-    Plan PlanOptions {output = OutputOptions format} -> format
-    List ListOptions {output = OutputOptions format} -> format
-    Check CheckOptions {output = OutputOptions format} -> format
-    Status StatusOptions {output = OutputOptions format} -> format
-    Verify VerifyOptions {output = OutputOptions format} -> format
-    Up UpOptions {output = OutputOptions format} -> format
-    Repair RepairOptions {output = OutputOptions format} -> format
-    New NewOptions {output = OutputOptions format} -> format
+    Plan options -> options ^. #output . #outputFormat
+    List options -> options ^. #output . #outputFormat
+    Check options -> options ^. #output . #outputFormat
+    Status options -> options ^. #output . #outputFormat
+    Verify options -> options ^. #output . #outputFormat
+    Up options -> options ^. #output . #outputFormat
+    Repair options -> options ^. #output . #outputFormat
+    New options -> options ^. #output . #outputFormat

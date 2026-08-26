@@ -28,7 +28,6 @@ module En.Migrations
   )
 where
 
-import Data.List.NonEmpty (NonEmpty (..))
 import Database.PostgreSQL.Migrate
   ( DefinitionError,
     MigrationComponent,
@@ -37,6 +36,7 @@ import Database.PostgreSQL.Migrate
     migrationPlan,
   )
 import En.Migrations.Internal.Definition (enMigrations)
+import En.Prelude
 
 -- | The complete single-component migration plan for en.
 --

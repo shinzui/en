@@ -43,6 +43,7 @@ library
     , base              >=4.19     && <5
     , bytestring
     , containers
+    , en-core
     , pg-migrate        ^>=1.1.0.0
     , pg-migrate-embed  ^>=1.1.0.0
 
@@ -59,7 +60,9 @@ executable en-migrate
     , aeson
     , base
     , bytestring
+    , en-core
     , en-migrations
+    , generic-lens          >=2.2      && <2.4
     , hasql                 >=1.10     && <1.11
     , optparse-applicative
     , pg-migrate            ^>=1.1.0.0

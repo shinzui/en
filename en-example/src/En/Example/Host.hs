@@ -31,20 +31,21 @@ module En.Example.Host
 where
 
 import Data.Aeson (FromJSON, ToJSON)
+import Data.Generics.Labels ()
 import Data.Map.Strict qualified as Map
-import Data.Text (Text)
 import Data.Time (UTCTime (..), fromGregorian)
 import Effectful (Eff, IOE, runEff)
 import Effectful qualified
 import Effectful.Dispatch.Dynamic (interpret_)
 import Effectful.Error.Static (Error, runErrorNoCallStack, throwError)
 import En.Budget (defaultEvaluationBudget)
-import En.Check (CheckDecision (..), CheckOutcome (..), check)
+import En.Check (CheckDecision (..), check)
 import En.Effect.ConsistencyStore (ConsistencyStore (..), TokenMetadata (TokenMetadata))
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
+import En.Prelude
 import En.Reachability (compileSchema)
 import En.Revision (Consistency (..), DatastoreId (..), Revision (..), SchemaHash (..))
 import En.Schema (CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
@@ -65,14 +66,12 @@ import En.Tuple
     Tuple (..),
   )
 import En.Watch (watchUnsupported)
-import GHC.Generics (Generic)
 import Servant
   ( Application,
     Capture,
     Get,
     Handler,
     JSON,
-    Proxy (..),
     Server,
     serve,
     type (:>),
@@ -186,9 +185,9 @@ resolveSecret env subject secretId =
 resolveWithGate :: Env ExampleEffects -> Subject -> ObjectRef -> DocumentView -> IO (Either ResolverError DocumentView)
 resolveWithGate Env {runPorts, readActiveSchema, checkOperation} subject object result = do
   active <- readActiveSchema
-  runPorts active (checkOperation active.graph MinimizeLatency emptyContext subject (RelationName "view") object) >>= \case
+  runPorts active (checkOperation (active ^. #graph) MinimizeLatency emptyContext subject (RelationName "view") object) >>= \case
     Right outcome ->
-      case outcome.decision of
+      case outcome ^. #decision of
         Allowed -> pure (Right result)
         Denied -> pure (Left ResolverForbidden)
         Conditional _ -> pure (Left ResolverForbidden)
