@@ -64,9 +64,10 @@ trace correlation, and the removal of two fields that are not in the bounded set
       construct the WAI middleware only after both globals are installed. Added validated
       `EN_TELEMETRY_ENABLED` configuration, defaulting to the no-provider `(Nothing, id)` path.
       Live disabled and enabled-with-unreachable-collector runs both served and drained cleanly.
-- [ ] Milestone 3 — Install the WAI middleware outermost and
-      `openTelemetryServantMiddleware` directly inside it, with the rest of the stack inside
-      that. Prove a request produces a span named by its Servant route, not by its method.
+- [x] (2026-08-26T01:01Z) Milestone 3 — Installed the WAI middleware outermost and
+      `openTelemetryServantMiddleware` directly inside it, using the same `servedProxy` passed
+      to `serveWithContext`. A collector-backed request produced a server span named
+      `POST v1/check`, preserving the caller's trace and parent span IDs.
 - [ ] Milestone 4 — Conform the request logger: the bounded field set, `trace_id` and
       `span_id` read from the server span's context, and the probe-path exclusion built from
       `Servant.Health.Paths.healthRawPaths`.
@@ -123,6 +124,15 @@ trace correlation, and the removal of two fields that are not in the bounded set
   `en-server: drained in-flight requests; shutting down` and exited 0. The same probe and
   shutdown behavior held with telemetry disabled.
 
+- Discovery (2026-08-25, Milestone 3): **the route middleware preserves the incoming context
+  and renames the WAI server span exactly as intended.** Against an OpenTelemetry Collector,
+  `POST /v1/check` with traceparent trace ID `4bf92f3577b34da6a3ce929d0e0e4736`
+  and parent span ID `00f067aa0ba902b7` exported a server span with span ID
+  `898de3ef5b171c47`, name `POST v1/check`, and attributes including
+  `http.route=v1/check`, `http.request.method=POST`, and
+  `http.response.status_code=400`. This proves route naming, propagation, and export together
+  rather than merely proving that the types compose.
+
 (Add further entries as work proceeds.)
 
 
@@ -172,6 +182,13 @@ trace correlation, and the removal of two fields that are not in the bounded set
   question: `en` runs its sessions through an effect stack and a connection pool, and where a
   span should start and end in that arrangement deserves its own thought. Recorded as a
   follow-up rather than folded in silently.
+  Date: 2026-08-25
+
+- Decision: Give the Servant telemetry middleware `servedProxy`, the same proxy passed to
+  `serveWithContext`, rather than the narrower API-only proxy used by some examples.
+  Rationale: route annotation is defined by the surface actually served. In `en-server` that
+  surface includes the generated OpenAPI route as well as `EnAPI`; using one proxy for serving
+  and another for instrumentation would create an avoidable naming gap.
   Date: 2026-08-25
 
 (Add further entries as work proceeds.)
@@ -965,3 +982,7 @@ from an observability regression.
 Revision note (2026-08-25): Milestone 2 fixed the service-specific switch as
 `EN_TELEMETRY_ENABLED` (default false), recorded its relationship to `OTEL_SDK_DISABLED`, and
 captured live enabled/disabled startup and shutdown evidence.
+
+Revision note (2026-08-25): Milestone 3 fixed the middleware order around the same
+`servedProxy` used by the application and recorded collector evidence for propagated context,
+Servant route naming, and OTLP export.

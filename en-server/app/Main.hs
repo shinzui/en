@@ -41,7 +41,7 @@ import En.Schema (Schema, ValidSchema, schemaHash, validateSchema)
 import En.Schema.Parse (parseSchema)
 import En.SchemaCheck (OrphanReport (..), renderTupleOrphan, validateTuplesAgainstSchema)
 import En.Servant.API (tupleFromWire, tupleToWire)
-import En.Servant.OpenApi (appWithOpenApiProbes)
+import En.Servant.OpenApi (appWithOpenApiProbes, servedProxy)
 import En.Servant.Probes (mkProbes)
 import En.Servant.Seam (ActiveSchema (..), AppEffects, Env (..), MintEnv (..))
 import En.Tuple (Tuple)
@@ -58,6 +58,8 @@ import Network.Wai qualified as Wai
 import Network.Wai.Handler.Warp qualified as Warp
 import Network.Wai.Handler.WarpTLS qualified as WarpTLS
 import Observability (newRequestLogger, requestIdMiddleware)
+import OpenTelemetry.Instrumentation.Servant (openTelemetryServantMiddleware)
+import OpenTelemetry.Trace qualified as OTel
 import System.Environment (getArgs)
 import System.Exit (ExitCode (ExitFailure), exitFailure, exitSuccess, exitWith)
 import System.IO (BufferMode (BlockBuffering, LineBuffering), hSetBuffering, stderr, stdout)
@@ -223,11 +225,16 @@ withStore say storeConfig action = do
 runServe :: ServerConfig -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
 runServe serverConfig loadedSchema pool config =
   withTelemetry serverConfig.telemetry $
-    const $
-      runServeApplication serverConfig loadedSchema pool config
+    runServeApplication serverConfig loadedSchema pool config
 
-runServeApplication :: ServerConfig -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
-runServeApplication serverConfig loadedSchema pool config = do
+runServeApplication ::
+  ServerConfig ->
+  LoadedSchema ->
+  Pool.Pool ->
+  ConsistencyConfig ->
+  (Maybe OTel.TracerProvider, Wai.Middleware) ->
+  IO ()
+runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelMiddleware) = do
   loadedAt <- getCurrentTime
   activeSchemaRef <-
     newIORef
@@ -412,16 +419,23 @@ runServeApplication serverConfig loadedSchema pool config = do
   rateLimit <- rateLimitMiddleware serverConfig.rateLimit
   requestLogger <- newRequestLogger
   metrics <- newMetrics
-  -- Outermost first. Authentication precedes logging so a log line can name a
-  -- verified caller, and precedes rate limiting so buckets are per-caller. Request
-  -- ids sit inside the limiter, so a throttled request costs no UUID. The metrics
-  -- layer wraps the servant application, so probes are counted; it cannot see the 401/403/429
-  -- the outer middlewares short-circuit, which stay countable at the proxy.
+  let servantTelemetryMiddleware =
+        maybe id (\provider -> openTelemetryServantMiddleware provider servedProxy) tracerProvider
+  -- Outermost first. The WAI telemetry layer creates and attaches the server span;
+  -- the Servant layer directly inside it annotates that span with the matched route.
+  -- Authentication remains outside rate limiting so buckets are per verified caller.
+  -- Request ids sit inside the limiter, so a throttled request costs no UUID. The
+  -- request logger is inside both telemetry layers and can therefore correlate its
+  -- line with the server span. The metrics layer wraps the servant application, so
+  -- probes are counted; it cannot see the 401/403/429 the outer middlewares
+  -- short-circuit, which stay countable at the proxy.
   --
   -- Serves `appWithOpenApi`, not `app`: the former adds GET /v1/openapi.json and the
   -- ErrorFormatters that make body-parse and 404 errors speak the error envelope.
   let wrappedApp =
-        authMiddleware serverConfig.auth
+        otelMiddleware
+          . servantTelemetryMiddleware
+          . authMiddleware serverConfig.auth
           . rateLimit
           . requestIdMiddleware
           . requestLogger
