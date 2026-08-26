@@ -69,8 +69,10 @@ artifact is identical" is the only acceptance criterion that means anything.
       conformance runner, and benchmark. A build with `-XNoOverloadedRecordDot` passed for
       every core component; the schema/TH negative fixtures retained their expected failures,
       all eight repository suites passed, and OpenAPI retained the baseline SHA-256.
-- [ ] Milestone 6 — Remove `OverloadedRecordDot` and `NoFieldSelectors` from every cabal
-      stanza, confirm the tree still builds, and write the ADR recording the idiom change.
+- [x] (2026-08-25 21:57-0700) Milestone 6 — Removed `OverloadedRecordDot` and
+      `NoFieldSelectors` from every Cabal stanza, converted the final compiler-discovered
+      reads, retained `NoFieldSelectors` only as targeted conflict control, and recorded the
+      durable idiom and orphan-instance discipline in ADR 7.
 
 
 ## Surprises & Discoveries
@@ -175,6 +177,19 @@ artifact is identical" is the only acceptance criterion that means anything.
   its assertions now inspect `CheckOutcome.decision` and `BatchOutcome.decisions` through
   labels, and the benchmark target compiles.
 
+- Discovery (2026-08-25, Milestone 6): **removing the extensions repository-wide found six
+  more source lines outside the core-focused strict build.** Two PostgreSQL lines still read
+  `Timed.value` and `TuplePage.rows`; four Servant assertions still selected a problem
+  `detail` from a parenthesized expression. All now use labels. This is separate from
+  Milestone 5's ten core lines and confirms that the final ordinary build and test build are
+  both required.
+
+- Discovery (2026-08-25, Milestone 6): **package-wide `NoFieldSelectors` was hiding three
+  genuine Servant name collisions.** Generated fields conflict with the error catalog's
+  `retryable` constructor, Aeson's `pairs`, Relay's `cursor`, and the tuple-store
+  `deleteRelationships` operation. `En.Servant.Problem`, `En.Check.Api`, and `En.Tuple.Api`
+  therefore retain local `NoFieldSelectors` pragmas; every Cabal default is gone.
+
 (Add further entries as work proceeds.)
 
 
@@ -247,12 +262,42 @@ artifact is identical" is the only acceptance criterion that means anything.
   changes the value representation nor expands the dependency closure.
   Date: 2026-08-25
 
+- Decision: Adopt generic-lens labels as en's durable record-access idiom and keep the
+  `Data.Generics.Labels` orphan import out of `En.Prelude`, as recorded in
+  [ADR 7](../adr/0007-generic-lens-labels-are-en-s-record-access-idiom.md).
+  Rationale: fleet consistency lets reference code compile without translation, while the
+  per-module orphan import preserves each consumer's ability to choose another `IsLabel`
+  interpretation. Local `NoFieldSelectors` remains permitted only where generated selectors
+  create real name collisions; it does not restore record-dot access.
+  Date: 2026-08-25
+
 (Add further entries as work proceeds.)
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+All eight packages now use the fleet record vocabulary: `En.Prelude`, generic-lens labels,
+and lens update operators. `OverloadedRecordDot` and package-wide `NoFieldSelectors` are gone
+from every Cabal stanza. The generic-lens orphan remains a deliberate per-module import and
+is absent from `En.Prelude`; three Servant modules retain local `NoFieldSelectors` solely to
+prevent generated-selector collisions. Non-`Generic` foreign and rank-polymorphic records use
+their exported access surfaces as the documented narrow exceptions.
+
+The migration remained behavior-neutral. All eight suites pass together, including the real
+PostgreSQL integration suite and the schema/TH negative fixtures; every core component also
+builds with `-XNoOverloadedRecordDot`; the benchmark compiles; and OpenAPI remains
+byte-identical to the baseline SHA-256
+`4db31037c3d823d9c0f5e19b968165e2d7364bf9f8a971cb4a7fc2b65ec0a183`.
+The safe black-box Hurl suite also passed all 15 requests against the packaged server on an
+alternate local port; port 8080 was already occupied by an unrelated HTML service. The known
+concurrent Biscuit timeout reproduced once in the final run, passed immediately in isolation,
+and the following full eight-suite run passed.
+
+The most reusable lesson is that protected textual conversion needs two compiler boundaries.
+The core-only strict build found ten lines containing fourteen reads, and normal extension
+removal found six more lines plus the selector conflicts hidden by package defaults.
+Neither source grep nor `cabal build all` alone covered the benchmark and test components.
+ADR 7 records the resulting idiom, exceptions, and orphan-instance discipline.
 
 
 ## Context and Orientation
