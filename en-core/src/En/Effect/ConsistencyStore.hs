@@ -39,7 +39,7 @@ data TokenMetadata = TokenMetadata
     schemaHash :: !SchemaHash,
     expiresAt :: !(Maybe UTCTime)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | A read consistency request after token validation and freshness selection.
 data ResolvedConsistency = ResolvedConsistency

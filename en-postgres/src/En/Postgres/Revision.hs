@@ -41,14 +41,14 @@ module En.Postgres.Revision
 where
 
 import Data.Char (digitToInt, isDigit, ord)
+import Data.Generics.Labels ()
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (nub, sort)
-import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
+import Data.Time (NominalDiffTime, diffUTCTime)
 import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
 import Data.Word (Word64)
-import Effectful (Eff, IOE, liftIO, (:>))
+import Effectful (Eff, IOE, (:>))
 import Effectful.Dispatch.Dynamic (interpret_)
 import Effectful.Error.Static (Error, throwError)
 import En.Effect.ConsistencyStore
@@ -59,6 +59,7 @@ import En.Effect.ConsistencyStore
 import En.Effect.TupleStore (TupleStore)
 import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError (..))
+import En.Prelude
 import En.Revision
   ( Consistency (..),
     ConsistencyToken (..),
@@ -67,7 +68,6 @@ import En.Revision
     RevisionOrder (..),
     SchemaHash (..),
   )
-import GHC.Generics (Generic)
 import Numeric (readDec, showHex)
 
 -- | A PostgreSQL MVCC snapshot, rendered as @xmin:xmax:xip1,xip2,...@.
@@ -124,11 +124,13 @@ data TtlCache a = TtlCache
     clock :: !(IO UTCTime),
     state :: !(IORef (Maybe (CachedValue a)))
   }
+  deriving stock (Generic)
 
 data CachedValue a = CachedValue
   { value :: !a,
     loadedAt :: !UTCTime
   }
+  deriving stock (Generic)
 
 -- | The 'Revision' instantiation of 'TtlCache', the only one in the tree.
 type OptimizedRevisionCache = TtlCache Revision
@@ -174,12 +176,12 @@ parsePgSnapshot input =
     _ -> Left "pg_snapshot must have xmin:xmax:xip shape"
 
 renderPgSnapshot :: PgSnapshot -> Text
-renderPgSnapshot PgSnapshot {xmin, xmax, xip} =
-  Text.pack (show xmin)
+renderPgSnapshot snapshot =
+  Text.pack (show (snapshot ^. #xmin))
     <> ":"
-    <> Text.pack (show xmax)
+    <> Text.pack (show (snapshot ^. #xmax))
     <> ":"
-    <> Text.intercalate "," (Text.pack . show <$> sort (nub xip))
+    <> Text.intercalate "," (Text.pack . show <$> sort (nub (snapshot ^. #xip)))
 
 revisionFromPgSnapshot :: PgSnapshot -> Revision
 revisionFromPgSnapshot =
@@ -187,7 +189,7 @@ revisionFromPgSnapshot =
 
 revisionToPgSnapshot :: Revision -> Either Text PgSnapshot
 revisionToPgSnapshot =
-  parsePgSnapshot . revisionEncoding
+  parsePgSnapshot . view #revisionEncoding
 
 newTtlCache :: OptimizedRevisionConfig -> IO UTCTime -> IO (TtlCache a)
 newTtlCache config clock = do
@@ -196,22 +198,22 @@ newTtlCache config clock = do
 
 lookupTtlCache :: TtlCache a -> IO (Maybe a)
 lookupTtlCache cache
-  | not cache.config.enabled || cache.config.ttl <= 0 = pure Nothing
+  | not (cache ^. #config . #enabled) || (cache ^. #config . #ttl) <= 0 = pure Nothing
   | otherwise = do
-      now <- cache.clock
-      cached <- readIORef cache.state
+      now <- (cache ^. #clock)
+      cached <- readIORef (cache ^. #state)
       pure do
         entry <- cached
-        if diffUTCTime now entry.loadedAt <= cache.config.ttl
-          then Just entry.value
+        if diffUTCTime now (entry ^. #loadedAt) <= (cache ^. #config . #ttl)
+          then Just (entry ^. #value)
           else Nothing
 
 storeTtlCache :: TtlCache a -> a -> IO ()
 storeTtlCache cache value
-  | not cache.config.enabled || cache.config.ttl <= 0 = pure ()
+  | not (cache ^. #config . #enabled) || (cache ^. #config . #ttl) <= 0 = pure ()
   | otherwise = do
-      now <- cache.clock
-      writeIORef cache.state (Just CachedValue {value, loadedAt = now})
+      now <- (cache ^. #clock)
+      writeIORef (cache ^. #state) (Just CachedValue {value, loadedAt = now})
 
 newOptimizedRevisionCache :: OptimizedRevisionConfig -> IO UTCTime -> IO OptimizedRevisionCache
 newOptimizedRevisionCache =
@@ -244,10 +246,10 @@ newOptimizedRevisionReader config clock readFresh = do
 -- | Whether a transaction id is visible in a snapshot, mirroring PostgreSQL's
 -- @pg_visible_in_snapshot@ rules for committed transaction ids.
 transactionVisible :: Word64 -> PgSnapshot -> Bool
-transactionVisible txid PgSnapshot {xmin, xmax, xip}
-  | txid < xmin = True
-  | txid >= xmax = False
-  | otherwise = txid `notElem` xip
+transactionVisible txid snapshot
+  | txid < (snapshot ^. #xmin) = True
+  | txid >= (snapshot ^. #xmax) = False
+  | otherwise = txid `notElem` (snapshot ^. #xip)
 
 -- | Is every transaction id below @horizon@ visible in @snapshot@?
 --
@@ -310,8 +312,8 @@ transactionVisible txid PgSnapshot {xmin, xmax, xip}
 -- Only asking the exact question answers both.
 retainedHistoryVisible :: Word64 -> PgSnapshot -> Bool
 retainedHistoryVisible horizon snapshot =
-  horizon <= snapshot.xmax
-    && all (\txid -> txid < snapshot.xmin || txid >= horizon) snapshot.xip
+  horizon <= (snapshot ^. #xmax)
+    && all (\txid -> txid < (snapshot ^. #xmin) || txid >= horizon) (snapshot ^. #xip)
 
 comparePgSnapshot :: PgSnapshot -> PgSnapshot -> RevisionOrder
 comparePgSnapshot left right =
@@ -326,7 +328,7 @@ comparePostgresRevision left right =
   comparePgSnapshot <$> revisionToPgSnapshot left <*> revisionToPgSnapshot right
 
 encodeToken :: TokenPayload -> ConsistencyToken
-encodeToken TokenPayload {datastoreId, schemaHash, revision, expiresAt} =
+encodeToken payload =
   ConsistencyToken $
     Text.intercalate
       "."
@@ -334,12 +336,12 @@ encodeToken TokenPayload {datastoreId, schemaHash, revision, expiresAt} =
         escapeText datastoreText,
         escapeText schemaHashText,
         escapeText revisionText,
-        maybe "" (escapeText . Text.pack . iso8601Show) expiresAt
+        maybe "" (escapeText . Text.pack . iso8601Show) (payload ^. #expiresAt)
       ]
   where
-    DatastoreId datastoreText = datastoreId
-    SchemaHash schemaHashText = schemaHash
-    revisionText = revisionEncoding revision
+    DatastoreId datastoreText = payload ^. #datastoreId
+    SchemaHash schemaHashText = payload ^. #schemaHash
+    revisionText = payload ^. #revision . #revisionEncoding
 
 decodeToken :: ConsistencyToken -> Either TokenDecodeError TokenPayload
 decodeToken (ConsistencyToken tokenText) =
@@ -370,25 +372,25 @@ tokenMetadataFromPayload token =
       Right
         TokenMetadata
           { token = token,
-            revision = payload.revision,
-            datastoreId = payload.datastoreId,
-            schemaHash = payload.schemaHash,
-            expiresAt = payload.expiresAt
+            revision = (payload ^. #revision),
+            datastoreId = (payload ^. #datastoreId),
+            schemaHash = (payload ^. #schemaHash),
+            expiresAt = (payload ^. #expiresAt)
           }
 
 validateTokenMetadata :: ConsistencyConfig -> UTCTime -> Word64 -> TokenMetadata -> Either EnError ()
 validateTokenMetadata config now oldestRetainedXid metadata
-  | metadata.datastoreId /= config.datastoreId =
+  | (metadata ^. #datastoreId) /= (config ^. #datastoreId) =
       Left (InvalidConsistencyToken "token datastore does not match this en datastore")
-  | metadata.schemaHash /= config.schemaHash =
+  | (metadata ^. #schemaHash) /= (config ^. #schemaHash) =
       Left (InvalidConsistencyToken "token schema hash does not match the active schema")
-  | maybe False (<= now) metadata.expiresAt =
+  | maybe False (<= now) (metadata ^. #expiresAt) =
       Left (ConsistencyTokenExpired "token is expired")
   | otherwise = do
       snapshot <-
         mapLeft
           (MalformedConsistencyToken . ("token revision is not a PostgreSQL snapshot: " <>))
-          (revisionToPgSnapshot metadata.revision)
+          (revisionToPgSnapshot (metadata ^. #revision))
       if retainedHistoryVisible oldestRetainedXid snapshot
         then Right ()
         else Left (ConsistencyTokenExpired "token is older than the garbage-collection window")
@@ -407,6 +409,7 @@ data ResolveEnv m = ResolveEnv
     getHorizon :: m Word64,
     getNow :: m UTCTime
   }
+  deriving stock (Generic)
 
 -- | Resolve a consistency request, fetching only what the mode demands.
 --
@@ -433,16 +436,16 @@ resolveConsistencyRequest ::
 resolveConsistencyRequest env decode validate request =
   case request of
     MinimizeLatency ->
-      resolvedAt <$> env.getOptimized
+      resolvedAt <$> (env ^. #getOptimized)
     FullyConsistent ->
-      resolvedAt <$> env.getHead
+      resolvedAt <$> (env ^. #getHead)
     AtExactSnapshot token ->
       withValidToken token \metadata ->
-        pure (resolvedAt metadata.revision)
+        pure (resolvedAt (metadata ^. #revision))
     AtLeastAsFresh token ->
       withValidToken token \metadata -> do
-        optimized <- env.getOptimized
-        pure (freshestOf optimized metadata.revision)
+        optimized <- (env ^. #getOptimized)
+        pure (freshestOf optimized (metadata ^. #revision))
   where
     resolvedAt revision =
       Right ResolvedConsistency {consistency = request, revision}
@@ -462,8 +465,8 @@ resolveConsistencyRequest env decode validate request =
       case decode token of
         Left err -> pure (Left err)
         Right metadata -> do
-          now <- env.getNow
-          horizon <- env.getHorizon
+          now <- (env ^. #getNow)
+          horizon <- (env ^. #getHorizon)
           case validate now horizon metadata of
             Left err -> pure (Left err)
             Right () -> continue metadata
@@ -509,8 +512,8 @@ runConsistencyStorePostgres config =
       pure
         ( encodeToken
             TokenPayload
-              { datastoreId = config.datastoreId,
-                schemaHash = config.schemaHash,
+              { datastoreId = (config ^. #datastoreId),
+                schemaHash = (config ^. #schemaHash),
                 revision,
                 expiresAt = Nothing
               }
@@ -521,12 +524,12 @@ snapshotIncludes candidate required =
   not (hasRequiredVisibleFutureGap candidate required)
     && all
       (\txid -> not (transactionVisible txid required))
-      (filter (< required.xmax) candidate.xip)
+      (filter (< (required ^. #xmax)) (candidate ^. #xip))
 
 hasRequiredVisibleFutureGap :: PgSnapshot -> PgSnapshot -> Bool
 hasRequiredVisibleFutureGap candidate required =
-  candidate.xmax < required.xmax
-    && not (rangeFullyCoveredByXip candidate.xmax required.xmax required.xip)
+  (candidate ^. #xmax) < (required ^. #xmax)
+    && not (rangeFullyCoveredByXip (candidate ^. #xmax) (required ^. #xmax) (required ^. #xip))
 
 rangeFullyCoveredByXip :: Word64 -> Word64 -> [Word64] -> Bool
 rangeFullyCoveredByXip lower upper xip =

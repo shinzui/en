@@ -49,6 +49,7 @@ library
     , effectful-core
     , en-core
     , en-migrations
+    , generic-lens              >=2.2  && <2.4
     , hasql
     , hasql-dynamic-statements
     , hasql-pool                ^>=1.4
