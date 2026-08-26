@@ -62,6 +62,7 @@ import System.Environment (getArgs)
 import System.Exit (ExitCode (ExitFailure), exitFailure, exitSuccess, exitWith)
 import System.IO (BufferMode (BlockBuffering, LineBuffering), hSetBuffering, stderr, stdout)
 import System.Posix.Signals (Handler (Catch), installHandler, sigHUP, sigINT, sigTERM)
+import Telemetry (withTelemetry)
 import Text.Read (readMaybe)
 
 -- | The four ways to run this binary.
@@ -220,7 +221,13 @@ withStore say storeConfig action = do
   action loadedSchema pool config `finally` Pool.release pool
 
 runServe :: ServerConfig -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
-runServe serverConfig loadedSchema pool config = do
+runServe serverConfig loadedSchema pool config =
+  withTelemetry serverConfig.telemetry $
+    const $
+      runServeApplication serverConfig loadedSchema pool config
+
+runServeApplication :: ServerConfig -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
+runServeApplication serverConfig loadedSchema pool config = do
   loadedAt <- getCurrentTime
   activeSchemaRef <-
     newIORef

@@ -59,9 +59,11 @@ trace correlation, and the removal of two fields that are not in the bounded set
       added and no code using them; every resolved version is recorded below. The full-suite
       baseline still reproduces the pre-existing concurrent `en-biscuit-tests` timeout, while
       that suite passes in isolation and the other seven suites pass.
-- [ ] Milestone 2 — Own the provider lifetimes in `en-server/app/Main.hs`: a tracer provider
-      and a meter provider, both initialized globally inside `bracket`s that flush and shut
-      down on exit, with an explicit disabled mode for local development.
+- [x] (2026-08-26T00:56Z) Milestone 2 — Added `en-server/app/Telemetry.hs` to own the global
+      tracer and meter providers in nested brackets, force-flush traces before shutdown, and
+      construct the WAI middleware only after both globals are installed. Added validated
+      `EN_TELEMETRY_ENABLED` configuration, defaulting to the no-provider `(Nothing, id)` path.
+      Live disabled and enabled-with-unreachable-collector runs both served and drained cleanly.
 - [ ] Milestone 3 — Install the WAI middleware outermost and
       `openTelemetryServantMiddleware` directly inside it, with the rest of the stack inside
       that. Prove a request produces a span named by its Servant route, not by its method.
@@ -114,6 +116,13 @@ trace correlation, and the removal of two fields that are not in the bounded set
   rejected: Timeout`; `cabal test en-biscuit` passed immediately in isolation, and the other
   seven suites passed in the full run.
 
+- Discovery (2026-08-25, Milestone 2): **provider initialization and shutdown do not make an
+  unreachable OTLP collector part of service availability.** With telemetry enabled and the
+  endpoint set to `http://127.0.0.1:14318`, `GET /health/live` still returned the released
+  `{"check":"all","failingSince":null,"status":"ok"}` body, and SIGINT immediately printed
+  `en-server: drained in-flight requests; shutting down` and exited 0. The same probe and
+  shutdown behavior held with telemetry disabled.
+
 (Add further entries as work proceeds.)
 
 
@@ -127,6 +136,10 @@ trace correlation, and the removal of two fields that are not in the bounded set
   neither of which is a good default for a developer who did not ask for telemetry. An
   explicit mode also makes the disabled path testable. The fleet reference implementation
   (`HospitalCapacity.Telemetry.withTelemetry`) does exactly this, so the shape is not novel.
+  The concrete switch is `EN_TELEMETRY_ENABLED`, parsed by `Config` and false by default.
+  When true, the SDK still honors `OTEL_SDK_DISABLED=true`; all remaining exporter, sampler,
+  resource, propagation, and collector settings remain standard `OTEL_*` variables and are
+  deliberately not duplicated into en-specific configuration.
   Date: 2026-08-25
 
 - Decision: Drop `requestId` and `caller` from the access-log line, replacing their
@@ -948,3 +961,7 @@ Revision note (2026-08-25): Milestone 1 corrected the dependency count from six 
 direct packages actually prescribed by the catalog, recorded the exact resolved cohort, and
 captured the pre-existing concurrent Biscuit timeout so later validation can distinguish it
 from an observability regression.
+
+Revision note (2026-08-25): Milestone 2 fixed the service-specific switch as
+`EN_TELEMETRY_ENABLED` (default false), recorded its relationship to `OTEL_SDK_DISABLED`, and
+captured live enabled/disabled startup and shutdown evidence.

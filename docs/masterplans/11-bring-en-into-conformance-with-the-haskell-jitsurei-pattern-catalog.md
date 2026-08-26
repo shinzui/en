@@ -354,7 +354,7 @@ checklist; this is the at-a-glance view of the initiative.
 - [x] EP-64: `servant-health` mounted; `/health/live` and `/health/ready` serving
 - [x] EP-64: Probe checks wired (`safeCheck`, `withProbeTimeout`, `sequenceChecks`, failure trackers)
 - [x] EP-64: Test-kit contract test passing; old `Health.hs` deleted; probes exempted from the problem-details test
-- [ ] EP-65: OpenTelemetry provider lifetimes owned in `main`, exporting over OTLP
+- [x] EP-65: OpenTelemetry provider lifetimes owned in `main`, exporting over OTLP
 - [ ] EP-65: Servant route naming, with the middleware stack in the required order
 - [ ] EP-65: The request logger conformed — bounded fields, trace correlation, probe exclusion
 - [ ] EP-66: Hurl available as a project tool and the suite skeleton runnable

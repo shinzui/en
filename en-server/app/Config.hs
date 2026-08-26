@@ -50,6 +50,7 @@ import Hasql.Statement qualified as Statement
 import Maintenance (MaintenanceConfig (..))
 import Middleware (ApiKey (..), AuthConfig (..), KeyRole (..), RateLimitConfig (..))
 import System.Environment (lookupEnv)
+import Telemetry (TelemetryConfig (..))
 import Text.Read (readMaybe)
 
 data PoolConfig = PoolConfig
@@ -119,6 +120,9 @@ data ServerConfig = ServerConfig
     biscuit :: !(Maybe BiscuitConfig),
     rateLimit :: !RateLimitConfig,
     maintenance :: !MaintenanceConfig,
+    -- | Whether this process initializes the OpenTelemetry SDK. Exporter and sampler
+    --     configuration remains under the SDK's standard @OTEL_*@ variables.
+    telemetry :: !TelemetryConfig,
     tls :: !(Maybe TlsConfig),
     -- | Activate a schema on @SIGHUP@ even when it strands live grants.
     --
@@ -159,6 +163,7 @@ knownVariables =
     "EN_RESULT_CAP",
     "EN_SCHEMA_PATH",
     "EN_SCHEMA_RELOAD_FORCE",
+    "EN_TELEMETRY_ENABLED",
     "EN_TLS_CERT_FILE",
     "EN_TLS_KEY_FILE",
     "EN_TUPLE_READ_CACHE_MAX_ENTRIES"
@@ -237,6 +242,7 @@ parseServerConfig environment = do
   tls <- parseTls environment
   rateLimit <- parseRateLimit environment
   maintenance <- parseMaintenance environment
+  telemetryEnabled <- withDefault "EN_TELEMETRY_ENABLED" False boolean
   schemaReloadForce <- withDefault "EN_SCHEMA_RELOAD_FORCE" False boolean
   (auth, authWarnings) <- parseAuth environment
   biscuit <- parseBiscuit environment
@@ -256,6 +262,7 @@ parseServerConfig environment = do
           biscuit,
           rateLimit,
           maintenance,
+          telemetry = if telemetryEnabled then TelemetryEnabled else TelemetryDisabled,
           tls,
           schemaReloadForce
         },
