@@ -57,8 +57,10 @@ artifact is identical" is the only acceptance criterion that means anything.
       `en-biscuit` (7 modules). Preserved the server middleware composition and Biscuit
       cryptographic construction order; the isolated Biscuit suite and all eight suites passed,
       and the OpenAPI hash remained byte-identical.
-- [ ] Milestone 3 — `en-servant` (13 modules), including its test suite. Highest risk: the
-      wire types whose exact JSON bytes are the contract.
+- [x] (2026-08-25 21:33-0700) Milestone 3 — Migrated `en-servant` (13 modules), including
+      its test suite. The golden wire suite passed after every production-module slice, the
+      full repository build and all eight suites passed, and the generated OpenAPI document
+      retained the baseline SHA-256 byte for byte.
 - [ ] Milestone 4 — `en-postgres` (9 modules), including the integration test and the lookup
       spike.
 - [ ] Milestone 5 — `en-core` (36 modules), the largest package and the one every other
@@ -127,6 +129,19 @@ artifact is identical" is the only acceptance criterion that means anything.
   Milestone 3 must run them and confirm `docs/api/openapi.json` is byte-identical, not merely
   that the package compiles.
 
+- Discovery (2026-08-25, Milestone 3): **blind textual record-dot rewrites are unsafe even
+  when the compiler will check the result.** Test fixtures contain record-shaped text such as
+  token prefixes and dotted identifiers; a rewrite can alter those string literals while
+  leaving perfectly valid Haskell. The servant golden suite caught the issue before commit,
+  and every affected fixture was restored. Subsequent milestones must keep SQL, fixture, and
+  documentation literals outside mechanical replacement ranges.
+
+- Discovery (2026-08-25, Milestone 3): **foreign record types need the same narrow exception
+  as non-`Generic` local records.** WAI requests, Servant errors and pagination responses, and
+  Aeson options do not expose the `Generic` representation needed by generic-lens. Their
+  packages' exported selectors and record updates remain the behavior-preserving access
+  surface; wrapping them would be an unrelated interface change.
+
 (Add further entries as work proceeds.)
 
 
@@ -180,8 +195,10 @@ artifact is identical" is the only acceptance criterion that means anything.
   version into the project closure.
   Date: 2026-08-25
 
-- Decision: Preserve record-pattern access for records that cannot have a lawful generic-lens
-  representation, beginning with the rank-polymorphic `En.Servant.Seam.Env`.
+- Decision: Preserve record-pattern and record-update access for records that cannot have a
+  lawful generic-lens representation, beginning with the rank-polymorphic
+  `En.Servant.Seam.Env`, and use a dependency's exported access surface for foreign records
+  that do not expose `Generic`.
   Rationale: GHC cannot derive `Generic` for a constructor with a polymorphic field, and
   wrapping `runPorts` would break the public `Env` construction surface used by embedded
   consumers. Fleet consistency does not justify a source-level API break in a plan whose
