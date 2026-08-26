@@ -53,7 +53,10 @@ artifact is identical" is the only acceptance criterion that means anything.
       (`en-migrations`, `en-example`, `en-client` — 8 modules, 677 lines between them), and
       write down the recipe that emerges: what a read becomes, what an update becomes, where
       `Data.Generics.Labels ()` goes, and what `En.Prelude` needs to gain.
-- [ ] Milestone 2 — `en-server` (7 modules) and `en-biscuit` (7 modules).
+- [x] (2026-08-25 20:54-0700) Milestone 2 — Migrated `en-server` (7 modules) and
+      `en-biscuit` (7 modules). Preserved the server middleware composition and Biscuit
+      cryptographic construction order; the isolated Biscuit suite and all eight suites passed,
+      and the OpenAPI hash remained byte-identical.
 - [ ] Milestone 3 — `en-servant` (13 modules), including its test suite. Highest risk: the
       wire types whose exact JSON bytes are the contract.
 - [ ] Milestone 4 — `en-postgres` (9 modules), including the integration test and the lookup
@@ -87,6 +90,14 @@ artifact is identical" is the only acceptance criterion that means anything.
   argument. Its record-pattern destructuring remains the narrow exception to `#label` reads.
   Ordinary records encountered in the same conversion, including `ActiveSchema` and
   `CheckOutcome`, gained behavior-neutral stock `Generic` derivations.
+
+- Discovery (2026-08-25, Milestone 2): **an executable's labels can require `Generic`
+  support in upstream packages before those packages' own migration milestones.** The server
+  reads `CacheConfig`, `CacheStats`, `TupleRow`, `ReachabilityGraph`, `Revision`,
+  `OrphanReport`, `ConsistencyConfig`, and `OptimizedRevisionConfig`; their owning `en-core`
+  and `en-postgres` modules gained stock `Generic` derivations now so the server could use the
+  shared idiom. These instances are representation-only and do not alter construction,
+  serialization, or runtime behavior.
 
 - Discovery (2026-08-25, while planning): **the work is very unevenly distributed, which
   decides the milestone order.** Counting field-access sites and record-update sites per
@@ -176,6 +187,14 @@ artifact is identical" is the only acceptance criterion that means anything.
   consumers. Fleet consistency does not justify a source-level API break in a plan whose
   acceptance criterion is no behavior or interface change. All fields of ordinary `Generic`
   records still use `#label`.
+  Date: 2026-08-25
+
+- Decision: Add behavior-neutral `Generic` derivations to cross-package record types when the
+  first migrated consumer needs label access, even if the owning package's mechanical sweep is
+  scheduled later.
+  Rationale: the package milestones order call sites, not type ownership. Deferring the instance
+  would force a migrated consumer to retain the old idiom, while deriving it early neither
+  changes the value representation nor expands the dependency closure.
   Date: 2026-08-25
 
 (Add further entries as work proceeds.)
