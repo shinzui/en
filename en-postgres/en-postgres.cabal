@@ -106,7 +106,9 @@ executable en-lookup-spike
   main-is:        Main.hs
   build-depends:
     , base
+    , en-core
     , ephemeral-pg
+    , generic-lens  >=2.2 && <2.4
     , hasql
     , text
 

@@ -8,12 +8,13 @@ module Main (main) where
 import Control.Exception (bracket)
 import Control.Monad (forM)
 import Data.Functor.Contravariant ((>$<))
+import Data.Generics.Labels ()
 import Data.Int (Int64)
 import Data.List (sort)
-import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Data.Traversable (for)
+import En.Prelude hiding (index)
 import EphemeralPg qualified as Pg
 import GHC.Clock (getMonotonicTimeNSec)
 import Hasql.Connection qualified as Connection
@@ -33,19 +34,19 @@ data Scenario = Scenario
     shape :: !Text,
     largeReachable :: !Bool
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data LabelStats = LabelStats
   { spaces :: !Int64,
     classes :: !Int64
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data AntiPatternStats = AntiPatternStats
   { rows :: !Int64,
     capped :: !Bool
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data Measurement = Measurement
   { scenario :: !Scenario,
@@ -59,19 +60,19 @@ data Measurement = Measurement
     antiP95Ms :: !Double,
     antiPatternStats :: !AntiPatternStats
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data Timed a = Timed
   { elapsedMs :: !Double,
     value :: !a
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data Percentiles = Percentiles
   { p50 :: !Double,
     p95 :: !Double
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 main :: IO ()
 main = do
@@ -122,14 +123,14 @@ measureScenario :: Connection.Connection -> Scenario -> IO Measurement
 measureScenario connection scenario = do
   actualRelationships <- run connection populateRelationshipsStatement scenario
   runScript connection analyzeSql
-  lookupRuns <- measuredRuns sampleRuns \_ -> run connection (lookupLabelsStatement scenario.shape) ()
-  readRuns <- measuredRuns sampleRuns \_ -> run connection (readPathStatement scenario.shape) ()
-  antiRuns <- measuredRuns antiSampleRuns \_ -> run connection (antiPatternStatement scenario.shape) ()
+  lookupRuns <- measuredRuns sampleRuns \_ -> run connection (lookupLabelsStatement (scenario ^. #shape)) ()
+  readRuns <- measuredRuns sampleRuns \_ -> run connection (readPathStatement (scenario ^. #shape)) ()
+  antiRuns <- measuredRuns antiSampleRuns \_ -> run connection (antiPatternStatement (scenario ^. #shape)) ()
   let labelStats = (last lookupRuns).value
       antiPatternStats = (last antiRuns).value
-      Percentiles {p50 = lookupP50Ms, p95 = lookupP95Ms} = percentiles ((.elapsedMs) <$> lookupRuns)
-      Percentiles {p50 = readP50Ms, p95 = readP95Ms} = percentiles ((.elapsedMs) <$> readRuns)
-      Percentiles {p50 = antiP50Ms, p95 = antiP95Ms} = percentiles ((.elapsedMs) <$> antiRuns)
+      Percentiles {p50 = lookupP50Ms, p95 = lookupP95Ms} = percentiles ((view #elapsedMs) <$> lookupRuns)
+      Percentiles {p50 = readP50Ms, p95 = readP95Ms} = percentiles ((view #elapsedMs) <$> readRuns)
+      Percentiles {p50 = antiP50Ms, p95 = antiP95Ms} = percentiles ((view #elapsedMs) <$> antiRuns)
   pure
     Measurement
       { scenario,
@@ -368,11 +369,11 @@ populateRelationshipsStatement =
         ((SELECT coalesce(sum(n), 0)::bigint FROM inserted_count)
       + (SELECT count(*)::bigint FROM filler_edges))::bigint
     """
-    ( ((\params -> params.relationships) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
-        <> ((\params -> params.depth) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
-        <> ((\params -> params.guestSharing) >$< Encoders.param (Encoders.nonNullable Encoders.bool))
-        <> ((\params -> params.shape) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-        <> ((\params -> params.largeReachable) >$< Encoders.param (Encoders.nonNullable Encoders.bool))
+    ( ((\params -> (params ^. #relationships)) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+        <> ((\params -> (params ^. #depth)) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+        <> ((\params -> (params ^. #guestSharing)) >$< Encoders.param (Encoders.nonNullable Encoders.bool))
+        <> ((\params -> (params ^. #shape)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> (params ^. #largeReachable)) >$< Encoders.param (Encoders.nonNullable Encoders.bool))
         <> ((\_ -> maxSpaceId) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
         <> ((\_ -> largeReachableSpaces) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
     )
@@ -541,9 +542,9 @@ renderResults activityRows measurements =
 
 renderMeasurement :: Measurement -> Text
 renderMeasurement measurement =
-  let Scenario {relationships, depth, guestSharing, shape, largeReachable} = measurement.scenario
-      LabelStats {spaces, classes} = measurement.labelStats
-      AntiPatternStats {capped} = measurement.antiPatternStats
+  let Scenario {relationships, depth, guestSharing, shape, largeReachable} = (measurement ^. #scenario)
+      LabelStats {spaces, classes} = (measurement ^. #labelStats)
+      AntiPatternStats {capped} = (measurement ^. #antiPatternStats)
    in Text.intercalate
         " | "
         [ "| " <> showText relationships,
@@ -551,15 +552,15 @@ renderMeasurement measurement =
           boolText guestSharing,
           shape,
           boolText largeReachable,
-          showText measurement.actualRelationships,
+          showText (measurement ^. #actualRelationships),
           showText spaces,
           showText classes,
-          fixed measurement.lookupP50Ms,
-          fixed measurement.lookupP95Ms,
-          fixed measurement.readP50Ms,
-          fixed measurement.readP95Ms,
-          fixed measurement.antiP50Ms,
-          fixed measurement.antiP95Ms,
+          fixed (measurement ^. #lookupP50Ms),
+          fixed (measurement ^. #lookupP95Ms),
+          fixed (measurement ^. #readP50Ms),
+          fixed (measurement ^. #readP95Ms),
+          fixed (measurement ^. #antiP50Ms),
+          fixed (measurement ^. #antiP95Ms),
           boolText capped <> " |"
         ]
 
