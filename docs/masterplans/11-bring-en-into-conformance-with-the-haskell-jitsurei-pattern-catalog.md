@@ -192,7 +192,7 @@ searched for the catalog's own decisions; the catalog publishes standards, not A
 | 65 | Instrument en with OpenTelemetry and a conformant production request log | docs/plans/65-instrument-en-with-opentelemetry-and-a-conformant-production-request-log.md | EP-64 | EP-63 | Complete |
 | 66 | Add a Hurl black-box API suite for en-server | docs/plans/66-add-a-hurl-black-box-api-suite-for-en-server.md | EP-61, EP-64 | EP-65 | Complete |
 | 67 | Adopt Relay pagination for en's list endpoints | docs/plans/67-adopt-relay-pagination-for-en-s-list-endpoints.md | EP-61 | EP-66 | Complete |
-| 68 | Migrate en's records to generic-lens label syntax and a custom prelude | docs/plans/68-migrate-en-s-records-to-generic-lens-label-syntax-and-a-custom-prelude.md | EP-63 | EP-61, EP-64, EP-65, EP-66, EP-67 | Not Started |
+| 68 | Migrate en's records to generic-lens label syntax and a custom prelude | docs/plans/68-migrate-en-s-records-to-generic-lens-label-syntax-and-a-custom-prelude.md | EP-63 | EP-61, EP-64, EP-65, EP-66, EP-67 | In Progress |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
 Hard Deps and Soft Deps reference other rows by their `#` prefix (e.g., EP-63).

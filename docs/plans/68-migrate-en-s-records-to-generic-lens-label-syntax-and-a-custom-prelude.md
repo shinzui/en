@@ -66,6 +66,13 @@ artifact is identical" is the only acceptance criterion that means anything.
 
 ## Surprises & Discoveries
 
+- Discovery (2026-08-25, baseline): **the previously recorded concurrent Biscuit timeout is
+  still the only failing baseline check.** `cabal build all` passed; seven of eight suites
+  passed under `cabal test all`, while `en-biscuit-tests` reported `authorization rejected:
+  Timeout`. The same suite passed immediately in isolation. `just openapi` was clean and the
+  immutable contract baseline is
+  `4db31037c3d823d9c0f5e19b968165e2d7364bf9f8a971cb4a7fc2b65ec0a183`.
+
 - Discovery (2026-08-25, while planning): **the work is very unevenly distributed, which
   decides the milestone order.** Counting field-access sites and record-update sites per
   package:
