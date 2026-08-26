@@ -70,6 +70,7 @@ test-suite en-postgres-revision-tests
     , effectful-core
     , en-core
     , en-postgres
+    , generic-lens    >=2.2 && <2.4
     , hasql
     , text
     , time

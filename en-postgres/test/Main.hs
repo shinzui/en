@@ -3,9 +3,10 @@
 module Main (main) where
 
 import Data.Either (isLeft)
+import Data.Generics.Labels ()
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text qualified as Text
-import Data.Time (UTCTime, addUTCTime, defaultTimeLocale, parseTimeOrError)
+import Data.Time (addUTCTime, defaultTimeLocale, parseTimeOrError)
 import En.Effect.ConsistencyStore (ResolvedConsistency (..), TokenMetadata (..))
 import En.Effect.TupleStore (StoreCursor (..))
 import En.Error (EnError (..))
@@ -35,6 +36,7 @@ import En.Postgres.Watch
     encodeWatchCursor,
     validateWatchCursor,
   )
+import En.Prelude
 import En.Revision
   ( Consistency (..),
     ConsistencyToken (..),
@@ -102,7 +104,7 @@ main = do
   assertEqual "token decoder rejects bad snapshots" True (isLeft (decodeToken (ConsistencyToken "en1.primary.schema.bad")))
   assertEqual
     "exact snapshot resolves to token revision"
-    (Right ResolvedConsistency {consistency = AtExactSnapshot (encodeToken payload), revision = payload.revision})
+    (Right ResolvedConsistency {consistency = AtExactSnapshot (encodeToken payload), revision = (payload ^. #revision)})
     =<< resolve optimizedRevision (AtExactSnapshot (encodeToken payload))
   assertEqual
     "fully consistent resolves to head revision"
@@ -114,15 +116,15 @@ main = do
     =<< resolve optimizedRevision (AtLeastAsFresh (encodeToken payload))
   let concurrentPayload =
         TokenPayload
-          { datastoreId = payload.datastoreId,
-            schemaHash = payload.schemaHash,
+          { datastoreId = (payload ^. #datastoreId),
+            schemaHash = (payload ^. #schemaHash),
             revision = Revision "10:20:11",
-            expiresAt = payload.expiresAt
+            expiresAt = (payload ^. #expiresAt)
           }
       concurrentOptimized = Revision "10:20:12"
   assertEqual
     "at least as fresh honors token revision when optimized is concurrent"
-    (Right ResolvedConsistency {consistency = AtLeastAsFresh (encodeToken concurrentPayload), revision = concurrentPayload.revision})
+    (Right ResolvedConsistency {consistency = AtLeastAsFresh (encodeToken concurrentPayload), revision = (concurrentPayload ^. #revision)})
     =<< resolve concurrentOptimized (AtLeastAsFresh (encodeToken concurrentPayload))
 
   -- The mode-to-requirement mapping (docs/plans/49, finding C3). Each getter is one
@@ -218,35 +220,35 @@ main = do
         }
     metadataWithWrongDatastore =
       TokenMetadata
-        { token = metadata.token,
-          revision = metadata.revision,
+        { token = (metadata ^. #token),
+          revision = (metadata ^. #revision),
           datastoreId = DatastoreId "other",
-          schemaHash = metadata.schemaHash,
-          expiresAt = metadata.expiresAt
+          schemaHash = (metadata ^. #schemaHash),
+          expiresAt = (metadata ^. #expiresAt)
         }
     metadataWithWrongSchema =
       TokenMetadata
-        { token = metadata.token,
-          revision = metadata.revision,
-          datastoreId = metadata.datastoreId,
+        { token = (metadata ^. #token),
+          revision = (metadata ^. #revision),
+          datastoreId = (metadata ^. #datastoreId),
           schemaHash = SchemaHash "other",
-          expiresAt = metadata.expiresAt
+          expiresAt = (metadata ^. #expiresAt)
         }
     expiredMetadata =
       TokenMetadata
-        { token = metadata.token,
-          revision = metadata.revision,
-          datastoreId = metadata.datastoreId,
-          schemaHash = metadata.schemaHash,
+        { token = (metadata ^. #token),
+          revision = (metadata ^. #revision),
+          datastoreId = (metadata ^. #datastoreId),
+          schemaHash = (metadata ^. #schemaHash),
           expiresAt = Just now
         }
     metadataAtRevision rev =
       TokenMetadata
-        { token = metadata.token,
+        { token = (metadata ^. #token),
           revision = rev,
-          datastoreId = metadata.datastoreId,
-          schemaHash = metadata.schemaHash,
-          expiresAt = metadata.expiresAt
+          datastoreId = (metadata ^. #datastoreId),
+          schemaHash = (metadata ^. #schemaHash),
+          expiresAt = (metadata ^. #expiresAt)
         }
     metadataFromToken token =
       case decodeToken token of
@@ -254,10 +256,10 @@ main = do
           Right
             TokenMetadata
               { token = token,
-                revision = tokenPayload.revision,
-                datastoreId = tokenPayload.datastoreId,
-                schemaHash = tokenPayload.schemaHash,
-                expiresAt = tokenPayload.expiresAt
+                revision = (tokenPayload ^. #revision),
+                datastoreId = (tokenPayload ^. #datastoreId),
+                schemaHash = (tokenPayload ^. #schemaHash),
+                expiresAt = (tokenPayload ^. #expiresAt)
               }
         Left err -> Left (MalformedConsistencyToken (renderTokenDecodeError err))
 
@@ -408,7 +410,7 @@ testWatchCursorCodec = do
   in-flight @110@ is invisible there, so a horizon above @110@ names a row (one deleted at
   @110@) that could already be reaped while still live at the start — and is refused. A
   horizon at or below @110@ is accepted. This retires @docs/plans/53@'s conservative
-  @horizon <= start.xmin@ rule: a horizon of @101@, which that rule refused, is accepted
+  @horizon <= (start ^. #xmin)@ rule: a horizon of @101@, which that rule refused, is accepted
   now, because @101@ is still visible in the start snapshot and nothing reaped below it is
   live there. -}
   assertEqual
