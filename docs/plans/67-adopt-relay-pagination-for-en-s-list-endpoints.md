@@ -54,13 +54,14 @@ rather than forcing four endpoints into a shape that fits two of them.
 
 ## Progress
 
-- [ ] Milestone 1 — Decide applicability per endpoint. Prove the four `relay-pagination`
+- [x] (2026-08-26T02:46:51Z) Milestone 1 — Decide applicability per endpoint. Prove the four `relay-pagination`
       packages resolve against `en`'s pinned closure, read their actual API, and produce a
       written verdict for each of the four endpoints: convert, convert with a recorded
       deviation, or exempt with a reason. Record every verdict in the Decision Log before
       writing any conversion code.
-- [ ] Milestone 2 — Make the database order total for each endpoint being converted, adding
-      the indexes the keyset queries need as a new append-only migration.
+- [ ] Milestone 2 — Prove the database order for `POST /v1/relationships/query` is total and
+      served by the existing `relation_tuple` primary-key index; add no migration unless
+      `EXPLAIN` disproves that index contract.
 - [ ] Milestone 3 — Convert the first endpoint end to end — route type, handler, hasql keyset
       query, client, OpenAPI — and ship its conformance test. One endpoint, fully done, before
       the others start.
@@ -126,6 +127,20 @@ rather than forcing four endpoints into a shape that fits two of them.
   versions and the lifecycle before committing, and this plan is sequenced last in its
   initiative precisely so that a bad answer here costs nothing already delivered.
 
+- Discovery (2026-08-26, Milestone 1): **the released cohort is internally coherent but is
+  still explicitly Experimental.** Hackage and the upstream `v0.1.1.0` tag publish all four
+  packages at `0.1.1.0`; the Mori checkout is exactly that tag (`224163d1`) and has no local
+  changes. `cabal build all` resolves and compiles the full cohort without disturbing en's
+  crypton/Biscuit pins. Mori nevertheless reports the project and all four packages as
+  `Experimental`, so adoption is intentionally limited to the one endpoint whose semantics
+  actually match the library.
+
+- Discovery (2026-08-26, baseline): **the pre-existing Biscuit timeout currently reproduces
+  even in an isolated Cabal invocation.** `cabal test all` passes seven suites and fails only
+  `en-biscuit-tests`; an immediate `cabal test en-biscuit-tests` also returns
+  `authorization rejected: Timeout`. This predates pagination code and is retained as baseline
+  evidence rather than treated as an EP-67 regression.
+
 (Add further entries as work proceeds.)
 
 
@@ -162,6 +177,49 @@ rather than forcing four endpoints into a shape that fits two of them.
   error envelope. After conversion it produces a `RelayPageError`, so a client has one decoder
   for every 400 the endpoint can answer.
   Date: 2026-08-25
+
+- Decision: Convert `POST /v1/relationships/query`, with Relay arguments in the query string
+  and the relationship filter plus initial consistency request in the POST body.
+  Rationale: this endpoint is a true ordered list over stored rows. Its PostgreSQL interpreter
+  already walks the unique `relation_tuple.id` key in ascending order, and both its PostgreSQL
+  and in-memory implementations can support forward and backward Relay walks. The Relay cursor
+  will carry the minted consistency token as a typed text key before the row-id key; on a
+  continuation the server validates that token and ignores the body's consistency request,
+  preserving the existing one-snapshot guarantee. There is no `truncated` case. Splitting page
+  controls into the POST query string is unusual but keeps the domain filter in JSON and lets
+  the released `RelayPage` combinator own validation and OpenAPI documentation.
+  Date: 2026-08-26
+
+- Decision: Exempt `POST /v1/lookup` and `POST /v1/lookup-subjects` from Relay conversion in
+  this initiative; retain their existing cursor envelopes.
+  Rationale: these endpoints are resumable graph traversals, not keyset queries over stored
+  rows. Their cursors carry traversal watermarks (and, for lookup, per-branch frontier state),
+  and `truncated` means a budget or live deadline interrupted discovery before a safe page
+  boundary. Relay's `PageInfo` cannot represent that outcome, while `last`/`before` would imply
+  an efficient reverse traversal neither engine implements. Wrapping those opaque continuation
+  programs in a Relay cursor would change the spelling but not adopt the Relay keyset model;
+  dropping `truncated` would weaken correctness. The endpoint bodies continue to carry `limit`
+  and their traversal cursor.
+  Date: 2026-08-26
+
+- Decision: Exempt `POST /v1/watch` from Relay conversion and classify it as a forward-only
+  changelog subscription rather than a list endpoint.
+  Rationale: a watch cursor fixes a half-open consistency window and can be either between
+  windows or part-way through draining one. An empty batch can still require another poll, and
+  completion is detected when the resume cursor stops advancing. There is no meaningful
+  backward direction, so publishing `last`, `before`, and Relay backward page flags would make
+  the contract dishonest. The existing always-present resume cursor is the feed protocol.
+  Date: 2026-08-26
+
+- Decision: Preserve one 400 decoder on the converted relationship route by mapping every
+  handler-level client fault into `RelayPageError`, not only cursor-fingerprint failures.
+  Rationale: `RelayPage` emits `RelayPageError` before the handler, while the body filter and
+  consistency token are validated inside it. Leaving those as RFC 9457 documents would give one
+  operation two incompatible 400 bodies. The mapped error keeps en's stable machine code and
+  detail in `RelayPageError.code` and `.message`; pagination-specific failures keep the released
+  Relay codes. The exemption is exact to this route and this status—its 412, 422, 500, and 503
+  responses remain problem documents.
+  Date: 2026-08-26
 
 (Add further entries as work proceeds; Milestone 1's four verdicts belong here.)
 
@@ -841,6 +899,11 @@ local working copy at `/Users/shinzui/Keikaku/bokuno/relay-pagination` shows all
 `0.1.1.0`. **Re-check Hackage and the upstream tags before setting bounds, and record what
 Milestone 1 resolved here**, along with the Mori lifecycle — the registry lists
 `shinzui/relay-pagination` as `Experimental`, which the standard does not mention.
+
+Milestone 1 resolved all four packages at `0.1.1.0`. Hackage lists `0.1.1.0` as the latest
+normal release for every package, upstream tag `v0.1.1.0` dereferences to commit
+`224163d11c97afe13366e9c440450a25f448599c`, and the Mori source checkout is clean at that
+exact commit. Mori's project and package lifecycle remains `Experimental`.
 
 `en`'s closure is bound by `crypton >= 1.1` and a forked `biscuit-haskell` under
 [ADR 2](../adr/0002-crypton-1-1-binds-en-s-dependency-closure-through-a-biscuit-haskell-fork.md);

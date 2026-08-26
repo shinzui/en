@@ -52,7 +52,7 @@ library
 
   build-depends:
     , aeson
-    , base                >=4.19 && <5
+    , base                      >=4.19 && <5
     , biscuit-haskell
     , bytestring
     , containers
@@ -64,10 +64,12 @@ library
     , http-media
     , http-types
     , lens
-    , openapi-hs          >=5.0  && <5.1
+    , openapi-hs                >=5.0  && <5.1
+    , relay-pagination          >=0.1  && <0.2
+    , relay-pagination-servant  >=0.1  && <0.2
     , servant
-    , servant-health      ^>=0.1
-    , servant-openapi-hs  >=5.1  && <5.2
+    , servant-health            ^>=0.1
+    , servant-openapi-hs        >=5.1  && <5.2
     , servant-server
     , sop-core
     , text
@@ -108,8 +110,11 @@ test-suite en-servant-tests
     , en-servant
     , http-types
     , openapi-hs
+    , relay-pagination
+    , relay-pagination-conformance  >=0.1  && <0.2
+    , relay-pagination-servant
     , servant
-    , servant-health          ^>=0.1
+    , servant-health                ^>=0.1
     , servant-health:testkit
     , servant-server
     , tasty
