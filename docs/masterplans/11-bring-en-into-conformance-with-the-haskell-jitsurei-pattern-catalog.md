@@ -187,7 +187,7 @@ searched for the catalog's own decisions; the catalog publishes standards, not A
 |---|-------|------|-----------|-----------|--------|
 | 63 | Adopt the fleet Haskell core standards across every en package | docs/plans/63-adopt-the-fleet-haskell-core-standards-across-every-en-package.md | None | None | Complete |
 | 61 | Adopt RFC 9457 problem details and close the API conformance audit | docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md | None | EP-63 | Complete |
-| 64 | Serve Kubernetes health probes from servant-health | docs/plans/64-serve-kubernetes-health-probes-from-servant-health.md | EP-61 | EP-63 | Not Started |
+| 64 | Serve Kubernetes health probes from servant-health | docs/plans/64-serve-kubernetes-health-probes-from-servant-health.md | EP-61 | EP-63 | In Progress |
 | 65 | Instrument en with OpenTelemetry and a conformant production request log | docs/plans/65-instrument-en-with-opentelemetry-and-a-conformant-production-request-log.md | EP-64 | EP-63 | Not Started |
 | 66 | Add a Hurl black-box API suite for en-server | docs/plans/66-add-a-hurl-black-box-api-suite-for-en-server.md | EP-61, EP-64 | EP-65 | Not Started |
 | 67 | Adopt Relay pagination for en's list endpoints | docs/plans/67-adopt-relay-pagination-for-en-s-list-endpoints.md | EP-61 | EP-66 | Not Started |

@@ -65,6 +65,7 @@ library
     , lens
     , openapi-hs          >=5.0  && <5.1
     , servant
+    , servant-health      ^>=0.1
     , servant-openapi-hs  >=5.1  && <5.2
     , servant-server
     , sop-core
@@ -106,6 +107,7 @@ test-suite en-servant-tests
     , http-types
     , openapi-hs
     , servant
+    , servant-health:testkit  ^>=0.1
     , servant-server
     , text
     , time

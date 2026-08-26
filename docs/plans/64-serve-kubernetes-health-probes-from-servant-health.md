@@ -63,9 +63,9 @@ the failure the shared body type otherwise makes invisible.
 
 ## Progress
 
-- [ ] Milestone 1 — Prove the `servant-health` cohort resolves against `en`'s pinned
+- [x] (2026-08-26 00:11Z) Milestone 1 — Proved the `servant-health` cohort resolves against `en`'s pinned
       dependency closure (`cabal build all` with the dependency added and nothing else
-      changed), and record the resolved version. No code yet.
+      changed), and recorded `servant-health-0.1.0.0`. No code yet.
 - [ ] Milestone 2 — Mount `HealthApi` under `"health"` on `en`'s API record, build the two
       probe checks from `en-server`'s existing liveness and readiness logic with
       `safeCheck`, `withProbeTimeout`, `sequenceChecks`, and failure trackers, and serve
@@ -102,6 +102,20 @@ the failure the shared body type otherwise makes invisible.
   `/healthz` to decide the server has started, and `process-compose.yaml:45` uses `/readyz`
   as its probe path. Milestone 4's checklist is that list; missing one leaves a dangling
   reference to a route that no longer exists.
+
+- Discovery (2026-08-26, Milestone 1): **the pre-existing `en-biscuit-tests` authorization
+  timeout remains sensitive to full-suite concurrency and is unrelated to the new
+  dependency.** Both the baseline and post-dependency `cabal test all` runs passed the other
+  seven suites but failed this one with `authorization rejected: Timeout`; the same suite
+  passed immediately in isolation both times. This reproduces the known EP-61 baseline and
+  does not block the dependency-resolution proof.
+
+  ```text
+  Test suite en-biscuit-tests: FAIL
+  en-biscuit test FAILED: smoke test: authorization rejected: Timeout
+  $ cabal test en-biscuit-tests
+  Test suite en-biscuit-tests: PASS
+  ```
 
 (Add further entries as work proceeds.)
 
@@ -846,8 +860,10 @@ One package and one of its sub-libraries are added:
   `probeContractTests` and the checks it flips between cases.
 
 Registered in Mori as `shinzui/servant-health`, `Active`, released on Hackage at 0.1.0.0.
-**Record the version the solver actually resolved here when Milestone 1 lands**, per the
-MasterPlan's rule that each child plan proves its cohort before writing code. `en`'s closure
+The solver resolved **`servant-health-0.1.0.0`** in Milestone 1. Hackage's preferred-version
+metadata and the upstream `v0.1.0.0` tag independently confirmed that this is the current
+release, satisfying the MasterPlan's rule that each child plan proves its cohort before
+writing code. `en`'s closure
 is bound by `crypton >= 1.1` and a forked `biscuit-haskell` under
 [ADR 2](../adr/0002-crypton-1-1-binds-en-s-dependency-closure-through-a-biscuit-haskell-fork.md).
 
