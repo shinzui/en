@@ -973,7 +973,7 @@ openApiDocumentTests = do
 
   assertEqual
     "openapi document lists exactly the served operations"
-    (List.sort ("/v1/schema" : postPaths))
+    (List.sort (["/health/live", "/health/ready", "/v1/schema"] <> postPaths))
     (List.sort (objectKeys (document `at` "paths")))
 
   mapM_

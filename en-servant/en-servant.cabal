@@ -43,6 +43,7 @@ library
     En.Servant.API
     En.Servant.Authorize
     En.Servant.OpenApi
+    En.Servant.Probes
     En.Servant.Problem
     En.Servant.Response
     En.Servant.Seam

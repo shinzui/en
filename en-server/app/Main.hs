@@ -41,7 +41,8 @@ import En.Schema (Schema, ValidSchema, schemaHash, validateSchema)
 import En.Schema.Parse (parseSchema)
 import En.SchemaCheck (OrphanReport (..), renderTupleOrphan, validateTuplesAgainstSchema)
 import En.Servant.API (tupleFromWire, tupleToWire)
-import En.Servant.OpenApi (appWithOpenApi)
+import En.Servant.OpenApi (appWithOpenApiProbes)
+import En.Servant.Probes (mkProbes)
 import En.Servant.Seam (ActiveSchema (..), AppEffects, Env (..), MintEnv (..))
 import En.Tuple (Tuple)
 import Hasql.Connection.Settings qualified as Settings
@@ -362,6 +363,10 @@ runServe serverConfig loadedSchema pool config = do
       checkReady = do
         healthy <- ping
         if healthy then pure True else ping
+  (livenessProbe, readinessProbe) <-
+    mkProbes
+      (readIORef activeSchemaRef >> pure True)
+      checkReady
   Text.putStrLn ("en-server listening on :" <> Text.pack (show serverConfig.port))
   Text.putStrLn
     ( "Connection pool: size="
@@ -421,7 +426,7 @@ runServe serverConfig loadedSchema pool config = do
             [ ("tuple_read", cacheStats tupleReadCache),
               ("decision", cacheStats decisionCache)
             ]
-          $ appWithOpenApi serverEnv
+          $ appWithOpenApiProbes serverEnv livenessProbe readinessProbe
   -- `serve` returns when SIGTERM drains the server, at which point `withAsync`
   -- cancels the maintenance thread and `withStore`'s `finally` releases the pool.
   -- Every maintenance batch is its own committed transaction, so cancelling mid-pass

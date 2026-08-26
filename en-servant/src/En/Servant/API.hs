@@ -17,7 +17,9 @@ module En.Servant.API
     apiProxy,
     EnServer,
     server,
+    serverWithProbes,
     app,
+    appWithProbes,
     problemMiddleware,
     envelopeFormatters,
 
@@ -75,6 +77,7 @@ import Servant
   )
 import Servant.API (NamedRoutes)
 import Servant.API.Generic (type (:-))
+import Servant.Health (HealthApi, ProbeCheck, ProbeVerdict (Healthy), healthServer)
 import Servant.Server (ErrorFormatter, ErrorFormatters (..), defaultErrorFormatters)
 
 -- | The en HTTP API as a servant @NamedRoutes@ record. Each field mounts one concept's
@@ -91,7 +94,10 @@ import Servant.Server (ErrorFormatter, ErrorFormatters (..), defaultErrorFormatt
 -- configuration from memory and cannot fail. @POST \/v1\/grants@ has its own @MultiVerb@
 -- response list: the shared tail plus its operation-specific 403 and 404 outcomes.
 data EnApi mode = EnApi
-  { relationships :: mode :- "v1" :> NamedRoutes TupleRoutes,
+  { -- Keep this literal aligned with 'Servant.Health.Paths.healthMountSegment'. The
+    -- value-level constant cannot appear in a type-level path segment.
+    health :: mode :- "health" :> NamedRoutes HealthApi,
+    relationships :: mode :- "v1" :> NamedRoutes TupleRoutes,
     checks :: mode :- "v1" :> NamedRoutes CheckRoutes,
     lookups :: mode :- "v1" :> NamedRoutes LookupRoutes,
     expands :: mode :- "v1" :> NamedRoutes ExpandRoutes,
@@ -107,9 +113,16 @@ apiProxy :: Proxy EnAPI
 apiProxy = Proxy
 
 server :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> Server EnAPI
-server env =
+server env = serverWithProbes env (pure Healthy) (pure Healthy)
+
+-- | Assemble the API with caller-supplied liveness and readiness checks. The
+-- standalone server uses this entry point; 'server' remains source-compatible for
+-- embedded hosts and supplies healthy in-process defaults.
+serverWithProbes :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> ProbeCheck -> ProbeCheck -> Server EnAPI
+serverWithProbes env liveness readiness =
   EnApi
-    { relationships = tupleRoutesServer env,
+    { health = healthServer liveness readiness,
+      relationships = tupleRoutesServer env,
       checks = checkRoutesServer env,
       lookups = lookupRoutesServer env,
       expands = expandRoutesServer env,
@@ -117,8 +130,12 @@ server env =
     }
 
 app :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> Application
-app env =
-  problemMiddleware (serveWithContext apiProxy (envelopeFormatters :. EmptyContext) (server env))
+app env = appWithProbes env (pure Healthy) (pure Healthy)
+
+-- | Serve the API with caller-supplied probe checks.
+appWithProbes :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es, IOE Effectful.:> es) => Env es -> ProbeCheck -> ProbeCheck -> Application
+appWithProbes env liveness readiness =
+  problemMiddleware (serveWithContext apiProxy (envelopeFormatters :. EmptyContext) (serverWithProbes env liveness readiness))
 
 -- | Replace Servant's otherwise empty 405 with the same problem dialect as every
 -- other error. En has no handler-owned 405, so replacing it unconditionally is safe.

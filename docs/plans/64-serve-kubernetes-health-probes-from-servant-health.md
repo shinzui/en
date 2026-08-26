@@ -51,7 +51,7 @@ answers, while PostgreSQL is down:
 HTTP/1.1 503 Service Unavailable
 Content-Type: application/json
 
-{"status":"unhealthy","check":"postgres","failingSince":"2026-08-25T19:04:11.221Z"}
+{"status":"failed","check":"postgres","failingSince":"2026-08-25T19:04:11.221Z"}
 ```
 
 and `GET /health/live` still answers `200` — because liveness must never depend on a
@@ -66,10 +66,12 @@ the failure the shared body type otherwise makes invisible.
 - [x] (2026-08-26 00:11Z) Milestone 1 — Proved the `servant-health` cohort resolves against `en`'s pinned
       dependency closure (`cabal build all` with the dependency added and nothing else
       changed), and recorded `servant-health-0.1.0.0`. No code yet.
-- [ ] Milestone 2 — Mount `HealthApi` under `"health"` on `en`'s API record, build the two
+- [x] (2026-08-26 00:20Z) Milestone 2 — Mounted `HealthApi` under `"health"` on `en`'s API record, built the two
       probe checks from `en-server`'s existing liveness and readiness logic with
-      `safeCheck`, `withProbeTimeout`, `sequenceChecks`, and failure trackers, and serve
-      them. `/healthz` and `/readyz` still answer during this milestone.
+      `safeCheck`, `withProbeTimeout`, `sequenceChecks`, and failure trackers, and served
+      them. `/healthz` and `/readyz` still answer during this milestone. A live database
+      stop proved readiness returns 503 with a stable `failingSince` while liveness remains
+      200.
 - [ ] Milestone 3 — Add the `servant-health:testkit` contract test and watch it fail against
       a deliberately swapped wiring before making it pass.
 - [ ] Milestone 4 — Delete `en-server/app/Health.hs` and every reference to `/healthz` and
@@ -117,6 +119,26 @@ the failure the shared body type otherwise makes invisible.
   Test suite en-biscuit-tests: PASS
   ```
 
+- Discovery (2026-08-26, Milestone 2): **three Mori-registered consumers call the
+  source-compatible `app env` builder, so changing it to require probe arguments would
+  create an unnecessary cross-repository break.** `mori://shinzui/kikan-en`,
+  `mori://shinzui/nagare`, and `mori://shinzui/meibo` all use the embedded builder. The
+  implementation therefore adds explicit `appWithProbes` / `appWithOpenApiProbes` seams
+  while retaining the existing entry points with healthy defaults. The standalone binary
+  uses the explicit seam and therefore always supplies real checks.
+
+- Discovery (2026-08-26, Milestone 2): **the released wire vocabulary is `ok` / `failed`,
+  with `check: "all"` for a healthy result, rather than the `healthy` / `unhealthy`
+  examples this plan originally carried.** The live packaged server confirmed the released
+  `servant-health-0.1.0.0` implementation read through Mori: with PostgreSQL stopped,
+  liveness stayed 200 and two readiness responses reused the exact same failure onset.
+
+  ```text
+  GET /health/live  -> 200 {"check":"all","failingSince":null,"status":"ok"}
+  GET /health/ready -> 503 {"check":"postgres","failingSince":"2026-08-26T00:19:23.413931Z","status":"failed"}
+  GET /health/ready -> 503 {"check":"postgres","failingSince":"2026-08-26T00:19:23.413931Z","status":"failed"}
+  ```
+
 (Add further entries as work proceeds.)
 
 
@@ -158,6 +180,17 @@ the failure the shared body type otherwise makes invisible.
   would burn the pool's stale connection on the probe instead of letting a real request
   absorb it — both of which `en-server/app/Main.hs` already documents.
   Date: 2026-08-25
+
+- Decision: Preserve the existing `server env`, `app env`, and `appWithOpenApi env`
+  entry points and add probe-parameterized siblings for the standalone server and the
+  contract test.
+  Rationale: the existing entry points are consumed directly by
+  `mori://shinzui/kikan-en`, `mori://shinzui/nagare`, and `mori://shinzui/meibo`.
+  Requiring two new arguments would break those consumers even though only the packaged
+  `en-server` owns the PostgreSQL pool needed for a truthful readiness check. The compatible
+  builders retain healthy defaults for embedded hosts; `en-server` uses
+  `appWithOpenApiProbes` and supplies the checks built once at startup by `mkProbes`.
+  Date: 2026-08-26
 
 (Add further entries as work proceeds.)
 
@@ -715,13 +748,13 @@ curl -s -i http://127.0.0.1:8080/health/live
 curl -s -i http://127.0.0.1:8080/health/ready
 ```
 
-Expected — both `200`, both `application/json`, both with a `status` of healthy:
+Expected — both `200`, both `application/json`, both with a `status` of `ok`:
 
 ```text
 HTTP/1.1 200 OK
 Content-Type: application/json
 
-{"status":"healthy","check":"liveness","failingSince":null}
+{"status":"ok","check":"all","failingSince":null}
 ```
 
 Now stop PostgreSQL while leaving `en-server` running, and probe again. This is the
@@ -736,7 +769,7 @@ Expected: liveness **still 200** — a database outage must not restart the pod 
 `503` with a body naming the failing check:
 
 ```json
-{"status":"unhealthy","check":"postgres","failingSince":"2026-08-25T19:04:11.221Z"}
+{"status":"failed","check":"postgres","failingSince":"2026-08-25T19:04:11.221Z"}
 ```
 
 Wait thirty seconds and probe readiness again. **`failingSince` must not move.** That is the
@@ -881,16 +914,18 @@ health :: mode :- "health" :> NamedRoutes HealthApi   -- new field on the API re
 and in the probes module (`en-server/app/Probes.hs` or the `en-servant` equivalent):
 
 ```haskell
-mkProbes :: (IO Bool) -> IO (ProbeCheck, ProbeCheck)
-  -- takes en's PostgreSQL ping; returns (liveness, readiness), each already wrapped in
-  -- its own failure tracker. Called ONCE at startup, never per request.
+mkProbes :: IO Bool -> IO Bool -> IO (ProbeCheck, ProbeCheck)
+  -- takes an in-process responsiveness action and en's double PostgreSQL ping; returns
+  -- (liveness, readiness), each already wrapped in its own failure tracker. Called ONCE
+  -- at startup, never per request.
 ```
 
 The application assembly must expose a seam taking the two checks as parameters, so
 Milestone 3's test can supply its own:
 
 ```haskell
-appWith :: Env es -> ProbeCheck -> ProbeCheck -> Application
+appWithProbes :: Env es -> ProbeCheck -> ProbeCheck -> Application
+appWithOpenApiProbes :: Env es -> ProbeCheck -> ProbeCheck -> Application
 ```
 
 At the end of **Milestone 4**, `en-server/app/Health.hs` does not exist, and

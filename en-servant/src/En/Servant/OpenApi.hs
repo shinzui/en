@@ -24,6 +24,7 @@ module En.Servant.OpenApi
     enOpenApi,
     narrowSuccessContent,
     appWithOpenApi,
+    appWithOpenApiProbes,
   )
 where
 
@@ -141,6 +142,7 @@ import En.Servant.API
     envelopeFormatters,
     problemMiddleware,
     server,
+    serverWithProbes,
   )
 import En.Servant.Problem (ProblemDetails, ProblemSpec (..), problemCatalog, problemJsonOptions)
 import Servant
@@ -152,6 +154,7 @@ import Servant
     type (:<|>) (..),
     type (:>),
   )
+import Servant.Health (ProbeCheck)
 import Servant.OpenApi (toOpenApi)
 
 -- | What @en-server@ actually serves: the client-facing API plus its own description.
@@ -285,6 +288,21 @@ appWithOpenApi ::
 appWithOpenApi env =
   problemMiddleware
     (serveWithContext servedProxy (envelopeFormatters :. EmptyContext) (server env :<|> pure enOpenApi))
+
+-- | Serve the documented API with caller-supplied liveness and readiness checks.
+appWithOpenApiProbes ::
+  ( ConsistencyStore Effectful.:> es,
+    TupleStore Effectful.:> es,
+    Error EnError Effectful.:> es,
+    IOE Effectful.:> es
+  ) =>
+  Env es ->
+  ProbeCheck ->
+  ProbeCheck ->
+  Application
+appWithOpenApiProbes env liveness readiness =
+  problemMiddleware
+    (serveWithContext servedProxy (envelopeFormatters :. EmptyContext) (serverWithProbes env liveness readiness :<|> pure enOpenApi))
 
 -- * Schema-construction helpers
 
