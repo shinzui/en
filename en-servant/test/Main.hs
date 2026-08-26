@@ -1533,21 +1533,21 @@ errorModelTests = do
   assertEqual
     "write_precondition_failed names the precondition that did not hold"
     "write precondition did not hold: must-exist: space:project-x#member@user:alice"
-    (problemOf (enErrorToFault (WritePreconditionFailed "must-exist: space:project-x#member@user:alice"))).detail
+    (problemOf (enErrorToFault (WritePreconditionFailed "must-exist: space:project-x#member@user:alice")) ^. #detail)
 
   -- The 503 message must never carry the SQL text and bound parameters that
   -- Hasql.toDetailedText puts in StoreError; the operator gets those on stderr.
   assertBool
     "store_error problem hides the store's detail"
-    (not (secretDetail `Text.isInfixOf` (problemOf (enErrorToFault (StoreError secretDetail))).detail))
+    (not (secretDetail `Text.isInfixOf` (problemOf (enErrorToFault (StoreError secretDetail)) ^. #detail)))
   assertBool
     "internal_error problem hides the implementation detail"
-    (not (secretDetail `Text.isInfixOf` (problemOf (enErrorToFault (InternalError secretDetail))).detail))
+    (not (secretDetail `Text.isInfixOf` (problemOf (enErrorToFault (InternalError secretDetail)) ^. #detail)))
 
   assertEqual
     "unknown_relation names the offending relation"
     "unknown relation or permission: audit"
-    (problemOf (enErrorToFault (UnknownRelation "audit"))).detail
+    (problemOf (enErrorToFault (UnknownRelation "audit")) ^. #detail)
 
   golden
     "ProblemDetails"
