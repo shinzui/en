@@ -80,9 +80,12 @@ the failure the shared body type otherwise makes invisible.
       exemptions in `en-server/app/Middleware.hs`, the metrics path list in
       `en-server/app/Metrics.hs`, the log exclusion in `en-server/app/Observability.hs`, the
       readiness wait in `justfile`, and the probe path in `process-compose.yaml`.
-- [ ] Milestone 5 — Exempt the two probe routes from the problem-details conformance test by
-      name, regenerate `docs/api/openapi.json`, and write the ADR recording that the probe
-      surface is `servant-health`'s.
+- [x] (2026-08-26 00:29Z) Milestone 5a — Exempted exactly the two package-owned probe
+      routes from the problem-details conformance test by name, documented them as
+      unauthenticated, and normalized their OpenAPI responses to one canonical JSON media
+      type.
+- [ ] Milestone 5b — Regenerate `docs/api/openapi.json`, write the ADR recording that the
+      probe surface is `servant-health`'s, and run final validation.
 
 
 ## Surprises & Discoveries
@@ -166,6 +169,13 @@ the failure the shared body type otherwise makes invisible.
   without credentials and the process-compose readiness state is `Ready` at
   `/health/ready`.
 
+- Discovery (2026-08-26, Milestone 5): **the released MultiVerb OpenAPI generator emits
+  two spellings of the same JSON media type for probe responses:** `application/json` and
+  `application/json;charset=utf-8`. The live server legitimately includes the charset, but
+  publishing two OpenAPI content-map entries makes a generated client model two variants
+  where the wire has one. `normalizeProbeContent` removes only the charset spelling from
+  the two exact paths sourced from `Servant.Health.Paths.healthRawPaths`.
+
 (Add further entries as work proceeds.)
 
 
@@ -217,6 +227,16 @@ the failure the shared body type otherwise makes invisible.
   `en-server` owns the PostgreSQL pool needed for a truthful readiness check. The compatible
   builders retain healthy defaults for embedded hosts; `en-server` uses
   `appWithOpenApiProbes` and supplies the checks built once at startup by `mkProbes`.
+  Date: 2026-08-26
+
+- Decision: Exempt exactly `/health/live` and `/health/ready` from the RFC 9457
+  problem-details media-type rule, sourcing both names from
+  `Servant.Health.Paths.healthRawPaths`.
+  Rationale: a 503 probe report is a typed observation of current system state, not an API
+  error document. Its fixed `ProbeStatus` body is consumed by orchestrators and operators,
+  so replacing it with `ProblemDetails` would violate the `servant-health` contract. The
+  test holds the exemptions in an exact `Set` rather than using a `/health` prefix, so a
+  future route cannot become exempt accidentally.
   Date: 2026-08-26
 
 (Add further entries as work proceeds.)

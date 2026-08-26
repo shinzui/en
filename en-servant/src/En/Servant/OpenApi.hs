@@ -23,6 +23,7 @@ module En.Servant.OpenApi
     servedProxy,
     enOpenApi,
     narrowSuccessContent,
+    normalizeProbeContent,
     appWithOpenApi,
     appWithOpenApiProbes,
   )
@@ -30,6 +31,7 @@ where
 
 import Control.Lens ((%~), (&), (.~), (?~), _Just)
 import Data.Aeson qualified as Aeson
+import Data.ByteString.Char8 qualified as Char8
 import Data.Char (toUpper)
 import Data.HashMap.Strict.InsOrd.Compat qualified as InsOrdHashMap
 import Data.OpenApi
@@ -155,6 +157,7 @@ import Servant
     type (:>),
   )
 import Servant.Health (ProbeCheck)
+import Servant.Health.Paths qualified as Health
 import Servant.OpenApi (toOpenApi)
 
 -- | What @en-server@ actually serves: the client-facing API plus its own description.
@@ -176,6 +179,7 @@ enOpenApi =
     & info . description ?~ "Relationship-based authorization: check, lookup, expand, and write."
     & withOperationIds
     & narrowSuccessContent
+    & normalizeProbeContent
     & withProblemCodes
     & withSecurityScheme
 
@@ -194,6 +198,26 @@ narrowSuccessContent =
     narrow responseStatus
       | responseStatus < 400 = _Inline . content %~ InsOrdHashMap.delete "application/problem+json"
       | otherwise = id
+
+-- | Publish one canonical JSON media type for the probe responses.
+--
+-- The released MultiVerb OpenAPI generator emits both @application/json@ and
+-- @application/json;charset=utf-8@ for servant's 'JSON' content type. They describe
+-- the same representation; keeping both makes generated clients model two response
+-- variants where the wire has one. Limit the normalization to the two package-owned
+-- probe paths and leave every other response untouched.
+normalizeProbeContent :: OpenApi -> OpenApi
+normalizeProbeContent document =
+  foldr normalizePath document (Char8.unpack <$> Health.healthRawPaths)
+  where
+    normalizePath rawPath =
+      paths
+        %~ InsOrdHashMap.adjust
+          (get . _Just . responses . responses %~ InsOrdHashMap.map normalizeResponse)
+          rawPath
+    normalizeResponse :: Referenced Response -> Referenced Response
+    normalizeResponse =
+      _Inline . content %~ InsOrdHashMap.delete "application/json;charset=utf-8"
 
 -- | Narrow each declared error's @code@ member to the runtime catalog entries for
 -- that status. The derived 'ProblemDetails' reference remains the base schema; this
@@ -236,13 +260,20 @@ withProblemCodes =
 -- the published production contract remains authenticated.
 withSecurityScheme :: OpenApi -> OpenApi
 withSecurityScheme document =
-  document
-    & components . securitySchemes
-      .~ SecurityDefinitions (InsOrdHashMap.singleton "bearerAuth" bearer)
-    & allOperations . security %~ (requirement :)
+  foldr clearProbeSecurity authenticated Health.healthRawPaths
   where
+    authenticated =
+      document
+        & components . securitySchemes
+          .~ SecurityDefinitions (InsOrdHashMap.singleton "bearerAuth" bearer)
+        & allOperations . security %~ (requirement :)
     bearer = SecurityScheme (SecuritySchemeHttp (HttpSchemeBearer Nothing)) Nothing
     requirement = SecurityRequirement (InsOrdHashMap.singleton "bearerAuth" [])
+    clearProbeSecurity rawPath =
+      paths
+        %~ InsOrdHashMap.adjust
+          (get . _Just . security .~ [])
+          (Char8.unpack rawPath)
 
 -- | Assign a stable @operationId@ to every operation, derived deterministically from its
 -- method and path, so a code generator consuming the checked-in @docs/api/openapi.json@ emits

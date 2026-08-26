@@ -109,7 +109,8 @@ test-suite en-servant-tests
     , http-types
     , openapi-hs
     , servant
-    , servant-health:testkit  ^>=0.1
+    , servant-health          ^>=0.1
+    , servant-health:testkit
     , servant-server
     , tasty
     , text

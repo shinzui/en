@@ -18,7 +18,7 @@ import Data.OpenApi (ToSchema, validateToJSON)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Text.Encoding (encodeUtf8)
+import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Time (UTCTime (..), fromGregorian, getCurrentTime, secondsToDiffTime)
 import Effectful (Eff, IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
@@ -133,6 +133,7 @@ import Network.HTTP.Types (methodDelete, methodPost, statusCode)
 import Network.Wai (Application, Request (..), defaultRequest)
 import Network.Wai.Test (SRequest (..), SResponse (..), runSession, setPath, srequest)
 import Servant (Handler, ServerError (errHTTPCode), runHandler)
+import Servant.Health.Paths qualified as Health
 import Servant.Health.TestKit (probeContractTests)
 import Test.Tasty (defaultMain)
 
@@ -979,7 +980,7 @@ openApiDocumentTests = do
 
   assertEqual
     "openapi document lists exactly the served operations"
-    (List.sort (["/health/live", "/health/ready", "/v1/schema"] <> postPaths))
+    (List.sort (["/v1/schema"] <> Set.toList problemDetailsExemptions <> postPaths))
     (List.sort (objectKeys (document `at` "paths")))
 
   mapM_
@@ -997,6 +998,24 @@ openApiDocumentTests = do
     "the schema endpoint is a GET with only a 200"
     ["200"]
     (List.sort (objectKeys (document `at` "paths" `at` "/v1/schema" `at` "get" `at` "responses")))
+
+  mapM_
+    ( \path -> do
+        let responses = document `at` "paths" `at` Key.fromText path `at` "get" `at` "responses"
+        assertEqual
+          ("probe " <> Text.unpack path <> " documents exactly 200 and 503")
+          ["200", "503"]
+          (List.sort (objectKeys responses))
+        mapM_
+          ( \responseStatus ->
+              assertEqual
+                ("probe " <> Text.unpack path <> " response " <> Text.unpack responseStatus <> " is the named problem-details exemption")
+                ["application/json"]
+                (objectKeys (responses `at` Key.fromText responseStatus `at` "content"))
+          )
+          ["200", "503"]
+    )
+    (Set.toList problemDetailsExemptions)
 
   mapM_
     ( \(path, statuses) ->
@@ -1056,6 +1075,15 @@ openApiDocumentTests = do
           | path <- postPaths
           ]
     )
+
+  mapM_
+    ( \path ->
+        assertEqual
+          ("GET " <> Text.unpack path <> " is explicitly unauthenticated")
+          Aeson.Null
+          (document `at` "paths" `at` Key.fromText path `at` "get" `at` "security")
+    )
+    (Set.toList problemDetailsExemptions)
 
   assertBool
     "openapi document defines RFC 9457 problem details"
@@ -1131,6 +1159,10 @@ openApiDocumentTests = do
       ("/v1/grants", ["200", "400", "403", "404", "412", "422", "500", "503"])
         : [(path, sharedStatuses) | path <- sharedPostPaths]
     postPaths = fst <$> responseExpectations
+    -- Probe reports describe current state rather than RFC 9457 errors. Keep the
+    -- exemption exact and sourced from the package's route constants so it cannot
+    -- silently grow or drift from the mounted surface.
+    problemDetailsExemptions = Set.fromList (decodeUtf8 <$> Health.healthRawPaths)
     expectedSecurity = Aeson.toJSON [Map.singleton ("bearerAuth" :: Text) ([] :: [Text])]
 
     catalogCodesAt responseStatus =
