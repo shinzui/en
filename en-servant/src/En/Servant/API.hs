@@ -51,6 +51,7 @@ import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError)
 import En.Expand.Api
 import En.Lookup.Api
+import En.Prelude
 import En.Schema.Api
 import En.Servant.Problem (problemResponse, specMalformedRequestBody, specMethodNotAllowed)
 import En.Servant.Response (EnResponses, EnResult (..))
@@ -64,13 +65,11 @@ import En.Servant.Seam
 import En.Servant.Seam qualified as Seam
 import En.Servant.Wire
 import En.Tuple.Api
-import GHC.Generics (Generic)
 import Network.HTTP.Types (status405)
 import Network.Wai (Middleware, responseStatus)
 import Servant
   ( Application,
     Context (..),
-    Proxy (..),
     Server,
     serveWithContext,
     type (:>),

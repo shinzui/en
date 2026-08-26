@@ -29,10 +29,10 @@ module En.Servant.OpenApi
   )
 where
 
-import Control.Lens ((%~), (&), (.~), (?~), _Just)
 import Data.Aeson qualified as Aeson
 import Data.ByteString.Char8 qualified as Char8
 import Data.Char (toUpper)
+import Data.Generics.Labels ()
 import Data.HashMap.Strict.InsOrd.Compat qualified as InsOrdHashMap
 import Data.OpenApi
   ( AdditionalProperties (..),
@@ -81,16 +81,14 @@ import Data.OpenApi
     _Inline,
   )
 import Data.OpenApi.Declare (Declare)
-import Data.Proxy (Proxy (..))
-import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Time (UTCTime)
 import Effectful (IOE)
 import Effectful qualified
 import Effectful.Error.Static (Error)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError)
+import En.Prelude hiding (allOf, children, element)
 import En.Servant.API
   ( BatchCheckPairWire,
     BatchCheckRequestWire,
@@ -144,7 +142,7 @@ import En.Servant.API
     server,
     serverWithProbes,
   )
-import En.Servant.Problem (ProblemDetails, ProblemSpec (..), problemCatalog, problemJsonOptions)
+import En.Servant.Problem (ProblemDetails, problemCatalog, problemJsonOptions)
 import Relay.Pagination.Servant.OpenApi ()
 import Servant
   ( Application,
@@ -173,9 +171,15 @@ servedProxy = Proxy
 enOpenApi :: OpenApi
 enOpenApi =
   toOpenApi apiProxy
-    & info . title .~ "en authorization API"
-    & info . version .~ "v1"
-    & info . description ?~ "Relationship-based authorization: check, lookup, expand, and write."
+    & info
+    . title
+    .~ "en authorization API"
+    & info
+    . version
+    .~ "v1"
+    & info
+    . description
+    ?~ "Relationship-based authorization: check, lookup, expand, and write."
     & withOperationIds
     & narrowSuccessContent
     & normalizeProbeContent
@@ -231,27 +235,31 @@ withProblemCodes =
         [] -> response
         codes ->
           response
-            & _Inline . content
-              %~ InsOrdHashMap.adjust
-                (schema . _Just %~ constrainCode codes)
-                "application/problem+json"
+            & _Inline
+            . content
+            %~ InsOrdHashMap.adjust
+              (schema . _Just %~ constrainCode codes)
+              "application/problem+json"
 
     codesAt responseStatus =
-      [spec.code | spec <- problemCatalog, responseStatus == fromInteger (fromIntegral spec.status)]
+      [spec ^. #code | spec <- problemCatalog, responseStatus == fromInteger (fromIntegral (spec ^. #status))]
 
     constrainCode codes original =
       Inline
         ( mempty
-            & allOf ?~ [original]
+            & allOf
+            ?~ [original]
             & properties
-              .~ InsOrdHashMap.singleton
-                "code"
-                ( Inline
-                    ( mempty
-                        & type_ ?~ OpenApiTypeSingle OpenApiString
-                        & enum_ ?~ (Aeson.String <$> codes)
-                    )
-                )
+            .~ InsOrdHashMap.singleton
+              "code"
+              ( Inline
+                  ( mempty
+                      & type_
+                      ?~ OpenApiTypeSingle OpenApiString
+                      & enum_
+                      ?~ (Aeson.String <$> codes)
+                  )
+              )
         )
 
 -- | Declare the bearer authentication enforced by @en-server@ and require it on
@@ -263,9 +271,12 @@ withSecurityScheme document =
   where
     authenticated =
       document
-        & components . securitySchemes
-          .~ SecurityDefinitions (InsOrdHashMap.singleton "bearerAuth" bearer)
-        & allOperations . security %~ (requirement :)
+        & components
+        . securitySchemes
+        .~ SecurityDefinitions (InsOrdHashMap.singleton "bearerAuth" bearer)
+        & allOperations
+        . security
+        %~ (requirement :)
     bearer = SecurityScheme (SecuritySchemeHttp (HttpSchemeBearer Nothing)) Nothing
     requirement = SecurityRequirement (InsOrdHashMap.singleton "bearerAuth" [])
     clearProbeSecurity rawPath =
@@ -289,8 +300,14 @@ withOperationIds =
   where
     setForPath path item =
       item
-        & post . _Just . operationId %~ orSet ("create" <> key)
-        & get . _Just . operationId %~ orSet ("get" <> key)
+        & post
+        . _Just
+        . operationId
+        %~ orSet ("create" <> key)
+        & get
+        . _Just
+        . operationId
+        %~ orSet ("get" <> key)
       where
         key = camel path
     orSet identifier = Just . maybe identifier id
@@ -340,9 +357,12 @@ appWithOpenApiProbes env liveness readiness =
 objectSchema :: [(Text, Referenced Schema)] -> Schema
 objectSchema props =
   mempty
-    & type_ ?~ OpenApiTypeSingle OpenApiObject
-    & properties .~ InsOrdHashMap.fromList props
-    & required .~ map fst props
+    & type_
+    ?~ OpenApiTypeSingle OpenApiObject
+    & properties
+    .~ InsOrdHashMap.fromList props
+    & required
+    .~ map fst props
 
 -- | An object schema with required properties followed by optional ones.
 --
@@ -352,17 +372,22 @@ objectSchema props =
 partialObjectSchema :: [(Text, Referenced Schema)] -> [(Text, Referenced Schema)] -> Schema
 partialObjectSchema requiredProps optionalProps =
   mempty
-    & type_ ?~ OpenApiTypeSingle OpenApiObject
-    & properties .~ InsOrdHashMap.fromList (requiredProps <> optionalProps)
-    & required .~ map fst requiredProps
+    & type_
+    ?~ OpenApiTypeSingle OpenApiObject
+    & properties
+    .~ InsOrdHashMap.fromList (requiredProps <> optionalProps)
+    & required
+    .~ map fst requiredProps
 
 -- | A string schema admitting exactly one value: a sum type's discriminator.
 literal :: Text -> Referenced Schema
 literal value =
   Inline
     ( mempty
-        & type_ ?~ OpenApiTypeSingle OpenApiString
-        & enum_ ?~ [Aeson.String value]
+        & type_
+        ?~ OpenApiTypeSingle OpenApiString
+        & enum_
+        ?~ [Aeson.String value]
     )
 
 -- | @null@ is a type in OpenAPI 3.1, so an optional field is a @oneOf@ with it.
@@ -380,8 +405,10 @@ arrayOf :: Referenced Schema -> Referenced Schema
 arrayOf element =
   Inline
     ( mempty
-        & type_ ?~ OpenApiTypeSingle OpenApiArray
-        & items ?~ OpenApiItemsObject element
+        & type_
+        ?~ OpenApiTypeSingle OpenApiArray
+        & items
+        ?~ OpenApiItemsObject element
     )
 
 -- | A sum type: @oneOf@ over its variants.
@@ -443,8 +470,10 @@ caveatValueMap = do
   pure $
     Inline
       ( mempty
-          & type_ ?~ OpenApiTypeSingle OpenApiObject
-          & additionalProperties ?~ AdditionalPropertiesSchema value
+          & type_
+          ?~ OpenApiTypeSingle OpenApiObject
+          & additionalProperties
+          ?~ AdditionalPropertiesSchema value
       )
 
 instance ToSchema TupleCaveatWire where
@@ -535,11 +564,11 @@ instance ToSchema MintGrantRequestWire where
             ("requestId", textRef)
           ]
           & description
-            ?~ "Mints a Biscuit decision token if the server's own check for this \
-               \subject/permission/object is Allowed. subject must be a concrete \"id\" \
-               \subject. ttlSeconds, if given, must be positive and no greater than the \
-               \server maximum (else 400). Returns 403 when the decision is not Allowed, \
-               \and 404 when grant minting is not configured."
+          ?~ "Mints a Biscuit decision token if the server's own check for this \
+             \subject/permission/object is Allowed. subject must be a concrete \"id\" \
+             \subject. ttlSeconds, if given, must be positive and no greater than the \
+             \server maximum (else 400). Returns 403 when the decision is not Allowed, \
+             \and 404 when grant minting is not configured."
 
 instance ToSchema MintGrantResponseWire where
   declareNamedSchema _ = do
@@ -553,10 +582,10 @@ instance ToSchema MintGrantResponseWire where
             ("checkedAt", textRef)
           ]
           & description
-            ?~ "token is the URL-safe base64 Biscuit to forward downstream in the \
-               \X-En-Biscuit header. revocationIds are the token's built-in block \
-               \revocation ids, hex-encoded. checkedAt is the consistency token the \
-               \mint's check evaluated at, also signed into the grant."
+          ?~ "token is the URL-safe base64 Biscuit to forward downstream in the \
+             \X-En-Biscuit header. revocationIds are the token's built-in block \
+             \revocation ids, hex-encoded. checkedAt is the consistency token the \
+             \mint's check evaluated at, also signed into the grant."
 
 instance ToSchema BatchCheckPairWire where
   declareNamedSchema _ = do
@@ -754,10 +783,10 @@ instance ToSchema RelationshipFilterWire where
             ("caveatName", textRef)
           ]
           & description
-            ?~ "Must constrain objectType or subjectType. objectId requires objectType; \
-               \subjectId and a subjectRelation other than \"any\" require subjectType. \
-               \A filter anchored on neither end would scan the whole store and is rejected \
-               \with 400."
+          ?~ "Must constrain objectType or subjectType. objectId requires objectType; \
+             \subjectId and a subjectRelation other than \"any\" require subjectType. \
+             \A filter anchored on neither end would scan the whole store and is rejected \
+             \with 400."
 
 instance ToSchema ReadRelationshipsRequestWire where
   declareNamedSchema _ = do
@@ -777,9 +806,9 @@ instance ToSchema DeleteRelationshipsRequestWire where
       NamedSchema (Just "DeleteRelationshipsRequestWire") $
         objectSchema [("filter", relationshipFilter), ("dryRun", primitive OpenApiBoolean)]
           & description
-            ?~ "dryRun has no default. A dry run reports how many relationships the filter \
-               \matches and deletes nothing; dryRun=false retires every match and returns a \
-               \consistency token that sees the revocation."
+          ?~ "dryRun has no default. A dry run reports how many relationships the filter \
+             \matches and deletes nothing; dryRun=false retires every match and returns a \
+             \consistency token that sees the revocation."
 
 instance ToSchema DeleteRelationshipsResponseWire where
   declareNamedSchema _ =
@@ -804,18 +833,20 @@ instance ToSchema WatchRequestWire where
             ("filter", nullable relationshipFilter)
           ]
           & description
-            ?~ "Supply cursor to resume a subscription, startToken to start from the \
-               \snapshot a consistency token pins, or neither to start from now. \
-               \Supplying both is rejected with 400. There is no consistency field: a \
-               \poll's window is fixed by its start position and the store's head."
+          ?~ "Supply cursor to resume a subscription, startToken to start from the \
+             \snapshot a consistency token pins, or neither to start from now. \
+             \Supplying both is rejected with 400. There is no consistency field: a \
+             \poll's window is fixed by its start position and the store's head."
 
 instance ToSchema ChangeKindWire where
   declareNamedSchema _ =
     pure $
       NamedSchema (Just "ChangeKindWire") $
         mempty
-          & type_ ?~ OpenApiTypeSingle OpenApiString
-          & enum_ ?~ [Aeson.String "touch", Aeson.String "delete"]
+          & type_
+          ?~ OpenApiTypeSingle OpenApiString
+          & enum_
+          ?~ [Aeson.String "touch", Aeson.String "delete"]
 
 instance ToSchema TupleChangeWire where
   declareNamedSchema _ = do
@@ -830,11 +861,11 @@ instance ToSchema WatchResponseWire where
       NamedSchema (Just "WatchResponseWire") $
         objectSchema [("changes", arrayOf change), ("cursor", textRef), ("checkedAt", textRef)]
           & description
-            ?~ "changes carries no order: it is the set difference of the live tuple set \
-               \across the batch's window. cursor is always present, including on an empty \
-               \batch, and is the only thing to send back. An empty changes array does not \
-               \mean the feed is caught up; a caught-up feed returns a cursor equal to the \
-               \one it was given."
+          ?~ "changes carries no order: it is the set difference of the live tuple set \
+             \across the batch's window. cursor is always present, including on an empty \
+             \batch, and is the only thing to send back. An empty changes array does not \
+             \mean the feed is caught up; a caught-up feed returns a cursor equal to the \
+             \one it was given."
 
 instance ToSchema SchemaInfoWire where
   declareNamedSchema _ = do
@@ -844,11 +875,11 @@ instance ToSchema SchemaInfoWire where
         objectSchema
           [("source", textRef), ("hash", textRef), ("origin", textRef), ("loadedAt", timestamp)]
           & description
-            ?~ "source is the verbatim schema text the server loaded, not a rendering of \
-               \the compiled model. origin is the file it came from, or builtin-demo. hash \
-               \is the fingerprint every consistency token is stamped with: when it changes, \
-               \every token minted under the old one is refused. There is no checkedAt — this \
-               \reads no tuples."
+          ?~ "source is the verbatim schema text the server loaded, not a rendering of \
+             \the compiled model. origin is the file it came from, or builtin-demo. hash \
+             \is the fingerprint every consistency token is stamped with: when it changes, \
+             \every token minted under the old one is refused. There is no checkedAt — this \
+             \reads no tuples."
 
 instance ToSchema PreconditionWire where
   declareNamedSchema _ = do

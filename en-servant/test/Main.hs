@@ -10,23 +10,21 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy (ByteString)
 import Data.Foldable qualified as Foldable
-import Data.Functor ((<&>))
+import Data.Generics.Labels ()
 import Data.List qualified as List
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isJust)
 import Data.OpenApi (ToSchema, validateToJSON)
 import Data.Set qualified as Set
-import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
-import Data.Time (UTCTime (..), fromGregorian, getCurrentTime, secondsToDiffTime)
+import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Effectful (Eff, IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import En.Biscuit.Grant (Audience (..))
 import En.Biscuit.Keys (parseSigningKeyText, singleKey)
-import En.Biscuit.Verify (VerifiedGrant (..), VerifyRequest (..), verifyGrant)
+import En.Biscuit.Verify (VerifyRequest (..), verifyGrant)
 import En.Budget (defaultEvaluationBudget)
-import En.Cache (Cache, CacheConfig (..), CacheStats (..), SubproblemKey, cacheStats, newCache)
+import En.Cache (Cache, CacheConfig (..), SubproblemKey, cacheStats, newCache)
 import En.Check (CheckCacheEnv (..), check, checkCached)
 import En.Conformance.Kikan
   ( fixtureTuples,
@@ -39,12 +37,12 @@ import En.Conformance.Kikan
   )
 import En.Decision (ResidualDecision)
 import En.Effect.ConsistencyStore (ConsistencyStore, mintToken)
-import En.Effect.TupleStore (ChangePage (..), RelationshipFilter, TupleStore, headRevision, readChanges)
+import En.Effect.TupleStore (RelationshipFilter, TupleStore, headRevision, readChanges)
 import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
 import En.Postgres.Revision (tokenMetadataFromPayload)
-import En.Reachability (ReachabilityGraph (..))
+import En.Prelude hiding (List, UTCTime, at)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), SchemaHash (..))
 import En.Schema (ObjectType (..), RelationName (..))
 import En.Servant.API
@@ -114,7 +112,6 @@ import En.Servant.API
 import En.Servant.OpenApi (enOpenApi)
 import En.Servant.Problem
   ( ProblemDetails (..),
-    ProblemSpec (..),
     problem,
     problemCatalog,
     specInvalidRequest,
@@ -186,12 +183,11 @@ main = do
   -- channel is docs/plans/35's to design.
   let failingPairRequest =
         request
-          { pairs =
-              [ pair "alice" "view" "project-x",
-                pair "alice" "no-such-permission" "project-x",
-                pair "bob" "view" "project-x"
-              ]
-          }
+          & #pairs
+          .~ [ pair "alice" "view" "project-x",
+               pair "alice" "no-such-permission" "project-x",
+               pair "bob" "view" "project-x"
+             ]
   assertEqual
     "an unevaluable pair fails closed without affecting the others"
     (Right (EnOk BatchCheckResponseWire {decisions = [AllowedWire, DeniedWire, DeniedWire], checkedAt = testCheckedAt}))
@@ -200,7 +196,7 @@ main = do
   -- The oversized batch is a returned value, not a thrown ServerError: that is the
   -- point of the MultiVerb response list.
   let smallEnv = env {maxBatchSize = 1}
-      oversized = request {pairs = [pair "alice" "view" "project-x", pair "bob" "view" "project-x"]}
+      oversized = request & #pairs .~ [pair "alice" "view" "project-x", pair "bob" "view" "project-x"]
   assertEqual
     "oversized batch returns a typed batch_too_large"
     (Just "batch_too_large")
@@ -275,10 +271,10 @@ main = do
             object = ObjectRefWire {objectType = "space", objectId = "project-x"}
           }
   assertEqual "cached check endpoint returns Allowed first" (Right (EnOk CheckResponseWire {decision = AllowedWire, checkedAt = testCheckedAt})) =<< runHandler (checkEndpoint checkRequest)
-  checkStatsAfterFirst <- cacheStats cachedCheckEnv.cacheDecisions
+  checkStatsAfterFirst <- cacheStats (cachedCheckEnv ^. #cacheDecisions)
   assertEqual "cached check endpoint returns Allowed second" (Right (EnOk CheckResponseWire {decision = AllowedWire, checkedAt = testCheckedAt})) =<< runHandler (checkEndpoint checkRequest)
-  checkStatsAfterSecond <- cacheStats cachedCheckEnv.cacheDecisions
-  assertBool "cached check endpoint uses decision cache" (checkStatsAfterSecond.hits > checkStatsAfterFirst.hits)
+  checkStatsAfterSecond <- cacheStats (cachedCheckEnv ^. #cacheDecisions)
+  assertBool "cached check endpoint uses decision cache" ((checkStatsAfterSecond ^. #hits) > (checkStatsAfterFirst ^. #hits))
 
   {- E3, the headline property: a read's token is accepted as a later read's
   freshness bound. Check, take the token the response says it was decided at, and
@@ -286,7 +282,7 @@ main = do
   needs in order to build "read your own writes, then read your own reads". -}
   checkedToken <-
     runHandler (checkHandler env checkRequest) >>= \case
-      Right (EnOk response) -> pure response.checkedAt
+      Right (EnOk response) -> pure (response ^. #checkedAt)
       other -> fail ("check endpoint did not answer: " <> show other)
   assertOk "a lookup at least as fresh as a check's token is served"
     =<< runHandler
@@ -323,10 +319,10 @@ main = do
             deadlineMillis = Nothing
           }
   assertOk "cached lookup endpoint returns a page first" =<< runHandler (lookupEndpoint lookupRequest)
-  lookupStatsAfterFirst <- cacheStats cachedLookupEnv.cacheDecisions
+  lookupStatsAfterFirst <- cacheStats (cachedLookupEnv ^. #cacheDecisions)
   assertOk "cached lookup endpoint returns a page second" =<< runHandler (lookupEndpoint lookupRequest)
-  lookupStatsAfterSecond <- cacheStats cachedLookupEnv.cacheDecisions
-  assertBool "cached lookup endpoint uses decision cache for confirmations" (lookupStatsAfterSecond.hits > lookupStatsAfterFirst.hits)
+  lookupStatsAfterSecond <- cacheStats (cachedLookupEnv ^. #cacheDecisions)
+  assertBool "cached lookup endpoint uses decision cache for confirmations" ((lookupStatsAfterSecond ^. #hits) > (lookupStatsAfterFirst ^. #hits))
 
   {- The wire carries a cursor as opaque text and hands it to the engine unread, so
   the engine's cursor validation is what protects the endpoint. A retired v1 cursor
@@ -337,11 +333,11 @@ main = do
   assertEqual
     "a retired v1 lookup cursor is a client error"
     (Just "invalid_cursor")
-    =<< clientErrorCodeOf (lookupEndpoint lookupRequest {cursor = Just "lookup-v1|13:test-revision|0:|0:"})
+    =<< clientErrorCodeOf (lookupEndpoint (lookupRequest & #cursor ?~ "lookup-v1|13:test-revision|0:|0:"))
   assertEqual
     "an unparsable lookup cursor is a client error"
     (Just "invalid_cursor")
-    =<< clientErrorCodeOf (lookupEndpoint lookupRequest {cursor = Just "not-a-cursor"})
+    =<< clientErrorCodeOf (lookupEndpoint (lookupRequest & #cursor ?~ "not-a-cursor"))
 
   -- The server owns the lookup budget, not the caller. A `deadlineMaxMillis` of zero
   -- is an already-expired budget, so if the clamp reaches the engine the page reports
@@ -398,8 +394,8 @@ problemMachineryTests = do
     ["code", "detail", "retryable", "status", "title", "type"]
     (List.sort (valueObjectKeys (either error id (Aeson.eitherDecode (encode sample)))))
 
-  let catalogCodes = map (.code) problemCatalog
-      retryableCodes = List.sort [spec.code | spec <- problemCatalog, spec.retryable]
+  let catalogCodes = map (^. #code) problemCatalog
+      retryableCodes = List.sort [(spec ^. #code) | spec <- problemCatalog, (spec ^. #retryable)]
   assertEqual
     "the problem catalog has one stable specification per code"
     (Set.size (Set.fromList catalogCodes))
@@ -436,24 +432,24 @@ lookupSubjectsTests env = do
   assertEqual
     "an empty subjectType is a client error"
     (Just "invalid_request")
-    =<< clientErrorCodeOf (lookupSubjectsHandler env groupNesting {subjectType = ""})
+    =<< clientErrorCodeOf (lookupSubjectsHandler env (groupNesting & #subjectType .~ ""))
   assertEqual
     "an empty permission is a client error"
     (Just "invalid_request")
-    =<< clientErrorCodeOf (lookupSubjectsHandler env groupNesting {permission = ""})
+    =<< clientErrorCodeOf (lookupSubjectsHandler env (groupNesting & #permission .~ ""))
   -- A zero limit would answer with an empty page whose cursor equals the caller's own,
   -- so a client draining pages would spin forever without advancing.
   assertEqual
     "a non-positive limit is a client error"
     (Just "invalid_request")
-    =<< clientErrorCodeOf (lookupSubjectsHandler env groupNesting {limit = 0})
+    =<< clientErrorCodeOf (lookupSubjectsHandler env (groupNesting & #limit .~ 0))
   -- The wire hands the cursor to the engine unread, so the engine's validation is what
   -- protects the endpoint. A malformed cursor is `InvalidCursor`, which `enErrorToFault`
   -- maps to a 400 under `invalid_cursor` (docs/plans/60, M2).
   assertEqual
     "an unparsable lookup-subjects cursor is a client error"
     (Just "invalid_cursor")
-    =<< clientErrorCodeOf (lookupSubjectsHandler env groupNesting {cursor = Just "not-a-cursor"})
+    =<< clientErrorCodeOf (lookupSubjectsHandler env (groupNesting & #cursor ?~ "not-a-cursor"))
 
   -- `audit = owner & member` is an intersection, so every candidate costs a confirming
   -- check. Those confirmations are what the decision cache serves on the second call.
@@ -461,14 +457,14 @@ lookupSubjectsTests env = do
   let cachedSubjectsEnv =
         env {lookupSubjectsWithDeadlineOperation = LookupSubjects.lookupSubjectsWithDeadlineCached cachedSubjectsCache}
       auditRequest :: LookupSubjectsRequestWire
-      auditRequest = groupNesting {object = auditedSpace, permission = "audit"}
+      auditRequest = groupNesting & #object .~ auditedSpace & #permission .~ "audit"
   assertOk "cached lookup-subjects returns a page first" =<< runHandler (lookupSubjectsHandler cachedSubjectsEnv auditRequest)
-  statsAfterFirst <- cacheStats cachedSubjectsCache.cacheDecisions
+  statsAfterFirst <- cacheStats (cachedSubjectsCache ^. #cacheDecisions)
   assertOk "cached lookup-subjects returns a page second" =<< runHandler (lookupSubjectsHandler cachedSubjectsEnv auditRequest)
-  statsAfterSecond <- cacheStats cachedSubjectsCache.cacheDecisions
+  statsAfterSecond <- cacheStats (cachedSubjectsCache ^. #cacheDecisions)
   assertBool
     "cached lookup-subjects uses the decision cache for confirmations"
-    (statsAfterSecond.hits > statsAfterFirst.hits)
+    ((statsAfterSecond ^. #hits) > (statsAfterFirst ^. #hits))
 
   -- The server owns the time budget. A `deadlineMaxMillis` of zero is an already-expired
   -- one, so if the clamp reaches the engine the page reports `truncated` however much
@@ -477,11 +473,14 @@ lookupSubjectsTests env = do
   let greedyRequest :: LookupSubjectsRequestWire
       greedyRequest =
         groupNesting
-          { object = exclusionSpace,
-            permission = "member",
-            limit = 1,
-            deadlineMillis = Just 86400000
-          }
+          & #object
+          .~ exclusionSpace
+          & #permission
+          .~ "member"
+          & #limit
+          .~ 1
+          & #deadlineMillis
+          ?~ 86400000
       clampedEnv = env {deadlineMaxMillis = 0}
   assertEqual
     "the server clamps a client-supplied lookup-subjects deadline"
@@ -510,7 +509,7 @@ lookupSubjectsTests env = do
 subjectsTruncated :: EnResult LookupSubjectsPageWire -> Bool
 subjectsTruncated = \case
   EnOk page ->
-    case page.state of
+    case (page ^. #state) of
       SubjectsTruncatedWire _ -> True
       _ -> False
   _ -> False
@@ -519,7 +518,7 @@ subjectsTruncated = \case
 subjectsHasMore :: EnResult LookupSubjectsPageWire -> Bool
 subjectsHasMore = \case
   EnOk page ->
-    case page.state of
+    case (page ^. #state) of
       SubjectsHasMoreWire _ -> True
       _ -> False
   _ -> False
@@ -541,7 +540,7 @@ writePreconditionTests env = do
         "{\"tuples\":[{\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"},\"relation\":\"owner\",\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"bob\"},\"caveat\":null}]}"
   assertEqual
     "a write body without the new fields still decodes to an unguarded request"
-    (WriteTuplesRequestWire {tuples = legacyBody.tuples, deletes = Nothing, preconditions = Nothing})
+    (WriteTuplesRequestWire {tuples = (legacyBody ^. #tuples), deletes = Nothing, preconditions = Nothing})
     legacyBody
   assertOk "a legacy write body still writes" =<< runHandler (writeTuplesHandler env legacyBody)
 
@@ -594,7 +593,7 @@ writePreconditionTests env = do
           WriteTuplesRequestWire
             { tuples = [],
               deletes = Nothing,
-              preconditions = Just [TupleMustExistWire (ownerFilter "alice") {objectType = ""}]
+              preconditions = Just [TupleMustExistWire (ownerFilter "alice" & #objectType .~ "")]
             }
       )
 
@@ -798,11 +797,11 @@ routingTests env = do
 
   -- POST /v1/check routes to the check handler and answers the typed decision.
   checkResponse <- postJson application "/v1/check" (encode aliceViewProjectX)
-  assertEqual "POST /v1/check returns 200" 200 (statusCode checkResponse.simpleStatus)
+  assertEqual "POST /v1/check returns 200" 200 (statusCode (simpleStatus checkResponse))
   assertEqual
     "POST /v1/check decodes to CheckResponseWire and alice may view project-x"
     (Just AllowedWire)
-    (fmap (.decision) (decode checkResponse.simpleBody :: Maybe CheckResponseWire))
+    (fmap (^. #decision) (decode (simpleBody checkResponse) :: Maybe CheckResponseWire))
 
   let unknownPermission =
         CheckRequestWire
@@ -813,15 +812,15 @@ routingTests env = do
             object = ObjectRefWire {objectType = "space", objectId = "project-x"}
           }
   typedFailure <- postJson application "/v1/check" (encode unknownPermission)
-  assertEqual "a typed check failure is a 400" 400 (statusCode typedFailure.simpleStatus)
+  assertEqual "a typed check failure is a 400" 400 (statusCode (simpleStatus typedFailure))
   assertEqual
     "a real MultiVerb failure is served as application/problem+json"
     (Just "application/problem+json")
-    (lookup "Content-Type" typedFailure.simpleHeaders)
+    (lookup "Content-Type" (simpleHeaders typedFailure))
   assertEqual
     "a real MultiVerb failure carries the typed stable code"
     (Just "unknown_relation")
-    (fmap (.code) (decode typedFailure.simpleBody :: Maybe ProblemDetails))
+    (fmap (^. #code) (decode (simpleBody typedFailure) :: Maybe ProblemDetails))
 
   -- POST /v1/lookup routes and returns a page.
   let aliceViewSpaces =
@@ -836,10 +835,10 @@ routingTests env = do
             deadlineMillis = Nothing
           }
   lookupResponse <- postJson application "/v1/lookup" (encode aliceViewSpaces)
-  assertEqual "POST /v1/lookup returns 200" 200 (statusCode lookupResponse.simpleStatus)
+  assertEqual "POST /v1/lookup returns 200" 200 (statusCode (simpleStatus lookupResponse))
   assertBool
     "POST /v1/lookup decodes to LookupPageWire"
-    (isJust (decode lookupResponse.simpleBody :: Maybe LookupPageWire))
+    (isJust (decode (simpleBody lookupResponse) :: Maybe LookupPageWire))
 
   let relationshipBody =
         ReadRelationshipsRequestWire
@@ -855,7 +854,7 @@ routingTests env = do
       fetchRelationshipPage :: PageRequest -> IO (Connection TupleWire)
       fetchRelationshipPage request = do
         response <- postJson application (relationshipPath request) (encode relationshipBody)
-        case (statusCode response.simpleStatus, decode response.simpleBody) of
+        case (statusCode (simpleStatus response), decode (simpleBody response)) of
           (200, Just page) -> pure page
           _ -> fail ("relationship page request failed: " <> show response)
 
@@ -865,31 +864,31 @@ routingTests env = do
       (defaultConformanceConfig 1)
       encode
       fetchRelationshipPage
-      [edge.node | edge <- allRelationships.edges]
+      [(edge ^. #node) | edge <- (allRelationships ^. #edges)]
   assertBool (Text.unpack (renderConformanceReport report)) (conformancePassed report)
 
   invalidCursor <- postJson application "/v1/relationships/query?first=1&after=broken" (encode relationshipBody)
-  assertEqual "a malformed Relay cursor is a 400" 400 (statusCode invalidCursor.simpleStatus)
+  assertEqual "a malformed Relay cursor is a 400" 400 (statusCode (simpleStatus invalidCursor))
   assertEqual
     "a malformed Relay cursor uses the released error envelope"
     (Just "invalid_cursor")
-    (fmap (.code) (decode invalidCursor.simpleBody :: Maybe RelayPageError))
+    (fmap code (decode (simpleBody invalidCursor) :: Maybe RelayPageError))
   assertEqual
     "a Relay 400 is JSON, not problem+json"
     (Just "application/json")
-    (lookup "Content-Type" invalidCursor.simpleHeaders)
+    (lookup "Content-Type" (simpleHeaders invalidCursor))
 
   mixedDirections <- postJson application "/v1/relationships/query?first=1&last=1" (encode relationshipBody)
   assertEqual
     "mixed Relay directions are rejected before the handler"
     (Just "mixed_pagination_directions")
-    (fmap (.code) (decode mixedDirections.simpleBody :: Maybe RelayPageError))
+    (fmap code (decode (simpleBody mixedDirections) :: Maybe RelayPageError))
 
   oversized <- postJson application "/v1/relationships/query?first=101" (encode relationshipBody)
   assertEqual
     "the route-level maximum is enforced without clamping"
     (Just "page_size_too_large")
-    (fmap (.code) (decode oversized.simpleBody :: Maybe RelayPageError))
+    (fmap code (decode (simpleBody oversized) :: Maybe RelayPageError))
 
   -- POST /v1/relationships routes to the write handler (the in-memory store accepts writes).
   let writeBody =
@@ -906,7 +905,7 @@ routingTests env = do
             preconditions = Nothing
           }
   writeResponse <- postJson application "/v1/relationships" (encode writeBody)
-  assertEqual "POST /v1/relationships routes to the write handler (200, not 404)" 200 (statusCode writeResponse.simpleStatus)
+  assertEqual "POST /v1/relationships routes to the write handler (200, not 404)" 200 (statusCode (simpleStatus writeResponse))
 
   -- POST /v1/expand routes.
   let expandBody =
@@ -919,7 +918,7 @@ routingTests env = do
             cursor = Nothing
           }
   expandResponse <- postJson application "/v1/expand" (encode expandBody)
-  assertEqual "POST /v1/expand returns 200" 200 (statusCode expandResponse.simpleStatus)
+  assertEqual "POST /v1/expand returns 200" 200 (statusCode (simpleStatus expandResponse))
 
   -- POST /v1/batch-check routes.
   let batchBody =
@@ -929,7 +928,7 @@ routingTests env = do
             pairs = [pair "alice" "view" "project-x"]
           }
   batchResponse <- postJson application "/v1/batch-check" (encode batchBody)
-  assertEqual "POST /v1/batch-check returns 200" 200 (statusCode batchResponse.simpleStatus)
+  assertEqual "POST /v1/batch-check returns 200" 200 (statusCode (simpleStatus batchResponse))
 
   let grantBody =
         MintGrantRequestWire
@@ -943,48 +942,48 @@ routingTests env = do
             requestId = Just "req-disabled-mint"
           }
   disabledGrant <- postJson application "/v1/grants" (encode grantBody)
-  assertEqual "a disabled grant minter returns 404" 404 (statusCode disabledGrant.simpleStatus)
+  assertEqual "a disabled grant minter returns 404" 404 (statusCode (simpleStatus disabledGrant))
   assertEqual
     "a disabled grant minter returns its typed not_found problem"
     (Just "not_found")
-    (fmap (.code) (decode disabledGrant.simpleBody :: Maybe ProblemDetails))
+    (fmap (^. #code) (decode (simpleBody disabledGrant) :: Maybe ProblemDetails))
   assertEqual
     "a disabled grant minter uses application/problem+json"
     (Just "application/problem+json")
-    (lookup "Content-Type" disabledGrant.simpleHeaders)
+    (lookup "Content-Type" (simpleHeaders disabledGrant))
 
   {- The point of the milestone: a malformed body comes back as a machine-readable
   problem, proving envelopeFormatters' bodyParserErrorFormatter survived the refactor. -}
   malformed <- postJson application "/v1/check" "not json at all"
-  assertEqual "a malformed body is a 400" 400 (statusCode malformed.simpleStatus)
+  assertEqual "a malformed body is a 400" 400 (statusCode (simpleStatus malformed))
   assertEqual
     "a malformed body returns ProblemDetails with code malformed_request_body"
     (Just "malformed_request_body")
-    (fmap (.code) (decode malformed.simpleBody :: Maybe ProblemDetails))
+    (fmap (^. #code) (decode (simpleBody malformed) :: Maybe ProblemDetails))
   assertEqual
     "a malformed body uses application/problem+json"
     (Just "application/problem+json")
-    (lookup "Content-Type" malformed.simpleHeaders)
+    (lookup "Content-Type" (simpleHeaders malformed))
   assertEqual
     "a malformed body's status member matches its HTTP status"
     (Just 400)
-    (fmap (.status) (decode malformed.simpleBody :: Maybe ProblemDetails))
+    (fmap (^. #status) (decode (simpleBody malformed) :: Maybe ProblemDetails))
 
   -- An unmatched path comes back as a 404 problem, proving notFoundErrorFormatter.
   notThere <- postJson application "/v1/no-such-path" "{}"
-  assertEqual "an unknown path is a 404" 404 (statusCode notThere.simpleStatus)
+  assertEqual "an unknown path is a 404" 404 (statusCode (simpleStatus notThere))
   assertEqual
     "an unknown path returns ProblemDetails with code not_found"
     (Just "not_found")
-    (fmap (.code) (decode notThere.simpleBody :: Maybe ProblemDetails))
+    (fmap (^. #code) (decode (simpleBody notThere) :: Maybe ProblemDetails))
   assertEqual
     "an unknown path uses application/problem+json"
     (Just "application/problem+json")
-    (lookup "Content-Type" notThere.simpleHeaders)
+    (lookup "Content-Type" (simpleHeaders notThere))
   assertEqual
     "an unknown path's status member matches its HTTP status"
     (Just 404)
-    (fmap (.status) (decode notThere.simpleBody :: Maybe ProblemDetails))
+    (fmap (^. #status) (decode (simpleBody notThere) :: Maybe ProblemDetails))
 
   methodMismatch <-
     runSession
@@ -995,19 +994,19 @@ routingTests env = do
             }
       )
       application
-  assertEqual "DELETE /v1/relationships is a 405" 405 (statusCode methodMismatch.simpleStatus)
+  assertEqual "DELETE /v1/relationships is a 405" 405 (statusCode (simpleStatus methodMismatch))
   assertEqual
     "the method mismatch returns the stable problem code"
     (Just "method_not_allowed")
-    (fmap (.code) (decode methodMismatch.simpleBody :: Maybe ProblemDetails))
+    (fmap (^. #code) (decode (simpleBody methodMismatch) :: Maybe ProblemDetails))
   assertEqual
     "the method mismatch uses application/problem+json"
     (Just "application/problem+json")
-    (lookup "Content-Type" methodMismatch.simpleHeaders)
+    (lookup "Content-Type" (simpleHeaders methodMismatch))
   assertEqual
     "the method mismatch body's status member matches its HTTP status"
     (Just 405)
-    (fmap (.status) (decode methodMismatch.simpleBody :: Maybe ProblemDetails))
+    (fmap (^. #status) (decode (simpleBody methodMismatch) :: Maybe ProblemDetails))
 
 -- | @POST <path>@ with a JSON body, driven through the WAI 'Application'.
 postJson :: Application -> BS.ByteString -> ByteString -> IO SResponse
@@ -1232,9 +1231,9 @@ openApiDocumentTests = do
 
     catalogCodesAt responseStatus =
       List.sort
-        [ spec.code
+        [ (spec ^. #code)
         | spec <- problemCatalog,
-          Text.pack (show spec.status) == responseStatus
+          Text.pack (show (spec ^. #status)) == responseStatus
         ]
 
     documentedCodes document path responseStatus =
@@ -1312,15 +1311,15 @@ subjectFilterWire subjectType subjectId =
 -- alongside it. A reload swaps the graph, and the reported hash follows by construction.
 schemaEndpointTests :: Env TestEffects -> IO ()
 schemaEndpointTests env = do
-  let SchemaHash expectedHash = testActiveSchema.graph.hash
+  let SchemaHash expectedHash = (testActiveSchema ^. #graph . #hash)
   assertEqual
     "the schema endpoint reports the active snapshot"
     ( Right
         SchemaInfoWire
-          { source = testActiveSchema.source,
+          { source = (testActiveSchema ^. #source),
             hash = expectedHash,
-            origin = testActiveSchema.origin,
-            loadedAt = testActiveSchema.loadedAt
+            origin = (testActiveSchema ^. #origin),
+            loadedAt = (testActiveSchema ^. #loadedAt)
           }
     )
     =<< runHandler (schemaHandler env)
@@ -1343,13 +1342,13 @@ watchEndpointTests env = do
           other -> fail (label <> "\nexpected EnOk, got: " <> show other)
 
       identify response =
-        [ (change.kind, change.tuple.object.objectType, change.tuple.object.objectId, change.tuple.relation)
-        | change <- response.changes
+        [ ((change ^. #kind), (change ^. #tuple . #object . #objectType), (change ^. #tuple . #object . #objectId), (change ^. #tuple . #relation))
+        | change <- (response ^. #changes)
         ]
 
   fromNow <- okPoll "poll from now" Nothing Nothing Nothing 100
-  assertBool "a batch always carries a cursor" (not (Text.null fromNow.cursor))
-  assertEqual "a batch carries the token of the snapshot it ends at" testCheckedAt fromNow.checkedAt
+  assertBool "a batch always carries a cursor" (not (Text.null (fromNow ^. #cursor)))
+  assertEqual "a batch carries the token of the snapshot it ends at" testCheckedAt (fromNow ^. #checkedAt)
 
   -- A filter scopes the subscription, through the very grammar the relationship read uses.
   scoped <- okPoll "poll alice's grants" Nothing Nothing (Just (subjectFilterWire "user" "alice")) 100
@@ -1366,7 +1365,7 @@ watchEndpointTests env = do
     runHandler (watchHandler smallEnv WatchRequestWire {cursor = Nothing, startToken = Nothing, filter = Nothing, limit = 100}) >>= \case
       Right (EnOk response) -> pure response
       other -> fail ("expected a clamped page, got: " <> show other)
-  assertEqual "a limit above the server's bound is clamped, not rejected" 1 (length clamped.changes)
+  assertEqual "a limit above the server's bound is clamped, not rejected" 1 (length (clamped ^. #changes))
 
   {- Exactly one start position. Supplying two is the mistake worth naming: a caller that
   passes both a cursor and a token does not know where it wants to start, and choosing for
@@ -1420,8 +1419,8 @@ relationshipEndpointTests env = do
         ]
 
       identify response =
-        [ (wire.object.objectType, wire.object.objectId, wire.relation)
-        | Edge {node = wire} <- response.edges
+        [ ((wire ^. #object . #objectType), (wire ^. #object . #objectId), (wire ^. #relation))
+        | Edge {node = wire} <- (response ^. #edges)
         ]
 
       okQuery label relationshipFilter pageRequest =
@@ -1431,25 +1430,25 @@ relationshipEndpointTests env = do
 
   aliceAll <- okQuery "query alice" (subjectFilterWire "user" "alice") (page 100 Forward Nothing)
   assertEqual "query returns every grant naming the subject" aliceGrants (identify aliceAll)
-  assertBool "a complete page has no continuation" (not aliceAll.pageInfo.hasNextPage)
+  assertBool "a complete page has no continuation" (not (aliceAll ^. #pageInfo . #hasNextPage))
 
   -- Keyset pagination: the cursor resumes, it does not restart.
   firstPage <- okQuery "query alice, page 1" (subjectFilterWire "user" "alice") (page 1 Forward Nothing)
   assertEqual "the first page carries the requested limit" (take 1 aliceGrants) (identify firstPage)
   cursor <-
-    case firstPage.pageInfo.endCursor of
-      Just next | firstPage.pageInfo.hasNextPage -> pure next
+    case (firstPage ^. #pageInfo . #endCursor) of
+      Just next | (firstPage ^. #pageInfo . #hasNextPage) -> pure next
       other -> fail ("expected the first page to have more, got " <> show other)
   secondPage <- okQuery "query alice, page 2" (subjectFilterWire "user" "alice") (page 1 Forward (Just cursor))
   assertEqual "the second page resumes rather than restarts" (drop 1 aliceGrants) (identify secondPage)
-  assertBool "the second page has no forward continuation" (not secondPage.pageInfo.hasNextPage)
+  assertBool "the second page has no forward continuation" (not (secondPage ^. #pageInfo . #hasNextPage))
 
   report <-
     checkConformance
       (defaultConformanceConfig 1)
-      (\wire -> (wire.object.objectType, wire.object.objectId, wire.relation))
+      (\wire -> ((wire ^. #object . #objectType), (wire ^. #object . #objectId), (wire ^. #relation)))
       (\request -> okQuery "conformance walk" (subjectFilterWire "user" "alice") request)
-      [edge.node | edge <- aliceAll.edges]
+      [(edge ^. #node) | edge <- (aliceAll ^. #edges)]
   assertBool (Text.unpack (renderConformanceReport report)) (conformancePassed report)
 
   -- A caveat name is a residual predicate, and it is anchored by the subject.
@@ -1495,9 +1494,9 @@ relationshipEndpointTests env = do
 
   runHandler (deleteRelationshipsHandler env DeleteRelationshipsRequestWire {filter = subjectFilterWire "user" "alice", dryRun = False}) >>= \case
     Right (EnOk response) -> do
-      assertEqual "a real delete reports the same count" 2 response.count
-      assertBool "a real delete mints a token" (response.token /= Nothing)
-      assertBool "a real delete says it was not a dry run" (not response.dryRun)
+      assertEqual "a real delete reports the same count" 2 (response ^. #count)
+      assertBool "a real delete mints a token" ((response ^. #token) /= Nothing)
+      assertBool "a real delete says it was not a dry run" (not (response ^. #dryRun))
     other -> fail ("delete\nexpected EnOk, got: " <> show other)
 
   assertEqual
@@ -1580,12 +1579,12 @@ errorModelTests = do
           assertEqual
             ("a malformed token is a stable malformed_consistency_token: " <> Text.unpack tokenText)
             "malformed_consistency_token"
-            details.code
+            (details ^. #code)
           Foldable.traverse_
             ( \forbidden ->
                 assertBool
-                  ("response body for " <> Text.unpack tokenText <> " must not leak the internal name " <> Text.unpack forbidden <> "; got: " <> Text.unpack details.detail)
-                  (not (forbidden `Text.isInfixOf` details.detail))
+                  ("response body for " <> Text.unpack tokenText <> " must not leak the internal name " <> Text.unpack forbidden <> "; got: " <> Text.unpack (details ^. #detail))
+                  (not (forbidden `Text.isInfixOf` (details ^. #detail)))
             )
             ["TokenBad", "MalformedConsistencyToken", "ConsistencyTokenExpired", "InvalidConsistencyToken"]
 
@@ -1595,7 +1594,7 @@ errorModelTests = do
 
     statusCodeRetryable :: EnFault -> (Int, Text, Bool)
     statusCodeRetryable fault =
-      (errHTTPCode (faultToServerError fault), details.code, details.retryable)
+      (errHTTPCode (faultToServerError fault), (details ^. #code), (details ^. #retryable))
       where
         details = problemOf fault
 
@@ -2084,13 +2083,13 @@ stubWatch _start relationshipFilter limit = do
   revision <- headRevision
   checkedAt <- mintToken revision
   page <- readChanges revision revision relationshipFilter limit Nothing
-  pure WatchBatch {changes = page.changes, cursor = "enwatch1.test.at.test-revision..", checkedAt}
+  pure WatchBatch {changes = (page ^. #changes), cursor = "enwatch1.test.at.test-revision..", checkedAt}
 
 -- | Did the engine stop early because its deadline had elapsed?
 isTruncated :: EnResult LookupPageWire -> Bool
 isTruncated = \case
   EnOk page ->
-    case page.state of
+    case (page ^. #state) of
       LookupTruncatedWire _ -> True
       _ -> False
   _ -> False
@@ -2099,7 +2098,7 @@ isTruncated = \case
 hasMore :: EnResult LookupPageWire -> Bool
 hasMore = \case
   EnOk page ->
-    case page.state of
+    case (page ^. #state) of
       LookupHasMoreWire _ -> True
       _ -> False
   _ -> False
@@ -2123,20 +2122,20 @@ objectToWire ObjectRef {objectType = ObjectType objectType, objectId} =
 clientErrorCodeOf :: Handler (EnResult a) -> IO (Maybe Text)
 clientErrorCodeOf handler =
   runHandler handler <&> \case
-    Right (EnClientError envelope) -> Just envelope.code
+    Right (EnClientError envelope) -> Just (envelope ^. #code)
     _ -> Nothing
 
 relationshipClientErrorCodeOf :: Handler RelationshipPageResult -> IO (Maybe Text)
 relationshipClientErrorCodeOf handler =
   runHandler handler <&> \case
-    Right (RelationshipPageBadRequest envelope) -> Just envelope.code
+    Right (RelationshipPageBadRequest envelope) -> Just (envelope ^. #code)
     _ -> Nothing
 
 -- | The stable code of a 412, or 'Nothing' if the handler answered anything else.
 preconditionCodeOf :: Handler (EnResult a) -> IO (Maybe Text)
 preconditionCodeOf handler =
   runHandler handler <&> \case
-    Right (EnPreconditionFailed envelope) -> Just envelope.code
+    Right (EnPreconditionFailed envelope) -> Just (envelope ^. #code)
     _ -> Nothing
 
 assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -2175,13 +2174,13 @@ testSigningKey = "1:a2c4ead323536b925f3488ee83e0888b79c2761405ca7c0c9a018c7c1905
 
 mintOutcome :: Either err MintGrantResult -> Maybe (Int, Text)
 mintOutcome = \case
-  Right (MintBadRequest details) -> Just (400, details.code)
-  Right (MintForbidden details) -> Just (403, details.code)
-  Right (MintNotFound details) -> Just (404, details.code)
-  Right (MintPreconditionFailed details) -> Just (412, details.code)
-  Right (MintUnprocessable details) -> Just (422, details.code)
-  Right (MintInternal details) -> Just (500, details.code)
-  Right (MintUnavailable details) -> Just (503, details.code)
+  Right (MintBadRequest details) -> Just (400, (details ^. #code))
+  Right (MintForbidden details) -> Just (403, (details ^. #code))
+  Right (MintNotFound details) -> Just (404, (details ^. #code))
+  Right (MintPreconditionFailed details) -> Just (412, (details ^. #code))
+  Right (MintUnprocessable details) -> Just (422, (details ^. #code))
+  Right (MintInternal details) -> Just (500, (details ^. #code))
+  Right (MintUnavailable details) -> Just (503, (details ^. #code))
   _ -> Nothing
 
 -- | @POST \/v1\/grants@ over the wire, against the in-memory store.
@@ -2226,8 +2225,8 @@ mintGrantTests baseEnv = do
     runHandler (grantsFor mintEnv request) >>= \case
       Right (MintGrantOk r) -> pure r
       other -> fail ("mint: expected MintGrantOk, got " <> show other)
-  assertEqual "mint: checkedAt is the snapshot the check evaluated at" testCheckedAt response.checkedAt
-  assertBool "mint: at least one revocation id" (not (null response.revocationIds))
+  assertEqual "mint: checkedAt is the snapshot the check evaluated at" testCheckedAt (response ^. #checkedAt)
+  assertBool "mint: at least one revocation id" (not (null (response ^. #revocationIds)))
 
   now <- getCurrentTime
   let verifyRequest =
@@ -2237,38 +2236,38 @@ mintGrantTests baseEnv = do
             operation = RelationName "view",
             resource = ObjectRef (ObjectType "space") "project-x",
             serviceName = Audience "document-service",
-            acceptedSchemaHashes = Set.singleton testActiveSchema.graph.hash,
+            acceptedSchemaHashes = Set.singleton (testActiveSchema ^. #graph . #hash),
             now = now,
             revoked = const (pure False),
             revokedBlockIds = const (pure False)
           }
-  verifyGrant keySet (encodeUtf8 response.token) verifyRequest >>= \case
+  verifyGrant keySet (encodeUtf8 (response ^. #token)) verifyRequest >>= \case
     Right grant -> do
-      let ConsistencyToken recovered = grant.consistencyToken
+      let ConsistencyToken recovered = (grant ^. #consistencyToken)
       assertEqual
         "mint: the token verifies and its consistency token is the response's checkedAt"
-        response.checkedAt
+        (response ^. #checkedAt)
         recovered
     Left err -> fail ("mint: the minted token should verify locally, got " <> show err)
 
   -- Denied -> 403, no token.
   denied <-
     runHandler
-      (grantsFor mintEnv request {subject = SubjectIdWire ObjectRefWire {objectType = "user", objectId = "bob"}})
+      (grantsFor mintEnv (request & #subject .~ SubjectIdWire ObjectRefWire {objectType = "user", objectId = "bob"}))
   assertEqual
     "mint: a Denied decision is 403 decision_not_allowed"
     (Just (403, "decision_not_allowed"))
     (mintOutcome denied)
 
   -- ttlSeconds above the configured maximum -> 400 (rejected, not clamped).
-  tooLong <- runHandler (grantsFor mintEnv request {ttlSeconds = Just 999999})
+  tooLong <- runHandler (grantsFor mintEnv (request & #ttlSeconds ?~ 999999))
   assertEqual
     "mint: ttlSeconds above the maximum is 400 invalid_request"
     (Just (400, "invalid_request"))
     (mintOutcome tooLong)
 
   -- A non-concrete subject -> 400.
-  nonConcrete <- runHandler (grantsFor mintEnv request {subject = SubjectWildcardWire "user"})
+  nonConcrete <- runHandler (grantsFor mintEnv (request & #subject .~ SubjectWildcardWire "user"))
   assertEqual
     "mint: a non-concrete subject is 400 invalid_request"
     (Just (400, "invalid_request"))

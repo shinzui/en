@@ -50,6 +50,7 @@ import En.Tuple
     Tuple (..),
     TupleCaveat (..),
   )
+import GHC.Generics (Generic)
 import Text.Read (readMaybe)
 import Prelude hiding (lookup)
 
@@ -126,7 +127,7 @@ data LookupObject = LookupObject
   { object :: !ObjectRef,
     decision :: !CheckDecision
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 data LookupState
   = LookupExhausted
@@ -146,7 +147,7 @@ data LookupPage = LookupPage
     state :: !LookupState,
     checkedAt :: !ConsistencyToken
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | List the objects of @objectType@ on which @subject@ has @permission@:
 -- reverse expansion (subject → resource) plus reach-then-check for conditional

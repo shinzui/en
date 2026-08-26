@@ -61,6 +61,7 @@ library
     , en-biscuit
     , en-core
     , en-postgres
+    , generic-lens              >=2.2  && <2.4
     , http-media
     , http-types
     , lens
@@ -108,6 +109,7 @@ test-suite en-servant-tests
     , en-core
     , en-postgres
     , en-servant
+    , generic-lens                  >=2.2  && <2.4
     , http-types
     , openapi-hs
     , relay-pagination

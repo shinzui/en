@@ -29,6 +29,7 @@ import En.Revision
     Revision,
     SchemaHash,
   )
+import GHC.Generics (Generic)
 
 -- | Decoded, validated token contents.
 data TokenMetadata = TokenMetadata
@@ -45,7 +46,7 @@ data ResolvedConsistency = ResolvedConsistency
   { consistency :: !Consistency,
     revision :: !Revision
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 data ConsistencyStore :: Effect where
   DecodeToken :: ConsistencyToken -> ConsistencyStore m TokenMetadata

@@ -28,7 +28,6 @@ module En.Check.Api
 where
 
 import Auth.Biscuit.Utils (encodeHex)
-import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (throwE)
 import Data.Aeson
   ( FromJSON (..),
@@ -40,21 +39,19 @@ import Data.Aeson
     (.=),
   )
 import Data.Aeson qualified as Aeson
+import Data.Generics.Labels ()
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.SOP (I (..), NS (..))
-import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding (decodeUtf8)
-import Data.Time (NominalDiffTime, UTCTime, addUTCTime, getCurrentTime)
+import Data.Time (NominalDiffTime, addUTCTime)
 import Effectful qualified
 import En.Biscuit.Grant (Audience (..), EnGrant (..), RequestId (..))
 import En.Biscuit.Mint (MintConfig (..), MintedGrant (..), mintObjectGrantWithExpiry)
-import En.Check (BatchOutcome (..), BatchPair (..), CheckDecision (..), CheckOutcome (..), checkMany)
+import En.Check (BatchPair (..), CheckDecision (..), CheckOutcome (..), checkMany)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
--- 'ReachabilityGraph' is imported for its @hash@ field, not its constructor: GHC solves the
--- @HasField "hash"@ constraint behind @active.graph.hash@ only when the field is in scope.
-import En.Reachability (ReachabilityGraph (..))
+import En.Prelude hiding ((.=))
 import En.Revision (Consistency, ConsistencyToken (..))
 import En.Schema (RelationName (..))
 import En.Servant.Problem
@@ -75,8 +72,7 @@ import En.Servant.Response
     traverseOrInvalid,
   )
 import En.Servant.Seam
-  ( ActiveSchema (..),
-    EnFault (..),
+  ( EnFault (..),
     Env (..),
     MintEnv (..),
     badRequest,
@@ -98,7 +94,6 @@ import En.Servant.Wire
     subjectFromWire,
   )
 import En.Tuple (CaveatContext, ObjectRef, Subject (..))
-import GHC.Generics (Generic)
 import Servant
   ( Handler,
     JSON,
@@ -151,24 +146,24 @@ data CheckRequestWire = CheckRequestWire
     permission :: !Text,
     object :: !ObjectRefWire
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON CheckRequestWire where
   toJSON wire =
     Aeson.object
-      [ "consistency" .= wire.consistency,
-        "context" .= wire.context,
-        "subject" .= wire.subject,
-        "permission" .= wire.permission,
-        "object" .= wire.object
+      [ "consistency" .= (wire ^. #consistency),
+        "context" .= (wire ^. #context),
+        "subject" .= (wire ^. #subject),
+        "permission" .= (wire ^. #permission),
+        "object" .= (wire ^. #object)
       ]
   toEncoding wire =
     pairs
-      ( "consistency" .= wire.consistency
-          <> "context" .= wire.context
-          <> "subject" .= wire.subject
-          <> "permission" .= wire.permission
-          <> "object" .= wire.object
+      ( "consistency" .= (wire ^. #consistency)
+          <> "context" .= (wire ^. #context)
+          <> "subject" .= (wire ^. #subject)
+          <> "permission" .= (wire ^. #permission)
+          <> "object" .= (wire ^. #object)
       )
 
 instance FromJSON CheckRequestWire where
@@ -189,11 +184,11 @@ data CheckResponseWire = CheckResponseWire
   { decision :: !CheckDecisionWire,
     checkedAt :: !Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON CheckResponseWire where
-  toJSON wire = Aeson.object ["decision" .= wire.decision, "checkedAt" .= wire.checkedAt]
-  toEncoding wire = pairs ("decision" .= wire.decision <> "checkedAt" .= wire.checkedAt)
+  toJSON wire = Aeson.object ["decision" .= (wire ^. #decision), "checkedAt" .= (wire ^. #checkedAt)]
+  toEncoding wire = pairs ("decision" .= (wire ^. #decision) <> "checkedAt" .= (wire ^. #checkedAt))
 
 instance FromJSON CheckResponseWire where
   parseJSON = withObject "CheckResponseWire" \o ->
@@ -204,13 +199,13 @@ data BatchCheckPairWire = BatchCheckPairWire
     permission :: !Text,
     object :: !ObjectRefWire
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON BatchCheckPairWire where
   toJSON wire =
-    Aeson.object ["subject" .= wire.subject, "permission" .= wire.permission, "object" .= wire.object]
+    Aeson.object ["subject" .= (wire ^. #subject), "permission" .= (wire ^. #permission), "object" .= (wire ^. #object)]
   toEncoding wire =
-    pairs ("subject" .= wire.subject <> "permission" .= wire.permission <> "object" .= wire.object)
+    pairs ("subject" .= (wire ^. #subject) <> "permission" .= (wire ^. #permission) <> "object" .= (wire ^. #object))
 
 instance FromJSON BatchCheckPairWire where
   parseJSON = withObject "BatchCheckPairWire" \o ->
@@ -221,20 +216,20 @@ data BatchCheckRequestWire = BatchCheckRequestWire
     context :: !CaveatContextWire,
     pairs :: ![BatchCheckPairWire]
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON BatchCheckRequestWire where
   toJSON wire =
     Aeson.object
-      [ "consistency" .= wire.consistency,
-        "context" .= wire.context,
-        "pairs" .= wire.pairs
+      [ "consistency" .= (wire ^. #consistency),
+        "context" .= (wire ^. #context),
+        "pairs" .= (wire ^. #pairs)
       ]
   toEncoding wire =
     pairs
-      ( "consistency" .= wire.consistency
-          <> "context" .= wire.context
-          <> "pairs" .= wire.pairs
+      ( "consistency" .= (wire ^. #consistency)
+          <> "context" .= (wire ^. #context)
+          <> "pairs" .= (wire ^. #pairs)
       )
 
 instance FromJSON BatchCheckRequestWire where
@@ -249,11 +244,11 @@ data BatchCheckResponseWire = BatchCheckResponseWire
   { decisions :: ![CheckDecisionWire],
     checkedAt :: !Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON BatchCheckResponseWire where
-  toJSON wire = Aeson.object ["decisions" .= wire.decisions, "checkedAt" .= wire.checkedAt]
-  toEncoding wire = pairs ("decisions" .= wire.decisions <> "checkedAt" .= wire.checkedAt)
+  toJSON wire = Aeson.object ["decisions" .= (wire ^. #decisions), "checkedAt" .= (wire ^. #checkedAt)]
+  toEncoding wire = pairs ("decisions" .= (wire ^. #decisions) <> "checkedAt" .= (wire ^. #checkedAt))
 
 instance FromJSON BatchCheckResponseWire where
   parseJSON = withObject "BatchCheckResponseWire" \o ->
@@ -279,30 +274,30 @@ data MintGrantRequestWire = MintGrantRequestWire
     ttlSeconds :: !(Maybe Int),
     requestId :: !(Maybe Text)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON MintGrantRequestWire where
   toJSON wire =
     Aeson.object $
-      [ "consistency" .= wire.consistency,
-        "context" .= wire.context,
-        "subject" .= wire.subject,
-        "permission" .= wire.permission,
-        "object" .= wire.object,
-        "audience" .= wire.audience
+      [ "consistency" .= (wire ^. #consistency),
+        "context" .= (wire ^. #context),
+        "subject" .= (wire ^. #subject),
+        "permission" .= (wire ^. #permission),
+        "object" .= (wire ^. #object),
+        "audience" .= (wire ^. #audience)
       ]
-        <> foldMap (\value -> ["ttlSeconds" .= value]) wire.ttlSeconds
-        <> foldMap (\value -> ["requestId" .= value]) wire.requestId
+        <> foldMap (\value -> ["ttlSeconds" .= value]) (wire ^. #ttlSeconds)
+        <> foldMap (\value -> ["requestId" .= value]) (wire ^. #requestId)
   toEncoding wire =
     pairs $
-      "consistency" .= wire.consistency
-        <> "context" .= wire.context
-        <> "subject" .= wire.subject
-        <> "permission" .= wire.permission
-        <> "object" .= wire.object
-        <> "audience" .= wire.audience
-        <> foldMap ("ttlSeconds" .=) wire.ttlSeconds
-        <> foldMap ("requestId" .=) wire.requestId
+      "consistency" .= (wire ^. #consistency)
+        <> "context" .= (wire ^. #context)
+        <> "subject" .= (wire ^. #subject)
+        <> "permission" .= (wire ^. #permission)
+        <> "object" .= (wire ^. #object)
+        <> "audience" .= (wire ^. #audience)
+        <> foldMap ("ttlSeconds" .=) (wire ^. #ttlSeconds)
+        <> foldMap ("requestId" .=) (wire ^. #requestId)
 
 instance FromJSON MintGrantRequestWire where
   parseJSON = withObject "MintGrantRequestWire" \o ->
@@ -331,22 +326,22 @@ data MintGrantResponseWire = MintGrantResponseWire
     revocationIds :: ![Text],
     checkedAt :: !Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON MintGrantResponseWire where
   toJSON wire =
     Aeson.object
-      [ "token" .= wire.token,
-        "expiresAt" .= wire.expiresAt,
-        "revocationIds" .= wire.revocationIds,
-        "checkedAt" .= wire.checkedAt
+      [ "token" .= (wire ^. #token),
+        "expiresAt" .= (wire ^. #expiresAt),
+        "revocationIds" .= (wire ^. #revocationIds),
+        "checkedAt" .= (wire ^. #checkedAt)
       ]
   toEncoding wire =
     pairs
-      ( "token" .= wire.token
-          <> "expiresAt" .= wire.expiresAt
-          <> "revocationIds" .= wire.revocationIds
-          <> "checkedAt" .= wire.checkedAt
+      ( "token" .= (wire ^. #token)
+          <> "expiresAt" .= (wire ^. #expiresAt)
+          <> "revocationIds" .= (wire ^. #revocationIds)
+          <> "checkedAt" .= (wire ^. #checkedAt)
       )
 
 instance FromJSON MintGrantResponseWire where
@@ -377,7 +372,7 @@ data MintGrantResult
   | MintUnprocessable !ProblemDetails
   | MintInternal !ProblemDetails
   | MintUnavailable !ProblemDetails
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance AsUnion MintGrantResponses MintGrantResult where
   toUnion = \case
@@ -403,68 +398,68 @@ instance AsUnion MintGrantResponses MintGrantResult where
 -- * Handlers
 
 checkHandler :: Env es -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
-checkHandler env request = enHandler do
+checkHandler env@Env {checkOperation} request = enHandler do
   active <- activeSchema env
-  consistency <- orInvalid (consistencyFromWire request.consistency)
-  context <- orInvalid (contextFromWire request.context)
-  subject <- orInvalid (subjectFromWire request.subject)
-  object <- orInvalid (objectRefFromWire request.object)
+  consistency <- orInvalid (consistencyFromWire (request ^. #consistency))
+  context <- orInvalid (contextFromWire (request ^. #context))
+  subject <- orInvalid (subjectFromWire (request ^. #subject))
+  object <- orInvalid (objectRefFromWire (request ^. #object))
   outcome <-
     engine
       env
       active
-      ( env.checkOperation
-          active.graph
+      ( checkOperation
+          (active ^. #graph)
           consistency
           context
           subject
-          (RelationName request.permission)
+          (RelationName (request ^. #permission))
           object
       )
-  let ConsistencyToken checkedAt = outcome.checkedAt
-  pure CheckResponseWire {decision = decisionToWire outcome.decision, checkedAt}
+  let ConsistencyToken checkedAt = (outcome ^. #checkedAt)
+  pure CheckResponseWire {decision = decisionToWire (outcome ^. #decision), checkedAt}
 
 batchCheckHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) => Env es -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
-batchCheckHandler env request = enHandler do
+batchCheckHandler env@Env {maxBatchSize} request = enHandler do
   active <- activeSchema env
-  if length request.pairs > env.maxBatchSize
+  if length (request ^. #pairs) > maxBatchSize
     then
       throwE
-        (batchTooLarge ("batch exceeds the maximum of " <> Text.pack (show env.maxBatchSize) <> " pairs"))
+        (batchTooLarge ("batch exceeds the maximum of " <> Text.pack (show maxBatchSize) <> " pairs"))
     else pure ()
-  consistency <- orInvalid (consistencyFromWire request.consistency)
-  context <- orInvalid (contextFromWire request.context)
-  batchPairs <- traverseOrInvalid pairFromWire request.pairs
+  consistency <- orInvalid (consistencyFromWire (request ^. #consistency))
+  context <- orInvalid (contextFromWire (request ^. #context))
+  batchPairs <- traverseOrInvalid pairFromWire (request ^. #pairs)
   outcome <-
     engine
       env
       active
       ( checkMany
-          active.graph
+          (active ^. #graph)
           consistency
           context
           batchPairs
       )
-  let ConsistencyToken checkedAt = outcome.checkedAt
+  let ConsistencyToken checkedAt = (outcome ^. #checkedAt)
   -- Fail closed on the wire: a pair the engine could not evaluate is reported
   -- as a denial. The engine now preserves the error, so
   -- docs/plans/35-version-the-wire-contract-and-type-the-error-model.md can
   -- add a per-pair error channel without touching evaluation.
   pure
     BatchCheckResponseWire
-      { decisions = either (const DeniedWire) decisionToWire <$> outcome.decisions,
+      { decisions = either (const DeniedWire) decisionToWire <$> (outcome ^. #decisions),
         checkedAt
       }
   where
     pairFromWire :: BatchCheckPairWire -> Either Text BatchPair
     pairFromWire wire =
       BatchPair
-        <$> subjectFromWire wire.subject
-        <*> ( if Text.null wire.permission
+        <$> subjectFromWire (wire ^. #subject)
+        <*> ( if Text.null (wire ^. #permission)
                 then Left "permission must not be empty"
-                else Right (RelationName wire.permission)
+                else Right (RelationName (wire ^. #permission))
             )
-        <*> objectRefFromWire wire.object
+        <*> objectRefFromWire (wire ^. #object)
 
 -- | The decoded, validated inputs a mint needs, projected out of
 -- 'MintGrantRequestWire' once so the handler proper reads as the check-then-mint
@@ -479,6 +474,7 @@ data MintInputs = MintInputs
     ttl :: !NominalDiffTime,
     requestId :: !(Maybe Text)
   }
+  deriving stock (Generic)
 
 -- | Mint a Biscuit decision token for one subject/permission/object, if an
 -- authenticated caller's request is 'Allowed'.
@@ -494,23 +490,23 @@ data MintInputs = MintInputs
 -- ran against (@active.graph.hash@). 'mintObjectGrantWithExpiry' enforces the
 -- 'Allowed'-only rule again, independently.
 mintGrantHandler :: Env es -> MintGrantRequestWire -> Handler MintGrantResult
-mintGrantHandler env request =
-  case env.mint of
+mintGrantHandler env@Env {mint, readActiveSchema, checkOperation} request =
+  case mint of
     Nothing -> pure (MintNotFound (problem specNotFound "grant minting is not enabled"))
     Just mintEnv ->
       case decodeMintRequest mintEnv request of
         Left fault -> pure (faultToMintResult fault)
         Right inputs -> do
-          active <- liftIO env.readActiveSchema
+          active <- liftIO readActiveSchema
           outcome <-
             runEngineEither env active $
-              env.checkOperation
-                active.graph
-                inputs.consistency
-                inputs.context
-                inputs.subject
-                inputs.permission
-                inputs.object
+              checkOperation
+                (active ^. #graph)
+                (inputs ^. #consistency)
+                (inputs ^. #context)
+                (inputs ^. #subject)
+                (inputs ^. #permission)
+                (inputs ^. #object)
           case outcome of
             Left fault -> pure (faultToMintResult fault)
             Right CheckOutcome {decision, checkedAt} ->
@@ -519,24 +515,24 @@ mintGrantHandler env request =
                 Conditional _ -> pure (MintForbidden (problem specDecisionNotAllowed "the authorization decision was Conditional"))
                 Allowed -> do
                   mintedAt <- liftIO getCurrentTime
-                  let expiry = addUTCTime inputs.ttl mintedAt
+                  let expiry = addUTCTime (inputs ^. #ttl) mintedAt
                       grant =
                         EnGrant
-                          { subject = inputs.subject,
-                            permission = inputs.permission,
-                            object = inputs.object,
+                          { subject = (inputs ^. #subject),
+                            permission = (inputs ^. #permission),
+                            object = (inputs ^. #object),
                             consistencyToken = checkedAt,
-                            schemaHash = active.graph.hash,
+                            schemaHash = (active ^. #graph . #hash),
                             expiresAt = expiry,
-                            audience = Audience inputs.audience,
-                            requestId = RequestId <$> inputs.requestId,
+                            audience = Audience (inputs ^. #audience),
+                            requestId = RequestId <$> (inputs ^. #requestId),
                             revocationId = Nothing
                           }
                       config =
                         MintConfig
-                          { issuerSecretKey = mintEnv.issuerSecretKey,
-                            issuerKeyId = mintEnv.issuerKeyId,
-                            defaultTtl = mintEnv.defaultTtl,
+                          { issuerSecretKey = (mintEnv ^. #issuerSecretKey),
+                            issuerKeyId = (mintEnv ^. #issuerKeyId),
+                            defaultTtl = (mintEnv ^. #defaultTtl),
                             now = pure mintedAt
                           }
                   minted <- mintObjectGrantWithExpiry config expiry decision grant
@@ -568,13 +564,13 @@ faultToMintResult = \case
 -- would otherwise become.
 decodeMintRequest :: MintEnv -> MintGrantRequestWire -> Either EnFault MintInputs
 decodeMintRequest mintEnv request = do
-  consistency <- orFault (consistencyFromWire request.consistency)
-  context <- orFault (contextFromWire request.context)
-  subject <- orFault (concreteSubjectFromWire request.subject)
-  object <- orFault (objectRefFromWire request.object)
-  permission <- orFault (nonEmptyRelation "permission" request.permission)
-  audience <- orFault (nonEmptyText "audience" request.audience)
-  ttl <- orFault (resolveTtl mintEnv request.ttlSeconds)
+  consistency <- orFault (consistencyFromWire (request ^. #consistency))
+  context <- orFault (contextFromWire (request ^. #context))
+  subject <- orFault (concreteSubjectFromWire (request ^. #subject))
+  object <- orFault (objectRefFromWire (request ^. #object))
+  permission <- orFault (nonEmptyRelation "permission" (request ^. #permission))
+  audience <- orFault (nonEmptyText "audience" (request ^. #audience))
+  ttl <- orFault (resolveTtl mintEnv (request ^. #ttlSeconds))
   pure
     MintInputs
       { consistency,
@@ -584,7 +580,7 @@ decodeMintRequest mintEnv request = do
         object,
         audience,
         ttl,
-        requestId = request.requestId
+        requestId = (request ^. #requestId)
       }
   where
     orFault :: Either Text a -> Either EnFault a
@@ -605,13 +601,13 @@ concreteSubjectFromWire wire = do
 -- caller never caches a token with a lifetime different from the one it asked for.
 resolveTtl :: MintEnv -> Maybe Int -> Either Text NominalDiffTime
 resolveTtl mintEnv = \case
-  Nothing -> Right mintEnv.defaultTtl
+  Nothing -> Right (mintEnv ^. #defaultTtl)
   Just seconds
     | seconds <= 0 -> Left "ttlSeconds must be positive"
-    | fromIntegral seconds > mintEnv.maxTtl ->
+    | fromIntegral seconds > (mintEnv ^. #maxTtl) ->
         Left
           ( "ttlSeconds exceeds the configured maximum of "
-              <> Text.pack (show (round mintEnv.maxTtl :: Integer))
+              <> Text.pack (show (round (mintEnv ^. #maxTtl) :: Integer))
               <> " seconds"
           )
     | otherwise -> Right (fromIntegral seconds)

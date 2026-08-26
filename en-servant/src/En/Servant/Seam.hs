@@ -22,11 +22,9 @@ module En.Servant.Seam
 where
 
 import Auth.Biscuit (SecretKey)
-import Control.Monad.IO.Class (liftIO)
-import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
-import Data.Time (NominalDiffTime, UTCTime)
+import Data.Time (NominalDiffTime)
 import Effectful (Eff, IOE)
 import Effectful.Error.Static (Error)
 import En.Biscuit.Keys (IssuerKeyId)
@@ -38,6 +36,7 @@ import En.Error (EnError (..))
 import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
 import En.Postgres.Database (Database)
+import En.Prelude
 import En.Reachability (ReachabilityGraph)
 import En.Revision (Consistency)
 import En.Schema (RelationName)
@@ -65,7 +64,6 @@ import En.Servant.Problem
   )
 import En.Tuple (CaveatContext, ObjectRef, Subject)
 import En.Watch qualified as Watch
-import GHC.Generics (Generic)
 import Servant (Handler, ServerError (..), err400, err403, err404, err412, err422, err500, err503, throwError)
 import System.IO (stderr)
 
@@ -152,6 +150,7 @@ data MintEnv = MintEnv
     --     a lifetime different from the one it asked for.
     maxTtl :: !NominalDiffTime
   }
+  deriving stock (Generic)
 
 type EnServer = Env AppEffects
 

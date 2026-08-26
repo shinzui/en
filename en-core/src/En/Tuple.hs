@@ -17,6 +17,7 @@ where
 import Data.Text (Text)
 import En.Caveat.Value (CaveatContext (..), CaveatPayload (..), CaveatValue (..))
 import En.Schema (CaveatName, ObjectType, RelationName)
+import GHC.Generics (Generic)
 
 -- | A concrete object, e.g. @intention:42@.
 data ObjectRef = ObjectRef
@@ -38,7 +39,7 @@ data TupleCaveat = TupleCaveat
   { name :: !CaveatName,
     payload :: !CaveatPayload
   }
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Generic, Eq, Ord, Show)
 
 -- | @subject@ has @relation@ on @object@, optionally caveated.
 data Tuple = Tuple
@@ -47,4 +48,4 @@ data Tuple = Tuple
     subject :: !Subject,
     caveat :: !(Maybe TupleCaveat)
   }
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Generic, Eq, Ord, Show)

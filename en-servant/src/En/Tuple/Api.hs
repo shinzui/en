@@ -57,13 +57,12 @@ import Data.Aeson
   )
 import Data.Aeson qualified as Aeson
 import Data.Bifunctor (first)
+import Data.Generics.Labels ()
 import Data.Int (Int64)
-import Data.Maybe (fromMaybe)
 import Data.SOP (I (..), NS (..))
-import Data.Text (Text)
 import Data.Text qualified as Text
 import Effectful qualified
-import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), mintToken, resolveConsistency)
+import En.Effect.ConsistencyStore (ConsistencyStore, mintToken, resolveConsistency)
 import En.Effect.TupleStore
   ( ChangeKind (..),
     Precondition (..),
@@ -71,7 +70,6 @@ import En.Effect.TupleStore
     SubjectRelationFilter (..),
     TupleChange (..),
     TupleFilter (..),
-    TupleRow (..),
     TupleStore,
     TupleWriteRequest (..),
     applyTupleWrites,
@@ -80,6 +78,7 @@ import En.Effect.TupleStore
     readRelationshipPage,
     validateRelationshipFilter,
   )
+import En.Prelude hiding ((.=))
 import En.RelationshipPagination (relationshipCursorToken)
 import En.Revision (Consistency (..), ConsistencyToken (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
@@ -111,7 +110,6 @@ import En.Servant.Wire
   )
 import En.Tuple (Tuple (..), TupleCaveat (..))
 import En.Watch qualified as Watch
-import GHC.Generics (Generic)
 import Relay.Pagination (Connection, CursorError, Direction (..), PageRequest (..))
 import Relay.Pagination.Servant (RelayPage, RelayPageError (..))
 import Servant (Handler, JSON, ReqBody, StdMethod (..), type (:>))
@@ -173,11 +171,11 @@ data TupleCaveatWire = TupleCaveatWire
   { name :: !Text,
     payload :: !CaveatPayloadWire
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON TupleCaveatWire where
-  toJSON wire = Aeson.object ["name" .= wire.name, "payload" .= wire.payload]
-  toEncoding wire = pairs ("name" .= wire.name <> "payload" .= wire.payload)
+  toJSON wire = Aeson.object ["name" .= (wire ^. #name), "payload" .= (wire ^. #payload)]
+  toEncoding wire = pairs ("name" .= (wire ^. #name) <> "payload" .= (wire ^. #payload))
 
 instance FromJSON TupleCaveatWire where
   parseJSON = withObject "TupleCaveatWire" \o ->
@@ -189,22 +187,22 @@ data TupleWire = TupleWire
     subject :: !SubjectWire,
     caveat :: !(Maybe TupleCaveatWire)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON TupleWire where
   toJSON wire =
     Aeson.object
-      [ "object" .= wire.object,
-        "relation" .= wire.relation,
-        "subject" .= wire.subject,
-        "caveat" .= wire.caveat
+      [ "object" .= (wire ^. #object),
+        "relation" .= (wire ^. #relation),
+        "subject" .= (wire ^. #subject),
+        "caveat" .= (wire ^. #caveat)
       ]
   toEncoding wire =
     pairs
-      ( "object" .= wire.object
-          <> "relation" .= wire.relation
-          <> "subject" .= wire.subject
-          <> "caveat" .= wire.caveat
+      ( "object" .= (wire ^. #object)
+          <> "relation" .= (wire ^. #relation)
+          <> "subject" .= (wire ^. #subject)
+          <> "caveat" .= (wire ^. #caveat)
       )
 
 instance FromJSON TupleWire where
@@ -221,7 +219,7 @@ data SubjectRelationFilterWire
   = AnySubjectRelationWire
   | NoSubjectRelationWire
   | ExactSubjectRelationWire !Text
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON SubjectRelationFilterWire where
   toJSON = \case
@@ -253,27 +251,27 @@ data TupleFilterWire = TupleFilterWire
     subjectId :: !(Maybe Text),
     subjectRelation :: !(Maybe SubjectRelationFilterWire)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | An absent constraint is an absent key, not a @null@ one: @null@ would read as
 -- "the subject relation must be null", which 'NoSubjectRelationWire' already says.
 instance ToJSON TupleFilterWire where
   toJSON wire =
     Aeson.object $
-      ["objectType" .= wire.objectType]
-        <> foldMap (\value -> ["objectId" .= value]) wire.objectId
-        <> foldMap (\value -> ["relation" .= value]) wire.relation
-        <> foldMap (\value -> ["subjectType" .= value]) wire.subjectType
-        <> foldMap (\value -> ["subjectId" .= value]) wire.subjectId
-        <> foldMap (\value -> ["subjectRelation" .= value]) wire.subjectRelation
+      ["objectType" .= (wire ^. #objectType)]
+        <> foldMap (\value -> ["objectId" .= value]) (wire ^. #objectId)
+        <> foldMap (\value -> ["relation" .= value]) (wire ^. #relation)
+        <> foldMap (\value -> ["subjectType" .= value]) (wire ^. #subjectType)
+        <> foldMap (\value -> ["subjectId" .= value]) (wire ^. #subjectId)
+        <> foldMap (\value -> ["subjectRelation" .= value]) (wire ^. #subjectRelation)
   toEncoding wire =
     pairs $
-      "objectType" .= wire.objectType
-        <> foldMap ("objectId" .=) wire.objectId
-        <> foldMap ("relation" .=) wire.relation
-        <> foldMap ("subjectType" .=) wire.subjectType
-        <> foldMap ("subjectId" .=) wire.subjectId
-        <> foldMap ("subjectRelation" .=) wire.subjectRelation
+      "objectType" .= (wire ^. #objectType)
+        <> foldMap ("objectId" .=) (wire ^. #objectId)
+        <> foldMap ("relation" .=) (wire ^. #relation)
+        <> foldMap ("subjectType" .=) (wire ^. #subjectType)
+        <> foldMap ("subjectId" .=) (wire ^. #subjectId)
+        <> foldMap ("subjectRelation" .=) (wire ^. #subjectRelation)
 
 instance FromJSON TupleFilterWire where
   parseJSON = withObject "TupleFilterWire" \o ->
@@ -289,7 +287,7 @@ instance FromJSON TupleFilterWire where
 data PreconditionWire
   = TupleMustExistWire !TupleFilterWire
   | TupleMustNotExistWire !TupleFilterWire
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON PreconditionWire where
   toJSON = \case
@@ -321,7 +319,7 @@ data WriteTuplesRequestWire = WriteTuplesRequestWire
     deletes :: !(Maybe [TupleWire]),
     preconditions :: !(Maybe [PreconditionWire])
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | Absent optional fields are omitted rather than encoded as @null@, so a request
 -- carrying only @tuples@ serializes to exactly the bytes it did before preconditions
@@ -329,14 +327,14 @@ data WriteTuplesRequestWire = WriteTuplesRequestWire
 instance ToJSON WriteTuplesRequestWire where
   toJSON wire =
     Aeson.object $
-      ["tuples" .= wire.tuples]
-        <> foldMap (\value -> ["deletes" .= value]) wire.deletes
-        <> foldMap (\value -> ["preconditions" .= value]) wire.preconditions
+      ["tuples" .= (wire ^. #tuples)]
+        <> foldMap (\value -> ["deletes" .= value]) (wire ^. #deletes)
+        <> foldMap (\value -> ["preconditions" .= value]) (wire ^. #preconditions)
   toEncoding wire =
     pairs $
-      "tuples" .= wire.tuples
-        <> foldMap ("deletes" .=) wire.deletes
-        <> foldMap ("preconditions" .=) wire.preconditions
+      "tuples" .= (wire ^. #tuples)
+        <> foldMap ("deletes" .=) (wire ^. #deletes)
+        <> foldMap ("preconditions" .=) (wire ^. #preconditions)
 
 instance FromJSON WriteTuplesRequestWire where
   parseJSON = withObject "WriteTuplesRequestWire" \o ->
@@ -347,14 +345,14 @@ data DeleteTuplesRequestWire = DeleteTuplesRequestWire
   { tuples :: ![TupleWire],
     preconditions :: !(Maybe [PreconditionWire])
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON DeleteTuplesRequestWire where
   toJSON wire =
     Aeson.object $
-      ["tuples" .= wire.tuples] <> foldMap (\value -> ["preconditions" .= value]) wire.preconditions
+      ["tuples" .= (wire ^. #tuples)] <> foldMap (\value -> ["preconditions" .= value]) (wire ^. #preconditions)
   toEncoding wire =
-    pairs ("tuples" .= wire.tuples <> foldMap ("preconditions" .=) wire.preconditions)
+    pairs ("tuples" .= (wire ^. #tuples) <> foldMap ("preconditions" .=) (wire ^. #preconditions))
 
 instance FromJSON DeleteTuplesRequestWire where
   parseJSON = withObject "DeleteTuplesRequestWire" \o ->
@@ -381,28 +379,28 @@ data RelationshipFilterWire = RelationshipFilterWire
     subjectRelation :: !(Maybe SubjectRelationFilterWire),
     caveatName :: !(Maybe Text)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | An absent constraint is an absent key, not a @null@ one. See 'TupleFilterWire'.
 instance ToJSON RelationshipFilterWire where
   toJSON wire =
     Aeson.object $
-      foldMap (\value -> ["objectType" .= value]) wire.objectType
-        <> foldMap (\value -> ["objectId" .= value]) wire.objectId
-        <> foldMap (\value -> ["relation" .= value]) wire.relation
-        <> foldMap (\value -> ["subjectType" .= value]) wire.subjectType
-        <> foldMap (\value -> ["subjectId" .= value]) wire.subjectId
-        <> foldMap (\value -> ["subjectRelation" .= value]) wire.subjectRelation
-        <> foldMap (\value -> ["caveatName" .= value]) wire.caveatName
+      foldMap (\value -> ["objectType" .= value]) (wire ^. #objectType)
+        <> foldMap (\value -> ["objectId" .= value]) (wire ^. #objectId)
+        <> foldMap (\value -> ["relation" .= value]) (wire ^. #relation)
+        <> foldMap (\value -> ["subjectType" .= value]) (wire ^. #subjectType)
+        <> foldMap (\value -> ["subjectId" .= value]) (wire ^. #subjectId)
+        <> foldMap (\value -> ["subjectRelation" .= value]) (wire ^. #subjectRelation)
+        <> foldMap (\value -> ["caveatName" .= value]) (wire ^. #caveatName)
   toEncoding wire =
     pairs $
-      foldMap ("objectType" .=) wire.objectType
-        <> foldMap ("objectId" .=) wire.objectId
-        <> foldMap ("relation" .=) wire.relation
-        <> foldMap ("subjectType" .=) wire.subjectType
-        <> foldMap ("subjectId" .=) wire.subjectId
-        <> foldMap ("subjectRelation" .=) wire.subjectRelation
-        <> foldMap ("caveatName" .=) wire.caveatName
+      foldMap ("objectType" .=) (wire ^. #objectType)
+        <> foldMap ("objectId" .=) (wire ^. #objectId)
+        <> foldMap ("relation" .=) (wire ^. #relation)
+        <> foldMap ("subjectType" .=) (wire ^. #subjectType)
+        <> foldMap ("subjectId" .=) (wire ^. #subjectId)
+        <> foldMap ("subjectRelation" .=) (wire ^. #subjectRelation)
+        <> foldMap ("caveatName" .=) (wire ^. #caveatName)
 
 instance FromJSON RelationshipFilterWire where
   parseJSON = withObject "RelationshipFilterWire" \o ->
@@ -419,18 +417,18 @@ data ReadRelationshipsRequestWire = ReadRelationshipsRequestWire
   { consistency :: !ConsistencyWire,
     filter :: !RelationshipFilterWire
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON ReadRelationshipsRequestWire where
   toJSON wire =
     Aeson.object
-      [ "consistency" .= wire.consistency,
-        "filter" .= wire.filter
+      [ "consistency" .= (wire ^. #consistency),
+        "filter" .= (wire ^. #filter)
       ]
   toEncoding wire =
     pairs
-      ( "consistency" .= wire.consistency
-          <> "filter" .= wire.filter
+      ( "consistency" .= (wire ^. #consistency)
+          <> "filter" .= (wire ^. #filter)
       )
 
 instance FromJSON ReadRelationshipsRequestWire where
@@ -458,7 +456,7 @@ data RelationshipPageResult
   | RelationshipPageUnprocessable !ProblemDetails
   | RelationshipPageInternal !ProblemDetails
   | RelationshipPageUnavailable !ProblemDetails
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance AsUnion RelationshipPageResponses RelationshipPageResult where
   toUnion = \case
@@ -486,11 +484,11 @@ data DeleteRelationshipsRequestWire = DeleteRelationshipsRequestWire
   { filter :: !RelationshipFilterWire,
     dryRun :: !Bool
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON DeleteRelationshipsRequestWire where
-  toJSON wire = Aeson.object ["filter" .= wire.filter, "dryRun" .= wire.dryRun]
-  toEncoding wire = pairs ("filter" .= wire.filter <> "dryRun" .= wire.dryRun)
+  toJSON wire = Aeson.object ["filter" .= (wire ^. #filter), "dryRun" .= (wire ^. #dryRun)]
+  toEncoding wire = pairs ("filter" .= (wire ^. #filter) <> "dryRun" .= (wire ^. #dryRun))
 
 instance FromJSON DeleteRelationshipsRequestWire where
   parseJSON = withObject "DeleteRelationshipsRequestWire" \o ->
@@ -505,13 +503,13 @@ data DeleteRelationshipsResponseWire = DeleteRelationshipsResponseWire
     count :: !Int64,
     token :: !(Maybe Text)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON DeleteRelationshipsResponseWire where
   toJSON wire =
-    Aeson.object ["dryRun" .= wire.dryRun, "count" .= wire.count, "token" .= wire.token]
+    Aeson.object ["dryRun" .= (wire ^. #dryRun), "count" .= (wire ^. #count), "token" .= (wire ^. #token)]
   toEncoding wire =
-    pairs ("dryRun" .= wire.dryRun <> "count" .= wire.count <> "token" .= wire.token)
+    pairs ("dryRun" .= (wire ^. #dryRun) <> "count" .= (wire ^. #count) <> "token" .= (wire ^. #token))
 
 instance FromJSON DeleteRelationshipsResponseWire where
   parseJSON = withObject "DeleteRelationshipsResponseWire" \o ->
@@ -538,22 +536,22 @@ data WatchRequestWire = WatchRequestWire
     filter :: !(Maybe RelationshipFilterWire),
     limit :: !Int
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON WatchRequestWire where
   toJSON wire =
     Aeson.object
-      [ "cursor" .= wire.cursor,
-        "startToken" .= wire.startToken,
-        "filter" .= wire.filter,
-        "limit" .= wire.limit
+      [ "cursor" .= (wire ^. #cursor),
+        "startToken" .= (wire ^. #startToken),
+        "filter" .= (wire ^. #filter),
+        "limit" .= (wire ^. #limit)
       ]
   toEncoding wire =
     pairs
-      ( "cursor" .= wire.cursor
-          <> "startToken" .= wire.startToken
-          <> "filter" .= wire.filter
-          <> "limit" .= wire.limit
+      ( "cursor" .= (wire ^. #cursor)
+          <> "startToken" .= (wire ^. #startToken)
+          <> "filter" .= (wire ^. #filter)
+          <> "limit" .= (wire ^. #limit)
       )
 
 instance FromJSON WatchRequestWire where
@@ -572,7 +570,7 @@ instance FromJSON WatchRequestWire where
 data ChangeKindWire
   = TouchWire
   | DeleteWire
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON ChangeKindWire where
   toJSON = \case
@@ -592,11 +590,11 @@ data TupleChangeWire = TupleChangeWire
   { kind :: !ChangeKindWire,
     tuple :: !TupleWire
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON TupleChangeWire where
-  toJSON wire = Aeson.object ["kind" .= wire.kind, "tuple" .= wire.tuple]
-  toEncoding wire = pairs ("kind" .= wire.kind <> "tuple" .= wire.tuple)
+  toJSON wire = Aeson.object ["kind" .= (wire ^. #kind), "tuple" .= (wire ^. #tuple)]
+  toEncoding wire = pairs ("kind" .= (wire ^. #kind) <> "tuple" .= (wire ^. #tuple))
 
 instance FromJSON TupleChangeWire where
   parseJSON = withObject "TupleChangeWire" \o ->
@@ -620,20 +618,20 @@ data WatchResponseWire = WatchResponseWire
     cursor :: !Text,
     checkedAt :: !Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON WatchResponseWire where
   toJSON wire =
     Aeson.object
-      [ "changes" .= wire.changes,
-        "cursor" .= wire.cursor,
-        "checkedAt" .= wire.checkedAt
+      [ "changes" .= (wire ^. #changes),
+        "cursor" .= (wire ^. #cursor),
+        "checkedAt" .= (wire ^. #checkedAt)
       ]
   toEncoding wire =
     pairs
-      ( "changes" .= wire.changes
-          <> "cursor" .= wire.cursor
-          <> "checkedAt" .= wire.checkedAt
+      ( "changes" .= (wire ^. #changes)
+          <> "cursor" .= (wire ^. #cursor)
+          <> "checkedAt" .= (wire ^. #checkedAt)
       )
 
 instance FromJSON WatchResponseWire where
@@ -643,11 +641,11 @@ instance FromJSON WatchResponseWire where
 newtype WriteTuplesResponseWire = WriteTuplesResponseWire
   { token :: Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON WriteTuplesResponseWire where
-  toJSON wire = Aeson.object ["token" .= wire.token]
-  toEncoding wire = pairs ("token" .= wire.token)
+  toJSON wire = Aeson.object ["token" .= (wire ^. #token)]
+  toEncoding wire = pairs ("token" .= (wire ^. #token))
 
 instance FromJSON WriteTuplesResponseWire where
   parseJSON = withObject "WriteTuplesResponseWire" \o -> WriteTuplesResponseWire <$> o .: "token"
@@ -657,17 +655,17 @@ instance FromJSON WriteTuplesResponseWire where
 writeTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> WriteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
 writeTuplesHandler env request = enHandler do
   active <- activeSchema env
-  writes <- traverseOrInvalid tupleFromWire request.tuples
-  deletes <- traverseOrInvalid tupleFromWire (fromMaybe [] request.deletes)
-  preconditions <- traverseOrInvalid preconditionFromWire (fromMaybe [] request.preconditions)
+  writes <- traverseOrInvalid tupleFromWire (request ^. #tuples)
+  deletes <- traverseOrInvalid tupleFromWire (fromMaybe [] (request ^. #deletes))
+  preconditions <- traverseOrInvalid preconditionFromWire (fromMaybe [] (request ^. #preconditions))
   token <- engine env active (applyTupleWrites TupleWriteRequest {preconditions, writes, deletes})
   pure (tokenToWire token)
 
 deleteTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> DeleteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)
 deleteTuplesHandler env request = enHandler do
   active <- activeSchema env
-  deletes <- traverseOrInvalid tupleFromWire request.tuples
-  preconditions <- traverseOrInvalid preconditionFromWire (fromMaybe [] request.preconditions)
+  deletes <- traverseOrInvalid tupleFromWire (request ^. #tuples)
+  preconditions <- traverseOrInvalid preconditionFromWire (fromMaybe [] (request ^. #preconditions))
   token <- engine env active (applyTupleWrites TupleWriteRequest {preconditions, writes = [], deletes})
   pure (tokenToWire token)
 
@@ -680,20 +678,22 @@ readRelationshipsHandler ::
 readRelationshipsHandler env pageRequest request = do
   result <- runExceptT do
     active <- activeSchema env
-    relationshipFilter <- orInvalid (relationshipFilterFromWire request.filter)
+    relationshipFilter <- orInvalid (relationshipFilterFromWire (request ^. #filter))
     pinned <-
-      case pageRequest.cursor of
+      case cursor pageRequest of
         Just cursor ->
           case relationshipCursorToken cursor of
             Left cursorError -> pure (Left (cursorRejected pageRequest cursorError))
             Right token -> do
-              ResolvedConsistency {revision} <- engine env active (resolveConsistency (AtExactSnapshot token))
+              resolved <- engine env active (resolveConsistency (AtExactSnapshot token))
+              let revision = resolved ^. #revision
               pure (Right (revision, token))
         Nothing -> do
-          consistency <- orInvalid (consistencyFromWire request.consistency)
+          consistency <- orInvalid (consistencyFromWire (request ^. #consistency))
           (revision, token) <-
             engine env active do
-              ResolvedConsistency {revision} <- resolveConsistency consistency
+              resolved <- resolveConsistency consistency
+              let revision = resolved ^. #revision
               token <- mintToken revision
               pure (revision, token)
           pure (Right (revision, token))
@@ -701,16 +701,16 @@ readRelationshipsHandler env pageRequest request = do
       Left err -> pure (Left err)
       Right (revision, token) -> do
         page <- engine env active (readRelationshipPage revision token relationshipFilter pageRequest)
-        pure (first (cursorRejected pageRequest) (fmap (tupleToWire . (.tuple)) <$> page))
+        pure (first (cursorRejected pageRequest) (fmap (tupleToWire . (^. #tuple)) <$> page))
   pure $ either relationshipFaultToResult (either RelationshipPageBadRequest RelationshipPageOk) result
 
 cursorRejected :: PageRequest -> CursorError -> RelayPageError
-cursorRejected PageRequest {direction} cursorError =
+cursorRejected pageRequest cursorError =
   RelayPageError
     { code = "invalid_cursor",
       message = "cursor rejected: " <> Text.pack (show cursorError),
       retryable = False,
-      parameter = Just (case direction of Forward -> "after"; Backward -> "before")
+      parameter = Just (case direction pageRequest of Forward -> "after"; Backward -> "before")
     }
 
 relationshipFaultToResult :: EnFault -> RelationshipPageResult
@@ -718,9 +718,9 @@ relationshipFaultToResult = \case
   BadRequestFault details ->
     RelationshipPageBadRequest
       RelayPageError
-        { code = details.code,
-          message = details.detail,
-          retryable = details.retryable,
+        { code = (details ^. #code),
+          message = (details ^. #detail),
+          retryable = (details ^. #retryable),
           parameter = Nothing
         }
   PreconditionFailedFault details -> RelationshipPagePreconditionFailed details
@@ -742,13 +742,13 @@ deleteRelationshipsHandler ::
   Handler (EnResult DeleteRelationshipsResponseWire)
 deleteRelationshipsHandler env request = enHandler do
   active <- activeSchema env
-  relationshipFilter <- orInvalid (relationshipFilterFromWire request.filter)
-  if request.dryRun
+  relationshipFilter <- orInvalid (relationshipFilterFromWire (request ^. #filter))
+  if (request ^. #dryRun)
     then do
       count <-
         engine env active do
-          ResolvedConsistency {revision} <- resolveConsistency FullyConsistent
-          countRelationships revision relationshipFilter
+          resolved <- resolveConsistency FullyConsistent
+          countRelationships (resolved ^. #revision) relationshipFilter
       pure DeleteRelationshipsResponseWire {dryRun = True, count, token = Nothing}
     else do
       (count, ConsistencyToken token) <- engine env active (deleteRelationships relationshipFilter)
@@ -761,34 +761,35 @@ deleteRelationshipsHandler env request = enHandler do
 -- how much that is. It must still be positive — a zero limit returns an empty page whose
 -- cursor equals the caller's own, so a drain loop over it never terminates and never advances.
 watchHandler :: Env es -> WatchRequestWire -> Handler (EnResult WatchResponseWire)
-watchHandler env request = enHandler do
+watchHandler env@Env {watchOperation, maxBatchSize} request = enHandler do
   active <- activeSchema env
-  start <- orInvalid (watchStartFromWire request.cursor request.startToken)
-  relationshipFilter <- orInvalid (traverse relationshipFilterFromWire request.filter)
-  limit <- orInvalid (positiveLimit request.limit)
-  batch <- engine env active (env.watchOperation start relationshipFilter (min env.maxBatchSize limit))
+  start <- orInvalid (watchStartFromWire (request ^. #cursor) (request ^. #startToken))
+  relationshipFilter <- orInvalid (traverse relationshipFilterFromWire (request ^. #filter))
+  limit <- orInvalid (positiveLimit (request ^. #limit))
+  batch <- engine env active (watchOperation start relationshipFilter (min maxBatchSize limit))
   pure (watchBatchToWire batch)
 
 -- * Conversions
 
 tupleToWire :: Tuple -> TupleWire
-tupleToWire Tuple {object, relation = RelationName relation, subject, caveat} =
-  TupleWire
-    { object = objectRefToWire object,
-      relation,
-      subject = subjectToWire subject,
-      caveat = tupleCaveatToWire <$> caveat
-    }
+tupleToWire tuple =
+  let RelationName relation = tuple ^. #relation
+   in TupleWire
+        { object = objectRefToWire (tuple ^. #object),
+          relation,
+          subject = subjectToWire (tuple ^. #subject),
+          caveat = tupleCaveatToWire <$> (tuple ^. #caveat)
+        }
 
 tupleFromWire :: TupleWire -> Either Text Tuple
-tupleFromWire TupleWire {object, relation, subject, caveat}
-  | Text.null relation = Left "relation must not be empty"
+tupleFromWire wire
+  | Text.null (wire ^. #relation) = Left "relation must not be empty"
   | otherwise =
       Tuple
-        <$> objectRefFromWire object
-        <*> Right (RelationName relation)
-        <*> subjectFromWire subject
-        <*> traverse tupleCaveatFromWire caveat
+        <$> objectRefFromWire (wire ^. #object)
+        <*> Right (RelationName (wire ^. #relation))
+        <*> subjectFromWire (wire ^. #subject)
+        <*> traverse tupleCaveatFromWire (wire ^. #caveat)
 
 preconditionFromWire :: PreconditionWire -> Either Text Precondition
 preconditionFromWire = \case
@@ -800,14 +801,14 @@ preconditionFromWire = \case
 -- make a must-exist precondition fail for a reason the caller cannot see.
 tupleFilterFromWire :: TupleFilterWire -> Either Text TupleFilter
 tupleFilterFromWire tupleFilter
-  | Text.null tupleFilter.objectType = Left "filter objectType must not be empty"
+  | Text.null (tupleFilter ^. #objectType) = Left "filter objectType must not be empty"
   | otherwise =
-      TupleFilter (ObjectType tupleFilter.objectType)
-        <$> traverse (nonEmpty "filter objectId") tupleFilter.objectId
-        <*> traverse (fmap RelationName . nonEmpty "filter relation") tupleFilter.relation
-        <*> traverse (fmap ObjectType . nonEmpty "filter subjectType") tupleFilter.subjectType
-        <*> traverse (nonEmpty "filter subjectId") tupleFilter.subjectId
-        <*> subjectRelationFromWire (fromMaybe AnySubjectRelationWire tupleFilter.subjectRelation)
+      TupleFilter (ObjectType (tupleFilter ^. #objectType))
+        <$> traverse (nonEmpty "filter objectId") (tupleFilter ^. #objectId)
+        <*> traverse (fmap RelationName . nonEmpty "filter relation") (tupleFilter ^. #relation)
+        <*> traverse (fmap ObjectType . nonEmpty "filter subjectType") (tupleFilter ^. #subjectType)
+        <*> traverse (nonEmpty "filter subjectId") (tupleFilter ^. #subjectId)
+        <*> subjectRelationFromWire (fromMaybe AnySubjectRelationWire (tupleFilter ^. #subjectRelation))
   where
     nonEmpty label value
       | Text.null value = Left (label <> " must not be empty")
@@ -824,13 +825,13 @@ relationshipFilterFromWire :: RelationshipFilterWire -> Either Text Relationship
 relationshipFilterFromWire wire = do
   converted <-
     RelationshipFilter
-      <$> traverse (fmap ObjectType . nonEmpty "filter objectType") wire.objectType
-      <*> traverse (nonEmpty "filter objectId") wire.objectId
-      <*> traverse (fmap RelationName . nonEmpty "filter relation") wire.relation
-      <*> traverse (fmap ObjectType . nonEmpty "filter subjectType") wire.subjectType
-      <*> traverse (nonEmpty "filter subjectId") wire.subjectId
-      <*> subjectRelationFromWire (fromMaybe AnySubjectRelationWire wire.subjectRelation)
-      <*> traverse (fmap CaveatName . nonEmpty "filter caveatName") wire.caveatName
+      <$> traverse (fmap ObjectType . nonEmpty "filter objectType") (wire ^. #objectType)
+      <*> traverse (nonEmpty "filter objectId") (wire ^. #objectId)
+      <*> traverse (fmap RelationName . nonEmpty "filter relation") (wire ^. #relation)
+      <*> traverse (fmap ObjectType . nonEmpty "filter subjectType") (wire ^. #subjectType)
+      <*> traverse (nonEmpty "filter subjectId") (wire ^. #subjectId)
+      <*> subjectRelationFromWire (fromMaybe AnySubjectRelationWire (wire ^. #subjectRelation))
+      <*> traverse (fmap CaveatName . nonEmpty "filter caveatName") (wire ^. #caveatName)
   validateRelationshipFilter converted
   where
     nonEmpty label value
@@ -856,12 +857,20 @@ watchStartFromWire maybeCursor maybeStartToken =
     (Nothing, Nothing) -> Right Watch.StartFromNow
 
 watchBatchToWire :: Watch.WatchBatch -> WatchResponseWire
-watchBatchToWire Watch.WatchBatch {changes, cursor, checkedAt = ConsistencyToken checkedAt} =
-  WatchResponseWire {changes = tupleChangeToWire <$> changes, cursor, checkedAt}
+watchBatchToWire batch =
+  let ConsistencyToken checkedAt = batch ^. #checkedAt
+   in WatchResponseWire
+        { changes = tupleChangeToWire <$> (batch ^. #changes),
+          cursor = (batch ^. #cursor),
+          checkedAt
+        }
 
 tupleChangeToWire :: TupleChange -> TupleChangeWire
-tupleChangeToWire TupleChange {kind, tuple} =
-  TupleChangeWire {kind = changeKindToWire kind, tuple = tupleToWire tuple}
+tupleChangeToWire change =
+  TupleChangeWire
+    { kind = changeKindToWire (change ^. #kind),
+      tuple = tupleToWire (change ^. #tuple)
+    }
 
 changeKindToWire :: ChangeKind -> ChangeKindWire
 changeKindToWire = \case
@@ -877,13 +886,14 @@ subjectRelationFromWire = \case
     | otherwise -> Right (ExactSubjectRelation (RelationName relation))
 
 tupleCaveatToWire :: TupleCaveat -> TupleCaveatWire
-tupleCaveatToWire TupleCaveat {name = CaveatName name, payload} =
-  TupleCaveatWire {name, payload = payloadToWire payload}
+tupleCaveatToWire caveat =
+  let CaveatName name = caveat ^. #name
+   in TupleCaveatWire {name, payload = payloadToWire (caveat ^. #payload)}
 
 tupleCaveatFromWire :: TupleCaveatWire -> Either Text TupleCaveat
-tupleCaveatFromWire TupleCaveatWire {name, payload}
-  | Text.null name = Left "caveat name must not be empty"
-  | otherwise = TupleCaveat (CaveatName name) <$> payloadFromWire payload
+tupleCaveatFromWire caveat
+  | Text.null (caveat ^. #name) = Left "caveat name must not be empty"
+  | otherwise = TupleCaveat (CaveatName (caveat ^. #name)) <$> payloadFromWire (caveat ^. #payload)
 
 tokenToWire :: ConsistencyToken -> WriteTuplesResponseWire
 tokenToWire (ConsistencyToken token) =

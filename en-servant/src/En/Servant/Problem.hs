@@ -48,7 +48,8 @@ import Data.Aeson
     genericParseJSON,
     genericToJSON,
   )
-import En.Prelude (Generic, Text)
+import Data.Generics.Labels ()
+import En.Prelude
 import Network.HTTP.Media ((//))
 import Network.HTTP.Types (Header, mkStatus)
 import Network.Wai (Response, responseLBS)
@@ -104,11 +105,11 @@ data ProblemSpec = ProblemSpec
     title :: !Text,
     retryable :: !Bool
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | Build a wire document from a stable specification and request-specific detail.
 problem :: ProblemSpec -> Text -> ProblemDetails
-problem spec = problemAtStatus spec.status spec
+problem spec = problemAtStatus (spec ^. #status) spec
 
 -- | Render a problem as a thrown Servant error.
 --
@@ -117,38 +118,38 @@ problem spec = problemAtStatus spec.status spec
 problemError :: ServerError -> ProblemDetails -> ServerError
 problemError base details =
   base
-    { errBody = encode (detailsAtStatus base.errHTTPCode details),
-      errHeaders = problemHeaders base.errHTTPCode <> withoutContentType base.errHeaders
+    { errBody = encode (detailsAtStatus (errHTTPCode base) details),
+      errHeaders = problemHeaders (errHTTPCode base) <> withoutContentType (errHeaders base)
     }
 
 detailsAtStatus :: Int -> ProblemDetails -> ProblemDetails
-detailsAtStatus responseStatus ProblemDetails {problemType = originalType, title = originalTitle, status = _, detail = originalDetail, code = originalCode, retryable = originalRetryable} =
+detailsAtStatus responseStatus details =
   ProblemDetails
-    { problemType = originalType,
-      title = originalTitle,
+    { problemType = (details ^. #problemType),
+      title = (details ^. #title),
       status = responseStatus,
-      detail = originalDetail,
-      code = originalCode,
-      retryable = originalRetryable
+      detail = (details ^. #detail),
+      code = (details ^. #code),
+      retryable = (details ^. #retryable)
     }
 
 -- | Render a problem directly as a WAI response for middleware outside Servant.
 problemResponse :: ProblemSpec -> Text -> Response
 problemResponse spec requestDetail =
   responseLBS
-    (mkStatus spec.status "")
-    (problemHeaders spec.status)
+    (mkStatus (spec ^. #status) "")
+    (problemHeaders (spec ^. #status))
     (encode (problem spec requestDetail))
 
 problemAtStatus :: Int -> ProblemSpec -> Text -> ProblemDetails
 problemAtStatus responseStatus spec requestDetail =
   ProblemDetails
     { problemType = "about:blank",
-      title = spec.title,
+      title = (spec ^. #title),
       status = responseStatus,
       detail = requestDetail,
-      code = spec.code,
-      retryable = spec.retryable
+      code = (spec ^. #code),
+      retryable = (spec ^. #retryable)
     }
 
 problemHeaders :: Int -> [Header]

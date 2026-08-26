@@ -31,6 +31,7 @@ import En.Reachability (ReachabilityGraph (..), RelationRef (..))
 import En.Revision (Consistency, ConsistencyToken, Revision)
 import En.Schema (CaveatName, ObjectType (..), Relation (..), RelationName (..), Rewrite (..))
 import En.Tuple (CaveatContext, ObjectRef (..), Subject (..), Tuple (..), TupleCaveat (..))
+import GHC.Generics (Generic)
 
 newtype ExpandCursor = ExpandCursor
   { cursorEncoding :: Text
@@ -94,7 +95,7 @@ data ExpandTree = ExpandTree
     state :: !ExpandState,
     checkedAt :: !ConsistencyToken
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 expand ::
   (ConsistencyStore :> es, TupleStore :> es, Error EnError :> es) =>

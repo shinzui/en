@@ -46,11 +46,11 @@ import Data.Aeson
   )
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Types (Parser)
+import Data.Generics.Labels ()
 import Data.Map.Strict (Map)
-import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Time (UTCTime)
 import En.Check (CaveatObligation (..), CheckDecision (..))
+import En.Prelude hiding ((.=))
 import En.Revision (Consistency (..), ConsistencyToken (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
 import En.Tuple
@@ -76,11 +76,11 @@ data ObjectRefWire = ObjectRefWire
   { objectType :: !Text,
     objectId :: !Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON ObjectRefWire where
-  toJSON wire = Aeson.object ["objectType" .= wire.objectType, "objectId" .= wire.objectId]
-  toEncoding wire = pairs ("objectType" .= wire.objectType <> "objectId" .= wire.objectId)
+  toJSON wire = Aeson.object ["objectType" .= (wire ^. #objectType), "objectId" .= (wire ^. #objectId)]
+  toEncoding wire = pairs ("objectType" .= (wire ^. #objectType) <> "objectId" .= (wire ^. #objectId))
 
 instance FromJSON ObjectRefWire where
   parseJSON = withObject "ObjectRefWire" objectRefFields
@@ -94,29 +94,29 @@ data SubjectWire
   = SubjectIdWire !ObjectRefWire
   | SubjectSetWire !ObjectRefWire !Text
   | SubjectWildcardWire !Text
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON SubjectWire where
   toJSON = \case
     SubjectIdWire ref ->
-      Aeson.object ["kind" .= ("id" :: Text), "objectType" .= ref.objectType, "objectId" .= ref.objectId]
+      Aeson.object ["kind" .= ("id" :: Text), "objectType" .= (ref ^. #objectType), "objectId" .= (ref ^. #objectId)]
     SubjectSetWire ref relation ->
       Aeson.object
         [ "kind" .= ("set" :: Text),
-          "objectType" .= ref.objectType,
-          "objectId" .= ref.objectId,
+          "objectType" .= (ref ^. #objectType),
+          "objectId" .= (ref ^. #objectId),
           "relation" .= relation
         ]
     SubjectWildcardWire objectType ->
       Aeson.object ["kind" .= ("wildcard" :: Text), "objectType" .= objectType]
   toEncoding = \case
     SubjectIdWire ref ->
-      pairs ("kind" .= ("id" :: Text) <> "objectType" .= ref.objectType <> "objectId" .= ref.objectId)
+      pairs ("kind" .= ("id" :: Text) <> "objectType" .= (ref ^. #objectType) <> "objectId" .= (ref ^. #objectId))
     SubjectSetWire ref relation ->
       pairs
         ( "kind" .= ("set" :: Text)
-            <> "objectType" .= ref.objectType
-            <> "objectId" .= ref.objectId
+            <> "objectType" .= (ref ^. #objectType)
+            <> "objectId" .= (ref ^. #objectId)
             <> "relation" .= relation
         )
     SubjectWildcardWire objectType ->
@@ -136,7 +136,7 @@ data CaveatValueWire
   | ValueIntegerWire !Integer
   | ValueTimestampWire !UTCTime
   | ValueEnumWire !Text
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON CaveatValueWire where
   toJSON = \case
@@ -169,11 +169,11 @@ instance FromJSON CaveatValueWire where
 newtype CaveatPayloadWire = CaveatPayloadWire
   { values :: Map Text CaveatValueWire
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON CaveatPayloadWire where
-  toJSON wire = Aeson.object ["values" .= wire.values]
-  toEncoding wire = pairs ("values" .= wire.values)
+  toJSON wire = Aeson.object ["values" .= (wire ^. #values)]
+  toEncoding wire = pairs ("values" .= (wire ^. #values))
 
 instance FromJSON CaveatPayloadWire where
   parseJSON = withObject "CaveatPayloadWire" \o -> CaveatPayloadWire <$> o .: "values"
@@ -181,11 +181,11 @@ instance FromJSON CaveatPayloadWire where
 newtype CaveatContextWire = CaveatContextWire
   { values :: Map Text CaveatValueWire
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON CaveatContextWire where
-  toJSON wire = Aeson.object ["values" .= wire.values]
-  toEncoding wire = pairs ("values" .= wire.values)
+  toJSON wire = Aeson.object ["values" .= (wire ^. #values)]
+  toEncoding wire = pairs ("values" .= (wire ^. #values))
 
 instance FromJSON CaveatContextWire where
   parseJSON = withObject "CaveatContextWire" \o -> CaveatContextWire <$> o .: "values"
@@ -195,7 +195,7 @@ data ConsistencyWire
   | FullyConsistentWire
   | AtLeastAsFreshWire !Text
   | AtExactSnapshotWire !Text
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON ConsistencyWire where
   toJSON = \case
@@ -226,7 +226,7 @@ data CheckDecisionWire
   = AllowedWire
   | DeniedWire
   | ConditionalWire ![CaveatObligationWire]
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON CheckDecisionWire where
   toJSON = \case
@@ -252,11 +252,11 @@ data CaveatObligationWire = CaveatObligationWire
   { caveat :: !Text,
     missingContext :: ![Text]
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON CaveatObligationWire where
-  toJSON wire = Aeson.object ["caveat" .= wire.caveat, "missingContext" .= wire.missingContext]
-  toEncoding wire = pairs ("caveat" .= wire.caveat <> "missingContext" .= wire.missingContext)
+  toJSON wire = Aeson.object ["caveat" .= (wire ^. #caveat), "missingContext" .= (wire ^. #missingContext)]
+  toEncoding wire = pairs ("caveat" .= (wire ^. #caveat) <> "missingContext" .= (wire ^. #missingContext))
 
 instance FromJSON CaveatObligationWire where
   parseJSON = withObject "CaveatObligationWire" \o ->

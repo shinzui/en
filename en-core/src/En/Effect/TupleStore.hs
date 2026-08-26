@@ -269,7 +269,7 @@ data TupleChange = TupleChange
     tuple :: !Tuple,
     rowId :: !TupleRowId
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | One page of a revision window's changes.
 --
@@ -281,7 +281,7 @@ data ChangePage = ChangePage
   { changes :: ![TupleChange],
     state :: !PageState
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | A fact the write transaction re-verifies before applying any change.
 --

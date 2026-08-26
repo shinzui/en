@@ -22,6 +22,7 @@ import Effectful.Error.Static (Error, throwError)
 import En.Effect.TupleStore (RelationshipFilter, TupleChange)
 import En.Error (EnError (..))
 import En.Revision (ConsistencyToken)
+import GHC.Generics (Generic)
 
 -- | Where a poll's revision window begins.
 --
@@ -48,7 +49,7 @@ data WatchBatch = WatchBatch
     cursor :: !Text,
     checkedAt :: !ConsistencyToken
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | The watch operation for a host that serves no feed.
 --

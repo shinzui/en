@@ -19,11 +19,10 @@ module En.Servant.Response
   )
 where
 
-import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT (..), runExceptT, throwE)
 import Data.SOP (I (..), NS (..))
-import Data.Text (Text)
 import Effectful (Eff)
+import En.Prelude
 import En.Servant.Problem (ProblemDetails, ProblemJSON)
 import En.Servant.Seam
   ( ActiveSchema,
@@ -137,8 +136,8 @@ engine env active action =
 
 -- | The schema this request is served under. Called once per handler. See 'engine'.
 activeSchema :: Env es -> ExceptT EnFault Handler ActiveSchema
-activeSchema env =
-  liftIO env.readActiveSchema
+activeSchema Env {readActiveSchema} =
+  liftIO readActiveSchema
 
 -- | A wire-to-engine conversion failure is a client fault, not an engine error.
 orInvalid :: Either Text a -> ExceptT EnFault Handler a

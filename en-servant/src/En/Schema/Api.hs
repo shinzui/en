@@ -17,17 +17,12 @@ module En.Schema.Api
   )
 where
 
-import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (FromJSON (..), ToJSON (..), pairs, withObject, (.:), (.=))
 import Data.Aeson qualified as Aeson
-import Data.Text (Text)
-import Data.Time (UTCTime)
--- 'ReachabilityGraph' is imported for its @hash@ field, not its constructor: GHC solves the
--- @HasField "hash"@ constraint behind @active.graph.hash@ only when the field is in scope.
-import En.Reachability (ReachabilityGraph (..))
+import Data.Generics.Labels ()
+import En.Prelude hiding ((.=))
 import En.Revision (SchemaHash (..))
-import En.Servant.Seam (ActiveSchema (..), Env (..))
-import GHC.Generics (Generic)
+import En.Servant.Seam (Env (..))
 import Servant (Get, Handler, JSON, type (:>))
 import Servant.API.Generic (type (:-))
 import Servant.Server.Generic (AsServerT)
@@ -64,22 +59,22 @@ data SchemaInfoWire = SchemaInfoWire
     origin :: !Text,
     loadedAt :: !UTCTime
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON SchemaInfoWire where
   toJSON wire =
     Aeson.object
-      [ "source" .= wire.source,
-        "hash" .= wire.hash,
-        "origin" .= wire.origin,
-        "loadedAt" .= wire.loadedAt
+      [ "source" .= (wire ^. #source),
+        "hash" .= (wire ^. #hash),
+        "origin" .= (wire ^. #origin),
+        "loadedAt" .= (wire ^. #loadedAt)
       ]
   toEncoding wire =
     pairs
-      ( "source" .= wire.source
-          <> "hash" .= wire.hash
-          <> "origin" .= wire.origin
-          <> "loadedAt" .= wire.loadedAt
+      ( "source" .= (wire ^. #source)
+          <> "hash" .= (wire ^. #hash)
+          <> "origin" .= (wire ^. #origin)
+          <> "loadedAt" .= (wire ^. #loadedAt)
       )
 
 instance FromJSON SchemaInfoWire where
@@ -94,13 +89,13 @@ instance FromJSON SchemaInfoWire where
 -- fail, so it has no fault to return into a response alternative. Everything on the API that
 -- can fail speaks the shared problem dialect; this operation cannot.
 schemaHandler :: Env es -> Handler SchemaInfoWire
-schemaHandler env = do
-  active <- liftIO env.readActiveSchema
-  let SchemaHash hash = active.graph.hash
+schemaHandler Env {readActiveSchema} = do
+  active <- liftIO readActiveSchema
+  let SchemaHash hash = (active ^. #graph . #hash)
   pure
     SchemaInfoWire
-      { source = active.source,
+      { source = (active ^. #source),
         hash,
-        origin = active.origin,
-        loadedAt = active.loadedAt
+        origin = (active ^. #origin),
+        loadedAt = (active ^. #loadedAt)
       }

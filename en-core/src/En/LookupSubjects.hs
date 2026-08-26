@@ -60,6 +60,7 @@ import En.Tuple
     Tuple (..),
     TupleCaveat (..),
   )
+import GHC.Generics (Generic)
 import Text.Read (readMaybe)
 
 newtype LookupSubjectsCursor = LookupSubjectsCursor
@@ -110,7 +111,7 @@ data LookupSubject = LookupSubject
   { subject :: !Subject,
     decision :: !CheckDecision
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 data LookupSubjectsState
   = SubjectsExhausted
@@ -129,7 +130,7 @@ data LookupSubjectsPage = LookupSubjectsPage
     state :: !LookupSubjectsState,
     checkedAt :: !ConsistencyToken
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | List the subjects of @subjectType@ holding @permission@ on @object@.
 --

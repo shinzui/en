@@ -85,12 +85,13 @@ data BatchOutcome = BatchOutcome
   { decisions :: ![Either EnError CheckDecision],
     checkedAt :: !ConsistencyToken
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 data CheckCacheEnv = CheckCacheEnv
   { cacheDatastoreId :: !DatastoreId,
     cacheDecisions :: !(Cache SubproblemKey ResidualDecision)
   }
+  deriving stock (Generic)
 
 -- | Does @subject@ have @permission@ on @object@? Forward evaluation over the
 -- reachability graph and the tuple store.

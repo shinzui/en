@@ -30,13 +30,14 @@ import Data.Aeson
     (.=),
   )
 import Data.Aeson qualified as Aeson
-import Data.Text (Text)
+import Data.Generics.Labels ()
 import Effectful qualified
 import Effectful.Error.Static (Error)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError)
 import En.Expand qualified as Expand
+import En.Prelude hiding (children, (.=))
 import En.Revision (ConsistencyToken (..))
 import En.Schema (CaveatName (..), RelationName (..))
 import En.Servant.Problem (ProblemJSON)
@@ -48,7 +49,7 @@ import En.Servant.Response
     engine,
     orInvalid,
   )
-import En.Servant.Seam (ActiveSchema (..), Env (..))
+import En.Servant.Seam (Env)
 import En.Servant.Wire
   ( CaveatContextWire,
     ConsistencyWire,
@@ -61,7 +62,6 @@ import En.Servant.Wire
     subjectToWire,
     unknownVariant,
   )
-import GHC.Generics (Generic)
 import Servant (Handler, JSON, ReqBody, StdMethod (..), type (:>))
 import Servant.API.Generic (type (:-))
 import Servant.API.MultiVerb (MultiVerb)
@@ -95,26 +95,26 @@ data ExpandRequestWire = ExpandRequestWire
     limit :: !Int,
     cursor :: !(Maybe Text)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON ExpandRequestWire where
   toJSON wire =
     Aeson.object
-      [ "consistency" .= wire.consistency,
-        "object" .= wire.object,
-        "permission" .= wire.permission,
-        "context" .= wire.context,
-        "limit" .= wire.limit,
-        "cursor" .= wire.cursor
+      [ "consistency" .= (wire ^. #consistency),
+        "object" .= (wire ^. #object),
+        "permission" .= (wire ^. #permission),
+        "context" .= (wire ^. #context),
+        "limit" .= (wire ^. #limit),
+        "cursor" .= (wire ^. #cursor)
       ]
   toEncoding wire =
     pairs
-      ( "consistency" .= wire.consistency
-          <> "object" .= wire.object
-          <> "permission" .= wire.permission
-          <> "context" .= wire.context
-          <> "limit" .= wire.limit
-          <> "cursor" .= wire.cursor
+      ( "consistency" .= (wire ^. #consistency)
+          <> "object" .= (wire ^. #object)
+          <> "permission" .= (wire ^. #permission)
+          <> "context" .= (wire ^. #context)
+          <> "limit" .= (wire ^. #limit)
+          <> "cursor" .= (wire ^. #cursor)
       )
 
 instance FromJSON ExpandRequestWire where
@@ -145,7 +145,7 @@ data ExpandNodeWire
   | ExpandIntersectionWire ![ExpandNodeWire]
   | -- | Granted children first, subtracted children second.
     ExpandExclusionWire ![ExpandNodeWire] ![ExpandNodeWire]
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON ExpandNodeWire where
   toJSON = \case
@@ -212,7 +212,7 @@ data ExpandStateWire
   = ExpandExhaustedWire
   | ExpandHasMoreWire !Text
   | ExpandTruncatedWire !Text
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON ExpandStateWire where
   toJSON = \case
@@ -240,24 +240,24 @@ data ExpandTreeWire = ExpandTreeWire
     state :: !ExpandStateWire,
     checkedAt :: !Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON ExpandTreeWire where
   toJSON wire =
     Aeson.object
-      [ "root" .= wire.root,
-        "permission" .= wire.permission,
-        "children" .= wire.children,
-        "state" .= wire.state,
-        "checkedAt" .= wire.checkedAt
+      [ "root" .= (wire ^. #root),
+        "permission" .= (wire ^. #permission),
+        "children" .= (wire ^. #children),
+        "state" .= (wire ^. #state),
+        "checkedAt" .= (wire ^. #checkedAt)
       ]
   toEncoding wire =
     pairs
-      ( "root" .= wire.root
-          <> "permission" .= wire.permission
-          <> "children" .= wire.children
-          <> "state" .= wire.state
-          <> "checkedAt" .= wire.checkedAt
+      ( "root" .= (wire ^. #root)
+          <> "permission" .= (wire ^. #permission)
+          <> "children" .= (wire ^. #children)
+          <> "state" .= (wire ^. #state)
+          <> "checkedAt" .= (wire ^. #checkedAt)
       )
 
 instance FromJSON ExpandTreeWire where
@@ -274,22 +274,22 @@ instance FromJSON ExpandTreeWire where
 expandHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es) => Env es -> ExpandRequestWire -> Handler (EnResult ExpandTreeWire)
 expandHandler env request = enHandler do
   active <- activeSchema env
-  consistency <- orInvalid (consistencyFromWire request.consistency)
-  context <- orInvalid (contextFromWire request.context)
-  object <- orInvalid (objectRefFromWire request.object)
+  consistency <- orInvalid (consistencyFromWire (request ^. #consistency))
+  context <- orInvalid (contextFromWire (request ^. #context))
+  object <- orInvalid (objectRefFromWire (request ^. #object))
   tree <-
     engine
       env
       active
       ( Expand.expand
-          active.graph
+          (active ^. #graph)
           consistency
           Expand.ExpandRequest
             { object,
-              permission = RelationName request.permission,
+              permission = RelationName (request ^. #permission),
               context,
-              limit = Expand.ExpandLimit request.limit,
-              cursor = Expand.ExpandCursor <$> request.cursor
+              limit = Expand.ExpandLimit (request ^. #limit),
+              cursor = Expand.ExpandCursor <$> (request ^. #cursor)
             }
       )
   pure (expandTreeToWire tree)
@@ -297,14 +297,16 @@ expandHandler env request = enHandler do
 -- * Conversions
 
 expandTreeToWire :: Expand.ExpandTree -> ExpandTreeWire
-expandTreeToWire Expand.ExpandTree {root, permission = RelationName permission, children, state, checkedAt = ConsistencyToken checkedAt} =
-  ExpandTreeWire
-    { root = objectRefToWire root,
-      permission,
-      children = expandNodeToWire <$> children,
-      state = expandStateToWire state,
-      checkedAt
-    }
+expandTreeToWire tree =
+  let RelationName permission = tree ^. #permission
+      ConsistencyToken checkedAt = tree ^. #checkedAt
+   in ExpandTreeWire
+        { root = objectRefToWire (tree ^. #root),
+          permission,
+          children = expandNodeToWire <$> (tree ^. #children),
+          state = expandStateToWire (tree ^. #state),
+          checkedAt
+        }
 
 expandNodeToWire :: Expand.ExpandNode -> ExpandNodeWire
 expandNodeToWire =

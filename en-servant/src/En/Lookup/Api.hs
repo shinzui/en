@@ -24,7 +24,6 @@ module En.Lookup.Api
   )
 where
 
-import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
 import Data.Aeson
   ( FromJSON (..),
@@ -36,14 +35,14 @@ import Data.Aeson
     (.=),
   )
 import Data.Aeson qualified as Aeson
-import Data.Maybe (fromMaybe)
-import Data.Text (Text)
+import Data.Generics.Labels ()
 import Data.Text qualified as Text
 import Data.Word (Word64)
 import Effectful (Eff, IOE)
 import Effectful qualified
 import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
+import En.Prelude hiding ((.=))
 import En.Revision (ConsistencyToken (..))
 import En.Schema (ObjectType (..), RelationName (..))
 import En.Servant.Problem (ProblemJSON)
@@ -55,7 +54,7 @@ import En.Servant.Response
     engine,
     orInvalid,
   )
-import En.Servant.Seam (ActiveSchema (..), Env (..))
+import En.Servant.Seam (Env (..))
 import En.Servant.Wire
   ( CaveatContextWire,
     CheckDecisionWire,
@@ -74,7 +73,6 @@ import En.Servant.Wire
     unknownVariant,
   )
 import GHC.Clock (getMonotonicTimeNSec)
-import GHC.Generics (Generic)
 import Servant (Handler, JSON, ReqBody, StdMethod (..), type (:>))
 import Servant.API.Generic (type (:-))
 import Servant.API.MultiVerb (MultiVerb)
@@ -118,30 +116,30 @@ data LookupRequestWire = LookupRequestWire
     cursor :: !(Maybe Text),
     deadlineMillis :: !(Maybe Int)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON LookupRequestWire where
   toJSON wire =
     Aeson.object
-      [ "consistency" .= wire.consistency,
-        "subject" .= wire.subject,
-        "permission" .= wire.permission,
-        "objectType" .= wire.objectType,
-        "context" .= wire.context,
-        "limit" .= wire.limit,
-        "cursor" .= wire.cursor,
-        "deadlineMillis" .= wire.deadlineMillis
+      [ "consistency" .= (wire ^. #consistency),
+        "subject" .= (wire ^. #subject),
+        "permission" .= (wire ^. #permission),
+        "objectType" .= (wire ^. #objectType),
+        "context" .= (wire ^. #context),
+        "limit" .= (wire ^. #limit),
+        "cursor" .= (wire ^. #cursor),
+        "deadlineMillis" .= (wire ^. #deadlineMillis)
       ]
   toEncoding wire =
     pairs
-      ( "consistency" .= wire.consistency
-          <> "subject" .= wire.subject
-          <> "permission" .= wire.permission
-          <> "objectType" .= wire.objectType
-          <> "context" .= wire.context
-          <> "limit" .= wire.limit
-          <> "cursor" .= wire.cursor
-          <> "deadlineMillis" .= wire.deadlineMillis
+      ( "consistency" .= (wire ^. #consistency)
+          <> "subject" .= (wire ^. #subject)
+          <> "permission" .= (wire ^. #permission)
+          <> "objectType" .= (wire ^. #objectType)
+          <> "context" .= (wire ^. #context)
+          <> "limit" .= (wire ^. #limit)
+          <> "cursor" .= (wire ^. #cursor)
+          <> "deadlineMillis" .= (wire ^. #deadlineMillis)
       )
 
 instance FromJSON LookupRequestWire where
@@ -160,11 +158,11 @@ data LookupObjectWire = LookupObjectWire
   { object :: !ObjectRefWire,
     decision :: !CheckDecisionWire
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON LookupObjectWire where
-  toJSON wire = Aeson.object ["object" .= wire.object, "decision" .= wire.decision]
-  toEncoding wire = pairs ("object" .= wire.object <> "decision" .= wire.decision)
+  toJSON wire = Aeson.object ["object" .= (wire ^. #object), "decision" .= (wire ^. #decision)]
+  toEncoding wire = pairs ("object" .= (wire ^. #object) <> "decision" .= (wire ^. #decision))
 
 instance FromJSON LookupObjectWire where
   parseJSON = withObject "LookupObjectWire" \o ->
@@ -174,7 +172,7 @@ data LookupStateWire
   = LookupExhaustedWire
   | LookupHasMoreWire !Text
   | LookupTruncatedWire !Text
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON LookupStateWire where
   toJSON = \case
@@ -204,13 +202,13 @@ data LookupPageWire = LookupPageWire
     state :: !LookupStateWire,
     checkedAt :: !Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON LookupPageWire where
   toJSON wire =
-    Aeson.object ["objects" .= wire.objects, "state" .= wire.state, "checkedAt" .= wire.checkedAt]
+    Aeson.object ["objects" .= (wire ^. #objects), "state" .= (wire ^. #state), "checkedAt" .= (wire ^. #checkedAt)]
   toEncoding wire =
-    pairs ("objects" .= wire.objects <> "state" .= wire.state <> "checkedAt" .= wire.checkedAt)
+    pairs ("objects" .= (wire ^. #objects) <> "state" .= (wire ^. #state) <> "checkedAt" .= (wire ^. #checkedAt))
 
 instance FromJSON LookupPageWire where
   parseJSON = withObject "LookupPageWire" \o ->
@@ -232,30 +230,30 @@ data LookupSubjectsRequestWire = LookupSubjectsRequestWire
     cursor :: !(Maybe Text),
     deadlineMillis :: !(Maybe Int)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON LookupSubjectsRequestWire where
   toJSON wire =
     Aeson.object
-      [ "consistency" .= wire.consistency,
-        "object" .= wire.object,
-        "permission" .= wire.permission,
-        "subjectType" .= wire.subjectType,
-        "context" .= wire.context,
-        "limit" .= wire.limit,
-        "cursor" .= wire.cursor,
-        "deadlineMillis" .= wire.deadlineMillis
+      [ "consistency" .= (wire ^. #consistency),
+        "object" .= (wire ^. #object),
+        "permission" .= (wire ^. #permission),
+        "subjectType" .= (wire ^. #subjectType),
+        "context" .= (wire ^. #context),
+        "limit" .= (wire ^. #limit),
+        "cursor" .= (wire ^. #cursor),
+        "deadlineMillis" .= (wire ^. #deadlineMillis)
       ]
   toEncoding wire =
     pairs
-      ( "consistency" .= wire.consistency
-          <> "object" .= wire.object
-          <> "permission" .= wire.permission
-          <> "subjectType" .= wire.subjectType
-          <> "context" .= wire.context
-          <> "limit" .= wire.limit
-          <> "cursor" .= wire.cursor
-          <> "deadlineMillis" .= wire.deadlineMillis
+      ( "consistency" .= (wire ^. #consistency)
+          <> "object" .= (wire ^. #object)
+          <> "permission" .= (wire ^. #permission)
+          <> "subjectType" .= (wire ^. #subjectType)
+          <> "context" .= (wire ^. #context)
+          <> "limit" .= (wire ^. #limit)
+          <> "cursor" .= (wire ^. #cursor)
+          <> "deadlineMillis" .= (wire ^. #deadlineMillis)
       )
 
 instance FromJSON LookupSubjectsRequestWire where
@@ -280,11 +278,11 @@ data LookupSubjectWire = LookupSubjectWire
   { subject :: !SubjectWire,
     decision :: !CheckDecisionWire
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON LookupSubjectWire where
-  toJSON wire = Aeson.object ["subject" .= wire.subject, "decision" .= wire.decision]
-  toEncoding wire = pairs ("subject" .= wire.subject <> "decision" .= wire.decision)
+  toJSON wire = Aeson.object ["subject" .= (wire ^. #subject), "decision" .= (wire ^. #decision)]
+  toEncoding wire = pairs ("subject" .= (wire ^. #subject) <> "decision" .= (wire ^. #decision))
 
 instance FromJSON LookupSubjectWire where
   parseJSON = withObject "LookupSubjectWire" \o ->
@@ -294,7 +292,7 @@ data LookupSubjectsStateWire
   = SubjectsExhaustedWire
   | SubjectsHasMoreWire !Text
   | SubjectsTruncatedWire !Text
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON LookupSubjectsStateWire where
   toJSON = \case
@@ -323,13 +321,13 @@ data LookupSubjectsPageWire = LookupSubjectsPageWire
     state :: !LookupSubjectsStateWire,
     checkedAt :: !Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 instance ToJSON LookupSubjectsPageWire where
   toJSON wire =
-    Aeson.object ["subjects" .= wire.subjects, "state" .= wire.state, "checkedAt" .= wire.checkedAt]
+    Aeson.object ["subjects" .= (wire ^. #subjects), "state" .= (wire ^. #state), "checkedAt" .= (wire ^. #checkedAt)]
   toEncoding wire =
-    pairs ("subjects" .= wire.subjects <> "state" .= wire.state <> "checkedAt" .= wire.checkedAt)
+    pairs ("subjects" .= (wire ^. #subjects) <> "state" .= (wire ^. #state) <> "checkedAt" .= (wire ^. #checkedAt))
 
 instance FromJSON LookupSubjectsPageWire where
   parseJSON = withObject "LookupSubjectsPageWire" \o ->
@@ -338,27 +336,27 @@ instance FromJSON LookupSubjectsPageWire where
 -- * Handlers
 
 lookupHandler :: (IOE Effectful.:> es) => Env es -> LookupRequestWire -> Handler (EnResult LookupPageWire)
-lookupHandler env request = enHandler do
+lookupHandler env@Env {lookupWithDeadlineOperation} request = enHandler do
   active <- activeSchema env
-  consistency <- orInvalid (consistencyFromWire request.consistency)
-  context <- orInvalid (contextFromWire request.context)
-  subject <- orInvalid (subjectFromWire request.subject)
-  deadline <- lift (lookupDeadline env request.deadlineMillis)
+  consistency <- orInvalid (consistencyFromWire (request ^. #consistency))
+  context <- orInvalid (contextFromWire (request ^. #context))
+  subject <- orInvalid (subjectFromWire (request ^. #subject))
+  deadline <- lift (lookupDeadline env (request ^. #deadlineMillis))
   page <-
     engine
       env
       active
-      ( env.lookupWithDeadlineOperation
+      ( lookupWithDeadlineOperation
           deadline
-          active.graph
+          (active ^. #graph)
           consistency
           Lookup.LookupRequest
             { subject,
-              permission = RelationName request.permission,
-              objectType = ObjectType request.objectType,
+              permission = RelationName (request ^. #permission),
+              objectType = ObjectType (request ^. #objectType),
               context,
-              limit = Lookup.LookupLimit request.limit,
-              cursor = Lookup.LookupCursor <$> request.cursor
+              limit = Lookup.LookupLimit (request ^. #limit),
+              cursor = Lookup.LookupCursor <$> (request ^. #cursor)
             }
       )
   pure (lookupPageToWire page)
@@ -369,22 +367,22 @@ lookupHandler env request = enHandler do
 -- cursor equals the caller's own, so a drain loop over it never terminates and never
 -- advances; the same reason 'En.Servant.Wire.positiveLimit' guards the relationship read.
 lookupSubjectsHandler :: (IOE Effectful.:> es) => Env es -> LookupSubjectsRequestWire -> Handler (EnResult LookupSubjectsPageWire)
-lookupSubjectsHandler env request = enHandler do
+lookupSubjectsHandler env@Env {lookupSubjectsWithDeadlineOperation} request = enHandler do
   active <- activeSchema env
-  consistency <- orInvalid (consistencyFromWire request.consistency)
-  context <- orInvalid (contextFromWire request.context)
-  object <- orInvalid (objectRefFromWire request.object)
-  permission <- orInvalid (nonEmptyRelation "permission" request.permission)
-  subjectType <- orInvalid (nonEmptyObjectType "subjectType" request.subjectType)
-  limit <- orInvalid (positiveLimit request.limit)
-  deadline <- lift (lookupDeadline env request.deadlineMillis)
+  consistency <- orInvalid (consistencyFromWire (request ^. #consistency))
+  context <- orInvalid (contextFromWire (request ^. #context))
+  object <- orInvalid (objectRefFromWire (request ^. #object))
+  permission <- orInvalid (nonEmptyRelation "permission" (request ^. #permission))
+  subjectType <- orInvalid (nonEmptyObjectType "subjectType" (request ^. #subjectType))
+  limit <- orInvalid (positiveLimit (request ^. #limit))
+  deadline <- lift (lookupDeadline env (request ^. #deadlineMillis))
   page <-
     engine
       env
       active
-      ( env.lookupSubjectsWithDeadlineOperation
+      ( lookupSubjectsWithDeadlineOperation
           deadline
-          active.graph
+          (active ^. #graph)
           consistency
           LookupSubjects.LookupSubjectsRequest
             { object,
@@ -392,7 +390,7 @@ lookupSubjectsHandler env request = enHandler do
               subjectType,
               context,
               limit,
-              cursor = LookupSubjects.LookupSubjectsCursor <$> request.cursor
+              cursor = LookupSubjects.LookupSubjectsCursor <$> (request ^. #cursor)
             }
       )
   pure (lookupSubjectsPageToWire page)
@@ -404,10 +402,10 @@ lookupSubjectsHandler env request = enHandler do
 -- 'deadlineMaxMillis' is clamped down to it rather than rejected, so a client asking for
 -- more time than it can have still gets an answer.
 lookupDeadline :: (IOE Effectful.:> es) => Env es' -> Maybe Int -> Handler (Lookup.Deadline (Eff es))
-lookupDeadline env maybeDeadlineMillis = do
+lookupDeadline Env {deadlineDefaultMillis, deadlineMaxMillis} maybeDeadlineMillis = do
   startedAt <- liftIO getMonotonicTimeNSec
-  let requestedMillis = fromMaybe env.deadlineDefaultMillis maybeDeadlineMillis
-      budgetMillis = min env.deadlineMaxMillis (max 0 requestedMillis)
+  let requestedMillis = fromMaybe deadlineDefaultMillis maybeDeadlineMillis
+      budgetMillis = min deadlineMaxMillis (max 0 requestedMillis)
       budgetNs :: Word64
       budgetNs = fromIntegral budgetMillis * 1000000
   pure $
@@ -423,16 +421,20 @@ nonEmptyObjectType label value
   | otherwise = Right (ObjectType value)
 
 lookupPageToWire :: Lookup.LookupPage -> LookupPageWire
-lookupPageToWire Lookup.LookupPage {objects, state, checkedAt = ConsistencyToken checkedAt} =
-  LookupPageWire
-    { objects = lookupObjectToWire <$> objects,
-      state = lookupStateToWire state,
-      checkedAt
-    }
+lookupPageToWire page =
+  let ConsistencyToken checkedAt = page ^. #checkedAt
+   in LookupPageWire
+        { objects = lookupObjectToWire <$> (page ^. #objects),
+          state = lookupStateToWire (page ^. #state),
+          checkedAt
+        }
 
 lookupObjectToWire :: Lookup.LookupObject -> LookupObjectWire
-lookupObjectToWire Lookup.LookupObject {object, decision} =
-  LookupObjectWire {object = objectRefToWire object, decision = decisionToWire decision}
+lookupObjectToWire object =
+  LookupObjectWire
+    { object = objectRefToWire (object ^. #object),
+      decision = decisionToWire (object ^. #decision)
+    }
 
 lookupStateToWire :: Lookup.LookupState -> LookupStateWire
 lookupStateToWire =
@@ -442,16 +444,20 @@ lookupStateToWire =
     Lookup.LookupTruncated (Lookup.LookupCursor cursor) -> LookupTruncatedWire cursor
 
 lookupSubjectsPageToWire :: LookupSubjects.LookupSubjectsPage -> LookupSubjectsPageWire
-lookupSubjectsPageToWire LookupSubjects.LookupSubjectsPage {subjects, state, checkedAt = ConsistencyToken checkedAt} =
-  LookupSubjectsPageWire
-    { subjects = lookupSubjectToWire <$> subjects,
-      state = lookupSubjectsStateToWire state,
-      checkedAt
-    }
+lookupSubjectsPageToWire page =
+  let ConsistencyToken checkedAt = page ^. #checkedAt
+   in LookupSubjectsPageWire
+        { subjects = lookupSubjectToWire <$> (page ^. #subjects),
+          state = lookupSubjectsStateToWire (page ^. #state),
+          checkedAt
+        }
 
 lookupSubjectToWire :: LookupSubjects.LookupSubject -> LookupSubjectWire
-lookupSubjectToWire LookupSubjects.LookupSubject {subject, decision} =
-  LookupSubjectWire {subject = subjectToWire subject, decision = decisionToWire decision}
+lookupSubjectToWire subject =
+  LookupSubjectWire
+    { subject = subjectToWire (subject ^. #subject),
+      decision = decisionToWire (subject ^. #decision)
+    }
 
 lookupSubjectsStateToWire :: LookupSubjects.LookupSubjectsState -> LookupSubjectsStateWire
 lookupSubjectsStateToWire =
