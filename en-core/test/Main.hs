@@ -10,6 +10,7 @@ where
 
 import Data.Either (isLeft, isRight)
 import Data.Foldable (traverse_)
+import Data.Generics.Labels ()
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.List (sort)
 import Data.Map.Strict qualified as Map
@@ -96,6 +97,7 @@ import En.Lookup
     noDeadline,
   )
 import En.Lookup qualified as Lookup
+import En.Prelude
 import En.Reachability
   ( EntryKind,
     EntryPoint (..),
@@ -381,7 +383,7 @@ main = do
   let graph = compile validKikan
   assertEqual "compileSchema round-trips identically to compile . validateSchema" (Right graph) (compileSchema kikanSchema)
   testDecisionCache graph
-  assertEqual "graph stores schema hash" (schemaHash validKikan) graph.hash
+  assertEqual "graph stores schema hash" (schemaHash validKikan) (graph ^. #hash)
   assertEqual "schema hash is stable across map insertion order" (schemaHash validKikan) (schemaHash validKikanReordered)
   assertBool "space view has a direct user entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "user") Nothing False) Reachability.Direct False validKikan)
   assertBool "space view has a guest-org userset entrypoint" (hasEntry (relationRef "space" "view") (SubjectSelector (ObjectType "org") (Just (RelationName "member")) False) Reachability.Direct False validKikan)
@@ -461,8 +463,8 @@ main = do
   token a single check at the same consistency reports, because 'checkMany'
   resolves consistency once and evaluates every pair against that revision. A
   per-pair token would be four copies of one value pretending to be four facts. -}
-  assertEqual "a check reports the snapshot it was decided at" (Right testToken) . fmap (.checkedAt) =<< checkOutcome consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
-  assertEqual "a batch reports exactly one token, equal to a single check's" (Right testToken) . fmap (.checkedAt) =<< batchOutcome consistencyStore tupleStore graph MinimizeLatency requestContext mixedBatch
+  assertEqual "a check reports the snapshot it was decided at" (Right testToken) . fmap (view (#checkedAt)) =<< checkOutcome consistencyStore tupleStore graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
+  assertEqual "a batch reports exactly one token, equal to a single check's" (Right testToken) . fmap (view (#checkedAt)) =<< batchOutcome consistencyStore tupleStore graph MinimizeLatency requestContext mixedBatch
   let overlappingBatch =
         [ BatchPair (SubjectId user) (RelationName "view") space,
           BatchPair (SubjectId user) (RelationName "owner") space,
@@ -477,7 +479,7 @@ main = do
   independentResults <-
     traverse
       ( \pair ->
-          check consistencyStore independentStore graph MinimizeLatency requestContext pair.subject pair.permission pair.object
+          check consistencyStore independentStore graph MinimizeLatency requestContext (pair ^. #subject) (pair ^. #permission) (pair ^. #object)
       )
       overlappingBatch
   assertEqual "independent overlapping checks return decisions" [Right Allowed, Right Allowed, Right Denied] independentResults
@@ -502,11 +504,10 @@ main = do
   let cursorState = LookupCursorState {version = 2, token = testToken, lastObject = Just childSpace, frontier = []}
       frontierCursorState =
         cursorState
-          { frontier =
-              [ FrontierEntry {branchType = ObjectType "space", branchRelation = RelationName "member", branchOrdinal = 0, branchCursor = Just (StoreCursor "17"), branchExhausted = False},
-                FrontierEntry {branchType = ObjectType "org", branchRelation = RelationName "member", branchOrdinal = 1, branchCursor = Nothing, branchExhausted = True}
-              ]
-          }
+          & #frontier
+          .~ [ FrontierEntry {branchType = ObjectType "space", branchRelation = RelationName "member", branchOrdinal = 0, branchCursor = Just (StoreCursor "17"), branchExhausted = False},
+               FrontierEntry {branchType = ObjectType "org", branchRelation = RelationName "member", branchOrdinal = 1, branchCursor = Nothing, branchExhausted = True}
+             ]
   assertEqual "lookup cursor codec round-trips" (Right cursorState) (decodeLookupCursor (encodeLookupCursor cursorState))
   assertEqual "lookup cursor codec round-trips a frontier" (Right frontierCursorState) (decodeLookupCursor (encodeLookupCursor frontierCursorState))
   -- B9: a cursor is client-supplied text. Nothing may read at a revision taken
@@ -624,10 +625,10 @@ main = do
   resumedFolders <- collectAllLookupPages noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) (Just truncatedCursor))
   assertLookupObjects "deadline cursor resumes remaining lookup results" (drop 500 expectedFolders) resumedFolders
   crowdedExpansion <- expandEngine consistencyStore (runTupleStoreInMemory expandTuples) streamingGraph MinimizeLatency (expandRequest crowdedFolder (RelationName "viewer") requestContext (ExpandLimit 1500) Nothing)
-  assertEqual "expand drains multi-page object rows before applying result cap" (Right (1000, ExpandTruncated (ExpandCursor "1000"))) (fmap (\tree -> (length tree.children, tree.state)) crowdedExpansion)
+  assertEqual "expand drains multi-page object rows before applying result cap" (Right (1000, ExpandTruncated (ExpandCursor "1000"))) (fmap (\tree -> (length (tree ^. #children), tree ^. #state)) crowdedExpansion)
   assertEqual "probe returns the matching row" (Right [tupleRow 1 (Tuple {object = space, relation = RelationName "owner", subject = SubjectId user, caveat = Nothing})]) =<< probe consistencyStore tupleStore space (RelationName "owner") [SubjectId user]
   assertEqual "probe returns nothing for a non-member" (Right []) =<< probe consistencyStore tupleStore space (RelationName "owner") [SubjectId bob]
-  assertEqual "probe carries the caveat name and payload" (Right [Just autonomyCaveat]) =<< fmap (fmap (fmap (\row -> row.tuple.caveat))) (probe consistencyStore tupleStore intention (RelationName "delegate") [SubjectId user])
+  assertEqual "probe carries the caveat name and payload" (Right [Just autonomyCaveat]) =<< fmap (fmap (fmap (\row -> (row ^. #tuple) ^. #caveat))) (probe consistencyStore tupleStore intention (RelationName "delegate") [SubjectId user])
   let wideStore = runTupleStoreInMemory wideTuples
   assertEqual "wide relation: direct member checks Allowed" (Right Allowed) =<< check consistencyStore wideStore streamingGraph MinimizeLatency requestContext (SubjectId wideMember) (RelationName "viewer") wideFolder
   assertEqual "wide relation: non-member checks Denied" (Right Denied) =<< check consistencyStore wideStore streamingGraph MinimizeLatency requestContext (SubjectId bob) (RelationName "viewer") wideFolder
@@ -680,20 +681,20 @@ main = do
   reason, and "this returns 1200 objects" is also true of a pageLimit that was
   never read. -}
   assertEqual "a four-space chain resolves under the default depth budget" (Right Allowed) =<< check consistencyStore (runTupleStoreInMemory deepChainTuples) deepChainGraph MinimizeLatency requestContext (SubjectId user) (RelationName "view") shallowChainRoot
-  assertEqual "the same chain exceeds a maxDepth of three" (Left ResolutionLimitExceeded) =<< checkBudgeted defaultEvaluationBudget {maxDepth = 3} consistencyStore (runTupleStoreInMemory deepChainTuples) deepChainGraph MinimizeLatency requestContext (SubjectId user) (RelationName "view") shallowChainRoot
+  assertEqual "the same chain exceeds a maxDepth of three" (Left ResolutionLimitExceeded) =<< checkBudgeted (defaultEvaluationBudget & #maxDepth .~ 3) consistencyStore (runTupleStoreInMemory deepChainTuples) deepChainGraph MinimizeLatency requestContext (SubjectId user) (RelationName "view") shallowChainRoot
   {- pageLimit is a batch size, not a semantics knob: draining makes it invisible to
   the answer. So the result-set assertion alone would pass against an engine that
   ignored the field entirely -- it is the store-read count that shows the batch size
   was used. Reading 1,200 rows ten at a time is also 120 store pages, which is where
   a cursor that advanced by 2*start rather than start+limit would lose rows. -}
-  assertLookupObjects "a tenth-size read page returns the identical lookup result set" expectedFolders =<< collectAllLookupPagesBudgeted defaultEvaluationBudget {pageLimit = 10} noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
+  assertLookupObjects "a tenth-size read page returns the identical lookup result set" expectedFolders =<< collectAllLookupPagesBudgeted (defaultEvaluationBudget & #pageLimit .~ 10) noDeadline consistencyStore streamingStore streamingGraph (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
   defaultPageReads <- newIORef 0
   _ <- lookupEngineBudgeted defaultEvaluationBudget noDeadline consistencyStore (countingStoreFor defaultPageReads streamingTuples) streamingGraph MinimizeLatency (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
   assertEqual "a 1200-row relation is two store pages at the default batch size" 2 =<< readIORef defaultPageReads
   smallPageReads <- newIORef 0
-  _ <- lookupEngineBudgeted defaultEvaluationBudget {pageLimit = 10} noDeadline consistencyStore (countingStoreFor smallPageReads streamingTuples) streamingGraph MinimizeLatency (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
+  _ <- lookupEngineBudgeted (defaultEvaluationBudget & #pageLimit .~ 10) noDeadline consistencyStore (countingStoreFor smallPageReads streamingTuples) streamingGraph MinimizeLatency (lookupRequest (SubjectId paginator) (RelationName "viewer") (ObjectType "folder") requestContext (LookupLimit 500) Nothing)
   assertEqual "the same relation is 120 store pages at a batch size of ten" 120 =<< readIORef smallPageReads
-  assertEqual "a smaller result cap truncates the expand tree sooner" (Right (5, ExpandTruncated (ExpandCursor "5"))) . fmap (\tree -> (length tree.children, tree.state)) =<< expandBudgeted defaultEvaluationBudget {resultCap = 5} consistencyStore (runTupleStoreInMemory expandTuples) streamingGraph MinimizeLatency (expandRequest crowdedFolder (RelationName "viewer") requestContext (ExpandLimit 1500) Nothing)
+  assertEqual "a smaller result cap truncates the expand tree sooner" (Right (5, ExpandTruncated (ExpandCursor "5"))) . fmap (\tree -> (length (tree ^. #children), tree ^. #state)) =<< expandBudgeted (defaultEvaluationBudget & #resultCap .~ 5) consistencyStore (runTupleStoreInMemory expandTuples) streamingGraph MinimizeLatency (expandRequest crowdedFolder (RelationName "viewer") requestContext (ExpandLimit 1500) Nothing)
   assertEqual "expand reports a cycle rather than hiding the branch" (Left (CycleDetected "space:recursive-space#view")) =<< expandEngine consistencyStore recursiveTupleStore graph MinimizeLatency (expandRequest recursiveSpace (RelationName "view") requestContext (ExpandLimit 10) Nothing)
   taintGraph <- either (fail . show) pure (compileSchema taintSchema)
   assertEqual "a cycle-tainted decision is not memoized across batch pairs" (Right [Right Allowed, Right Allowed]) =<< checkMany consistencyStore (runTupleStoreInMemory taintTuples) taintGraph MinimizeLatency requestContext [BatchPair (SubjectId carol) (RelationName "x") taintNode, BatchPair (SubjectId carol) (RelationName "y") taintNode]
@@ -722,12 +723,12 @@ main = do
   that snapshot, so page two reports the token page one did -- taken from the
   cursor's /validated/ token rather than resolved afresh, which is what makes a
   multi-page lookup one answer rather than several. -}
-  firstPageToken <- fmap (fmap (.checkedAt)) (lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) Nothing))
-  secondPageToken <- fmap (fmap (.checkedAt)) (lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) (Just childCursor)))
+  firstPageToken <- fmap (fmap (view (#checkedAt))) (lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) Nothing))
+  secondPageToken <- fmap (fmap (view (#checkedAt))) (lookupEngine noDeadline consistencyStore tupleStore graph MinimizeLatency (lookupRequest (SubjectId user) (RelationName "view") (ObjectType "space") requestContext (LookupLimit 1) (Just childCursor)))
   assertEqual "a resumed lookup page reports the first page's token" firstPageToken secondPageToken
   assertEqual "a lookup page reports the snapshot it was evaluated at" (Right testToken) firstPageToken
   spaceExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest space (RelationName "view") requestContext (ExpandLimit 20) Nothing)
-  assertEqual "expand reports the snapshot it was taken at" (Right testToken) (fmap (.checkedAt) spaceExpansion)
+  assertEqual "expand reports the snapshot it was taken at" (Right testToken) (fmap (view (#checkedAt)) spaceExpansion)
   assertBool "expand includes direct owner subject" (treeHasSubject (SubjectId user) spaceExpansion)
   childExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest childSpace (RelationName "view") requestContext (ExpandLimit 20) Nothing)
   assertBool "expand includes parent userset" (treeHasUserset space (RelationName "view") childExpansion)
@@ -741,10 +742,10 @@ main = do
   assertEqual "expand paginates top-level children" (Right (ExpandHasMore (ExpandCursor "1"))) =<< fmap (fmap expandState) (expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest exclusionSpace (RelationName "member") requestContext (ExpandLimit 1) Nothing))
   auditExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest auditedSpace (RelationName "audit") requestContext (ExpandLimit 20) Nothing)
   assertBool "expand preserves the audit intersection operator" (treeHasIntersection auditExpansion)
-  assertEqual "expand renders one child per conjunct" (Right [2]) (fmap (fmap conjunctCount . (.children)) auditExpansion)
+  assertEqual "expand renders one child per conjunct" (Right [2]) (fmap (fmap conjunctCount . (view (#children))) auditExpansion)
   assertBool "expand finds both conjuncts' subjects through the intersection" (all (\relation -> treeHasUserset auditedSpace (RelationName relation) auditExpansion) ["owner", "member"])
   -- Operator nodes are atomic under paging: a limit of 1 cannot split a conjunction.
-  assertEqual "expand never splits an operator node across pages" (Right (1, ExpandExhausted)) =<< fmap (fmap (\tree -> (length tree.children, tree.state))) (expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest auditedSpace (RelationName "audit") requestContext (ExpandLimit 1) Nothing))
+  assertEqual "expand never splits an operator node across pages" (Right (1, ExpandExhausted)) =<< fmap (fmap (\tree -> (length (tree ^. #children), tree ^. #state))) (expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest auditedSpace (RelationName "audit") requestContext (ExpandLimit 1) Nothing))
   exclusionExpansion <- expandEngine consistencyStore tupleStore graph MinimizeLatency (expandRequest exclusionSpace (RelationName "member_not_owner") requestContext (ExpandLimit 20) Nothing)
   let exclusionSides = treeExclusionSides exclusionExpansion
       onEachSide predicate = fmap (\(granted, subtracted) -> (any predicate granted, any predicate subtracted)) exclusionSides
@@ -1151,7 +1152,7 @@ testStorePaging = do
   assertEqual
     "the in-memory store drains every row of a relation spanning four pages"
     [SubjectId (pagedUser index) | index <- [1 .. pagedRowCount]]
-    (fmap ((.subject) . (.tuple)) drained)
+    (fmap ((view (#subject)) . (view (#tuple))) drained)
 
 -- | The public mutable store is a historical interpreter, not another fixture list.
 --
@@ -1168,20 +1169,20 @@ testMutableInMemoryStore = do
       =<< runMutable
         world
         (Check.check mutableGraph FullyConsistent mutableContext (SubjectId mutableAlice) mutableView mutableDocument)
-  assertEqual "mutable store: check is denied before write" Denied initialCheck.decision
+  assertEqual "mutable store: check is denied before write" Denied (initialCheck ^. #decision)
 
   writeToken <- expectMutable "write grant" =<< runMutable world (writeTuples [mutableGrant])
   exactPage <-
     expectMutable "read exact write snapshot"
       =<< runMutable world (readMutableAt (AtExactSnapshot writeToken) mutableDocument mutableViewer 10 Nothing)
-  assertEqual "mutable store: a write is visible at its token" [mutableGrant] (fmap (.tuple) exactPage.rows)
+  assertEqual "mutable store: a write is visible at its token" [mutableGrant] (fmap (view (#tuple)) (exactPage ^. #rows))
 
   allowedAfterWrite <-
     expectMutable "check after write"
       =<< runMutable
         world
         (Check.check mutableGraph (AtLeastAsFresh writeToken) mutableContext (SubjectId mutableAlice) mutableView mutableDocument)
-  assertEqual "mutable store: check becomes allowed after write" Allowed allowedAfterWrite.decision
+  assertEqual "mutable store: check becomes allowed after write" Allowed (allowedAfterWrite ^. #decision)
 
   lookupAfterWrite <-
     expectMutable "lookup after write"
@@ -1192,13 +1193,13 @@ testMutableInMemoryStore = do
             FullyConsistent
             (lookupRequest (SubjectId mutableAlice) mutableView (ObjectType "document") mutableContext (LookupLimit 10) Nothing)
         )
-  assertEqual "mutable store: lookup observes a written grant" [allowed mutableDocument] lookupAfterWrite.objects
+  assertEqual "mutable store: lookup observes a written grant" [allowed mutableDocument] (lookupAfterWrite ^. #objects)
 
   _identicalToken <- expectMutable "touch identical grant" =<< runMutable world (writeTuples [mutableGrant])
   identicalPage <-
     expectMutable "read after identical touch"
       =<< runMutable world (readMutableAt FullyConsistent mutableDocument mutableViewer 10 Nothing)
-  assertEqual "mutable store: an identical touch preserves one live row" [mutableGrant] (fmap (.tuple) identicalPage.rows)
+  assertEqual "mutable store: an identical touch preserves one live row" [mutableGrant] (fmap (view (#tuple)) (identicalPage ^. #rows))
 
   headBeforeFailure <- expectMutable "head before precondition failure" =<< runMutable world headRevision
   failedWrite <-
@@ -1227,47 +1228,47 @@ testMutableInMemoryStore = do
   assertEqual
     "mutable store: a differing caveat replaces the live row"
     [Just mutableCaveat]
-    (fmap ((.caveat) . (.tuple)) replacementPage.rows)
+    (fmap ((view (#caveat)) . (view (#tuple))) (replacementPage ^. #rows))
 
   deleteToken <- expectMutable "delete grant" =<< runMutable world (deleteTuples [mutableGrant])
   deletedPage <-
     expectMutable "read after delete"
       =<< runMutable world (readMutableAt FullyConsistent mutableDocument mutableViewer 10 Nothing)
-  assertEqual "mutable store: delete hides the live row" [] deletedPage.rows
+  assertEqual "mutable store: delete hides the live row" [] (deletedPage ^. #rows)
   oldPage <-
     expectMutable "read pre-delete exact snapshot"
       =<< runMutable world (readMutableAt (AtExactSnapshot writeToken) mutableDocument mutableViewer 10 Nothing)
-  assertEqual "mutable store: exact snapshot survives delete" [mutableGrant] (fmap (.tuple) oldPage.rows)
+  assertEqual "mutable store: exact snapshot survives delete" [mutableGrant] (fmap (view (#tuple)) (oldPage ^. #rows))
 
   deniedAfterDelete <-
     expectMutable "check after delete"
       =<< runMutable
         world
         (Check.check mutableGraph FullyConsistent mutableContext (SubjectId mutableAlice) mutableView mutableDocument)
-  assertEqual "mutable store: check becomes denied after delete" Denied deniedAfterDelete.decision
+  assertEqual "mutable store: check becomes denied after delete" Denied (deniedAfterDelete ^. #decision)
 
   writeRevision <-
-    (.revision) <$> (expectMutable "resolve write token" =<< runMutable world (resolveConsistency (AtExactSnapshot writeToken)))
+    (view (#revision)) <$> (expectMutable "resolve write token" =<< runMutable world (resolveConsistency (AtExactSnapshot writeToken)))
   deleteRevision <-
-    (.revision) <$> (expectMutable "resolve delete token" =<< runMutable world (resolveConsistency (AtExactSnapshot deleteToken)))
+    (view (#revision)) <$> (expectMutable "resolve delete token" =<< runMutable world (resolveConsistency (AtExactSnapshot deleteToken)))
   touchChanges <-
     expectMutable "read touch changes"
       =<< runMutable world (readChanges initialRevision writeRevision Nothing 10 Nothing)
   assertEqual
     "mutable store: changelog reports the entering row"
     [TupleChange ChangeTouch mutableGrant (TupleRowId "mem-row:1")]
-    touchChanges.changes
+    (touchChanges ^. #changes)
   netChanges <-
     expectMutable "read net changes"
       =<< runMutable world (readChanges initialRevision deleteRevision Nothing 10 Nothing)
-  assertEqual "mutable store: a created-then-deleted grant is a net no-op" [] netChanges.changes
+  assertEqual "mutable store: a created-then-deleted grant is a net no-op" [] (netChanges ^. #changes)
 
   newerToken <- expectMutable "write newer grant" =<< runMutable world (writeTuples [mutableOtherGrant])
   resolvedFresh <-
     expectMutable "resolve at least as fresh"
       =<< runMutable world (resolveConsistency (AtLeastAsFresh deleteToken))
   newerHead <- expectMutable "read newer head" =<< runMutable world headRevision
-  assertEqual "mutable store: at-least-as-fresh chooses current head" newerHead resolvedFresh.revision
+  assertEqual "mutable store: at-least-as-fresh chooses current head" newerHead (resolvedFresh ^. #revision)
   assertBool "mutable store: the newer write minted another token" (newerToken /= deleteToken)
 
   testMutablePagination
@@ -1288,7 +1289,7 @@ testMutablePagination = do
     expectMutable "read pagination first page"
       =<< runMutable world (readMutableAt (AtExactSnapshot snapshotToken) mutableDocument mutableViewer 2 Nothing)
   firstCursor <-
-    case firstPage.state of
+    case (firstPage ^. #state) of
       HasMore cursor -> pure cursor
       other -> fail ("mutable store: expected first page cursor, got " <> show other)
   _ <- expectMutable "interleave pagination write" =<< runMutable world (writeTuples [interleaved])
@@ -1296,7 +1297,7 @@ testMutablePagination = do
     expectMutable "read pagination second page"
       =<< runMutable world (readMutableAt (AtExactSnapshot snapshotToken) mutableDocument mutableViewer 2 (Just firstCursor))
   secondCursor <-
-    case secondPage.state of
+    case (secondPage ^. #state) of
       HasMore cursor -> pure cursor
       other -> fail ("mutable store: expected second page cursor, got " <> show other)
   thirdPage <-
@@ -1305,8 +1306,8 @@ testMutablePagination = do
   assertEqual
     "mutable store: row-id cursors survive an interleaved write"
     grants
-    (fmap (.tuple) (firstPage.rows <> secondPage.rows <> thirdPage.rows))
-  assertEqual "mutable store: fixed snapshot pagination exhausts" Exhausted thirdPage.state
+    (fmap (view (#tuple)) ((firstPage ^. #rows) <> (secondPage ^. #rows) <> (thirdPage ^. #rows)))
+  assertEqual "mutable store: fixed snapshot pagination exhausts" Exhausted (thirdPage ^. #state)
 
 testMutableFilters :: IO ()
 testMutableFilters = do
@@ -1326,7 +1327,7 @@ testMutableFilters = do
       =<< runMutable world do
         ResolvedConsistency {revision} <- resolveConsistency FullyConsistent
         readRelationships revision aliceFilter 10 Nothing
-  assertEqual "mutable store: relationship read returns both grants" 2 (length listed.rows)
+  assertEqual "mutable store: relationship read returns both grants" 2 (length (listed ^. #rows))
   (deletedCount, _) <-
     expectMutable "delete mutable relationships"
       =<< runMutable world (deleteRelationships (objectTypeFilter "document"))
@@ -1336,7 +1337,7 @@ testMutableFilters = do
       =<< runMutable world do
         ResolvedConsistency {revision} <- resolveConsistency FullyConsistent
         readAllTuples revision 10 Nothing
-  assertEqual "mutable store: delete-by-filter retires matches" [] remaining.rows
+  assertEqual "mutable store: delete-by-filter retires matches" [] (remaining ^. #rows)
 
 testMutableFailuresAndReaping :: IO ()
 testMutableFailuresAndReaping = do
@@ -1597,7 +1598,7 @@ clearancePayload entries =
 testSchemaCheck :: IO ()
 testSchemaCheck = do
   valid <- either (fail . show) pure (validateSchema schemaCheckSchema)
-  let reasonOf tuple = (.reason) <$> checkTupleAgainstSchema valid tuple
+  let reasonOf tuple = (view (#reason)) <$> checkTupleAgainstSchema valid tuple
       aliceUser = SubjectId ObjectRef {objectType = ObjectType "user", objectId = "alice"}
       engMembers = SubjectSet ObjectRef {objectType = ObjectType "group", objectId = "eng"} (RelationName "member")
       userWildcard = SubjectWildcard (ObjectType "user")
@@ -1763,7 +1764,7 @@ testValidateTuplesAgainstSchema = do
 testRelationshipFilterMatching :: IO ()
 testRelationshipFilterMatching = do
   let matching relationshipFilter =
-        [tuple.relation | tuple <- filterTuples, matchesRelationshipFilter relationshipFilter tuple]
+        [(tuple ^. #relation) | tuple <- filterTuples, matchesRelationshipFilter relationshipFilter tuple]
 
   assertEqual
     "a subject-anchored filter finds every grant naming the subject"
@@ -1840,16 +1841,16 @@ testRelationshipStoreOperations = do
   -- Paging: two matches at a limit of one must arrive across two pages, and the
   -- second page must be exhausted rather than repeating the first.
   let firstPage = withFilterStore (readRelationships testRevision aliceFilter 1 Nothing)
-  assertEqual "the first page carries one row" 1 (length firstPage.rows)
-  case firstPage.state of
+  assertEqual "the first page carries one row" 1 (length (firstPage ^. #rows))
+  case (firstPage ^. #state) of
     HasMore cursor -> do
       let secondPage = withFilterStore (readRelationships testRevision aliceFilter 1 (Just cursor))
-      assertEqual "the second page carries the remaining row" 1 (length secondPage.rows)
-      assertEqual "the second page is exhausted" Exhausted secondPage.state
+      assertEqual "the second page carries the remaining row" 1 (length (secondPage ^. #rows))
+      assertEqual "the second page is exhausted" Exhausted (secondPage ^. #state)
       assertEqual
         "the two pages together are the whole match set, in order"
         [RelationName "owner", RelationName "delegate"]
-        (fmap ((.relation) . (.tuple)) (firstPage.rows <> secondPage.rows))
+        (fmap ((view (#relation)) . (view (#tuple))) ((firstPage ^. #rows) <> (secondPage ^. #rows)))
     other -> fail ("expected the first page to have more, got " <> show other)
 
   -- Delete-by-filter retires exactly the matching grants and leaves the rest.
@@ -1857,7 +1858,7 @@ testRelationshipStoreOperations = do
         withFilterStore do
           (count, _token) <- deleteRelationships aliceFilter
           survivors <- readAllTuples testRevision 100 Nothing
-          pure (count, fmap ((.relation) . (.tuple)) survivors.rows)
+          pure (count, fmap ((view (#relation)) . (view (#tuple))) (survivors ^. #rows))
   assertEqual "deleteRelationships retires every match" 2 deleted
   assertEqual
     "deleteRelationships leaves every non-match"
@@ -1890,8 +1891,8 @@ pagedUser index =
 drainPaged :: (TupleStore :> es) => Maybe StoreCursor -> [TupleRow] -> Eff es [TupleRow]
 drainPaged cursor acc = do
   page <- readObjectRelation testRevision pagedFolder (RelationName "viewer") pagedPageLimit cursor
-  let acc' = acc <> page.rows
-  case page.state of
+  let acc' = acc <> (page ^. #rows)
+  case (page ^. #state) of
     Exhausted -> pure acc'
     HasMore next -> drainPaged (Just next) acc'
     Truncated next -> drainPaged (Just next) acc'
@@ -1992,7 +1993,7 @@ testCachedTupleStore = do
 
 sampleObjectPage :: Int -> Maybe StoreCursor -> TuplePage
 sampleObjectPage limit cursor =
-  pageTuples limit cursor [tuple | tuple <- fixtureTuples, tuple.object == space, tuple.relation == RelationName "view"]
+  pageTuples limit cursor [tuple | tuple <- fixtureTuples, tuple ^. #object == space, tuple ^. #relation == RelationName "view"]
 
 -- | The residual decision algebra: a decision with its caveats left symbolic.
 --
@@ -2006,7 +2007,7 @@ sampleObjectPage limit cursor =
 -- fold constants the decision algebra would have folded anyway.
 testResidualDecision :: IO ()
 testResidualDecision = do
-  let payload = autonomyCaveat.payload
+  let payload = (autonomyCaveat ^. #payload)
       withinAutonomy = RCaveat (CaveatName "within_autonomy") payload
       always = RCaveat (CaveatName "always") emptyPayload
       never = RCaveat (CaveatName "never") emptyPayload
@@ -2103,7 +2104,7 @@ testResidualDecision = do
         RDenied,
         RCaveat (CaveatName "always") emptyPayload,
         RCaveat (CaveatName "never") emptyPayload,
-        RCaveat (CaveatName "within_autonomy") autonomyCaveat.payload
+        RCaveat (CaveatName "within_autonomy") (autonomyCaveat ^. #payload)
       ]
 
 emptyPayload :: CaveatPayload
@@ -2189,11 +2190,11 @@ testDecisionCache graph = do
   assertEqual "caveated check under context A evaluates" (Right Allowed) =<< crossCheck requestContext
   readsAfterFirst <- readIORef crossReads
   assertBool "the first context reads the store" (readsAfterFirst > 0)
-  crossStatsAfterFirst <- cacheStats crossContextEnv.cacheDecisions
+  crossStatsAfterFirst <- cacheStats (crossContextEnv ^. #cacheDecisions)
   assertEqual "caveated check under a later context still allows" (Right Allowed) =<< crossCheck laterRequestContext
   assertEqual "a context differing only in current_time performs no store reads" readsAfterFirst =<< readIORef crossReads
-  crossStatsAfterSecond <- cacheStats crossContextEnv.cacheDecisions
-  assertBool "cache stats show hits across caveat contexts" (crossStatsAfterSecond.hits > crossStatsAfterFirst.hits)
+  crossStatsAfterSecond <- cacheStats (crossContextEnv ^. #cacheDecisions)
+  assertBool "cache stats show hits across caveat contexts" ((crossStatsAfterSecond ^. #hits) > (crossStatsAfterFirst ^. #hits))
   assertEqual "an expired context gets Denied from the shared entry" (Right Denied) =<< crossCheck expiredContext
   assertEqual "a context missing the caveat's parameter gets Conditional from the shared entry" (Right conditionalDecision) =<< crossCheck missingAutonomyContext
   assertEqual "no context ever re-read the store" readsAfterFirst =<< readIORef crossReads
@@ -2205,7 +2206,7 @@ testDecisionCache graph = do
   assertEqual "decision key separates revision through checkCached" (Right Allowed) =<< checkCachedEngine (fixedRevisionConsistencyStore (Revision "revision:other")) (countingTupleStore separationReadCount tupleStore) separationEnv graph MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
   separationReadsAfterRevisionMiss <- readIORef separationReadCount
   assertBool "different revision misses decision cache" (separationReadsAfterRevisionMiss > separationReadsAfterFirst)
-  let graphWithOtherHash = graph {hash = SchemaHash "schema:other"}
+  let graphWithOtherHash = graph & #hash .~ SchemaHash "schema:other"
   assertEqual "decision key separates schema hash through checkCached" (Right Allowed) =<< checkCachedEngine consistencyStore (countingTupleStore separationReadCount tupleStore) separationEnv graphWithOtherHash MinimizeLatency requestContext (SubjectId user) (RelationName "view") space
   assertBool "different schema hash misses decision cache" =<< ((> separationReadsAfterRevisionMiss) <$> readIORef separationReadCount)
 
@@ -2216,7 +2217,7 @@ testDecisionCache graph = do
   lookupStatsAfterFirst <- cacheStats cacheDecisions
   assertEqual "cached lookup confirms candidates second" (Right (lookupPage [allowed auditedSpace, allowed exclusionSpace] LookupExhausted)) =<< lookupCachedEngine consistencyStore tupleStore lookupEnv graph MinimizeLatency lookupAudit
   lookupStatsAfterSecond <- cacheStats cacheDecisions
-  assertBool "cached lookup reuses decision cache for confirmations" (lookupStatsAfterSecond.hits > lookupStatsAfterFirst.hits)
+  assertBool "cached lookup reuses decision cache for confirmations" ((lookupStatsAfterSecond ^. #hits) > (lookupStatsAfterFirst ^. #hits))
 
   {- Lookup confirms its candidates through 'checkCached', so it inherits
   cross-context sharing -- and must inherit never-staleness with it.
@@ -2242,11 +2243,11 @@ testDecisionCache graph = do
   lookupReadsAfterFirst <- readIORef crossLookupReads
   assertEqual "cached lookup repeating context A admits frank" (Right (lookupPage [allowed roomR] LookupExhausted)) =<< crossLookup requestContext
   lookupReadsAfterRepeat <- readIORef crossLookupReads
-  crossLookupStatsBefore <- cacheStats crossLookupEnv.cacheDecisions
+  crossLookupStatsBefore <- cacheStats (crossLookupEnv ^. #cacheDecisions)
   assertEqual "cached lookup under a later context still admits frank" (Right (lookupPage [allowed roomR] LookupExhausted)) =<< crossLookup laterRequestContext
   lookupReadsAfterContextChange <- readIORef crossLookupReads
-  crossLookupStatsAfter <- cacheStats crossLookupEnv.cacheDecisions
-  assertBool "cached lookup hits the decision cache across caveat contexts" (crossLookupStatsAfter.hits > crossLookupStatsBefore.hits)
+  crossLookupStatsAfter <- cacheStats (crossLookupEnv ^. #cacheDecisions)
+  assertBool "cached lookup hits the decision cache across caveat contexts" ((crossLookupStatsAfter ^. #hits) > (crossLookupStatsBefore ^. #hits))
   assertEqual
     "a different caveat context costs a cached lookup no extra store reads"
     (lookupReadsAfterRepeat - lookupReadsAfterFirst)
@@ -2270,7 +2271,7 @@ checkCachedEngine ::
   ObjectRef ->
   IO (Either EnError CheckDecision)
 checkCachedEngine cStore tStore cacheEnv graph consistency context subject relation object =
-  fmap (.decision) <$> runEngine cStore tStore (Check.checkCached cacheEnv graph consistency context subject relation object)
+  fmap (view (#decision)) <$> runEngine cStore tStore (Check.checkCached cacheEnv graph consistency context subject relation object)
 
 lookupCachedEngine ::
   ConsistencyInterpreter ->
@@ -2317,7 +2318,7 @@ check ::
   ObjectRef ->
   IO (Either EnError CheckDecision)
 check cStore tStore graph consistency context subject relation object =
-  fmap (.decision) <$> checkOutcome cStore tStore graph consistency context subject relation object
+  fmap (view (#decision)) <$> checkOutcome cStore tStore graph consistency context subject relation object
 
 -- | 'check', keeping the token it was decided at. See 'Check.CheckOutcome'.
 checkOutcome ::
@@ -2345,7 +2346,7 @@ checkBudgeted ::
   ObjectRef ->
   IO (Either EnError CheckDecision)
 checkBudgeted budget cStore tStore graph consistency context subject relation object =
-  fmap (.decision) <$> runEngine cStore tStore (Check.checkWithBudget budget graph consistency context subject relation object)
+  fmap (view (#decision)) <$> runEngine cStore tStore (Check.checkWithBudget budget graph consistency context subject relation object)
 
 probe ::
   ConsistencyInterpreter ->
@@ -2366,7 +2367,7 @@ checkMany ::
   [BatchPair] ->
   IO (Either EnError [Either EnError CheckDecision])
 checkMany cStore tStore graph consistency context pairs =
-  fmap (.decisions) <$> batchOutcome cStore tStore graph consistency context pairs
+  fmap (view (#decisions)) <$> batchOutcome cStore tStore graph consistency context pairs
 
 -- | 'checkMany', keeping the one token the whole batch was decided at.
 batchOutcome ::
@@ -2459,11 +2460,11 @@ collectAllLookupPagesBudgeted budget deadline cStore tStore graph request = do
 requestWithCursor :: LookupRequest -> LookupCursor -> LookupRequest
 requestWithCursor request cursor =
   LookupRequest
-    { subject = request.subject,
-      permission = request.permission,
-      objectType = request.objectType,
-      context = request.context,
-      limit = request.limit,
+    { subject = (request ^. #subject),
+      permission = (request ^. #permission),
+      objectType = (request ^. #objectType),
+      context = (request ^. #context),
+      limit = (request ^. #limit),
       cursor = Just cursor
     }
 
@@ -2508,7 +2509,7 @@ conditional object obligations =
 
 treeHasSubject :: Subject -> Either EnError ExpandTree -> Bool
 treeHasSubject subject =
-  either (const False) (any (nodeHasSubject subject) . (.children))
+  either (const False) (any (nodeHasSubject subject) . (view (#children)))
 
 nodeHasSubject :: Subject -> ExpandNode -> Bool
 nodeHasSubject subject =
@@ -2522,7 +2523,7 @@ nodeHasSubject subject =
 
 treeHasUserset :: ObjectRef -> RelationName -> Either EnError ExpandTree -> Bool
 treeHasUserset object relation =
-  either (const False) (any (nodeHasUserset object relation) . (.children))
+  either (const False) (any (nodeHasUserset object relation) . (view (#children)))
 
 nodeHasUserset :: ObjectRef -> RelationName -> ExpandNode -> Bool
 nodeHasUserset object relation =
@@ -2539,7 +2540,7 @@ nodeHasUserset object relation =
 
 treeHasCaveat :: CaveatName -> Either EnError ExpandTree -> Bool
 treeHasCaveat caveat =
-  either (const False) (any (nodeHasCaveat caveat) . (.children))
+  either (const False) (any (nodeHasCaveat caveat) . (view (#children)))
 
 nodeHasCaveat :: CaveatName -> ExpandNode -> Bool
 nodeHasCaveat caveat =
@@ -2554,7 +2555,7 @@ nodeHasCaveat caveat =
 
 treeHasUnion :: Either EnError ExpandTree -> Bool
 treeHasUnion =
-  either (const False) (any nodeIsUnion . (.children))
+  either (const False) (any nodeIsUnion . (view (#children)))
   where
     nodeIsUnion = \case
       ExpandUnion _ -> True
@@ -2569,7 +2570,7 @@ conjunctCount = \case
 -- | The conjuncts of the tree's first top-level intersection node.
 treeConjuncts :: Either EnError ExpandTree -> Maybe [ExpandNode]
 treeConjuncts =
-  either (const Nothing) (firstIntersection . (.children))
+  either (const Nothing) (firstIntersection . (view (#children)))
   where
     firstIntersection nodes =
       case [conjuncts | ExpandIntersection conjuncts <- nodes] of
@@ -2584,7 +2585,7 @@ branchWidth = \case
 
 treeHasIntersection :: Either EnError ExpandTree -> Bool
 treeHasIntersection =
-  either (const False) (any nodeIsIntersection . (.children))
+  either (const False) (any nodeIsIntersection . (view (#children)))
   where
     nodeIsIntersection = \case
       ExpandIntersection _ -> True
@@ -2598,7 +2599,7 @@ treeHasIntersection =
 -- distinguishes "granted" from "carved out".
 treeExclusionSides :: Either EnError ExpandTree -> Maybe ([ExpandNode], [ExpandNode])
 treeExclusionSides =
-  either (const Nothing) (firstExclusion . (.children))
+  either (const Nothing) (firstExclusion . (view (#children)))
   where
     firstExclusion nodes =
       case [(granted, subtracted) | ExpandExclusion granted subtracted <- nodes] of
@@ -2680,9 +2681,10 @@ kikanSchemaManual =
 kikanSchemaReordered :: Schema
 kikanSchemaReordered =
   kikanSchema
-    { objectTypes = Map.fromList (reverse (Map.toList kikanSchema.objectTypes)),
-      caveats = Map.fromList (reverse (Map.toList kikanSchema.caveats))
-    }
+    & #objectTypes
+    .~ Map.fromList (reverse (Map.toList (kikanSchema ^. #objectTypes)))
+    & #caveats
+    .~ Map.fromList (reverse (Map.toList (kikanSchema ^. #caveats)))
 
 invalidTupleToUsersetSchema :: Schema
 invalidTupleToUsersetSchema =
@@ -2812,9 +2814,9 @@ hasEntry :: RelationRef -> SubjectSelector -> EntryKind -> Bool -> ValidSchema -
 hasEntry target source kind recursive valid =
   any
     ( \entry ->
-        entry.source == source
-          && entry.kind == kind
-          && entry.recursive == recursive
+        (entry ^. #source) == source
+          && (entry ^. #kind) == kind
+          && (entry ^. #recursive) == recursive
     )
     (Map.findWithDefault [] target (entryPoints valid))
 
@@ -2949,18 +2951,18 @@ interpretFixtureTupleStore countRef errorObject tuples =
       countRead
       if Just object == errorObject
         then pure (injectedErrorRows object relation)
-        else pure (pageTuples limit cursor [tuple | tuple <- tuples, tuple.object == object, tuple.relation == relation])
+        else pure (pageTuples limit cursor [tuple | tuple <- tuples, (tuple ^. #object) == object, (tuple ^. #relation) == relation])
     ReadStartingWithUser _ query -> do
       countRead
       pure
         ( pageTuples
-            query.queryLimit
-            query.queryCursor
+            (query ^. #queryLimit)
+            (query ^. #queryCursor)
             [ tuple
             | tuple <- tuples,
-              tuple.object.objectType == query.queryType,
-              tuple.relation == query.queryRelation,
-              tuple.subject `elem` query.querySubjects
+              (tuple ^. #object . #objectType) == (query ^. #queryType),
+              (tuple ^. #relation) == (query ^. #queryRelation),
+              (tuple ^. #subject) `elem` (query ^. #querySubjects)
             ]
         )
     ReadAllTuples _ limit cursor -> do
@@ -2974,9 +2976,9 @@ interpretFixtureTupleStore countRef errorObject tuples =
           pure
             [ tupleRow index tuple
             | (index, tuple) <- zip [1 ..] tuples,
-              tuple.object == object,
-              tuple.relation == relation,
-              tuple.subject `elem` subjects
+              (tuple ^. #object) == object,
+              (tuple ^. #relation) == relation,
+              (tuple ^. #subject) `elem` subjects
             ]
     ReadRelationships _ relationshipFilter limit cursor -> do
       countRead

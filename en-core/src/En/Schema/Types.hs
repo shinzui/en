@@ -21,6 +21,7 @@ import Data.Map.Strict (Map)
 import Data.Set (Set)
 import Data.Text (Text)
 import En.Caveat.Value (CaveatValue)
+import GHC.Generics (Generic)
 import Language.Haskell.TH.Syntax (Lift)
 
 newtype ObjectType = ObjectType Text
@@ -80,14 +81,14 @@ data CaveatDefinition = CaveatDefinition
     parameters :: !(Map CaveatParameterName CaveatParameterType),
     predicate :: !CaveatPredicate
   }
-  deriving stock (Eq, Show, Lift)
+  deriving stock (Eq, Generic, Show, Lift)
 
 -- | A complete authorization model: every object type and its relations.
 data Schema = Schema
   { objectTypes :: !(Map ObjectType (Map RelationName Relation)),
     caveats :: !(Map CaveatName CaveatDefinition)
   }
-  deriving stock (Eq, Show, Lift)
+  deriving stock (Eq, Generic, Show, Lift)
 
 -- | A relation is a name plus the rewrite rule that computes its effective members.
 data Relation = Relation
@@ -95,7 +96,7 @@ data Relation = Relation
     allowedSubjects :: !(Set AllowedSubject),
     rewrite :: !Rewrite
   }
-  deriving stock (Eq, Show, Lift)
+  deriving stock (Eq, Generic, Show, Lift)
 
 -- | A subject shape accepted by direct tuples on a relation.
 --
@@ -107,7 +108,7 @@ data AllowedSubject = AllowedSubject
     relation :: !(Maybe RelationName),
     wildcard :: !Bool
   }
-  deriving stock (Eq, Ord, Show, Lift)
+  deriving stock (Eq, Generic, Ord, Show, Lift)
 
 -- | Userset-rewrite expressions — the Zanzibar relation algebra. @en@ leans on
 -- 'Union', 'ComputedUserset', and 'TupleToUserset'; 'Intersection' / 'Exclusion'

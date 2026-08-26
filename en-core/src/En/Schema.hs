@@ -37,6 +37,7 @@ where
 import Control.Monad (void)
 import Data.Bits (xor)
 import Data.Foldable (traverse_)
+import Data.Generics.Labels ()
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
@@ -45,6 +46,7 @@ import Data.Text qualified as Text
 import Data.Word (Word64)
 import En.Caveat.Value (CaveatContext (..), CaveatPayload (..), CaveatValue (..))
 import En.Error (EnError (..))
+import En.Prelude
 import En.Revision (SchemaHash (..))
 import En.Schema.Internal (ValidSchema (..), unValidSchema)
 import En.Schema.Types
@@ -68,17 +70,17 @@ import Numeric (showHex)
 -- | Validate a schema and, on success, return it wrapped as evidence.
 validateSchema :: Schema -> Either EnError ValidSchema
 validateSchema schema = do
-  traverse_ validateCaveatDefinition (Map.toAscList schema.caveats)
-  traverse_ validateObjectType (Map.toAscList schema.objectTypes)
+  traverse_ validateCaveatDefinition (Map.toAscList (schema ^. #caveats))
+  traverse_ validateObjectType (Map.toAscList (schema ^. #objectTypes))
   validateProductiveCycles schema
   pure (ValidSchema schema)
   where
     validateCaveatDefinition (name, definition)
-      | name /= definition.name =
+      | name /= (definition ^. #name) =
           Left (SchemaViolation ("caveat map key does not match definition name: " <> caveatText name))
       | otherwise = do
-          traverse_ validateParameterType (Map.toAscList definition.parameters)
-          validatePredicate definition.parameters definition.predicate
+          traverse_ validateParameterType (Map.toAscList (definition ^. #parameters))
+          validatePredicate (definition ^. #parameters) (definition ^. #predicate)
 
     validateParameterType (parameterName, parameterType) =
       case parameterType of
@@ -112,27 +114,27 @@ validateSchema schema = do
 
     validateRelation :: ObjectType -> Map RelationName Relation -> (RelationName, Relation) -> Either EnError ()
     validateRelation objectType relations (relationName, relation)
-      | relationName /= relation.relationName =
+      | relationName /= (relation ^. #relationName) =
           Left (SchemaViolation ("relation map key does not match relation name: " <> relationText objectType relationName))
-      | Set.null relation.allowedSubjects && rewriteContainsThis relation.rewrite =
+      | Set.null (relation ^. #allowedSubjects) && rewriteContainsThis (relation ^. #rewrite) =
           Left (SchemaViolation ("relation with This must declare at least one allowed subject: " <> relationText objectType relationName))
       | otherwise = do
-          traverse_ validateAllowedSubject relation.allowedSubjects
-          validateRewrite objectType relations relationName relation.rewrite
+          traverse_ validateAllowedSubject (relation ^. #allowedSubjects)
+          validateRewrite objectType relations relationName (relation ^. #rewrite)
 
     validateAllowedSubject allowed =
-      case Map.lookup allowed.objectType schema.objectTypes of
+      case Map.lookup (allowed ^. #objectType) (schema ^. #objectTypes) of
         Nothing ->
-          Left (UnknownRelation ("unknown allowed subject object type: " <> objectText allowed.objectType))
+          Left (UnknownRelation ("unknown allowed subject object type: " <> objectText (allowed ^. #objectType)))
         Just subjectRelations ->
-          case (allowed.wildcard, allowed.relation) of
+          case ((allowed ^. #wildcard), (allowed ^. #relation)) of
             (True, Just _) ->
-              Left (SchemaViolation ("wildcard allowed subject cannot name a userset relation: " <> objectText allowed.objectType))
+              Left (SchemaViolation ("wildcard allowed subject cannot name a userset relation: " <> objectText (allowed ^. #objectType)))
             (_, Nothing) -> Right ()
             (_, Just relationName) ->
               if Map.member relationName subjectRelations
                 then Right ()
-                else Left (UnknownRelation ("unknown allowed subject relation: " <> relationText allowed.objectType relationName))
+                else Left (UnknownRelation ("unknown allowed subject relation: " <> relationText (allowed ^. #objectType) relationName))
 
     validateRewrite :: ObjectType -> Map RelationName Relation -> RelationName -> Rewrite -> Either EnError ()
     validateRewrite objectType relations relationName =
@@ -143,10 +145,10 @@ validateSchema schema = do
         TupleToUserset tuplesetRelation computedRelation -> do
           tupleset <- requireRelation objectType relations tuplesetRelation
           let compatibleTargets =
-                [ allowed.objectType
-                | allowed <- Set.toList tupleset.allowedSubjects,
-                  not allowed.wildcard,
-                  hasRelation allowed.objectType computedRelation
+                [ (allowed ^. #objectType)
+                | allowed <- Set.toList (tupleset ^. #allowedSubjects),
+                  not (allowed ^. #wildcard),
+                  hasRelation (allowed ^. #objectType) computedRelation
                 ]
           if null compatibleTargets
             then
@@ -165,7 +167,7 @@ validateSchema schema = do
         Intersection rewrites -> validateNonEmpty "intersection" objectType relationName rewrites
         Exclusion left right -> validateRewrite objectType relations relationName left *> validateRewrite objectType relations relationName right
         Caveated caveatName rewrite ->
-          if Map.member caveatName schema.caveats
+          if Map.member caveatName (schema ^. #caveats)
             then validateRewrite objectType relations relationName rewrite
             else Left (UnknownRelation ("unknown caveat: " <> caveatText caveatName))
       where
@@ -181,7 +183,7 @@ validateSchema schema = do
         Nothing -> Left (UnknownRelation ("unknown relation: " <> relationText objectType relationName))
 
     hasRelation objectType relationName =
-      maybe False (Map.member relationName) (Map.lookup objectType schema.objectTypes)
+      maybe False (Map.member relationName) (Map.lookup objectType (schema ^. #objectTypes))
 
 -- | Validate schema references and rewrite shapes before compilation.
 validate :: Schema -> Either EnError ()
@@ -194,8 +196,8 @@ validateProductiveCycles schema =
   where
     relationGraph =
       Map.fromList
-        [ (RelationRef objectType relationName, dependencies objectType relation.rewrite)
-        | (objectType, relations) <- Map.toAscList schema.objectTypes,
+        [ (RelationRef objectType relationName, dependencies objectType (relation ^. #rewrite))
+        | (objectType, relations) <- Map.toAscList (schema ^. #objectTypes),
           (relationName, relation) <- Map.toAscList relations
         ]
 
@@ -230,9 +232,9 @@ validateProductiveCycles schema =
       any hasDirectBase (ref : Set.toList (reachable ref))
 
     lookupRewrite (RelationRef objectType relationName) = do
-      relations <- Map.lookup objectType schema.objectTypes
+      relations <- Map.lookup objectType (schema ^. #objectTypes)
       relation <- Map.lookup relationName relations
-      pure relation.rewrite
+      pure (relation ^. #rewrite)
 
     dependencies objectType =
       \case
@@ -243,10 +245,10 @@ validateProductiveCycles schema =
             Nothing -> Set.empty
             Just tupleset ->
               Set.fromList
-                [ RelationRef {objectType = allowed.objectType, relation = computedRelation}
-                | allowed <- Set.toList tupleset.allowedSubjects,
-                  not allowed.wildcard,
-                  hasRelation allowed.objectType computedRelation
+                [ RelationRef {objectType = (allowed ^. #objectType), relation = computedRelation}
+                | allowed <- Set.toList (tupleset ^. #allowedSubjects),
+                  not (allowed ^. #wildcard),
+                  hasRelation (allowed ^. #objectType) computedRelation
                 ]
         Union rewrites -> foldMap (dependencies objectType) rewrites
         Intersection rewrites -> foldMap (dependencies objectType) rewrites
@@ -254,17 +256,17 @@ validateProductiveCycles schema =
         Caveated _ rewrite -> dependencies objectType rewrite
 
     lookupRelation objectType relationName = do
-      relations <- Map.lookup objectType schema.objectTypes
+      relations <- Map.lookup objectType (schema ^. #objectTypes)
       Map.lookup relationName relations
 
     hasRelation objectType relationName =
-      maybe False (Map.member relationName) (Map.lookup objectType schema.objectTypes)
+      maybe False (Map.member relationName) (Map.lookup objectType (schema ^. #objectTypes))
 
 data RelationRef = RelationRef
   { objectType :: !ObjectType,
     relation :: !RelationName
   }
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Eq, Generic, Ord, Show)
 
 rewriteContainsThis :: Rewrite -> Bool
 rewriteContainsThis =
@@ -288,9 +290,9 @@ renderSchema schema =
     "|"
     [ "schema",
       "objects",
-      renderList renderObjectType (Map.toAscList schema.objectTypes),
+      renderList renderObjectType (Map.toAscList (schema ^. #objectTypes)),
       "caveats",
-      renderList renderCaveatDefinition (Map.toAscList schema.caveats)
+      renderList renderCaveatDefinition (Map.toAscList (schema ^. #caveats))
     ]
   where
     renderObjectType (objectType, relations) =
@@ -306,17 +308,17 @@ renderSchema schema =
         ":"
         [ "relation",
           renderText (relationNameText relationName),
-          renderList renderAllowedSubject (Set.toAscList relation.allowedSubjects),
-          renderRewrite relation.rewrite
+          renderList renderAllowedSubject (Set.toAscList (relation ^. #allowedSubjects)),
+          renderRewrite (relation ^. #rewrite)
         ]
 
     renderAllowedSubject allowed =
       Text.intercalate
         ":"
         [ "subject",
-          renderText (objectText allowed.objectType),
-          maybe "_" (renderText . relationNameText) allowed.relation,
-          if allowed.wildcard then "wildcard" else "concrete"
+          renderText (objectText (allowed ^. #objectType)),
+          maybe "_" (renderText . relationNameText) (allowed ^. #relation),
+          if allowed ^. #wildcard then "wildcard" else "concrete"
         ]
 
     renderCaveatDefinition (caveatName, definition) =
@@ -324,8 +326,8 @@ renderSchema schema =
         ":"
         [ "caveat",
           renderText (caveatText caveatName),
-          renderList renderParameter (Map.toAscList definition.parameters),
-          renderPredicate definition.predicate
+          renderList renderParameter (Map.toAscList (definition ^. #parameters)),
+          renderPredicate (definition ^. #predicate)
         ]
 
     renderParameter (parameterName, parameterType) =
@@ -430,4 +432,4 @@ relationText objectType relationName =
 
 renderRef :: RelationRef -> Text
 renderRef ref =
-  relationText ref.objectType ref.relation
+  relationText (ref ^. #objectType) (ref ^. #relation)

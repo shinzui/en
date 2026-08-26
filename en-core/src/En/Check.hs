@@ -22,6 +22,7 @@ module En.Check
 where
 
 import Control.Monad (foldM)
+import Data.Generics.Labels ()
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isNothing)
 import Data.Set (Set)
@@ -37,6 +38,7 @@ import En.Decision qualified as Decision
 import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), mintToken, resolveConsistency)
 import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, UsersetQuery (..), probeTuples, readObjectRelation, readStartingWithUser)
 import En.Error (EnError (..))
+import En.Prelude
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
 import En.Revision (Consistency, ConsistencyToken, DatastoreId, Revision (..))
 import En.Schema (CaveatName (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..))
@@ -59,7 +61,7 @@ data BatchPair = BatchPair
     permission :: !RelationName,
     object :: !ObjectRef
   }
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Eq, Generic, Ord, Show)
 
 -- | A decision, and the snapshot it was decided at.
 --
@@ -128,7 +130,7 @@ checkWithBudget budget graph consistency context subject permission object = do
   ResolvedConsistency {revision} <- resolveConsistency consistency
   checkedAt <- mintToken revision
   (residual, _memo) <- runCheckMemo budget graph revision subject permission object Map.empty
-  decision <- either throwError pure (residual >>= applyResidual graph.caveats context)
+  decision <- either throwError pure (residual >>= applyResidual (graph ^. #caveats) context)
   pure CheckOutcome {decision, checkedAt}
 
 -- | Cached variant of 'check'. Cache hits are keyed by datastore id, schema
@@ -170,7 +172,7 @@ checkCachedWithBudget budget cacheEnv graph consistency context subject permissi
   ResolvedConsistency {revision} <- resolveConsistency consistency
   checkedAt <- mintToken revision
   (residual, _memo) <- runCheckMemoWithCache budget (Just (decisionCacheOps cacheEnv graph)) graph revision subject permission object Map.empty
-  decision <- either throwError pure (residual >>= applyResidual graph.caveats context)
+  decision <- either throwError pure (residual >>= applyResidual (graph ^. #caveats) context)
   pure CheckOutcome {decision, checkedAt}
 
 -- | Evaluate many checks against one resolved consistency snapshot.
@@ -233,7 +235,7 @@ checkManyWithBudget budget graph consistency context pairs = do
   pure
     BatchOutcome
       { decisions =
-          [ Map.findWithDefault (Right RDenied) pair residualsByPair >>= applyResidual graph.caveats context
+          [ Map.findWithDefault (Right RDenied) pair residualsByPair >>= applyResidual (graph ^. #caveats) context
           | pair <- pairs
           ],
         checkedAt
@@ -241,7 +243,7 @@ checkManyWithBudget budget graph consistency context pairs = do
   where
     evaluateDistinct revision (residualsByPair, memo) pair = do
       (residual, memo') <-
-        runCheckMemo budget graph revision pair.subject pair.permission pair.object memo
+        runCheckMemo budget graph revision (pair ^. #subject) (pair ^. #permission) (pair ^. #object) memo
       pure (Map.insert pair residual residualsByPair, memo')
 
 -- | Engine-internal: check at an already-resolved revision, threading a
@@ -289,7 +291,7 @@ checkAtRevisionWithBudget ::
   Eff es (Either EnError CheckDecision, CheckMemo)
 checkAtRevisionWithBudget budget graph context revision subject permission object memo = do
   (residual, memo') <- runCheckMemo budget graph revision subject permission object memo
-  pure (residual >>= applyResidual graph.caveats context, memo')
+  pure (residual >>= applyResidual (graph ^. #caveats) context, memo')
 
 -- | 'checkAtRevision' against the cross-request decision cache. See 'checkCached'
 -- for what that cache stores and why a caveat context never enters it.
@@ -322,7 +324,7 @@ checkCachedAtRevisionWithBudget ::
   Eff es (Either EnError CheckDecision, CheckMemo)
 checkCachedAtRevisionWithBudget budget cacheEnv graph context revision subject permission object memo = do
   (residual, memo') <- runCheckMemoWithCache budget (Just (decisionCacheOps cacheEnv graph)) graph revision subject permission object memo
-  pure (residual >>= applyResidual graph.caveats context, memo')
+  pure (residual >>= applyResidual (graph ^. #caveats) context, memo')
 
 -- | A memo with nothing in it, for the first check of a batch.
 emptyCheckMemo :: CheckMemo
@@ -342,6 +344,7 @@ data EvalState = EvalState
     visited :: !(Set Subproblem),
     budget :: !EvaluationBudget
   }
+  deriving stock (Generic)
 
 data Subproblem = Subproblem
   { subject :: !Subject,
@@ -411,6 +414,7 @@ data DecisionCacheOps es = DecisionCacheOps
   { lookupDecision :: !(Revision -> Subject -> RelationName -> ObjectRef -> Eff es (Maybe ResidualDecision)),
     insertDecision :: !(Revision -> Subject -> RelationName -> ObjectRef -> ResidualDecision -> Eff es ())
   }
+  deriving stock (Generic)
 
 -- | The cross-request decision cache, as the evaluator sees it.
 --
@@ -433,7 +437,7 @@ decisionCacheOps CheckCacheEnv {cacheDatastoreId, cacheDecisions} graph =
     cacheKey revision subject relation object =
       SubproblemKey
         { datastoreId = cacheDatastoreId,
-          schemaHash = graph.hash,
+          schemaHash = (graph ^. #hash),
           revision,
           subject,
           relation,
@@ -478,9 +482,9 @@ evalRelationMemo ::
   CheckMemo ->
   Eff es (Either EnError ResidualDecision, CheckMemo, CutTaint)
 evalRelationMemo cacheOps graph revision subject object relation state memo
-  | state.depth >= state.budget.maxDepth =
+  | (state ^. #depth) >= (state ^. #budget . #maxDepth) =
       pure (Left ResolutionLimitExceeded, memo, Untainted)
-  | Set.member subproblem state.visited =
+  | Set.member subproblem (state ^. #visited) =
       pure (Right RDenied, memo, Tainted)
   | otherwise =
       case Map.lookup key memo of
@@ -492,7 +496,7 @@ evalRelationMemo cacheOps graph revision subject object relation state memo
             Just residual ->
               pure (Right residual, Map.insert key residual memo, Untainted)
             Nothing ->
-              case Map.lookup ref graph.relations of
+              case Map.lookup ref (graph ^. #relations) of
                 Nothing ->
                   pure (Left (UnknownRelation (renderRef ref)), memo, Untainted)
                 Just schemaRelation -> do
@@ -504,8 +508,8 @@ evalRelationMemo cacheOps graph revision subject object relation state memo
                       subject
                       object
                       relation
-                      schemaRelation.rewrite
-                      state {depth = state.depth + 1, visited = Set.insert subproblem state.visited}
+                      (schemaRelation ^. #rewrite)
+                      (state & #depth %~ (+ 1) & #visited %~ Set.insert subproblem)
                       memo
                   case (result, taint) of
                     (Right residual, Untainted) -> do
@@ -514,17 +518,17 @@ evalRelationMemo cacheOps graph revision subject object relation state memo
                     _ ->
                       pure (result, memo', taint)
   where
-    ref = RelationRef {objectType = object.objectType, relation}
+    ref = RelationRef {objectType = (object ^. #objectType), relation}
     subproblem = Subproblem {subject, object, relation}
-    key = MemoKey revision.revisionEncoding subproblem
+    key = MemoKey (revision ^. #revisionEncoding) subproblem
     lookupExternalDecision =
       case cacheOps of
         Nothing -> pure Nothing
-        Just ops -> ops.lookupDecision revision subject relation object
+        Just ops -> (ops ^. #lookupDecision) revision subject relation object
     insertExternalDecision residual =
       case cacheOps of
         Nothing -> pure ()
-        Just ops -> ops.insertDecision revision subject relation object residual
+        Just ops -> (ops ^. #insertDecision) revision subject relation object residual
 
 evalRewriteMemo ::
   (TupleStore :> es) =>
@@ -679,16 +683,16 @@ evalThisMemo ::
 -- difference between twenty store reads and three when an object is shared with
 -- twenty teams.
 evalThisMemo cacheOps graph revision subject object relation state memo
-  | state.depth >= state.budget.maxDepth =
+  | (state ^. #depth) >= (state ^. #budget . #maxDepth) =
       pure (Left ResolutionLimitExceeded, memo, Untainted)
   | otherwise = do
       probedRows <- probeTuples revision object relation candidates
       let probeResiduals =
-            [residualGate graph tuple.caveat RAllowed | TupleRow {tuple} <- probedRows]
+            [residualGate graph (tuple ^. #caveat) RAllowed | TupleRow {tuple} <- probedRows]
       if Right RAllowed `elem` probeResiduals
         then pure (Right RAllowed, memo, Untainted)
         else do
-          rows <- drainObjectRelation state.budget.pageLimit revision object relation
+          rows <- drainObjectRelation (state ^. #budget . #pageLimit) revision object relation
           let usersetRows = filter recursable rows
           proven <- provenByDirectGroupMembership usersetRows
           if proven
@@ -701,8 +705,8 @@ evalThisMemo cacheOps graph revision subject object relation state memo
 
     -- The probe answered for these; recursing would double-count them.
     recursable TupleRow {tuple} =
-      case tuple.subject of
-        SubjectSet _ _ -> tuple.subject `notElem` candidates
+      case (tuple ^. #subject) of
+        SubjectSet _ _ -> (tuple ^. #subject) `notElem` candidates
         SubjectId _ -> False
         SubjectWildcard _ -> False
 
@@ -716,13 +720,13 @@ evalThisMemo cacheOps graph revision subject object relation state memo
     recursive path would actually have taken, so a subproblem barred by the cycle
     or depth guard is left to recursion to reject exactly as before. -}
     acceleratable row@TupleRow {tuple} =
-      case tuple.subject of
+      case (tuple ^. #subject) of
         SubjectSet groupObject groupRelation ->
           recursable row
-            && isNothing tuple.caveat
-            && relationUnionsThis graph groupObject.objectType groupRelation
-            && state.depth < state.budget.maxDepth
-            && Set.notMember Subproblem {subject, object = groupObject, relation = groupRelation} state.visited
+            && isNothing (tuple ^. #caveat)
+            && relationUnionsThis graph (groupObject ^. #objectType) groupRelation
+            && (state ^. #depth) < (state ^. #budget . #maxDepth)
+            && Set.notMember Subproblem {subject, object = groupObject, relation = groupRelation} (state ^. #visited)
         _ -> False
 
     {- One reverse query per (group type, group relation) bucket answers "which
@@ -739,29 +743,29 @@ evalThisMemo cacheOps graph revision subject object relation state memo
           [ (groupObject, groupRelation)
           | row@TupleRow {tuple} <- rows,
             acceleratable row,
-            SubjectSet groupObject groupRelation <- [tuple.subject]
+            SubjectSet groupObject groupRelation <- [(tuple ^. #subject)]
           ]
         buckets =
           Map.fromListWith
             (<>)
-            [((groupObject.objectType, groupRelation), [groupObject]) | (groupObject, groupRelation) <- targets]
+            [(((groupObject ^. #objectType), groupRelation), [groupObject]) | (groupObject, groupRelation) <- targets]
 
     confirmBucket ((groupType, groupRelation), groupObjects) = do
-      rows <- drainStartingWithUser state.budget.pageLimit revision groupType groupRelation candidates
+      rows <- drainStartingWithUser (state ^. #budget . #pageLimit) revision groupType groupRelation candidates
       pure (any grantsDirectly rows)
       where
         grantsDirectly TupleRow {tuple} =
-          tuple.object `elem` groupObjects
-            && isNothing tuple.caveat
+          (tuple ^. #object) `elem` groupObjects
+            && isNothing (tuple ^. #caveat)
 
     -- Residuals accumulate reversed and are flipped back by the caller: appending
     -- one row at a time to the tail copies the list per row, and a relation
     -- attached to n groups then costs n^2 conses to fold.
     rowResidual (residuals, memo', taint) TupleRow {tuple} =
-      case tuple.subject of
+      case (tuple ^. #subject) of
         SubjectSet subjectObject subjectRelation -> do
           (residual, memo'', rowTaint) <- evalRelationMemo cacheOps graph revision subject subjectObject subjectRelation state memo'
-          pure ((residual >>= residualGate graph tuple.caveat) : residuals, memo'', taint <> rowTaint)
+          pure ((residual >>= residualGate graph (tuple ^. #caveat)) : residuals, memo'', taint <> rowTaint)
         _ ->
           pure (residuals, memo', taint)
 
@@ -772,9 +776,9 @@ evalThisMemo cacheOps graph revision subject object relation state memo
 -- its own stored tuples, or subtract from them.
 relationUnionsThis :: ReachabilityGraph -> ObjectType -> RelationName -> Bool
 relationUnionsThis graph objectType relation =
-  case Map.lookup RelationRef {objectType, relation} graph.relations of
+  case Map.lookup RelationRef {objectType, relation} (graph ^. #relations) of
     Nothing -> False
-    Just schemaRelation -> unionsThis schemaRelation.rewrite
+    Just schemaRelation -> unionsThis (schemaRelation ^. #rewrite)
   where
     unionsThis = \case
       This -> True
@@ -794,7 +798,7 @@ evalTupleToUsersetMemo ::
   CheckMemo ->
   Eff es (Either EnError ResidualDecision, CheckMemo, CutTaint)
 evalTupleToUsersetMemo cacheOps graph revision subject object tuplesetRelation computedRelation state memo = do
-  rows <- drainObjectRelation state.budget.pageLimit revision object tuplesetRelation
+  rows <- drainObjectRelation (state ^. #budget . #pageLimit) revision object tuplesetRelation
   (residuals, memo', taint) <- foldM rowResidual ([], memo, mempty) rows
   pure (Decision.rUnion <$> sequence (reverse residuals), memo', taint)
   where
@@ -802,7 +806,7 @@ evalTupleToUsersetMemo cacheOps graph revision subject object tuplesetRelation c
     -- 'sequence' runs, because 'sequence' reports the first 'Left' it meets and
     -- which row that is should not depend on how the list was built.
     rowResidual (residuals, memo', taint) TupleRow {tuple} =
-      case tuple.subject of
+      case (tuple ^. #subject) of
         SubjectId subjectObject -> do
           (residual, memo'', rowTaint) <- evalRelationMemo cacheOps graph revision subject subjectObject computedRelation state memo'
           pure (applyRowGate tuple residual : residuals, memo'', taint <> rowTaint)
@@ -813,7 +817,7 @@ evalTupleToUsersetMemo cacheOps graph revision subject object tuplesetRelation c
           pure (Right RDenied : residuals, memo', taint)
 
     applyRowGate tuple =
-      (>>= residualGate graph tuple.caveat)
+      (>>= residualGate graph (tuple ^. #caveat))
 
 -- | Gate a residual behind a tuple's caveat, if it has one.
 --
@@ -832,7 +836,7 @@ residualGate graph (Just TupleCaveat {name, payload}) residual = do
 
 requireCaveat :: ReachabilityGraph -> CaveatName -> Either EnError ()
 requireCaveat graph caveat
-  | Map.member caveat graph.caveats = Right ()
+  | Map.member caveat (graph ^. #caveats) = Right ()
   | otherwise = Left (UnknownRelation ("unknown caveat: " <> caveatText caveat))
 
 -- | The subjects a stored row may name to grant @subject@ directly: the subject
@@ -842,7 +846,7 @@ subjectsWithWildcard :: Subject -> [Subject]
 subjectsWithWildcard subject =
   subject
     : case subject of
-      SubjectId object -> [SubjectWildcard object.objectType]
+      SubjectId object -> [SubjectWildcard (object ^. #objectType)]
       SubjectSet _ _ -> []
       SubjectWildcard _ -> []
 
@@ -866,8 +870,8 @@ drainObjectRelation pageLimit revision object relation =
     -- exactly the wide relations the probe exists to make cheap.
     drain cursor acc = do
       page <- readObjectRelation revision object relation pageLimit cursor
-      let acc' = page.rows : acc
-      case page.state of
+      let acc' = (page ^. #rows) : acc
+      case (page ^. #state) of
         Exhausted -> pure (concat (reverse acc'))
         HasMore next -> drain (Just next) acc'
         Truncated next -> drain (Just next) acc'
@@ -900,8 +904,8 @@ drainStartingWithUser pageLimit revision objectType relation subjects =
               queryLimit = pageLimit,
               queryCursor = cursor
             }
-      let acc' = page.rows : acc
-      case page.state of
+      let acc' = (page ^. #rows) : acc
+      case (page ^. #state) of
         Exhausted -> pure (concat (reverse acc'))
         HasMore next -> drain (Just next) acc'
         Truncated next -> drain (Just next) acc'

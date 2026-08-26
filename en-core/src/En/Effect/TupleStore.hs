@@ -48,12 +48,14 @@ module En.Effect.TupleStore
   )
 where
 
+import Data.Generics.Labels ()
 import Data.Int (Int64)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Word (Word64)
 import Effectful (Dispatch (..), DispatchOf, Eff, Effect, (:>))
 import Effectful.Dispatch.Dynamic (send)
+import En.Prelude
 import En.Revision (ConsistencyToken, Revision)
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
 import En.Tuple (ObjectRef (..), Subject (..), Tuple (..))
@@ -192,12 +194,12 @@ anyRelationshipFilter =
 widenTupleFilter :: TupleFilter -> RelationshipFilter
 widenTupleFilter tupleFilter =
   RelationshipFilter
-    { objectType = Just tupleFilter.objectType,
-      objectId = tupleFilter.objectId,
-      relation = tupleFilter.relation,
-      subjectType = tupleFilter.subjectType,
-      subjectId = tupleFilter.subjectId,
-      subjectRelation = tupleFilter.subjectRelation,
+    { objectType = Just (tupleFilter ^. #objectType),
+      objectId = (tupleFilter ^. #objectId),
+      relation = (tupleFilter ^. #relation),
+      subjectType = (tupleFilter ^. #subjectType),
+      subjectId = (tupleFilter ^. #subjectId),
+      subjectRelation = (tupleFilter ^. #subjectRelation),
       -- A precondition names a grant's identity, and a caveat is an attribute of the
       -- grant rather than part of that identity, so 'TupleFilter' constrains none.
       caveatName = Nothing
@@ -235,14 +237,14 @@ validateRelationshipFilter relationshipFilter
   | otherwise =
       Right relationshipFilter
   where
-    hasObjectType = isJust relationshipFilter.objectType
-    hasSubjectType = isJust relationshipFilter.subjectType
+    hasObjectType = isJust (relationshipFilter ^. #objectType)
+    hasSubjectType = isJust (relationshipFilter ^. #subjectType)
 
     unanchored = not hasObjectType && not hasSubjectType
-    danglingObjectId = isJust relationshipFilter.objectId && not hasObjectType
-    danglingSubjectId = isJust relationshipFilter.subjectId && not hasSubjectType
+    danglingObjectId = isJust (relationshipFilter ^. #objectId) && not hasObjectType
+    danglingSubjectId = isJust (relationshipFilter ^. #subjectId) && not hasSubjectType
     danglingSubjectRelation =
-      case relationshipFilter.subjectRelation of
+      case (relationshipFilter ^. #subjectRelation) of
         AnySubjectRelation -> False
         _ -> not hasSubjectType
 
@@ -315,16 +317,16 @@ data TupleWriteRequest = TupleWriteRequest
 exactTupleFilter :: Tuple -> TupleFilter
 exactTupleFilter tuple =
   TupleFilter
-    { objectType = tuple.object.objectType,
-      objectId = Just tuple.object.objectId,
-      relation = Just tuple.relation,
-      subjectType = Just subjectObject.objectType,
-      subjectId = Just subjectObject.objectId,
+    { objectType = (tuple ^. #object . #objectType),
+      objectId = Just (tuple ^. #object . #objectId),
+      relation = Just (tuple ^. #relation),
+      subjectType = Just (subjectObject ^. #objectType),
+      subjectId = Just (subjectObject ^. #objectId),
       subjectRelation = subjectRelationFilter
     }
   where
     (subjectObject, subjectRelationFilter) =
-      case tuple.subject of
+      case (tuple ^. #subject) of
         SubjectId object -> (object, NoSubjectRelation)
         SubjectSet object relationName -> (object, ExactSubjectRelation relationName)
         SubjectWildcard objectType -> (ObjectRef {objectType, objectId = "*"}, NoSubjectRelation)
@@ -339,16 +341,16 @@ renderPrecondition = \case
   TupleMustNotExist tupleFilter -> "must-not-exist: " <> renderFilter tupleFilter
   where
     renderFilter tupleFilter =
-      unObjectType tupleFilter.objectType
+      unObjectType (tupleFilter ^. #objectType)
         <> ":"
-        <> anyOr tupleFilter.objectId
+        <> anyOr (tupleFilter ^. #objectId)
         <> "#"
-        <> anyOr (unRelationName <$> tupleFilter.relation)
+        <> anyOr (unRelationName <$> (tupleFilter ^. #relation))
         <> "@"
-        <> anyOr (unObjectType <$> tupleFilter.subjectType)
+        <> anyOr (unObjectType <$> (tupleFilter ^. #subjectType))
         <> ":"
-        <> anyOr tupleFilter.subjectId
-        <> renderSubjectRelation tupleFilter.subjectRelation
+        <> anyOr (tupleFilter ^. #subjectId)
+        <> renderSubjectRelation (tupleFilter ^. #subjectRelation)
 
     renderSubjectRelation = \case
       AnySubjectRelation -> "#*"

@@ -5,6 +5,7 @@ module En.Caveat
   )
 where
 
+import Data.Generics.Labels ()
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
@@ -13,6 +14,7 @@ import En.Caveat.Value (CaveatContext (..), CaveatPayload (..), CaveatValue (..)
 import En.Decision (CaveatObligation (..), CheckDecision (..), ResidualDecision (..))
 import En.Decision qualified as Decision
 import En.Error (EnError (..))
+import En.Prelude
 import En.Schema
   ( CaveatCompare (..),
     CaveatDefinition (..),
@@ -26,7 +28,7 @@ import En.Schema
 
 evaluateCaveat :: CaveatDefinition -> CaveatPayload -> CaveatContext -> CheckDecision
 evaluateCaveat definition payload context =
-  evalPredicate definition payload context definition.predicate
+  evalPredicate definition payload context (definition ^. #predicate)
 
 -- | Resolve a residual decision against one request's caveat context.
 --
@@ -136,7 +138,7 @@ missingContexts =
 
 missingDecision :: CaveatDefinition -> [Text] -> CheckDecision
 missingDecision definition names =
-  Conditional [CaveatObligation {caveat = definition.name, missingContext = dedupe names}]
+  Conditional [CaveatObligation {caveat = (definition ^. #name), missingContext = dedupe names}]
 
 compareValues :: CaveatDefinition -> CaveatOperand -> CaveatOperand -> CaveatCompare -> CaveatValue -> CaveatValue -> Bool
 compareValues definition leftOperand rightOperand comparator leftValue rightValue =
@@ -163,7 +165,7 @@ enumOrder definition left right =
     firstEnum =
       \case
         OperandParam _ parameterName ->
-          case Map.lookup parameterName definition.parameters of
+          case Map.lookup parameterName (definition ^. #parameters) of
             Just (ParameterEnum values) -> Just values
             _ -> Nothing
         OperandLiteral _ -> Nothing

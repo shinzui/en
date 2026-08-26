@@ -18,6 +18,8 @@ module En.Budget
   )
 where
 
+import GHC.Generics (Generic)
+
 data EvaluationBudget = EvaluationBudget
   { -- | Recursion depth bound; exceeding it fails with @ResolutionLimitExceeded@.
     maxDepth :: !Int,
@@ -29,7 +31,7 @@ data EvaluationBudget = EvaluationBudget
     -- | Bound on returned result sets (lookup objects, expand nodes) per page.
     resultCap :: !Int
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 defaultEvaluationBudget :: EvaluationBudget
 defaultEvaluationBudget =

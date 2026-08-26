@@ -15,10 +15,12 @@ module En.Cache
   )
 where
 
+import Data.Generics.Labels ()
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import En.Effect.TupleStore (StoreCursor, UsersetQuery (..))
+import En.Prelude
 import En.Revision (DatastoreId, Revision (..), SchemaHash)
 import En.Schema (ObjectType, RelationName)
 import En.Tuple (CaveatContext, ObjectRef, Subject)
@@ -42,6 +44,7 @@ data Cache key value = Cache
   { config :: !CacheConfig,
     state :: !(IORef (CacheState key value))
   }
+  deriving stock (Generic)
 
 -- | 'bySequence' is the eviction index: insertion ordinal to key, so the oldest
 -- entry is 'Map.lookupMin' rather than a fold over every entry. It is maintained in
@@ -54,11 +57,13 @@ data CacheState key value = CacheState
     nextSequence :: !Int,
     stats :: !CacheStats
   }
+  deriving stock (Generic)
 
 data CacheEntry value = CacheEntry
   { sequenceNumber :: !Int,
     value :: value
   }
+  deriving stock (Generic)
 
 -- | Identifies one tuple-store read. Every variant pins the resolved revision the
 -- engine asked for, which is what makes an entry safe to reuse: it can never serve
@@ -71,7 +76,7 @@ data TupleReadKey
   = ObjectRelationReadKey !Revision !ObjectRef !RelationName !Int !(Maybe StoreCursor)
   | StartingWithUserReadKey !Revision !UsersetQuery
   | ProbeReadKey !Revision !ObjectRef !RelationName ![Subject]
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 instance Ord TupleReadKey where
   compare left right =
@@ -102,13 +107,13 @@ data DecisionKey = DecisionKey
     object :: !ObjectRef,
     context :: !CaveatContext
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 instance Ord DecisionKey where
   compare left right =
     compare
-      (left.datastoreId, left.schemaHash, revisionEncoding left.revision, left.subject, left.permission, left.object, left.context)
-      (right.datastoreId, right.schemaHash, revisionEncoding right.revision, right.subject, right.permission, right.object, right.context)
+      ((left ^. #datastoreId), (left ^. #schemaHash), revisionEncoding (left ^. #revision), (left ^. #subject), (left ^. #permission), (left ^. #object), (left ^. #context))
+      ((right ^. #datastoreId), (right ^. #schemaHash), revisionEncoding (right ^. #revision), (right ^. #subject), (right ^. #permission), (right ^. #object), (right ^. #context))
 
 -- | Identifies one check subproblem: "is @subject@ a member of @object#relation@,
 -- at this revision, under this schema, in this datastore?"
@@ -132,13 +137,13 @@ data SubproblemKey = SubproblemKey
     relation :: !RelationName,
     object :: !ObjectRef
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 instance Ord SubproblemKey where
   compare left right =
     compare
-      (left.datastoreId, left.schemaHash, revisionEncoding left.revision, left.subject, left.relation, left.object)
-      (right.datastoreId, right.schemaHash, revisionEncoding right.revision, right.subject, right.relation, right.object)
+      ((left ^. #datastoreId), (left ^. #schemaHash), revisionEncoding (left ^. #revision), (left ^. #subject), (left ^. #relation), (left ^. #object))
+      ((right ^. #datastoreId), (right ^. #schemaHash), revisionEncoding (right ^. #revision), (right ^. #subject), (right ^. #relation), (right ^. #object))
 
 newCache :: CacheConfig -> IO (Cache key value)
 newCache config = do
@@ -156,51 +161,54 @@ lookupCache :: (Ord key) => Cache key value -> key -> IO (Maybe value)
 lookupCache cache key
   | disabled cache = pure Nothing
   | otherwise =
-      atomicModifyIORef' cache.state \state ->
-        case Map.lookup key state.entries of
+      atomicModifyIORef' (cache ^. #state) \state ->
+        case Map.lookup key (state ^. #entries) of
           Nothing ->
-            let updated = state {stats = state.stats {misses = state.stats.misses + 1}}
+            let updated = state & #stats . #misses %~ (+ 1)
              in (updated, Nothing)
           Just entry ->
-            let updated = state {stats = state.stats {hits = state.stats.hits + 1}}
-             in (updated, Just entry.value)
+            let updated = state & #stats . #hits %~ (+ 1)
+             in (updated, Just (entry ^. #value))
 
 insertCache :: (Ord key) => Cache key value -> key -> value -> IO ()
 insertCache cache key value
   | disabled cache = pure ()
   | otherwise =
-      atomicModifyIORef' cache.state \state ->
-        let entry = CacheEntry {sequenceNumber = state.nextSequence, value}
-            inserted = Map.insert key entry state.entries
+      atomicModifyIORef' (cache ^. #state) \state ->
+        let entry = CacheEntry {sequenceNumber = (state ^. #nextSequence), value}
+            inserted = Map.insert key entry (state ^. #entries)
             -- Re-inserting a key retires its old ordinal; leaving it would make
             -- the index name a key whose entry has since been replaced.
             indexed =
-              Map.insert state.nextSequence key $
-                case Map.lookup key state.entries of
-                  Nothing -> state.bySequence
-                  Just existing -> Map.delete existing.sequenceNumber state.bySequence
+              Map.insert (state ^. #nextSequence) key $
+                case Map.lookup key (state ^. #entries) of
+                  Nothing -> (state ^. #bySequence)
+                  Just existing -> Map.delete (existing ^. #sequenceNumber) (state ^. #bySequence)
             (boundedEntries, boundedIndex, evictionCount) =
-              evictOldest cache.config.maxEntries inserted indexed
+              evictOldest (cache ^. #config . #maxEntries) inserted indexed
             updated =
               state
-                { entries = boundedEntries,
-                  bySequence = boundedIndex,
-                  nextSequence = state.nextSequence + 1,
-                  stats =
-                    state.stats
-                      { inserts = state.stats.inserts + 1,
-                        evictions = state.stats.evictions + evictionCount
-                      }
-                }
+                & #entries
+                .~ boundedEntries
+                & #bySequence
+                .~ boundedIndex
+                & #nextSequence
+                %~ (+ 1)
+                & #stats
+                . #inserts
+                %~ (+ 1)
+                & #stats
+                . #evictions
+                %~ (+ evictionCount)
          in (updated, ())
 
 disabled :: Cache key value -> Bool
 disabled cache =
-  not cache.config.enabled || cache.config.maxEntries <= 0
+  not (cache ^. #config . #enabled) || (cache ^. #config . #maxEntries) <= 0
 
 cacheStats :: Cache key value -> IO CacheStats
 cacheStats cache =
-  (.stats) <$> readIORef cache.state
+  (view (#stats)) <$> readIORef (cache ^. #state)
 
 emptyCacheState :: CacheState key value
 emptyCacheState =
@@ -236,4 +244,4 @@ evictOldest maxEntries entries index
 
 usersetQueryKey :: UsersetQuery -> (ObjectType, RelationName, [Subject], Int, Maybe StoreCursor)
 usersetQueryKey query =
-  (query.queryType, query.queryRelation, query.querySubjects, query.queryLimit, query.queryCursor)
+  ((query ^. #queryType), (query ^. #queryRelation), (query ^. #querySubjects), (query ^. #queryLimit), (query ^. #queryCursor))

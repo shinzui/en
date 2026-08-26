@@ -21,6 +21,7 @@ module En.Store.InMemory
   )
 where
 
+import Data.Generics.Labels ()
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.List (find)
@@ -59,6 +60,7 @@ import En.Effect.TupleStore
     widenTupleFilter,
   )
 import En.Error (EnError (..))
+import En.Prelude
 import En.RelationshipPagination (relationshipPageFromRows)
 import En.Revision
   ( Consistency (..),
@@ -76,6 +78,7 @@ data InMemoryRow = InMemoryRow
     memoryCreatedAt :: !Word64,
     memoryDeletedAt :: !(Maybe Word64)
   }
+  deriving stock (Generic)
 
 data InMemoryState = InMemoryState
   { memoryRows :: !(Map Word64 InMemoryRow),
@@ -83,6 +86,7 @@ data InMemoryState = InMemoryState
     memoryNextRowId :: !Word64,
     memoryGcHorizon :: !Word64
   }
+  deriving stock (Generic)
 
 -- | One isolated in-memory datastore. The representation is intentionally hidden so
 -- callers cannot violate revision, row-id, or garbage-collection invariants.
@@ -90,6 +94,7 @@ data InMemoryWorld = InMemoryWorld
   { memoryWorldId :: !Text,
     memoryState :: !(IORef InMemoryState)
   }
+  deriving stock (Generic)
 
 -- | Allocate an empty, isolated store.
 newInMemoryWorld :: IO InMemoryWorld
@@ -123,7 +128,7 @@ runTupleStoreInMemory world =
     ReadObjectRelation revision object relation limit cursor -> do
       revisionNumber <- requireRevision world revision
       cursorId <- requireCursor cursor
-      state <- liftIO (readIORef world.memoryState)
+      state <- liftIO (readIORef (world ^. #memoryState))
       pure $
         tuplePage
           world
@@ -131,43 +136,43 @@ runTupleStoreInMemory world =
           cursorId
           [ row
           | row <- visibleRows revisionNumber state,
-            row.memoryTuple.object == object,
-            row.memoryTuple.relation == relation
+            (row ^. #memoryTuple . #object) == object,
+            (row ^. #memoryTuple . #relation) == relation
           ]
     ReadStartingWithUser revision query -> do
       revisionNumber <- requireRevision world revision
-      cursorId <- requireCursor query.queryCursor
-      state <- liftIO (readIORef world.memoryState)
+      cursorId <- requireCursor (query ^. #queryCursor)
+      state <- liftIO (readIORef (world ^. #memoryState))
       pure $
         tuplePage
           world
-          query.queryLimit
+          (query ^. #queryLimit)
           cursorId
           [ row
           | row <- visibleRows revisionNumber state,
-            row.memoryTuple.object.objectType == query.queryType,
-            row.memoryTuple.relation == query.queryRelation,
-            row.memoryTuple.subject `elem` query.querySubjects
+            (row ^. #memoryTuple . #object . #objectType) == (query ^. #queryType),
+            (row ^. #memoryTuple . #relation) == (query ^. #queryRelation),
+            (row ^. #memoryTuple . #subject) `elem` (query ^. #querySubjects)
           ]
     ReadAllTuples revision limit cursor -> do
       revisionNumber <- requireRevision world revision
       cursorId <- requireCursor cursor
-      state <- liftIO (readIORef world.memoryState)
+      state <- liftIO (readIORef (world ^. #memoryState))
       pure (tuplePage world limit cursorId (visibleRows revisionNumber state))
     ProbeTuples revision object relation subjects -> do
       revisionNumber <- requireRevision world revision
-      state <- liftIO (readIORef world.memoryState)
+      state <- liftIO (readIORef (world ^. #memoryState))
       pure
         [ toTupleRow world row
         | row <- visibleRows revisionNumber state,
-          row.memoryTuple.object == object,
-          row.memoryTuple.relation == relation,
-          row.memoryTuple.subject `elem` subjects
+          (row ^. #memoryTuple . #object) == object,
+          (row ^. #memoryTuple . #relation) == relation,
+          (row ^. #memoryTuple . #subject) `elem` subjects
         ]
     ApplyTupleWrites request -> do
       outcome <-
         liftIO $
-          atomicModifyIORef' world.memoryState \state ->
+          atomicModifyIORef' (world ^. #memoryState) \state ->
             case applyWriteRequest request state of
               Left err -> (state, Left err)
               Right (nextState, revisionNumber) ->
@@ -176,51 +181,52 @@ runTupleStoreInMemory world =
     ReadRelationships revision relationshipFilter limit cursor -> do
       revisionNumber <- requireRevision world revision
       cursorId <- requireCursor cursor
-      state <- liftIO (readIORef world.memoryState)
+      state <- liftIO (readIORef (world ^. #memoryState))
       pure $
         tuplePage
           world
           limit
           cursorId
           ( filter
-              (matchesRelationshipFilter relationshipFilter . (.memoryTuple))
+              (matchesRelationshipFilter relationshipFilter . (view (#memoryTuple)))
               (visibleRows revisionNumber state)
           )
     ReadRelationshipPage revision token relationshipFilter pageRequest -> do
       revisionNumber <- requireRevision world revision
-      state <- liftIO (readIORef world.memoryState)
+      state <- liftIO (readIORef (world ^. #memoryState))
       pure
         ( relationshipPageFromRows
             token
             pageRequest
             [ toTupleRow world row
             | row <- visibleRows revisionNumber state,
-              matchesRelationshipFilter relationshipFilter row.memoryTuple
+              matchesRelationshipFilter relationshipFilter (row ^. #memoryTuple)
             ]
         )
     CountRelationships revision relationshipFilter -> do
       revisionNumber <- requireRevision world revision
-      state <- liftIO (readIORef world.memoryState)
+      state <- liftIO (readIORef (world ^. #memoryState))
       pure $
         fromIntegral $
           length $
             filter
-              (matchesRelationshipFilter relationshipFilter . (.memoryTuple))
+              (matchesRelationshipFilter relationshipFilter . (view (#memoryTuple)))
               (visibleRows revisionNumber state)
     DeleteRelationships relationshipFilter ->
       liftIO $
-        atomicModifyIORef' world.memoryState \state ->
-          let revisionNumber = state.memoryHead + 1
+        atomicModifyIORef' (world ^. #memoryState) \state ->
+          let revisionNumber = (state ^. #memoryHead) + 1
               (retiredCount, rows') =
                 Map.mapAccum
                   (retireMatching revisionNumber relationshipFilter)
                   0
-                  state.memoryRows
+                  (state ^. #memoryRows)
               nextState =
                 state
-                  { memoryRows = rows',
-                    memoryHead = revisionNumber
-                  }
+                  & #memoryRows
+                  .~ rows'
+                  & #memoryHead
+                  .~ revisionNumber
            in (nextState, (retiredCount, tokenAt world revisionNumber))
     ReadChanges start end relationshipFilter limit cursor -> do
       startNumber <- requireRevision world start
@@ -229,43 +235,44 @@ runTupleStoreInMemory world =
         then throwError (StoreError "in-memory change window starts after it ends")
         else do
           cursorId <- requireCursor cursor
-          state <- liftIO (readIORef world.memoryState)
+          state <- liftIO (readIORef (world ^. #memoryState))
           pure
             ( changePage
                 limit
                 cursorId
-                [ (row.memoryRowId, change)
-                | row <- Map.elems state.memoryRows,
-                  maybe True (`matchesRelationshipFilter` row.memoryTuple) relationshipFilter,
+                [ ((row ^. #memoryRowId), change)
+                | row <- Map.elems (state ^. #memoryRows),
+                  maybe True (`matchesRelationshipFilter` (row ^. #memoryTuple)) relationshipFilter,
                   change <- classifyChange startNumber endNumber row
                 ]
             )
     HeadRevision -> do
-      state <- liftIO (readIORef world.memoryState)
-      pure (revisionAt world state.memoryHead)
+      state <- liftIO (readIORef (world ^. #memoryState))
+      pure (revisionAt world (state ^. #memoryHead))
     OptimizedRevision -> do
       -- There is no replica lag or quantization in one in-memory world.
-      state <- liftIO (readIORef world.memoryState)
-      pure (revisionAt world state.memoryHead)
+      state <- liftIO (readIORef (world ^. #memoryState))
+      pure (revisionAt world (state ^. #memoryHead))
     OldestRetainedXid ->
-      (.memoryGcHorizon) <$> liftIO (readIORef world.memoryState)
+      (view (#memoryGcHorizon)) <$> liftIO (readIORef (world ^. #memoryState))
     AdvanceGcHorizon ->
       liftIO $
-        atomicModifyIORef' world.memoryState \state ->
-          let horizon = max state.memoryGcHorizon state.memoryHead
-           in (state {memoryGcHorizon = horizon}, horizon)
+        atomicModifyIORef' (world ^. #memoryState) \state ->
+          let horizon = max (state ^. #memoryGcHorizon) (state ^. #memoryHead)
+           in (state & #memoryGcHorizon .~ horizon, horizon)
     ReapDeletedTuples horizon ->
       liftIO $
-        atomicModifyIORef' world.memoryState \state ->
+        atomicModifyIORef' (world ^. #memoryState) \state ->
           let (reaped, retained) =
                 Map.partition
-                  (maybe False (< horizon) . (.memoryDeletedAt))
-                  state.memoryRows
+                  (maybe False (< horizon) . (view (#memoryDeletedAt)))
+                  (state ^. #memoryRows)
               nextState =
                 state
-                  { memoryRows = retained,
-                    memoryGcHorizon = max state.memoryGcHorizon horizon
-                  }
+                  & #memoryRows
+                  .~ retained
+                  & #memoryGcHorizon
+                  .~ max (state ^. #memoryGcHorizon) horizon
            in (nextState, fromIntegral (Map.size reaped))
 
 -- | Interpret consistency tokens and requests against the same mutable world.
@@ -284,7 +291,7 @@ runConsistencyStoreInMemory world =
       resolveInMemoryConsistency world consistency
     MintToken revision -> do
       _ <- requireRevision world revision
-      pure (ConsistencyToken revision.revisionEncoding)
+      pure (ConsistencyToken (revision ^. #revisionEncoding))
 
 -- | Install both store effects over one world.
 runInMemoryStores ::
@@ -300,35 +307,37 @@ applyWriteRequest ::
   InMemoryState ->
   Either EnError (InMemoryState, Word64)
 applyWriteRequest request state =
-  case find (not . preconditionHolds liveTuples) request.preconditions of
+  case find (not . preconditionHolds liveTuples) (request ^. #preconditions) of
     Just failed ->
       Left (WritePreconditionFailed (renderPrecondition failed))
     Nothing ->
-      let revisionNumber = state.memoryHead + 1
+      let revisionNumber = (state ^. #memoryHead) + 1
           deletedRows =
             foldl'
               (flip (retireTupleKey revisionNumber))
-              state.memoryRows
-              request.deletes
-          deduplicatedWrites = dedupeWrites request.writes
+              (state ^. #memoryRows)
+              (request ^. #deletes)
+          deduplicatedWrites = dedupeWrites (request ^. #writes)
           (rows', nextRowId') =
             foldl'
               (touchTuple revisionNumber)
-              (deletedRows, state.memoryNextRowId)
+              (deletedRows, (state ^. #memoryNextRowId))
               deduplicatedWrites
        in Right
             ( state
-                { memoryRows = rows',
-                  memoryHead = revisionNumber,
-                  memoryNextRowId = nextRowId'
-                },
+                & #memoryRows
+                .~ rows'
+                & #memoryHead
+                .~ revisionNumber
+                & #memoryNextRowId
+                .~ nextRowId',
               revisionNumber
             )
   where
     liveTuples =
-      [ row.memoryTuple
-      | row <- Map.elems state.memoryRows,
-        isNothing row.memoryDeletedAt
+      [ (row ^. #memoryTuple)
+      | row <- Map.elems (state ^. #memoryRows),
+        isNothing (row ^. #memoryDeletedAt)
       ]
 
 touchTuple ::
@@ -338,7 +347,7 @@ touchTuple ::
   (Map Word64 InMemoryRow, Word64)
 touchTuple revisionNumber (rows, nextRowId) tuple
   | any
-      (\row -> isNothing row.memoryDeletedAt && row.memoryTuple == tuple)
+      (\row -> isNothing (row ^. #memoryDeletedAt) && (row ^. #memoryTuple) == tuple)
       (Map.elems rows) =
       (rows, nextRowId)
   | otherwise =
@@ -355,8 +364,8 @@ touchTuple revisionNumber (rows, nextRowId) tuple
 retireTupleKey :: Word64 -> Tuple -> Map Word64 InMemoryRow -> Map Word64 InMemoryRow
 retireTupleKey revisionNumber tuple =
   Map.map \row ->
-    if isNothing row.memoryDeletedAt && tupleKey row.memoryTuple == tupleKey tuple
-      then row {memoryDeletedAt = Just revisionNumber}
+    if isNothing (row ^. #memoryDeletedAt) && tupleKey (row ^. #memoryTuple) == tupleKey tuple
+      then row & #memoryDeletedAt ?~ revisionNumber
       else row
 
 retireMatching ::
@@ -366,9 +375,9 @@ retireMatching ::
   InMemoryRow ->
   (Int64, InMemoryRow)
 retireMatching revisionNumber relationshipFilter count row
-  | isNothing row.memoryDeletedAt
-      && matchesRelationshipFilter relationshipFilter row.memoryTuple =
-      (count + 1, row {memoryDeletedAt = Just revisionNumber})
+  | isNothing (row ^. #memoryDeletedAt)
+      && matchesRelationshipFilter relationshipFilter (row ^. #memoryTuple) =
+      (count + 1, row & #memoryDeletedAt ?~ revisionNumber)
   | otherwise =
       (count, row)
 
@@ -388,7 +397,7 @@ dedupeWrites tuples =
 
 tupleKey :: Tuple -> (ObjectRef, RelationName, Subject)
 tupleKey tuple =
-  (tuple.object, tuple.relation, tuple.subject)
+  ((tuple ^. #object), (tuple ^. #relation), (tuple ^. #subject))
 
 preconditionHolds :: [Tuple] -> Precondition -> Bool
 preconditionHolds tuples = \case
@@ -403,16 +412,16 @@ matchesTupleFilter =
 
 matchesRelationshipFilter :: RelationshipFilter -> Tuple -> Bool
 matchesRelationshipFilter relationshipFilter tuple =
-  matchesMaybe relationshipFilter.objectType tuple.object.objectType
-    && matchesMaybe relationshipFilter.objectId tuple.object.objectId
-    && matchesMaybe relationshipFilter.relation tuple.relation
-    && matchesMaybe relationshipFilter.subjectType subjectObject.objectType
-    && matchesMaybe relationshipFilter.subjectId subjectObject.objectId
-    && matchesSubjectRelation relationshipFilter.subjectRelation subjectRelation
-    && matchesCaveat relationshipFilter.caveatName tuple.caveat
+  matchesMaybe (relationshipFilter ^. #objectType) (tuple ^. #object . #objectType)
+    && matchesMaybe (relationshipFilter ^. #objectId) (tuple ^. #object . #objectId)
+    && matchesMaybe (relationshipFilter ^. #relation) (tuple ^. #relation)
+    && matchesMaybe (relationshipFilter ^. #subjectType) (subjectObject ^. #objectType)
+    && matchesMaybe (relationshipFilter ^. #subjectId) (subjectObject ^. #objectId)
+    && matchesSubjectRelation (relationshipFilter ^. #subjectRelation) subjectRelation
+    && matchesCaveat (relationshipFilter ^. #caveatName) (tuple ^. #caveat)
   where
     (subjectObject, subjectRelation) =
-      case tuple.subject of
+      case (tuple ^. #subject) of
         SubjectId object -> (object, Nothing)
         SubjectSet object relation -> (object, Just relation)
         SubjectWildcard objectType ->
@@ -432,19 +441,19 @@ matchesRelationshipFilter relationshipFilter tuple =
     matchesCaveat :: Maybe CaveatName -> Maybe TupleCaveat -> Bool
     matchesCaveat Nothing _ = True
     matchesCaveat (Just expected) actual =
-      fmap (.name) actual == Just expected
+      fmap (view (#name)) actual == Just expected
 
 visibleRows :: Word64 -> InMemoryState -> [InMemoryRow]
 visibleRows revisionNumber state =
   [ row
-  | row <- Map.elems state.memoryRows,
-    row.memoryCreatedAt <= revisionNumber,
-    maybe True (> revisionNumber) row.memoryDeletedAt
+  | row <- Map.elems (state ^. #memoryRows),
+    (row ^. #memoryCreatedAt) <= revisionNumber,
+    maybe True (> revisionNumber) (row ^. #memoryDeletedAt)
   ]
 
 tuplePage :: InMemoryWorld -> Int -> Word64 -> [InMemoryRow] -> TuplePage
 tuplePage world limit cursorId rows =
-  let candidates = filter ((> cursorId) . (.memoryRowId)) rows
+  let candidates = filter ((> cursorId) . (view (#memoryRowId))) rows
       (pageRows, extraRows) = splitAt (max 0 limit) candidates
       pageState =
         case extraRows of
@@ -454,7 +463,7 @@ tuplePage world limit cursorId rows =
               ( cursorAt
                   ( case reverse pageRows of
                       [] -> cursorId
-                      lastRow : _ -> lastRow.memoryRowId
+                      lastRow : _ -> (lastRow ^. #memoryRowId)
                   )
               )
    in TuplePage
@@ -499,23 +508,23 @@ classifyChange start end row =
     change kind =
       TupleChange
         { kind,
-          tuple = row.memoryTuple,
-          rowId = rowIdAt row.memoryRowId
+          tuple = (row ^. #memoryTuple),
+          rowId = rowIdAt (row ^. #memoryRowId)
         }
 
 visibleAt :: Word64 -> InMemoryRow -> Bool
 visibleAt revisionNumber row =
-  row.memoryCreatedAt <= revisionNumber
-    && maybe True (> revisionNumber) row.memoryDeletedAt
+  (row ^. #memoryCreatedAt) <= revisionNumber
+    && maybe True (> revisionNumber) (row ^. #memoryDeletedAt)
 
 toTupleRow :: InMemoryWorld -> InMemoryRow -> TupleRow
 toTupleRow world row =
   TupleRow
-    { pageKey = fromIntegral row.memoryRowId,
-      rowId = rowIdAt row.memoryRowId,
-      tuple = row.memoryTuple,
-      createdAt = revisionAt world row.memoryCreatedAt,
-      deletedAt = revisionAt world <$> row.memoryDeletedAt
+    { pageKey = fromIntegral (row ^. #memoryRowId),
+      rowId = rowIdAt (row ^. #memoryRowId),
+      tuple = (row ^. #memoryTuple),
+      createdAt = revisionAt world (row ^. #memoryCreatedAt),
+      deletedAt = revisionAt world <$> (row ^. #memoryDeletedAt)
     }
 
 rowIdAt :: Word64 -> TupleRowId
@@ -531,12 +540,12 @@ revisionAt world revisionNumber =
   Revision
     ( Text.intercalate
         ":"
-        ["mem", world.memoryWorldId, showText revisionNumber]
+        ["mem", world ^. #memoryWorldId, showText revisionNumber]
     )
 
 tokenAt :: InMemoryWorld -> Word64 -> ConsistencyToken
 tokenAt world =
-  ConsistencyToken . (.revisionEncoding) . revisionAt world
+  ConsistencyToken . (view (#revisionEncoding)) . revisionAt world
 
 requireRevision ::
   (Error EnError :> es) =>
@@ -548,16 +557,16 @@ requireRevision world revision =
 
 decodeRevisionFor :: InMemoryWorld -> Revision -> Either EnError Word64
 decodeRevisionFor world revision =
-  case decodeMemoryEncoding revision.revisionEncoding of
+  case decodeMemoryEncoding (revision ^. #revisionEncoding) of
     Just (worldId, revisionNumber)
-      | worldId == world.memoryWorldId ->
+      | worldId == (world ^. #memoryWorldId) ->
           Right revisionNumber
       | otherwise ->
           Left (StoreError "revision belongs to a different in-memory world")
     Nothing ->
       Left
         ( StoreError
-            ("malformed in-memory revision: " <> revision.revisionEncoding)
+            ("malformed in-memory revision: " <> (revision ^. #revisionEncoding))
         )
 
 requireCursor ::
@@ -594,22 +603,22 @@ validateMetadata ::
   TokenMetadata ->
   Eff es ()
 validateMetadata world metadata
-  | metadata.datastoreId /= datastoreIdFor world.memoryWorldId =
+  | (metadata ^. #datastoreId) /= datastoreIdFor (world ^. #memoryWorldId) =
       throwError
         (InvalidConsistencyToken "token datastore does not match this in-memory world")
-  | metadata.schemaHash /= inMemorySchemaHash =
+  | (metadata ^. #schemaHash) /= inMemorySchemaHash =
       throwError
         (InvalidConsistencyToken "token schema hash does not match the in-memory store")
   | otherwise = do
       revisionNumber <-
-        case decodeRevisionFor world metadata.revision of
+        case decodeRevisionFor world (metadata ^. #revision) of
           Left _ ->
             throwError
               (MalformedConsistencyToken "token revision is not an in-memory revision")
           Right value ->
             pure value
-      state <- liftIO (readIORef world.memoryState)
-      if revisionNumber < state.memoryGcHorizon
+      state <- liftIO (readIORef (world ^. #memoryState))
+      if revisionNumber < (state ^. #memoryGcHorizon)
         then
           throwError
             (ConsistencyTokenExpired "token is older than the in-memory garbage-collection horizon")
@@ -629,24 +638,24 @@ resolveInMemoryConsistency world consistency =
     AtExactSnapshot token -> do
       metadata <- either throwError pure (decodeTokenMetadata token)
       validateMetadata world metadata
-      pure ResolvedConsistency {consistency, revision = metadata.revision}
+      pure ResolvedConsistency {consistency, revision = (metadata ^. #revision)}
     AtLeastAsFresh token -> do
       metadata <- either throwError pure (decodeTokenMetadata token)
       validateMetadata world metadata
-      tokenRevision <- requireRevision world metadata.revision
-      state <- liftIO (readIORef world.memoryState)
+      tokenRevision <- requireRevision world (metadata ^. #revision)
+      state <- liftIO (readIORef (world ^. #memoryState))
       pure
         ResolvedConsistency
           { consistency,
-            revision = revisionAt world (max tokenRevision state.memoryHead)
+            revision = revisionAt world (max tokenRevision (state ^. #memoryHead))
           }
   where
     atHead = do
-      state <- liftIO (readIORef world.memoryState)
+      state <- liftIO (readIORef (world ^. #memoryState))
       pure
         ResolvedConsistency
           { consistency,
-            revision = revisionAt world state.memoryHead
+            revision = revisionAt world (state ^. #memoryHead)
           }
 
 datastoreIdFor :: Text -> DatastoreId

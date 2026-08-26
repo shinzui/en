@@ -10,11 +10,13 @@ module En.RelationshipPagination
   )
 where
 
+import Data.Generics.Labels ()
 import Data.Int (Int64)
 import Data.List (sortOn)
 import Data.Maybe (isJust, listToMaybe)
 import Data.Word (Word32)
 import En.Effect.TupleStore (TupleRow (..))
+import En.Prelude
 import En.Revision (ConsistencyToken (..))
 import Relay.Pagination
   ( Connection (..),
@@ -30,6 +32,9 @@ import Relay.Pagination
     decodeCursor,
     encodeCursor,
   )
+import Relay.Pagination.Connection qualified as RelayConnection
+import Relay.Pagination.Cursor qualified as RelayCursor
+import Relay.Pagination.Request qualified as RelayRequest
 
 -- | FNV-1a fingerprint of @snapshot_token ASC text, id ASC int8@ under the
 -- relay-pagination 0.1 cursor format. The PostgreSQL SortSpec is tested against
@@ -48,26 +53,26 @@ relationshipPageFromRows ::
   [TupleRow] ->
   Either CursorError (Connection TupleRow)
 relationshipPageFromRows token request rows = do
-  anchor <- traverse decodeRelationshipCursor request.cursor
+  anchor <- traverse decodeRelationshipCursor (RelayRequest.cursor request)
   case anchor of
     Just (cursorToken, _)
       | cursorToken /= token ->
           Left (BadJson "relationship cursor snapshot does not match resolved consistency token")
     _ -> pure ()
-  let canonicalRows = sortOn (.pageKey) rows
+  let canonicalRows = sortOn (view (#pageKey)) rows
       anchorKey = snd <$> anchor
       candidates =
-        case request.direction of
-          Forward -> maybe canonicalRows (\key -> filter ((> key) . (.pageKey)) canonicalRows) anchorKey
+        case RelayRequest.direction request of
+          Forward -> maybe canonicalRows (\key -> filter ((> key) . (view (#pageKey))) canonicalRows) anchorKey
           Backward ->
-            reverse (maybe canonicalRows (\key -> filter ((< key) . (.pageKey)) canonicalRows) anchorKey)
-      fetched = take (request.pageSize + 1) candidates
+            reverse (maybe canonicalRows (\key -> filter ((< key) . (view (#pageKey))) canonicalRows) anchorKey)
+      fetched = take (RelayRequest.pageSize request + 1) candidates
   pure (connectionFromRows token request fetched)
 
 decodeRelationshipCursor :: Cursor -> Either CursorError (ConsistencyToken, Int64)
 decodeRelationshipCursor cursor = do
   payload <- decodeCursor relationshipSortFingerprint cursor
-  case payload.keys of
+  case RelayCursor.keys payload of
     [tokenValue, keyValue] -> do
       token <-
         case tokenValue of
@@ -85,18 +90,18 @@ connectionFromRows :: ConsistencyToken -> PageRequest -> [TupleRow] -> Connectio
 connectionFromRows token request rows =
   Connection {edges, pageInfo}
   where
-    probe = length rows > request.pageSize
-    kept = take request.pageSize rows
+    probe = length rows > RelayRequest.pageSize request
+    kept = take (RelayRequest.pageSize request) rows
     canonical =
-      case request.direction of
+      case RelayRequest.direction request of
         Forward -> kept
         Backward -> reverse kept
     edges = [Edge {node = row, cursor = mintRelationshipCursor token row} | row <- canonical]
-    cursors = (.cursor) <$> edges
+    cursors = RelayConnection.cursor <$> edges
     (nextPage, previousPage) =
-      case request.direction of
-        Forward -> (probe, isJust request.cursor)
-        Backward -> (isJust request.cursor, probe)
+      case RelayRequest.direction request of
+        Forward -> (probe, isJust (RelayRequest.cursor request))
+        Backward -> (isJust (RelayRequest.cursor request), probe)
     pageInfo =
       PageInfo
         { hasNextPage = nextPage,
@@ -111,5 +116,5 @@ mintRelationshipCursor (ConsistencyToken token) row =
     CursorPayload
       { version = cursorVersion,
         fingerprint = relationshipSortFingerprint,
-        keys = [KvText token, KvInt row.pageKey]
+        keys = [KvText token, KvInt (row ^. #pageKey)]
       }

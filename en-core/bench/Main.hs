@@ -2,6 +2,7 @@
 
 module Main (main) where
 
+import Data.Generics.Labels ()
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as Text
 import Effectful (Eff, runPureEff)
@@ -16,6 +17,7 @@ import En.Error (EnError)
 import En.Expand (ExpandLimit (..), ExpandRequest (..), ExpandTree (..), expand)
 import En.Lookup (LookupLimit (..), LookupPage (..), LookupRequest (..))
 import En.Lookup qualified as Lookup
+import En.Prelude
 import En.Reachability (ReachabilityGraph, compileSchema)
 import En.Revision (Consistency (..))
 import En.Schema (ObjectType (..), RelationName (..), Schema)
@@ -93,16 +95,16 @@ main = do
 -- turns it into an early error would otherwise look like an optimization.
 assertFixtures :: ReachabilityGraph -> ReachabilityGraph -> IO ()
 assertFixtures graph wideGraph = do
-  expectEq "check/shallow-owner" (Right Allowed) =<< runEngine (check graph MinimizeLatency emptyContext (SubjectId user) (RelationName "view") space)
-  expectEq "check/nested-parent" (Right Allowed) =<< runEngine (check graph MinimizeLatency emptyContext (SubjectId user) (RelationName "view") childSpace)
-  expectEq "check/deep-nested" (Right Allowed) =<< runDeepEngine (check graph MinimizeLatency emptyContext (SubjectId user) (RelationName "view") deepLeaf)
-  expectEq "checkMany/overlapping" (Right [Right Allowed, Right Allowed, Right Allowed]) =<< runEngine (checkMany graph MinimizeLatency emptyContext overlappingPairs)
-  expectEq "checkMany/wide-overlapping" (Right [Right Allowed, Right Allowed, Right Allowed]) =<< runWideEngine (checkMany wideGraph MinimizeLatency emptyContext wideOverlappingPairs)
-  expectEq "check-wide/direct-member" (Right Allowed) =<< runWideEngine (check wideGraph MinimizeLatency emptyContext (SubjectId wideMember) (RelationName "viewer") wideFolder)
-  expectEq "check-wide/non-member" (Right Denied) =<< runWideEngine (check wideGraph MinimizeLatency emptyContext (SubjectId outsider) (RelationName "viewer") wideFolder)
-  expectEq "lookup/reachable-spaces" (Right 2) . fmap (length . (.objects)) =<< runEngine (Lookup.lookup graph MinimizeLatency viewSpacesRequest)
-  expectEq "lookup/wide-fanout" (Right 50) . fmap (length . (.objects)) =<< runFanoutEngine (Lookup.lookup wideGraph MinimizeLatency fanoutRequest)
-  expectEq "expand/deep-nested" (Right deepLeaf) . fmap (.root) =<< runDeepEngine (expand graph MinimizeLatency deepExpandRequest)
+  expectEq "check/shallow-owner" (Right Allowed) . fmap (view (#decision)) =<< runEngine (check graph MinimizeLatency emptyContext (SubjectId user) (RelationName "view") space)
+  expectEq "check/nested-parent" (Right Allowed) . fmap (view (#decision)) =<< runEngine (check graph MinimizeLatency emptyContext (SubjectId user) (RelationName "view") childSpace)
+  expectEq "check/deep-nested" (Right Allowed) . fmap (view (#decision)) =<< runDeepEngine (check graph MinimizeLatency emptyContext (SubjectId user) (RelationName "view") deepLeaf)
+  expectEq "checkMany/overlapping" (Right [Right Allowed, Right Allowed, Right Allowed]) . fmap (view (#decisions)) =<< runEngine (checkMany graph MinimizeLatency emptyContext overlappingPairs)
+  expectEq "checkMany/wide-overlapping" (Right [Right Allowed, Right Allowed, Right Allowed]) . fmap (view (#decisions)) =<< runWideEngine (checkMany wideGraph MinimizeLatency emptyContext wideOverlappingPairs)
+  expectEq "check-wide/direct-member" (Right Allowed) . fmap (view (#decision)) =<< runWideEngine (check wideGraph MinimizeLatency emptyContext (SubjectId wideMember) (RelationName "viewer") wideFolder)
+  expectEq "check-wide/non-member" (Right Denied) . fmap (view (#decision)) =<< runWideEngine (check wideGraph MinimizeLatency emptyContext (SubjectId outsider) (RelationName "viewer") wideFolder)
+  expectEq "lookup/reachable-spaces" (Right 2) . fmap (length . (view (#objects))) =<< runEngine (Lookup.lookup graph MinimizeLatency viewSpacesRequest)
+  expectEq "lookup/wide-fanout" (Right 50) . fmap (length . (view (#objects))) =<< runFanoutEngine (Lookup.lookup wideGraph MinimizeLatency fanoutRequest)
+  expectEq "expand/deep-nested" (Right deepLeaf) . fmap (view (#root)) =<< runDeepEngine (expand graph MinimizeLatency deepExpandRequest)
 
 expectEq :: (Eq a, Show a) => String -> a -> a -> IO ()
 expectEq label expected actual
@@ -328,7 +330,7 @@ viewSpacesRequest =
   LookupRequest
     { subject = SubjectId user,
       permission = RelationName "view",
-      objectType = space.objectType,
+      objectType = (space ^. #objectType),
       context = emptyContext,
       limit = LookupLimit 50,
       cursor = Nothing

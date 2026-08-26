@@ -4,10 +4,12 @@ module En.Effect.CachedTupleStore
   )
 where
 
-import Effectful (Eff, IOE, liftIO, (:>))
+import Data.Generics.Labels ()
+import Effectful (Eff, IOE, (:>))
 import Effectful.Dispatch.Dynamic (interpose, passthrough, send)
 import En.Cache (Cache, TupleReadKey (..), insertCache, lookupCache)
 import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleStore (..))
+import En.Prelude
 
 -- | Cache tuple-store read pages by resolved revision and read parameters.
 --
@@ -45,7 +47,7 @@ cachedTupleStore cache =
         (StartingWithUserReadKey revision query)
         (send (ReadStartingWithUser revision query))
     ProbeTuples revision object relation subjects ->
-      (.rows)
+      (view (#rows))
         <$> cachedRead
           cache
           (ProbeReadKey revision object relation subjects)

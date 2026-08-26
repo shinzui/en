@@ -12,10 +12,12 @@ module En.Reachability
   )
 where
 
+import Data.Generics.Labels ()
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import En.Error (EnError)
+import En.Prelude
 import En.Revision (SchemaHash)
 import En.Schema
   ( AllowedSubject (..),
@@ -51,7 +53,7 @@ data RelationRef = RelationRef
   { objectType :: !ObjectType,
     relation :: !RelationName
   }
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Eq, Generic, Ord, Show)
 
 -- | A subject shape at the reverse edge source. A concrete subject source has
 -- @relation = Nothing@. A userset source has @relation = Just r@ and means
@@ -61,7 +63,7 @@ data SubjectSelector = SubjectSelector
     relation :: !(Maybe RelationName),
     wildcard :: !Bool
   }
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Eq, Generic, Ord, Show)
 
 data EntryKind
   = Direct
@@ -86,7 +88,7 @@ data EntryPoint = EntryPoint
     caveats :: ![CaveatName],
     recursive :: !Bool
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | Compile a validated schema into the reachability graph 'En.Check.check' and
 -- 'En.Lookup.lookup' traverse. Total: the only thing that could fail is validation,
@@ -97,10 +99,10 @@ compile valid =
     { relations =
         Map.fromList
           [ (RelationRef {objectType, relation = relationName}, relation)
-          | (objectType, objectRelations) <- Map.toAscList schema.objectTypes,
+          | (objectType, objectRelations) <- Map.toAscList (schema ^. #objectTypes),
             (relationName, relation) <- Map.toAscList objectRelations
           ],
-      caveats = schema.caveats,
+      caveats = (schema ^. #caveats),
       hash = schemaHash valid
     }
   where
@@ -128,7 +130,7 @@ entryPoints :: ValidSchema -> Map RelationRef [EntryPoint]
 entryPoints valid =
   Map.fromList
     [ (target, compileRelation schema target relation)
-    | (objectType, relations) <- Map.toAscList schema.objectTypes,
+    | (objectType, relations) <- Map.toAscList (schema ^. #objectTypes),
       (relationName, relation) <- Map.toAscList relations,
       let target = RelationRef {objectType, relation = relationName}
     ]
@@ -138,7 +140,7 @@ entryPoints valid =
 
 compileRelation :: Schema -> RelationRef -> Relation -> [EntryPoint]
 compileRelation schema target relation =
-  compileRewrite schema target target Set.empty Direct [] [] relation.rewrite
+  compileRewrite schema target target Set.empty Direct [] [] (relation ^. #rewrite)
 
 compileRewrite ::
   Schema ->
@@ -154,17 +156,17 @@ compileRewrite schema target current visited kind path caveats =
   \case
     This ->
       [ EntryPoint
-          { source = SubjectSelector {objectType = allowed.objectType, relation = allowed.relation, wildcard = allowed.wildcard},
+          { source = SubjectSelector {objectType = (allowed ^. #objectType), relation = (allowed ^. #relation), wildcard = (allowed ^. #wildcard)},
             target = target,
             kind = kind,
             path = reverse (StepThis : path),
             caveats = reverse caveats,
             recursive = False
           }
-      | allowed <- maybe [] (Set.toAscList . (.allowedSubjects)) (lookupRelation schema current)
+      | allowed <- maybe [] (Set.toAscList . (view (#allowedSubjects))) (lookupRelation schema current)
       ]
     ComputedUserset relationName ->
-      let computed = RelationRef {objectType = current.objectType, relation = relationName}
+      let computed = RelationRef {objectType = (current ^. #objectType), relation = relationName}
        in if Set.member computed visited
             then []
             else
@@ -179,21 +181,21 @@ compileRewrite schema target current visited kind path caveats =
                       kind
                       (StepComputedUserset relationName : path)
                       caveats
-                      relation.rewrite
+                      (relation ^. #rewrite)
                 )
                 (lookupRelation schema computed)
     TupleToUserset tuplesetRelation computedRelation ->
       [ EntryPoint
-          { source = SubjectSelector {objectType = allowed.objectType, relation = Just computedRelation, wildcard = False},
+          { source = SubjectSelector {objectType = (allowed ^. #objectType), relation = Just computedRelation, wildcard = False},
             target = target,
             kind = kind,
             path = reverse (StepTupleToUserset tuplesetRelation computedRelation : path),
             caveats = reverse caveats,
-            recursive = RelationRef {objectType = allowed.objectType, relation = computedRelation} == target
+            recursive = RelationRef {objectType = (allowed ^. #objectType), relation = computedRelation} == target
           }
-      | allowed <- maybe [] (Set.toAscList . (.allowedSubjects)) (lookupRelation schema RelationRef {objectType = current.objectType, relation = tuplesetRelation}),
-        not allowed.wildcard,
-        hasRelation schema allowed.objectType computedRelation
+      | allowed <- maybe [] (Set.toAscList . (view (#allowedSubjects))) (lookupRelation schema RelationRef {objectType = (current ^. #objectType), relation = tuplesetRelation}),
+        not (allowed ^. #wildcard),
+        hasRelation schema (allowed ^. #objectType) computedRelation
       ]
     Union rewrites ->
       concatMap (compileRewrite schema target current visited kind (StepUnion : path) caveats) rewrites
@@ -207,9 +209,9 @@ compileRewrite schema target current visited kind path caveats =
 
 lookupRelation :: Schema -> RelationRef -> Maybe Relation
 lookupRelation schema ref = do
-  relations <- Map.lookup ref.objectType schema.objectTypes
-  Map.lookup ref.relation relations
+  relations <- Map.lookup (ref ^. #objectType) (schema ^. #objectTypes)
+  Map.lookup (ref ^. #relation) relations
 
 hasRelation :: Schema -> ObjectType -> RelationName -> Bool
 hasRelation schema objectType relationName =
-  maybe False (Map.member relationName) (Map.lookup objectType schema.objectTypes)
+  maybe False (Map.member relationName) (Map.lookup objectType (schema ^. #objectTypes))

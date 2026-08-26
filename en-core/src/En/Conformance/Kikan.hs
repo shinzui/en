@@ -43,6 +43,7 @@ module En.Conformance.Kikan
   )
 where
 
+import Data.Generics.Labels ()
 import Data.List (find, partition)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isNothing)
@@ -74,6 +75,7 @@ import En.Effect.TupleStore
     widenTupleFilter,
   )
 import En.Error (EnError (..))
+import En.Prelude
 import En.Reachability (ReachabilityGraph, compileSchema)
 import En.RelationshipPagination (relationshipPageFromRows)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), Revision (..), SchemaHash (..))
@@ -182,18 +184,18 @@ runTupleStoreInMemory initialTuples =
   reinterpret_ (evalState initialTuples) \case
     ReadObjectRelation _ object relation limit cursor -> do
       tuples <- get
-      pure (pageTuples limit cursor [tuple | tuple <- tuples, tuple.object == object, tuple.relation == relation])
+      pure (pageTuples limit cursor [tuple | tuple <- tuples, (tuple ^. #object) == object, (tuple ^. #relation) == relation])
     ReadStartingWithUser _ query -> do
       tuples <- get
       pure
         ( pageTuples
-            query.queryLimit
-            query.queryCursor
+            (query ^. #queryLimit)
+            (query ^. #queryCursor)
             [ tuple
             | tuple <- tuples,
-              tuple.object.objectType == query.queryType,
-              tuple.relation == query.queryRelation,
-              tuple.subject `elem` query.querySubjects
+              (tuple ^. #object . #objectType) == (query ^. #queryType),
+              (tuple ^. #relation) == (query ^. #queryRelation),
+              (tuple ^. #subject) `elem` (query ^. #querySubjects)
             ]
         )
     ReadAllTuples _ limit cursor -> do
@@ -235,7 +237,7 @@ runTupleStoreInMemory initialTuples =
           TuplePage {rows, state} = pageTuples limit cursor matching
       pure
         ChangePage
-          { changes = [TupleChange {kind = ChangeTouch, tuple = row.tuple, rowId = row.rowId} | row <- rows],
+          { changes = [TupleChange {kind = ChangeTouch, tuple = (row ^. #tuple), rowId = (row ^. #rowId)} | row <- rows],
             state
           }
     ProbeTuples _ object relation subjects -> do
@@ -243,18 +245,18 @@ runTupleStoreInMemory initialTuples =
       pure
         [ tupleRow index tuple
         | (index, tuple) <- zip [1 ..] tuples,
-          tuple.object == object,
-          tuple.relation == relation,
-          tuple.subject `elem` subjects
+          (tuple ^. #object) == object,
+          (tuple ^. #relation) == relation,
+          (tuple ^. #subject) `elem` subjects
         ]
     ApplyTupleWrites request -> do
       tuples <- get
-      case find (not . preconditionHolds tuples) request.preconditions of
+      case find (not . preconditionHolds tuples) (request ^. #preconditions) of
         Just failed ->
           throwError (WritePreconditionFailed (renderPrecondition failed))
         Nothing -> do
-          modify (\current -> foldl' (flip deleteTupleByKey) current request.deletes)
-          modify (\current -> foldl' (flip touchTuple) current request.writes)
+          modify (\current -> foldl' (flip deleteTupleByKey) current (request ^. #deletes))
+          modify (\current -> foldl' (flip touchTuple) current (request ^. #writes))
           pure (ConsistencyToken "in-memory-write")
     HeadRevision ->
       pure testRevision
@@ -270,7 +272,7 @@ runTupleStoreInMemory initialTuples =
 -- | The touch identity of a tuple: everything except the caveat.
 tupleKey :: Tuple -> (ObjectRef, RelationName, Subject)
 tupleKey tuple =
-  (tuple.object, tuple.relation, tuple.subject)
+  ((tuple ^. #object), (tuple ^. #relation), (tuple ^. #subject))
 
 -- | Apply one write with touch semantics: retire whatever grant shares the
 -- tuple's key, whatever its caveat, then append the new grant.
@@ -315,16 +317,16 @@ matchesFilter =
 -- answerable.
 matchesRelationshipFilter :: RelationshipFilter -> Tuple -> Bool
 matchesRelationshipFilter relationshipFilter tuple =
-  matchesMaybe relationshipFilter.objectType tuple.object.objectType
-    && matchesMaybe relationshipFilter.objectId tuple.object.objectId
-    && matchesMaybe relationshipFilter.relation tuple.relation
-    && matchesMaybe relationshipFilter.subjectType subjectObject.objectType
-    && matchesMaybe relationshipFilter.subjectId subjectObject.objectId
-    && matchesSubjectRelation relationshipFilter.subjectRelation subjectRelationName
-    && matchesCaveatName relationshipFilter.caveatName
+  matchesMaybe (relationshipFilter ^. #objectType) (tuple ^. #object . #objectType)
+    && matchesMaybe (relationshipFilter ^. #objectId) (tuple ^. #object . #objectId)
+    && matchesMaybe (relationshipFilter ^. #relation) (tuple ^. #relation)
+    && matchesMaybe (relationshipFilter ^. #subjectType) (subjectObject ^. #objectType)
+    && matchesMaybe (relationshipFilter ^. #subjectId) (subjectObject ^. #objectId)
+    && matchesSubjectRelation (relationshipFilter ^. #subjectRelation) subjectRelationName
+    && matchesCaveatName (relationshipFilter ^. #caveatName)
   where
     (subjectObject, subjectRelationName) =
-      case tuple.subject of
+      case (tuple ^. #subject) of
         SubjectId object -> (object, Nothing)
         SubjectSet object relationName -> (object, Just relationName)
         SubjectWildcard objectType -> (ObjectRef {objectType, objectId = "*"}, Nothing)
@@ -342,7 +344,7 @@ matchesRelationshipFilter relationshipFilter tuple =
     -- can never equal 'Just name' on the filter.
     matchesCaveatName = \case
       Nothing -> True
-      Just name -> ((.name) <$> tuple.caveat) == Just name
+      Just name -> ((view (#name)) <$> (tuple ^. #caveat)) == Just name
 
 -- | Page a filtered tuple list by a row-ordinal cursor.
 --
@@ -453,7 +455,7 @@ runConsistencyStoreInMemoryStrict datastoreId =
                 expiresAt = Nothing
               }
     ValidateToken metadata
-      | metadata.datastoreId /= datastoreId ->
+      | (metadata ^. #datastoreId) /= datastoreId ->
           throwError (InvalidConsistencyToken "token datastore does not match this en datastore")
       | otherwise ->
           pure ()
@@ -471,7 +473,7 @@ inMemoryDatastore =
 -- pins.
 inMemoryToken :: DatastoreId -> Revision -> ConsistencyToken
 inMemoryToken (DatastoreId datastoreId) revision =
-  ConsistencyToken ("in-memory:" <> datastoreId <> ":" <> revision.revisionEncoding)
+  ConsistencyToken ("in-memory:" <> datastoreId <> ":" <> (revision ^. #revisionEncoding))
 
 parseInMemoryToken :: ConsistencyToken -> Maybe (DatastoreId, Revision)
 parseInMemoryToken (ConsistencyToken tokenText) = do
@@ -502,7 +504,7 @@ agencyTuples :: [Tuple]
 agencyTuples =
   [ tuple
   | tuple <- fixtureTuples,
-    tuple.object /= usersetMemberSpace
+    (tuple ^. #object) /= usersetMemberSpace
   ]
 
 autonomyCaveat :: TupleCaveat

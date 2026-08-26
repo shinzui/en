@@ -33,6 +33,7 @@ module En.LookupSubjects
   )
 where
 
+import Data.Generics.Labels ()
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
@@ -49,6 +50,7 @@ import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), T
 import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, readObjectRelation)
 import En.Error (EnError (..))
 import En.Lookup (Deadline (..), noDeadline)
+import En.Prelude hiding (Traversal)
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
 import En.Revision (Consistency, ConsistencyToken (..), Revision)
 import En.Schema (CaveatName (..), ObjectType (..), Relation (..), RelationName (..), Rewrite (..))
@@ -85,7 +87,7 @@ data LookupSubjectsCursorState = LookupSubjectsCursorState
     token :: !ConsistencyToken,
     lastSubject :: !(Maybe Subject)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | Who to ask about, and how much of the answer to return.
 --
@@ -100,7 +102,7 @@ data LookupSubjectsRequest = LookupSubjectsRequest
     limit :: !Int,
     cursor :: !(Maybe LookupSubjectsCursor)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | One subject holding the permission, and on what terms.
 --
@@ -242,6 +244,7 @@ newtype ConfirmCheck es = ConfirmCheck
       CheckMemo ->
       Eff es (Either EnError CheckDecision, CheckMemo)
   }
+  deriving stock (Generic)
 
 -- | Resolve the snapshot this request reads at, then walk it.
 --
@@ -260,11 +263,11 @@ lookupSubjectsWithChecker ::
   LookupSubjectsRequest ->
   Eff es LookupSubjectsPage
 lookupSubjectsWithChecker budget confirm deadline graph consistency request =
-  case request.cursor of
+  case (request ^. #cursor) of
     Just cursor -> do
       resolved <- resolveLookupSubjectsCursor cursor
       (revision, cursorState) <- either throwError pure resolved
-      run revision cursorState.token (Just cursorState)
+      run revision (cursorState ^. #token) (Just cursorState)
     Nothing -> do
       ResolvedConsistency {revision} <- resolveConsistency consistency
       token <- mintToken revision
@@ -288,23 +291,23 @@ runLookupSubjects ::
 runLookupSubjects budget confirm deadline graph revision token cursorState request = do
   outcome <-
     runErrorNoCallStack
-      (evalRelation traversal request.object request.permission (initialState budget))
+      (evalRelation traversal (request ^. #object) (request ^. #permission) (initialState budget))
   case outcome of
     Left Interrupt ->
       pure (Right (interruptedPage cursorState token))
     Right subjects ->
       -- The one place the working set becomes a list. 'Map.toAscList' is already
       -- ascending by subject, which is the order pages and watermarks assume.
-      traverse (pageSubjects budget deadline request.limit cursorState token) subjects
+      traverse (pageSubjects budget deadline (request ^. #limit) cursorState token) subjects
   where
     traversal =
       Traversal
         { confirm = raiseConfirm confirm,
           deadline = raiseDeadline deadline,
           graph,
-          context = request.context,
+          context = (request ^. #context),
           revision,
-          subjectType = request.subjectType
+          subjectType = (request ^. #subjectType)
         }
 
 -- | The traversal ran out of budget before it could decide anything.
@@ -324,7 +327,7 @@ interruptedPage cursorState token =
               LookupSubjectsCursorState
                 { version = 1,
                   token,
-                  lastSubject = cursorState >>= (.lastSubject)
+                  lastSubject = cursorState >>= (view (#lastSubject))
                 }
           ),
       checkedAt = token
@@ -339,17 +342,17 @@ data Interrupt = Interrupt
 -- | Stop the traversal unless the caller's budget still permits more store work.
 requireBudget :: (Error Interrupt :> es) => Deadline (Eff es) -> Eff es ()
 requireBudget deadline = do
-  hasBudget <- deadline.remainingBudget
+  hasBudget <- (deadline ^. #remainingBudget)
   if hasBudget then pure () else throwError Interrupt
 
 raiseDeadline :: Deadline (Eff es) -> Deadline (Eff (Error Interrupt : es))
 raiseDeadline deadline =
-  Deadline (raise deadline.remainingBudget)
+  Deadline (raise (deadline ^. #remainingBudget))
 
 raiseConfirm :: ConfirmCheck es -> ConfirmCheck (Error Interrupt : es)
 raiseConfirm confirm =
   ConfirmCheck \graph context revision subject relation object memo ->
-    raise (confirm.runConfirm graph context revision subject relation object memo)
+    raise ((confirm ^. #runConfirm) graph context revision subject relation object memo)
 
 -- | Everything the walk needs that does not change as it descends.
 --
@@ -363,12 +366,14 @@ data Traversal es = Traversal
     revision :: !Revision,
     subjectType :: !ObjectType
   }
+  deriving stock (Generic)
 
 data EvalState = EvalState
   { depth :: !Int,
     visited :: !(Set Subproblem),
     budget :: !EvaluationBudget
   }
+  deriving stock (Generic)
 
 data Subproblem = Subproblem
   { object :: !ObjectRef,
@@ -402,12 +407,12 @@ evalRelation ::
   EvalState ->
   Eff es (Either EnError LookupSubjectsMap)
 evalRelation env object relation state
-  | state.depth >= state.budget.maxDepth =
+  | (state ^. #depth) >= (state ^. #budget . #maxDepth) =
       pure (Left ResolutionLimitExceeded)
-  | Set.member subproblem state.visited =
+  | Set.member subproblem (state ^. #visited) =
       pure (Right Map.empty)
   | otherwise =
-      case Map.lookup ref env.graph.relations of
+      case Map.lookup ref (env ^. #graph . #relations) of
         Nothing ->
           pure (Left (UnknownRelation (renderRef ref)))
         Just schemaRelation ->
@@ -415,10 +420,10 @@ evalRelation env object relation state
             env
             object
             relation
-            schemaRelation.rewrite
-            state {depth = state.depth + 1, visited = Set.insert subproblem state.visited}
+            (schemaRelation ^. #rewrite)
+            (state & #depth %~ (+ 1) & #visited %~ Set.insert subproblem)
   where
-    ref = RelationRef {objectType = object.objectType, relation}
+    ref = RelationRef {objectType = (object ^. #objectType), relation}
     subproblem = Subproblem {object, relation}
 
 -- | Expand one rewrite node.
@@ -458,7 +463,7 @@ evalRewrite env object currentRelation rewrite state =
         =<< evalRewrite env object currentRelation base state
     Caveated caveat inner -> do
       expanded <- evalRewrite env object currentRelation inner state
-      pure (applyRewriteCaveat env.graph env.context caveat =<< expanded)
+      pure (applyRewriteCaveat (env ^. #graph) (env ^. #context) caveat =<< expanded)
   where
     -- One budget poll per branch. A branch is the coarsest unit of traversal work that
     -- can be skipped whole, and polling any finer costs a clock read per row.
@@ -466,7 +471,7 @@ evalRewrite env object currentRelation rewrite state =
       results <-
         traverse
           ( \current -> do
-              requireBudget env.deadline
+              requireBudget (env ^. #deadline)
               evalRewrite env object currentRelation current state
           )
           rewrites
@@ -486,7 +491,7 @@ evalThis ::
   EvalState ->
   Eff es (Either EnError LookupSubjectsMap)
 evalThis env object relation state = do
-  rows <- drainObjectRows env.deadline state.budget.pageLimit env.revision object relation
+  rows <- drainObjectRows (env ^. #deadline) (state ^. #budget . #pageLimit) (env ^. #revision) object relation
   case rows of
     Left err -> pure (Left err)
     Right tupleRows -> do
@@ -494,21 +499,21 @@ evalThis env object relation state = do
       pure (mergeAllSubjects <$> sequence collected)
   where
     subjectsFromRow TupleRow {tuple} =
-      case tuple.subject of
+      case (tuple ^. #subject) of
         SubjectId subjectObject
-          | subjectObject.objectType == env.subjectType ->
-              pure (gateLeaf tuple.caveat (SubjectId subjectObject))
+          | (subjectObject ^. #objectType) == (env ^. #subjectType) ->
+              pure (gateLeaf (tuple ^. #caveat) (SubjectId subjectObject))
           | otherwise -> pure (Right Map.empty)
         SubjectWildcard wildcardType
-          | wildcardType == env.subjectType ->
-              pure (gateLeaf tuple.caveat (SubjectWildcard wildcardType))
+          | wildcardType == (env ^. #subjectType) ->
+              pure (gateLeaf (tuple ^. #caveat) (SubjectWildcard wildcardType))
           | otherwise -> pure (Right Map.empty)
         SubjectSet groupObject groupRelation -> do
           inner <- evalRelation env groupObject groupRelation state
-          pure (gateSubjects env tuple.caveat =<< inner)
+          pure (gateSubjects env (tuple ^. #caveat) =<< inner)
 
     gateLeaf caveat subject = do
-      gate <- evaluateTupleCaveat env.graph env.context caveat
+      gate <- evaluateTupleCaveat (env ^. #graph) (env ^. #context) caveat
       pure case Decision.applyGate gate Allowed of
         Denied -> Map.empty
         allowed -> Map.singleton subject allowed
@@ -529,7 +534,7 @@ evalTupleToUserset ::
   EvalState ->
   Eff es (Either EnError LookupSubjectsMap)
 evalTupleToUserset env object tuplesetRelation computedRelation state = do
-  rows <- drainObjectRows env.deadline state.budget.pageLimit env.revision object tuplesetRelation
+  rows <- drainObjectRows (env ^. #deadline) (state ^. #budget . #pageLimit) (env ^. #revision) object tuplesetRelation
   case rows of
     Left err -> pure (Left err)
     Right tupleRows -> do
@@ -537,9 +542,9 @@ evalTupleToUserset env object tuplesetRelation computedRelation state = do
       pure (mergeAllSubjects <$> sequence collected)
   where
     expandRow TupleRow {tuple} =
-      case tuple.subject of
-        SubjectId target -> follow tuple.caveat target computedRelation
-        SubjectSet target targetRelation -> follow tuple.caveat target targetRelation
+      case (tuple ^. #subject) of
+        SubjectId target -> follow (tuple ^. #caveat) target computedRelation
+        SubjectSet target targetRelation -> follow (tuple ^. #caveat) target targetRelation
         SubjectWildcard _ -> pure (Right Map.empty)
 
     follow caveat target relation = do
@@ -575,7 +580,7 @@ confirmCandidates env object relation (Right candidates) =
       pure (Right confirmed)
     go memo confirmed (candidate : rest) = do
       (decision, memo') <-
-        env.confirm.runConfirm env.graph env.context env.revision candidate relation object memo
+        (env ^. #confirm . #runConfirm) (env ^. #graph) (env ^. #context) (env ^. #revision) candidate relation object memo
       case decision of
         Left err -> pure (Left err)
         Right Denied -> go memo' confirmed rest
@@ -603,8 +608,8 @@ drainObjectRows deadline pageLimit revision object relation =
     -- everything read so far, so draining k pages would copy O(k^2) rows.
     drain cursor acc = do
       page <- readObjectRelation revision object relation pageLimit cursor
-      let acc' = page.rows : acc
-      case page.state of
+      let acc' = (page ^. #rows) : acc
+      case (page ^. #state) of
         Exhausted -> pure (Right (concat (reverse acc')))
         HasMore next -> continue next acc'
         Truncated next -> continue next acc'
@@ -627,7 +632,7 @@ mergeAllSubjects =
 -- | Gate every subject behind a granting row's caveat, dropping those the gate denies.
 gateSubjects :: Traversal es -> Maybe TupleCaveat -> LookupSubjectsMap -> Either EnError LookupSubjectsMap
 gateSubjects env caveat subjects = do
-  gate <- evaluateTupleCaveat env.graph env.context caveat
+  gate <- evaluateTupleCaveat (env ^. #graph) (env ^. #context) caveat
   pure (applyGate gate subjects)
 
 -- | Gate every subject behind a rewrite-level @Caveated@ node.
@@ -656,7 +661,7 @@ evaluateTupleCaveat graph context (Just TupleCaveat {name, payload}) =
 
 evaluateNamedCaveat :: ReachabilityGraph -> CaveatContext -> CaveatName -> CaveatPayload -> Either EnError CheckDecision
 evaluateNamedCaveat graph context caveat payload =
-  case Map.lookup caveat graph.caveats of
+  case Map.lookup caveat (graph ^. #caveats) of
     Nothing -> Left (UnknownRelation ("unknown caveat: " <> caveatText caveat))
     Just definition -> Right (evaluateCaveat definition payload context)
 
@@ -677,21 +682,21 @@ pageSubjects ::
   LookupSubjectsMap ->
   m LookupSubjectsPage
 pageSubjects budget deadline rawLimit cursorState token subjects = do
-  hasBudget <- deadline.remainingBudget
+  hasBudget <- (deadline ^. #remainingBudget)
   let limit = max 0 rawLimit
-      startAfter = cursorState >>= (.lastSubject)
+      startAfter = cursorState >>= (view (#lastSubject))
       ordered = [LookupSubject {subject, decision} | (subject, decision) <- Map.toAscList subjects]
       remaining =
         case startAfter of
           Nothing -> ordered
-          Just lastSeen -> filter (\found -> found.subject > lastSeen) ordered
-      visible = take (min budget.resultCap limit) remaining
+          Just lastSeen -> filter (\found -> (found ^. #subject) > lastSeen) ordered
+      visible = take (min (budget ^. #resultCap) limit) remaining
       hasMore = length visible < length remaining
       nextCursor =
         LookupSubjectsCursorState
           { version = 1,
             token,
-            lastSubject = (.subject) <$> lastMaybe visible
+            lastSubject = (view (#subject)) <$> lastMaybe visible
           }
       state
         | hasMore && hasBudget = SubjectsHasMore (encodeLookupSubjectsCursor nextCursor)
@@ -732,10 +737,10 @@ encodeLookupSubjectsCursor LookupSubjectsCursorState {token, lastSubject} =
 encodeSubject :: Maybe Subject -> [Text]
 encodeSubject = \case
   Nothing -> ["", "", "", ""]
-  Just (SubjectId object) -> ["id", objectText object.objectType, object.objectId, ""]
+  Just (SubjectId object) -> ["id", objectText (object ^. #objectType), object ^. #objectId, ""]
   Just (SubjectWildcard objectType) -> ["wildcard", objectText objectType, "", ""]
   Just (SubjectSet object relation) ->
-    ["set", objectText object.objectType, object.objectId, relationText relation]
+    ["set", objectText (object ^. #objectType), object ^. #objectId, relationText relation]
 
 -- | Parse cursor text. This is /parsing only/ — it does not validate the embedded token,
 -- and its 'Right' therefore does not mean the cursor may be obeyed. Callers inside the
@@ -783,9 +788,9 @@ resolveLookupSubjectsCursor cursor =
   case decodeLookupSubjectsCursor cursor of
     Left err -> pure (Left err)
     Right cursorState -> do
-      metadata <- decodeToken cursorState.token
+      metadata <- decodeToken (cursorState ^. #token)
       validateToken metadata
-      pure (Right (metadata.revision, cursorState))
+      pure (Right ((metadata ^. #revision), cursorState))
 
 encodeField :: Text -> Text
 encodeField value =

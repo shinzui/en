@@ -16,6 +16,7 @@ module En.Expand
   )
 where
 
+import Data.Generics.Labels ()
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
@@ -27,6 +28,7 @@ import En.Budget (EvaluationBudget (..), defaultEvaluationBudget)
 import En.Effect.ConsistencyStore (ConsistencyStore, ResolvedConsistency (..), mintToken, resolveConsistency)
 import En.Effect.TupleStore (PageState (..), TuplePage (..), TupleRow (..), TupleStore, readObjectRelation)
 import En.Error (EnError (..))
+import En.Prelude
 import En.Reachability (ReachabilityGraph (..), RelationRef (..))
 import En.Revision (Consistency, ConsistencyToken, Revision)
 import En.Schema (CaveatName, ObjectType (..), Relation (..), RelationName (..), Rewrite (..))
@@ -50,7 +52,7 @@ data ExpandRequest = ExpandRequest
     limit :: !ExpandLimit,
     cursor :: !(Maybe ExpandCursor)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 data ExpandState
   = ExpandExhausted
@@ -128,13 +130,13 @@ runExpand ::
   ExpandRequest ->
   Eff es (Either EnError ExpandTree)
 runExpand budget graph revision checkedAt request = do
-  children <- expandRelation graph revision request.object request.permission (initialState budget)
+  children <- expandRelation graph revision (request ^. #object) (request ^. #permission) (initialState budget)
   pure $
     ( \nodes ->
-        let (visible, state) = pageNodes budget request.limit request.cursor nodes
+        let (visible, state) = pageNodes budget (request ^. #limit) (request ^. #cursor) nodes
          in ExpandTree
-              { root = request.object,
-                permission = request.permission,
+              { root = (request ^. #object),
+                permission = (request ^. #permission),
                 children = visible,
                 state,
                 checkedAt
@@ -147,6 +149,7 @@ data EvalState = EvalState
     visited :: !(Set Subproblem),
     budget :: !EvaluationBudget
   }
+  deriving stock (Generic)
 
 data Subproblem = Subproblem
   { object :: !ObjectRef,
@@ -170,12 +173,12 @@ expandRelation ::
 -- empty result: it renders a tree for a human to audit, and quietly dropping a
 -- cyclic branch would hide data from the reviewer.
 expandRelation graph revision object relation state
-  | state.depth >= state.budget.maxDepth =
+  | (state ^. #depth) >= (state ^. #budget . #maxDepth) =
       pure (Left ResolutionLimitExceeded)
-  | Set.member subproblem state.visited =
+  | Set.member subproblem (state ^. #visited) =
       pure (Left (CycleDetected (renderSubproblem subproblem)))
   | otherwise =
-      case lookupRelation graph object.objectType relation of
+      case lookupRelation graph (object ^. #objectType) relation of
         Left err -> pure (Left err)
         Right schemaRelation ->
           expandRewrite
@@ -183,8 +186,8 @@ expandRelation graph revision object relation state
             revision
             object
             relation
-            schemaRelation.rewrite
-            state {depth = state.depth + 1, visited = Set.insert subproblem state.visited}
+            (schemaRelation ^. #rewrite)
+            (state & #depth %~ (+ 1) & #visited %~ Set.insert subproblem)
   where
     subproblem = Subproblem {object, relation}
 
@@ -259,7 +262,7 @@ expandThis ::
   EvalState ->
   Eff es (Either EnError [ExpandNode])
 expandThis graph revision object relation state = do
-  rows <- readObjectRows state.budget.pageLimit revision object relation
+  rows <- readObjectRows (state ^. #budget . #pageLimit) revision object relation
   case rows of
     Left err -> pure (Left err)
     Right tupleRows -> do
@@ -279,7 +282,7 @@ expandTupleToUserset ::
   EvalState ->
   Eff es (Either EnError [ExpandNode])
 expandTupleToUserset graph revision object tuplesetRelation computedRelation state = do
-  rows <- readObjectRows state.budget.pageLimit revision object tuplesetRelation
+  rows <- readObjectRows (state ^. #budget . #pageLimit) revision object tuplesetRelation
   case rows of
     Left err -> pure (Left err)
     Right tupleRows -> do
@@ -290,16 +293,16 @@ expandTupleToUserset graph revision object tuplesetRelation computedRelation sta
           Right expanded -> Right (concat expanded)
   where
     expandRow row@TupleRow {tuple} =
-      case tuple.subject of
+      case (tuple ^. #subject) of
         SubjectId subjectObject ->
           usersetNode row subjectObject computedRelation
         SubjectSet subjectObject subjectRelation ->
           usersetNode row subjectObject subjectRelation
         SubjectWildcard subjectType ->
-          pure (Right (wrapTupleCaveat tuple.caveat [ExpandSubject (SubjectWildcard subjectType) (Just row)]))
+          pure (Right (wrapTupleCaveat (tuple ^. #caveat) [ExpandSubject (SubjectWildcard subjectType) (Just row)]))
     usersetNode TupleRow {tuple} subjectObject relation = do
       children <- expandRelation graph revision subjectObject relation state
-      pure (wrapTupleCaveat tuple.caveat . pure . ExpandUserset subjectObject relation <$> children)
+      pure (wrapTupleCaveat (tuple ^. #caveat) . pure . ExpandUserset subjectObject relation <$> children)
 
 nodeFromRow ::
   (TupleStore :> es) =>
@@ -309,14 +312,14 @@ nodeFromRow ::
   TupleRow ->
   Eff es (Either EnError [ExpandNode])
 nodeFromRow graph revision state row@TupleRow {tuple} =
-  case tuple.subject of
+  case (tuple ^. #subject) of
     SubjectId subject ->
-      pure (Right (wrapTupleCaveat tuple.caveat [ExpandSubject (SubjectId subject) (Just row)]))
+      pure (Right (wrapTupleCaveat (tuple ^. #caveat) [ExpandSubject (SubjectId subject) (Just row)]))
     SubjectSet subject relation -> do
       children <- expandRelation graph revision subject relation state
-      pure (wrapTupleCaveat tuple.caveat . pure . ExpandUserset subject relation <$> children)
+      pure (wrapTupleCaveat (tuple ^. #caveat) . pure . ExpandUserset subject relation <$> children)
     SubjectWildcard subjectType ->
-      pure (Right (wrapTupleCaveat tuple.caveat [ExpandSubject (SubjectWildcard subjectType) (Just row)]))
+      pure (Right (wrapTupleCaveat (tuple ^. #caveat) [ExpandSubject (SubjectWildcard subjectType) (Just row)]))
 
 wrapTupleCaveat :: Maybe TupleCaveat -> [ExpandNode] -> [ExpandNode]
 wrapTupleCaveat Nothing nodes = nodes
@@ -336,21 +339,21 @@ readObjectRows pageLimit revision object relation =
     -- "En.Check" and "En.Lookup".
     drain cursor acc = do
       page <- readObjectRelation revision object relation pageLimit cursor
-      let acc' = page.rows : acc
-      case page.state of
+      let acc' = (page ^. #rows) : acc
+      case (page ^. #state) of
         Exhausted -> pure (Right (concat (reverse acc')))
         HasMore next -> drain (Just next) acc'
         Truncated next -> drain (Just next) acc'
 
 lookupRelation :: ReachabilityGraph -> ObjectType -> RelationName -> Either EnError Relation
 lookupRelation graph objectType relation =
-  case Map.lookup RelationRef {objectType, relation} graph.relations of
+  case Map.lookup RelationRef {objectType, relation} (graph ^. #relations) of
     Just found -> Right found
     Nothing -> Left (UnknownRelation (renderRef RelationRef {objectType, relation}))
 
 pageNodes :: EvaluationBudget -> ExpandLimit -> Maybe ExpandCursor -> [ExpandNode] -> ([ExpandNode], ExpandState)
 pageNodes budget (ExpandLimit rawLimit) cursor nodes =
-  let resultCap = budget.resultCap
+  let resultCap = (budget ^. #resultCap)
       limit = max 0 rawLimit
       start = maybe 0 decodeCursor cursor
       capped = take resultCap nodes

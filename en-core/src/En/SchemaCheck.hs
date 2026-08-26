@@ -30,6 +30,7 @@ module En.SchemaCheck
   )
 where
 
+import Data.Generics.Labels ()
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
@@ -38,6 +39,7 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Effectful (Eff, (:>))
 import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore, readAllTuples)
+import En.Prelude
 import En.Revision (Revision)
 import En.Schema
   ( AllowedSubject (..),
@@ -62,7 +64,7 @@ data TupleOrphan = TupleOrphan
   { tuple :: !Tuple,
     reason :: !OrphanReason
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | Why a tuple is orphaned. Exactly one reason is reported per tuple — the first the
 -- checks below encounter — because a tuple whose object type is gone has no relation to
@@ -108,38 +110,38 @@ checkTupleAgainstSchema validSchema tuple =
 
     reasonFor :: Maybe OrphanReason
     reasonFor =
-      case Map.lookup tuple.object.objectType schema.objectTypes of
-        Nothing -> Just (OrphanUnknownObjectType tuple.object.objectType)
+      case Map.lookup (tuple ^. #object . #objectType) (schema ^. #objectTypes) of
+        Nothing -> Just (OrphanUnknownObjectType (tuple ^. #object . #objectType))
         Just relations ->
-          case Map.lookup tuple.relation relations of
-            Nothing -> Just (OrphanUnknownRelation tuple.object.objectType tuple.relation)
+          case Map.lookup (tuple ^. #relation) relations of
+            Nothing -> Just (OrphanUnknownRelation (tuple ^. #object . #objectType) (tuple ^. #relation))
             Just relation ->
               subjectReason relation `orElse` caveatReason
 
     subjectReason :: Relation -> Maybe OrphanReason
     subjectReason relation =
-      case tuple.subject of
+      case (tuple ^. #subject) of
         SubjectId object ->
-          knownType object.objectType
-            `orElse` requireAllowed relation AllowedSubject {objectType = object.objectType, relation = Nothing, wildcard = False}
+          knownType (object ^. #objectType)
+            `orElse` requireAllowed relation AllowedSubject {objectType = (object ^. #objectType), relation = Nothing, wildcard = False}
         SubjectWildcard objectType ->
           knownType objectType
             `orElse` requireAllowed relation AllowedSubject {objectType, relation = Nothing, wildcard = True}
         SubjectSet object subjectRelation ->
-          knownUserset object.objectType subjectRelation
-            `orElse` requireAllowed relation AllowedSubject {objectType = object.objectType, relation = Just subjectRelation, wildcard = False}
+          knownUserset (object ^. #objectType) subjectRelation
+            `orElse` requireAllowed relation AllowedSubject {objectType = (object ^. #objectType), relation = Just subjectRelation, wildcard = False}
 
     -- The subject's type must be modelled at all. A schema that dropped `user` strands every
     -- grant naming a user, whatever relation it was written on.
     knownType :: ObjectType -> Maybe OrphanReason
     knownType objectType
-      | Map.member objectType schema.objectTypes = Nothing
+      | Map.member objectType (schema ^. #objectTypes) = Nothing
       | otherwise = Just (OrphanUnknownSubjectType objectType)
 
     -- A userset subject `group:eng#member` needs both `group` and `group#member`.
     knownUserset :: ObjectType -> RelationName -> Maybe OrphanReason
     knownUserset objectType subjectRelation =
-      case Map.lookup objectType schema.objectTypes of
+      case Map.lookup objectType (schema ^. #objectTypes) of
         Nothing -> Just (OrphanUnknownSubjectType objectType)
         Just relations
           | Map.member subjectRelation relations -> Nothing
@@ -147,18 +149,18 @@ checkTupleAgainstSchema validSchema tuple =
 
     requireAllowed :: Relation -> AllowedSubject -> Maybe OrphanReason
     requireAllowed relation allowed
-      | Set.member allowed relation.allowedSubjects = Nothing
-      | otherwise = Just (OrphanDisallowedSubject tuple.subject)
+      | Set.member allowed (relation ^. #allowedSubjects) = Nothing
+      | otherwise = Just (OrphanDisallowedSubject (tuple ^. #subject))
 
     caveatReason :: Maybe OrphanReason
     caveatReason =
-      case tuple.caveat of
+      case (tuple ^. #caveat) of
         Nothing -> Nothing
         Just TupleCaveat {name, payload} ->
-          case Map.lookup name schema.caveats of
+          case Map.lookup name (schema ^. #caveats) of
             Nothing -> Just (OrphanUnknownCaveat name)
             Just definition ->
-              case payloadErrors definition.parameters payload of
+              case payloadErrors (definition ^. #parameters) payload of
                 [] -> Nothing
                 errors -> Just (OrphanCaveatPayloadMismatch name errors)
 
@@ -245,8 +247,8 @@ validateTuplesAgainstSchema validSchema revision =
       TuplePage {rows, state} <- readAllTuples revision scanPageSize cursor
       let found =
             OrphanReport
-              { scanned = report.scanned + length rows,
-                orphans = report.orphans <> mapMaybe (checkTupleAgainstSchema validSchema . (.tuple)) rows
+              { scanned = (report ^. #scanned) + length rows,
+                orphans = (report ^. #orphans) <> mapMaybe (checkTupleAgainstSchema validSchema . (view (#tuple))) rows
               }
       case state of
         Exhausted -> pure found

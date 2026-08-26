@@ -2,6 +2,7 @@
 
 module Main (main) where
 
+import Data.Generics.Labels ()
 import Data.List (sort)
 import Effectful (Eff, runPureEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
@@ -23,6 +24,7 @@ import En.LookupSubjects
     encodeLookupSubjectsCursor,
     lookupSubjects,
   )
+import En.Prelude qualified as Lens
 import En.Reachability (ReachabilityGraph, compileSchema)
 import En.Revision (Consistency (..), ConsistencyToken, DatastoreId (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..), Schema)
@@ -35,7 +37,7 @@ main = do
   assertEqual "guest cannot view an internal item" (Right Denied) (checkDecision (SubjectId agencyUser) view internalItem)
   assertEqual "guest cannot act on the shared space" (Right Denied) (checkDecision (SubjectId agencyUser) act guestSpace)
   assertEqual "non-guest cannot view the project" (Right Denied) (checkDecision (SubjectId bob) view sharedItem)
-  assertEqual "a check reports the snapshot it was decided at" (Right conformanceToken) (fmap (.checkedAt) (runEngine (check kikanGraph MinimizeLatency requestContext (SubjectId agencyUser) view sharedItem)))
+  assertEqual "a check reports the snapshot it was decided at" (Right conformanceToken) (fmap (Lens.view (#checkedAt)) (runEngine (check kikanGraph MinimizeLatency requestContext (SubjectId agencyUser) view sharedItem)))
   assertEqual
     "guest view reaches exactly the shared subset"
     (Right (lookupPage (allowed <$> sort [guestSpace, sharedItem]) LookupExhausted))
@@ -49,7 +51,7 @@ main = do
     view = RelationName "view"
     act = RelationName "act"
     checkDecision subject permission object =
-      fmap (.decision) (runEngine (check kikanGraph MinimizeLatency requestContext subject permission object))
+      fmap (Lens.view (#decision)) (runEngine (check kikanGraph MinimizeLatency requestContext subject permission object))
 
 -- | The properties that distinguish a real lookup-subjects from a client-side flattening
 -- of the expand tree.
@@ -130,7 +132,7 @@ lookupSubjectsTests = do
   assertEqual
     "a limited page emits the smallest subject and offers a cursor"
     (Right [allowedSubject (SubjectId memberOnly)])
-    (fmap (.subjects) firstPage)
+    (fmap (Lens.view (#subjects)) firstPage)
   case firstPage of
     Right LookupSubjectsPage {state = SubjectsHasMore cursor} -> do
       assertEqual
@@ -144,7 +146,7 @@ lookupSubjectsTests = do
     "a malformed cursor is refused"
     (Left (InvalidCursor "not-a-cursor"))
     ( fmap
-        (.subjects)
+        (Lens.view (#subjects))
         (fixtureLookupSubjects requestContext exclusionSpace member userType 1 (Just (LookupSubjectsCursor "not-a-cursor")))
     )
 
@@ -154,7 +156,7 @@ lookupSubjectsTests = do
     "a cursor bearing another datastore's token is refused"
     (Left (InvalidConsistencyToken "token datastore does not match this en datastore"))
     ( fmap
-        (.subjects)
+        (Lens.view (#subjects))
         ( runEngineStrict
             fixtureTuples
             ( lookupSubjects

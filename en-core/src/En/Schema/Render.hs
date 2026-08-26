@@ -11,11 +11,13 @@ module En.Schema.Render
 where
 
 import Data.Char (isAlphaNum)
+import Data.Generics.Labels ()
 import Data.List (intersperse)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
+import En.Prelude
 import En.Reachability
   ( EntryKind (..),
     EntryPoint (..),
@@ -43,7 +45,7 @@ renderMarkdown schema =
   Text.intercalate
     "\n"
     ( ["# Schema reference", ""]
-        <> joinBlocks (renderObject <$> Map.toAscList schema.objectTypes)
+        <> joinBlocks (renderObject <$> Map.toAscList (schema ^. #objectTypes))
         <> ["", "## Caveats", ""]
         <> renderCaveats
     )
@@ -60,19 +62,19 @@ renderMarkdown schema =
       "- **"
         <> relationName
         <> "** — subjects: "
-        <> renderSubjects relation.allowedSubjects
+        <> renderSubjects (relation ^. #allowedSubjects)
         <> "; rule: "
-        <> renderRewrite relation.rewrite
+        <> renderRewrite (relation ^. #rewrite)
 
     renderCaveats
-      | Map.null schema.caveats = ["(none)"]
-      | otherwise = renderCaveat <$> Map.toAscList schema.caveats
+      | Map.null (schema ^. #caveats) = ["(none)"]
+      | otherwise = renderCaveat <$> Map.toAscList (schema ^. #caveats)
 
     renderCaveat (CaveatName caveatName, caveat) =
       "- **"
         <> caveatName
         <> "** — parameters: "
-        <> renderParameters caveat.parameters
+        <> renderParameters (caveat ^. #parameters)
 
 -- | Fold a schema into a Mermaid flowchart of declared object types and relations.
 renderMermaid :: Schema -> Text
@@ -80,19 +82,19 @@ renderMermaid schema =
   Text.unlines
     ( ["flowchart LR"]
         <> [ "  " <> objectId objectType <> "[\"" <> escapeMermaidLabel (objectText objectType) <> "\"]"
-           | objectType <- Map.keys schema.objectTypes
+           | objectType <- Map.keys (schema ^. #objectTypes)
            ]
-        <> concatMap renderObjectEdges (Map.toAscList schema.objectTypes)
+        <> concatMap renderObjectEdges (Map.toAscList (schema ^. #objectTypes))
     )
   where
     renderObjectEdges (objectType, relations) =
       concatMap (renderRelationEdges objectType) (Map.toAscList relations)
 
     renderRelationEdges objectType (relationName, relation) =
-      case relation.rewrite of
+      case (relation ^. #rewrite) of
         This ->
-          [ edge Solid (objectId objectType) (objectId subject.objectType) (directEdgeLabel relationName subject)
-          | subject <- Set.toAscList relation.allowedSubjects
+          [ edge Solid (objectId objectType) (objectId (subject ^. #objectType)) (directEdgeLabel relationName subject)
+          | subject <- Set.toAscList (relation ^. #allowedSubjects)
           ]
         rewrite ->
           [ edge (rewriteEdgeStyle rewrite) (objectId objectType) (objectId objectType) (relationNameText relationName <> " = " <> renderRewrite rewrite)
@@ -121,7 +123,7 @@ renderReachabilityMermaid valid =
           ( [ node (relationRefId target) (renderRelationRef target)
             | target <- Map.keys graphEntries
             ]
-              <> [ node (subjectSelectorId entry.source) (renderSubjectSelector entry.source)
+              <> [ node (subjectSelectorId (entry ^. #source)) (renderSubjectSelector (entry ^. #source))
                  | entries <- Map.elems graphEntries,
                    entry <- entries
                  ]
@@ -130,7 +132,7 @@ renderReachabilityMermaid valid =
     renderEntries (target, entries) =
       [ edge
           (entryStyle entry)
-          (subjectSelectorId entry.source)
+          (subjectSelectorId (entry ^. #source))
           (relationRefId target)
           (entryLabel entry)
       | entry <- entries
@@ -146,9 +148,9 @@ renderSubjects subjects
 
 renderAllowedSubject :: AllowedSubject -> Text
 renderAllowedSubject subject =
-  objectText subject.objectType
-    <> maybe "" (("#" <>) . relationNameText) subject.relation
-    <> if subject.wildcard then ":*" else ""
+  objectText (subject ^. #objectType)
+    <> maybe "" (("#" <>) . relationNameText) (subject ^. #relation)
+    <> if subject ^. #wildcard then ":*" else ""
 
 renderParameters :: Map.Map CaveatParameterName CaveatParameterType -> Text
 renderParameters parameters
@@ -206,13 +208,13 @@ simpleLabelChar char =
 directEdgeLabel :: RelationName -> AllowedSubject -> Text
 directEdgeLabel relationName subject =
   relationNameText relationName
-    <> case subject.relation of
+    <> case (subject ^. #relation) of
       Nothing ->
-        if subject.wildcard
-          then " (" <> objectText subject.objectType <> ":*)"
+        if (subject ^. #wildcard)
+          then " (" <> objectText (subject ^. #objectType) <> ":*)"
           else ""
       Just subjectRelation ->
-        " (" <> objectText subject.objectType <> "#" <> relationNameText subjectRelation <> ")"
+        " (" <> objectText (subject ^. #objectType) <> "#" <> relationNameText subjectRelation <> ")"
 
 rewriteEdgeStyle :: Rewrite -> EdgeStyle
 rewriteEdgeStyle rewrite
@@ -221,15 +223,15 @@ rewriteEdgeStyle rewrite
 
 entryStyle :: EntryPoint -> EdgeStyle
 entryStyle entry
-  | entry.kind == Conditional || not (null entry.caveats) = Dotted
+  | (entry ^. #kind) == Conditional || not (null (entry ^. #caveats)) = Dotted
   | otherwise = Solid
 
 entryLabel :: EntryPoint -> Text
 entryLabel entry =
-  relationRefText entry.target
-    <> if null entry.caveats
+  relationRefText (entry ^. #target)
+    <> if null (entry ^. #caveats)
       then ""
-      else " [" <> Text.intercalate ", " (caveatText <$> entry.caveats) <> "]"
+      else " [" <> Text.intercalate ", " (caveatText <$> entry ^. #caveats) <> "]"
 
 hasCaveat :: Rewrite -> Bool
 hasCaveat =
@@ -248,9 +250,9 @@ renderRelationRef ref =
 
 renderSubjectSelector :: SubjectSelector -> Text
 renderSubjectSelector selector =
-  objectText selector.objectType
-    <> maybe "" (("#" <>) . relationNameText) selector.relation
-    <> if selector.wildcard then ":*" else ""
+  objectText (selector ^. #objectType)
+    <> maybe "" (("#" <>) . relationNameText) (selector ^. #relation)
+    <> if selector ^. #wildcard then ":*" else ""
 
 objectId :: ObjectType -> Text
 objectId =
@@ -298,7 +300,7 @@ parameterNameText (CaveatParameterName text) =
 
 relationRefText :: RelationRef -> Text
 relationRefText ref =
-  objectText ref.objectType <> "#" <> relationNameText ref.relation
+  objectText (ref ^. #objectType) <> "#" <> relationNameText (ref ^. #relation)
 
 joinBlocks :: [[Text]] -> [Text]
 joinBlocks =
