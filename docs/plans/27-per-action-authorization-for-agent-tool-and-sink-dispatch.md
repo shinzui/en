@@ -15,819 +15,629 @@ Decision Log, and Outcomes & Retrospective must be kept up to date as work proce
 
 ## Purpose / Big Picture
 
-Today an autonomous agent in the portfolio is authorized **coarsely and statically**. When the
-agent runtime (`shinzui/shikigami`) wants to send an agent's output somewhere — raise an
-awareness signal, record an action against a plan, write a digest back into memory, reply on a
-customer channel — it calls one function,
-`checkGrant :: AgentIdentity -> SinkKind -> IO (Either Denied ())`, which looks the agent's name
-up in a hard-coded table (`defaultGrantTable`) and answers yes/no **per sink *kind***. "May
-`heartbeat` raise *any* signal?" is the only question it can ask. It cannot ask "may `heartbeat`
-raise a signal **about this particular customer**?", "may this agent record an action against
-**intention 42** specifically?", or "may this agent run a **bash** tool inside **this**
-repository but not that one?". And there is no check at all when an agent runs a **work tool**
-(read/write/edit/bash a file) — only when it emits a sink.
+Kikan already has a working relationship-based authorization model in `shinzui/kikan-en`.
+Its schema and conformance executable can grant an agent one exact sink target or workspace and
+deny a sibling target of the same kind. What is still missing is the production contract between
+that model and `shinzui/shikigami`: Shikigami still enforces only its coarse, database-backed
+sink-kind grant, and its newer capability-overlay tool runtime has no per-acquisition or
+per-invocation Kikan check.
 
-After this change, authorization becomes **fine-grained and relationship-derived**. Each agent
-action is checked against the **specific object it touches** through `en`, the portfolio's
-relationship-based access-control engine provided by `shinzui/en`. A grant is no
-longer a row in a hard-coded Haskell table; it is a **relationship tuple** written into `en` —
-for example "`agent:triage` is the *signaler* of `kizashi_recipient:acct-9931`" or
-"`agent:repo-bot` is a *writer* of `workspace:shinzui/kikan`". The runtime answers each action
-by asking `en` one question: *does this agent have this permission on this exact object?*
+After this plan is implemented, an agent declaration remains only a request for a capability. A
+Shomei-authenticated Shikigami process asks Kikan-En to authorize one verified Meibo agent
+principal, one closed action, and one exact typed target. An allowed answer carries a short-lived,
+signed En Biscuit decision proof. The dispatch boundary verifies that proof against the same
+principal, action, target, audience, schema hash, and expiry before it connects to a capability
+provider, invokes a tool, or emits a sink. A missing identity, unknown action, malformed target,
+denial, conditional result, expired or tampered proof, or authorization-service outage fails
+closed.
 
-This plan was originally drafted in `shinzui/en`, but the implementation belongs in the new
-`kikan-en` project at `/Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en`. `en` is the reusable
-authorization engine and service library. The Kikan-specific schema vocabulary, Kikan grant
-fixtures, Kikan conformance harness, and Kikan deployment wrapper are product policy and must live
-in `kikan-en`, which depends on the `en-*` packages instead of adding Kikan product concepts to
-`en-core`.
+The observable proof is deliberately sharper than “the endpoint returned 200.” With one grant,
+the conformance suite and live service show all of the following:
 
-Concretely, after this plan a reader can, from a checkout of
-`/Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en`:
+- an agent may acquire one immutable capability-overlay provider revision but not a sibling
+  revision;
+- the agent may invoke one named tool from that provider while another advertised tool remains
+  denied;
+- the same tool under another capability or another agent principal remains denied;
+- a granted sink target proceeds while an ungranted target of the same sink kind is skipped;
+- an allowed decision returns a bounded Biscuit that verifies for the exact dispatch and fails
+  after expiry or when its subject, operation, resource, audience, schema hash, or bytes change;
+- deleting the relationship prevents new proofs immediately, while an already-issued proof can
+  live no longer than the documented 60-second ceiling.
 
-- Run a self-contained conformance harness that **writes grant tuples**, then shows `en` **allows**
-  a permitted agent action against the granted object and **denies** the same action against an
-  object that was never granted — proving per-object granularity, not per-kind.
-- See the **on-behalf-of** case resolve: a delegation tuple
-  `(intention:42, act_delegate, agent:triage)` carrying an autonomy/time caveat makes
-  `check(agent:triage, can_act, intention:42)` return `Allowed` while the autonomy budget holds and
-  `Denied` once the time bound expires or the requested autonomy exceeds the grant.
-- Run the Kikan authorization server wrapper and reproduce the **exact HTTP `check` request** the
-  agent runtime will send at dispatch time and at tool-execution time, observing `AllowedWire` /
-  `DeniedWire`.
-
-The user-visible result: agents act under an **attributable, bounded, per-object** authorization
-that a human can grant and revoke by writing/deleting a single relationship, and the same gate now
-covers **both** what an agent emits (sinks) **and** what an agent does (work tools).
+This plan is coordinated from `shinzui/en` because it began as an En integration plan, but Kikan
+policy is not added to En. The product schema, public action contract, client, service host, and
+fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong to
+`mori://shinzui/shikigami`. En remains the generic engine and proof implementation.
 
 
 ## Progress
 
-Use a checklist to summarize granular steps. Every stopping point must be documented here,
-even if it requires splitting a partially completed task into two ("done" vs. "remaining").
-This section must always reflect the actual current state of the work.
-
-- [ ] M0.1 — Keep this `shinzui/en` plan as a relocation record and carry the executable
-      implementation work into `/Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en`.
-- [ ] M1.1 — Add the agent-authorization object types, relations, and permissions to the Kikan
-      schema owned by `kikan-en`: sink-target types (`kawa_source`,
-      `kizashi_recipient`, `danwa_thread`, `channel_egress`), tool-target type (`workspace`), the
-      `act_delegate` caveated relation + `can_act` permission on the existing `intention` type, and
-      the `agent` subject namespace.
-- [ ] M1.2 — Schema compiles inside `kikan-en`: `compileSchema kikanSchema` succeeds and any
-      generic `en` conformance assertions remain untouched in `shinzui/en`.
-- [ ] M2.1 — Define the grant-tuple shapes and the object-identifier scheme for every sink kind and
-      tool class as named fixtures in a new `kikan-en` module, for example
-      `Kikan.En.Conformance.Agent`.
-- [ ] M2.2 — Prove tuple writes are idempotent (re-writing a grant is a no-op; one live edge).
-- [ ] M3.1 — Per-action conformance harness in `kikan-en` proving
-      allow-on-granted-object / deny-on-ungranted-object for each sink kind and tool class.
-- [ ] M3.2 — On-behalf-of (`act`) conformance: caveated delegation allows within autonomy/time and
-      denies when expired or over-budget.
-- [ ] M4.1 — Document and reproduce the exact `en-server` HTTP `check` request the runtime sends,
-      for a sink dispatch and a tool invocation, against a live server.
-- [ ] M5.1 — Write the shikigami integration contract: the new `checkAction` signature, the
-      SinkKind/ToolKind → (permission, objectType) mapping, the two call sites, and the
-      consistency/`act`-claim handling. (Downstream edits live in `shinzui/shikigami`; this plan
-      owns the contract only.)
+- [x] 2026-06-29 — Historical foundation: `mori://shinzui/kikan-en` was created with the Kikan
+  schema, grant fixtures, embedded conformance executable, PostgreSQL-backed server, and written
+  Shikigami hand-off contract.
+- [x] 2026-08-26 — Refresh discovery: re-read the current En, Kikan-En, Shikigami, and Shomei
+  sources through Mori; verified the released/tagged dependency state; reviewed relevant local
+  ADRs; and replaced the June implementation assumptions in this plan.
+- [ ] M1 — Rebase Kikan-En’s host and migration commands on the current En seam at commit
+  `51edaab17473f7b9310f8802ccffd23bac5e4a9e`, preserving the already-working policy behavior.
+- [ ] M2 — Add the closed action vocabulary, canonical capability-provider/tool targets, and
+  corresponding Kikan schema relations and conformance fixtures.
+- [ ] M3 — Add a Shomei-authenticated, proof-minting Kikan action endpoint plus small public
+  `kikan-en-contract` and `kikan-en-client` packages.
+- [ ] M4 — Prove the public client, denial taxonomy, Biscuit verification, expiry, tamper
+  resistance, revocation bound, and live HTTP behavior.
+- [ ] M5 — Integrate Shikigami’s capability-provider acquisition, exact tool invocation, and sink
+  enqueue/publish boundaries while retaining the shipped C11 grant gate.
+- [ ] M6 — Run the cross-repository end-to-end matrix, update operator/consumer documentation,
+  refresh Mori metadata, and distill durable decisions into the owning repositories’ ADR corpora.
 
 
 ## Surprises & Discoveries
 
-Document unexpected behaviors, bugs, optimizations, or insights discovered during
-implementation. Provide concise evidence.
+- Discovery: the work originally described as future Kikan-En scaffolding is already present.
+  `mori registry show shinzui/kikan-en --full` reports the `kikan-en`,
+  `kikan-en-conformance`, and `kikan-en-server` packages, and commits `f29744b`, `c182121`, and
+  `b182b7d` implemented the schema, conformance harness, and server on 2026-06-29.
+  Date: 2026-08-26.
 
-(None yet from implementation.)
+- Discovery: Kikan-En’s server wrapper no longer matches the current En host seam. Its
+  `src/Kikan/En/Server.hs` constructs the old `En.Servant.Seam.Env` with `graph` and a
+  one-argument `runPorts`; current En requires a request-time `ActiveSchema`, a two-argument
+  `runPorts`, `CheckOutcome`, lookup-subjects/watch operations, evaluation/deadline settings, and
+  optional grant minting. The old unversioned `/check` transcript is also stale; current En serves
+  `/v1/check` and `/v1/grants`, returns `checkedAt`, and uses stable hand-written wire JSON and RFC
+  9457 problem documents.
+  Date: 2026-08-26.
 
-- Discovery: `/Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en` has been bootstrapped as a git
-  repository with Nix/Haskell scaffolding, but no `mori.dhall` was present when this plan was
-  revised. Implementation steps should add project metadata if the Kikan repository registration
-  depends on it.
-  Evidence: `find /Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en -maxdepth 2 -type f -print`
-  showed `.seihou`, `flake.nix`, `process-compose.yaml`, and Nix files; `test -f mori.dhall &&
-  mori show --full || true` produced no project metadata output.
-  Date: 2026-06-29
+- Discovery: En now ships the proof primitive the newer requirement needs. `en-biscuit` signs a
+  successful object decision into a short-lived Biscuit carrying subject, operation, resource,
+  consistency token, schema hash, audience, expiry, and optional request id. `En.Biscuit.Verify`
+  rejects wrong or tampered values locally, and `POST /v1/grants` performs check-then-mint without
+  trusting a caller-asserted decision.
+  Date: 2026-08-26.
+
+- Discovery: Shikigami’s “coarse static grant” premise is obsolete but the coarse gate itself is
+  still required. `mori://shinzui/shikigami` plan 21 shipped `GrantSource`,
+  `shikigami.sink_grants`, runtime grant/revoke commands, verified Meibo principal keys, and two
+  checks per sink (enqueue and publish). This C11 gate is defense in depth and must be composed
+  with C13, not replaced.
+  Date: 2026-08-26.
+
+- Discovery: raw `mcpServers` declarations and the proposed `mcp__<server>__<tool>` identity were
+  superseded. Shikigami now declares `capabilityOverlays`; an operator catalog resolves each
+  request to an immutable `CapabilityDescriptor {capability, revision, tools}`, the provider
+  registry selects the exact `(CapabilityId, CapabilityRevision)`, and the model-facing tool name
+  is `overlay__<capability-with-dashes>__<logical-tool>`. Authorization must bind to that stable
+  provider/tool identity, not to a mutable endpoint or an agent-authored server record.
+  Date: 2026-08-26.
+
+- Discovery: En has no upstream tags and `https://hackage.haskell.org/package/en-core/en-core.cabal`
+  returns 404, so there is no released En version to select. Kikan-En currently co-develops against
+  sibling En packages in `cabal.project`; implementation must record the exact En commit used.
+  Shomei’s source tags `shomei-core-0.1.0.0`, `shomei-jwt-0.1.0.0`, and
+  `shomei-servant-0.1.0.0` all resolve to commit
+  `65551cb120336b53695c0dd30ebe0e473d6efcb2`, although the corresponding Hackage package URL is
+  not yet published. Kikan-En must therefore use that exact upstream tag/commit rather than invent
+  a version bound.
+  Date: 2026-08-26.
 
 
 ## Decision Log
 
-Record every decision made while working on the plan.
+- Decision: Keep Kikan-specific authorization in `mori://shinzui/kikan-en`; make no product-schema
+  additions to En.
+  Rationale: En is schema-parametric infrastructure. Capability, sink, workspace, and intention
+  names are Kikan product policy.
+  Date: 2026-06-29; reaffirmed 2026-08-26.
 
-- Decision: Model each agent action as a **permission on the target object**, with the agent as the
-  **subject** — never as a relation hung off the agent. So a sink dispatch is
-  `check(agent:<name>, can_dispatch, <sinkObject>)` and a tool invocation is
-  `check(agent:<name>, <tool-permission>, workspace:<id>)`.
-  Rationale: this is exactly `en`'s Zanzibar model (`object#relation@subject`, see
-  `en-core/src/En/Tuple.hs` and `En/Check.hs`). Permissions are computed *on* the object from
-  relations *on* the object; there is no "relation on a subject". The design-intent shorthand
-  `agent#can_dispatch` names the *agent's capability*, which `en` realizes as the permission
-  `can_dispatch` on the sink object granted to the agent subject.
-  Date: 2026-06-27
+- Decision: Continue to model the agent as the En subject and the touched thing as the En object.
+  Do not duplicate the agent principal inside every object id merely to distinguish two agents.
+  Rationale: a check is already `(subject, permission, object)`. The same tool under another agent
+  is denied because the subject differs; copying the subject into the object id creates two sources
+  of identity that can disagree.
+  Date: 2026-08-26.
 
-- Decision: Use **one object type per sink kind** (`kawa_source`, `kizashi_recipient`,
-  `danwa_thread`, `channel_egress`) plus the existing `intention` for `ReiAction`, each with a
-  uniform writable relation and a uniform `can_dispatch` permission — except `intention`, whose
-  `ReiAction` permission is `can_act` (caveated). For tools, **one `workspace` type** with three
-  graded relations (`reader` ⊆ `writer` ⊆ `executor`) and three permissions (`can_read`,
-  `can_write`, `can_bash`).
-  Rationale: a uniform permission name per concern keeps the runtime's mapping table tiny while the
-  *object type + object id* carries the per-action granularity. Graded tool relations demonstrate
-  fine-grained, per-verb authorization without a permission explosion.
-  Date: 2026-06-27
+- Decision: Preserve Shikigami’s C11 lifecycle and coarse sink-kind checks and add Kikan-En C13
+  after them. Re-check both gates at enqueue and publish.
+  Rationale: C11 answers whether the verified agent may use the action class at all; C13 answers
+  whether it may touch this exact target. The existing second check closes the revoke-after-enqueue
+  race and should not be weakened.
+  Date: 2026-08-26.
 
-- Decision: Object-identifier scheme. Sinks: `kawa_source:<source>` (e.g.
-  `kawa_source:shinzui/shikigami`), `kizashi_recipient:<recipientId>`, `intention:<intentionId>`,
-  `danwa_thread:<threadId>`, `channel_egress:<provider>/<conversationKey>` (e.g.
-  `channel_egress:zendesk/ticket-4815`). Tools: `workspace:<repo-or-path-id>` (e.g.
-  `workspace:shinzui/kikan`). Subjects: `agent:<name>`, where `<name>` is the agent's
-  `shomei` loginId tail (the verified `agent:<name>` identity from C11/C13).
-  Rationale: object ids mirror the identifiers the runtime already has in hand at dispatch time (the
-  sink's destination) and at tool-execution time (the `ToolEnv` workspace), so no extra resolution
-  step is needed.
-  Date: 2026-06-27
+- Decision: Use En Biscuit object grants as the only allow proof. The Kikan endpoint performs the
+  check and mint atomically at one `checkedAt` token; neither the client nor Shikigami may submit a
+  precomputed “allowed” decision.
+  Rationale: the shipped generic primitive already signs every required decision coordinate and
+  has a fail-closed verifier. A second Kikan proof format would duplicate cryptography and drift.
+  Date: 2026-08-26.
 
-- Decision: Represent **on-behalf-of** (`act`) as a graph-derived delegation, not an asserted claim.
-  The grant is a tuple `(intention:<id>, act_delegate, agent:<name>)` with the existing
-  `within_autonomy` caveat carrying `{autonomy, until}`; the runtime supplies request context
-  `{requested_autonomy, current_time}` on the `check`. The human the agent serves (`act.sub` on the
-  shomei token) is carried for **attribution/audit** and may additionally be checked as the
-  intention owner, but the agent's authority itself comes from the delegation edge, per C13 ("on-
-  behalf-of authority is graph-derived, not asserted").
-  Rationale: matches the C13 contract and uses the same `within_autonomy` caveat model in the
-  `kikan-en` Kikan schema.
-  Date: 2026-06-27
+- Decision: Define capability resources from the operator-owned overlay snapshot:
+  `capability_provider:<capability>@<revision>` and
+  `capability_tool:<capability>@<revision>/<logical-tool-name>`. Give provider objects
+  `can_connect` and `can_discover`; give tool objects `can_invoke`. A provider grant never implies
+  a tool grant.
+  Rationale: the capability id and immutable revision are the current stable provider key. The
+  logical tool name is what the descriptor and lease both validate. Mutable URLs, credentials,
+  model-facing renamed tools, and agent-authored declarations are not authorization identities.
+  Date: 2026-08-26.
 
-- Decision: Keep the **coarse / fine split**. `shomei` (C11) stays the *first* gate — identity plus
-  coarse scopes (`signal:raise`, `channel:egress`, …) checked with `requireScope`. `en` (C13) is the
-  *second* gate — the per-object check. This plan owns only the second gate; it does **not** absorb
-  shomei's static per-agent scope grants.
-  Rationale: defense in depth, and the explicit division of labor in C11/C13
-  (`shinzui/kikan → docs/architecture/evolution/contracts.md`).
-  Date: 2026-06-27
+- Decision: Put the stable action/target/proof vocabulary in a dependency-light
+  `kikan-en-contract` package and the HTTP wrapper in `kikan-en-client`; do not make Shikigami
+  depend on Kikan-En’s PostgreSQL server library or internal schema module.
+  Rationale: the consumer request explicitly requires a versioned public contract. Separate
+  packages make the dependency boundary enforceable by Cabal and Mori.
+  Date: 2026-08-26.
 
-- Decision: shikigami consumes `en` over **HTTP** (the `en-server` `/check` endpoint), not as a
-  linked library, in its first integration. Rationale: shikigami already mirrors wire DTOs and uses
-  `http-client` to avoid servant version-coherence pins (see its EP-3 Surprises); an HTTP `check` is
-  the lowest-friction swap for the current `checkGrant` body. The embedded-library path
-  (`En.Check.check`) remains available and is what this plan's conformance harness uses directly.
-  Date: 2026-06-27
+- Decision: Authenticate the Kikan action endpoint with a Shomei machine token carrying the closed
+  scope `kikan-en:authorize-agent-action`. The token authenticates the Shikigami service account;
+  the request names a validated Meibo `agent_…` principal. Kikan logs both identities. Only service
+  accounts configured with that Shomei scope may assert an agent principal.
+  Rationale: Shikigami hosts many agents, so its machine-token subject cannot equal every agent.
+  Restricting the assertion right to one coarse Shomei scope preserves the C11/C13 split while En
+  still decides the asserted agent’s exact relationship.
+  Date: 2026-08-26.
 
-- Decision: Implement this plan in the new `kikan-en` project, not in `shinzui/en`.
-  Rationale: `shinzui/en` is registered as a reusable Haskell ReBAC toolkit and standalone
-  authorization service. The object types and relations in this plan (`kawa_source`,
-  `kizashi_recipient`, `danwa_thread`, `channel_egress`, `workspace`, `intention`, and
-  agent/tool-dispatch semantics) are Kikan product policy. Keeping them in `kikan-en` lets Kikan
-  depend on `en-core`, `en-postgres`, `en-servant`, `en-server`, and `en-client` without making the
-  generic engine carry portfolio-specific vocabulary.
-  Date: 2026-06-29
+- Decision: Fix the proof audience to `shikigami`, default the TTL to 30 seconds, and cap it at 60
+  seconds in the Kikan host. The public action request does not choose its own audience or TTL.
+  Rationale: these are issuer policy, not caller-controlled capabilities. A short ceiling bounds
+  how long a proof can survive relationship revocation without requiring a new revocation service.
+  Date: 2026-08-26.
+
+- Decision: Authorize provider connection immediately before acquisition and authorize every
+  logical tool immediately before its `SomeTool.run` callback. Do not treat catalog resolution,
+  descriptor presence, provider acquisition, or discovery as permission to invoke every tool.
+  Rationale: Shikigami’s current pure catalog resolver cannot make a fresh network decision, and a
+  server/provider can expose tools with materially different authority. Wrapping the two actual IO
+  boundaries is both current and non-bypassable.
+  Date: 2026-08-26.
 
 
 ## Outcomes & Retrospective
 
-Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
-Compare the result against the original purpose.
+The 2026-06-29 foundation succeeded: Kikan policy moved out of En, the schema compiles, the
+embedded conformance matrix proves per-object behavior, and a PostgreSQL-backed Kikan server was
+built. The original plan stopped at a document-only Shikigami hand-off, so no runtime dispatch
+uses it yet.
 
-(To be filled during and after implementation.)
+This 2026-08-26 refresh converts that stale hand-off into executable remaining work. It reuses
+En’s since-shipped proof layer, preserves Shikigami’s since-shipped identity and grant gates, and
+targets the since-shipped capability-overlay provider boundary. No production implementation or
+ADR was changed during the refresh.
 
 
 ## Context and Orientation
 
-This section assumes no prior knowledge of `en`, of the agent runtime, or of the surrounding
-architecture. Read it before touching code.
+En is a relationship-based access-control engine. Its stored fact is a relationship tuple of the
+form `(object, relation, subject)`. A schema defines writable relations and computed permissions;
+`check` asks whether one subject has one permission on one exact object. `CheckDecision` is
+three-valued: `Allowed`, `Denied`, or `Conditional` when a caveat path exists but required context
+is missing. Every boundary in this plan treats only `Allowed` as permission.
 
-### What `en` is, in plain terms
+The current En checkout is `mori://shinzui/en`. The interfaces used here are:
 
-`en` (縁, "the ties that bind") is a **relationship-based access-control (ReBAC) toolkit** written in
-Haskell, in the **Zanzibar lineage** (the family of Google's Zanzibar paper → OpenFGA → SpiceDB).
-"ReBAC" means access is decided by **relationships between principals and objects**, not by static
-roles. The core question `en` answers is *"may **this** subject do **this** to **THIS** object,
-given how they are related?"* — the **object-level** question, as opposed to coarse identity
-questions like "is this caller logged in" or "does this caller have the `signal:raise` scope".
+- `en-core/src/En/Check.hs`, `En.Decision`, `En.Tuple`, `En.Schema`, and
+  `En.Store.InMemory` for the engine, typed targets, decisions, and test store;
+- `en-servant/src/En/Check/Api.hs` for `/v1/check`, `/v1/grants`, `checkedAt`, and the current wire
+  types;
+- `en-servant/src/En/Servant/Seam.hs` for `ActiveSchema`, the current host `Env`, and `MintEnv`;
+- `en-client/src/En/Client.hs` for the Servant-derived client;
+- `en-biscuit/src/En/Biscuit/Grant.hs` and `En.Biscuit.Verify` for the stable proof facts and local
+  verifier.
 
-The unit of data is a **relationship tuple**: `(object, relation, subject)` — read as "*subject*
-has *relation* on *object*". For example `(space:eng, member, user:bob)` means "bob is a member of
-the eng space". A tuple may carry a **caveat**: a small bounded condition (e.g. a time limit or an
-autonomy level) evaluated at query time. Tuples are the only authorization data; everything else is
-computed from them.
+Relevant local durable decisions are [ADR 1](../adr/0001-en-s-schema-is-an-append-only-pg-migrate-component.md),
+which requires the `en-migrate` pg-migrate plan instead of Kikan-En’s old probe scripts;
+[ADR 3](../adr/0003-the-in-memory-store-is-for-tests-and-demos-only.md), which permits the current public
+in-memory interpreter only for conformance and tests; [ADR 5](../adr/0005-telemetry-configuration-and-provider-lifetimes-belong-to-the-standalone-host.md), which makes
+the Kikan host responsible for its own telemetry providers and middleware; and
+[ADR 7](../adr/0007-generic-lens-labels-are-en-s-record-access-idiom.md), which governs record access in
+new En-facing Haskell code. Kikan-En has no `docs/adr/` corpus today, so M6 must inspect its then
+current ADR convention before distilling new product decisions.
 
-A **schema** declares the object types, their relations, and **permissions**. A *relation* is
-writable (you store tuples for it); a *permission* is **computed** from relations by **rewrite
-rules** — unions, intersections, exclusions, and "arrows" that follow a relation to another object.
-For example `permission view = owner ∪ member` says "you may view if you are an owner or a member".
-`en` is **schema-parametric**: it ships no built-in model; each consumer supplies a schema as a
-Haskell value (built with `En.Schema.Builder`). Earlier Kikan conformance examples may exist in
-`shinzui/en`, but this plan's production Kikan schema belongs in
-`/Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en`, not in `en-core`.
+Kikan-En is `mori://shinzui/kikan-en`. Its current important files are
+`src/Kikan/En/Schema.hs`, `src/Kikan/En/Conformance/Agent.hs`,
+`src/Kikan/En/Testing/InMemory.hs`, `src/Kikan/En/Server.hs`,
+`app/kikan-en-conformance/Main.hs`, `app/kikan-en-server/Main.hs`, `kikan-en.cabal`,
+`cabal.project`, and `Justfile`. The repository-local plans that built those files have intended
+handles under `mori://shinzui/kikan-en/plans/`; current Mori releases do not yet resolve that
+artifact kind, so use the project URI plus paths `docs/plans/2-kikan-agent-authorization-schema.md`,
+`docs/plans/4-kikan-authorization-service-and-live-http-check-contract.md`, and
+`docs/plans/5-shikigami-per-action-authorization-integration-contract.md` until plan handles are
+indexed. The active requirement is
+`mori://shinzui/kikan-en/okf/improvement-requests/concepts/IR-3`; the broader dispatch blocker is
+`mori://shinzui/kikan-en/okf/shikigami-blockers/concepts/IR-1`.
 
-The query surface (all over a compiled schema plus a tuple store):
+Shikigami is `mori://shinzui/shikigami`. Its present boundaries are materially different from the
+June plan:
 
-- `check(subject, permission, object) → CheckDecision` — the gate; the one this plan uses.
-- `lookup(subject, permission, objectType) → [object]` — "what may this subject reach?" (read-filter).
-- `expand(object, permission) → tree` — "who can reach this object?" (audit).
-- `write` / `delete` tuples → return a `ConsistencyToken`.
+- `shikigami-core/src/Shikigami/Agent/Principal.hs` defines verified Meibo principals as
+  `VerifiedIdentity AgentPrincipal`, whose canonical text starts with `agent_`;
+- `shikigami-core/src/Shikigami/Sink/GrantStore.hs` owns the C11 `GrantSource` and
+  `checkGrant :: GrantSource -> AgentIdentity -> SinkKind -> IO (Either Denied ())`;
+- `shikigami-core/src/Shikigami/Sink/Intent.hs` checks C11 before enqueue, while the sink publisher
+  checks again before external delivery;
+- `shikigami-core/src/Shikigami/Capability/Overlay.hs` defines immutable capability descriptors;
+- `Shikigami.Capability.Provider` selects exact provider revisions and brackets provider leases;
+- `Shikigami.Capability.Tools` produces `overlay__…` model-facing names while retaining logical
+  tool names inside each descriptor and lease.
 
-A `CheckDecision` (`en-core/src/En/Decision.hs`) is three-valued: `Allowed`, `Denied`, or
-`Conditional [obligations]` (a path exists but a caveat needs context the caller did not supply).
-**Fail closed**: treat anything that is not `Allowed` as a denial unless you can supply the missing
-caveat context and retry.
-
-### The two gates: `shomei` (C11) and `en` (C13)
-
-The architecture splits authorization into two composed gates, documented in
-`shinzui/kikan → docs/architecture/evolution/contracts.md` as **C11** and **C13**, and in
-`shinzui/kikan → docs/architecture/evolution/trust-grants.md`:
-
-- **C11 / `shomei` (証明, "proof") — *who you are* and *may you do this class of thing at all*.**
-  `shomei` is the portfolio's JWT/JWKS authentication service. It issues tokens carrying a verified
-  `sub` (a user-id), coarse `scopes` (e.g. `signal:raise`, `channel:egress`), and an `act` claim
-  (on-behalf-of attribution). It can mint **scoped service tokens** for machine callers
-  (`POST /auth/service-token`, see `shinzui/shomei → docs/user/service-tokens.md`). The verified
-  `sub` resolves to a stable **loginId**; an agent's loginId has the form `agent:<name>`.
-- **C13 / `en` — *may you do this to **THIS** object, given how you are related to it*.** This plan.
-  A request passes `shomei`'s coarse gate **first**, then `en`'s object gate **second** — two gates,
-  never one in place of the other.
-
-This plan is the realization of **gap #7** in
-`shinzui/kikan → docs/architecture/evolution/agent-infrastructure-gaps.md` ("Per-action
-authorization — extend `checkGrant` from sink-level to per-action via `en` ReBAC, the C13 seam").
-
-### What exists today on the consumer side (the thing being replaced)
-
-The agent runtime is `shinzui/shikigami`. Its current authorization seam is one module:
-`/Users/shinzui/Keikaku/bokuno/shikigami/shikigami-core/src/Shikigami/Sink/Permission.hs`. It defines:
-
-- `data SinkKind = SKawaDigest | SKizashiSignal | SReiAction | SDanwaConversation | SChannelEgress`
-  — the five sink *kinds* an agent can emit. (`SChannelEgress` is reserved for a not-yet-added
-  channel egress sink variant.)
-- `newtype AgentIdentity = AgentIdentity { agentName :: Text }` — who is asking (the agent's name;
-  destined to become the shomei-verified `sub`/loginId).
-- `newtype Denied = Denied { deniedReason :: Text }`.
-- `defaultGrantTable :: Map Text (Set SinkKind)` — a **hard-coded** allow-list keyed by agent name.
-- `checkGrant :: AgentIdentity -> SinkKind -> IO (Either Denied ())` — looks the agent up in the
-  table and returns `Right ()` if the *kind* is granted, else `Left Denied`. A denied sink is
-  recorded and skipped; the run never crashes.
-
-This is gated **only at sink level**, **only by agent name**, **statically**, and **only at sink
-dispatch** (never at tool execution). The shikigami EP-3 plan
-(`shinzui/shikigami → docs/plans/3-sink-dispatcher-permission-gate-and-kawa-stub.md`) that built it
-explicitly anticipates this swap.
-
-### Repository boundaries and modules this plan relies on
-
-This plan is implemented in `/Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en`. The concrete
-module names in that repo may be adjusted to its package layout as it is scaffolded, but the
-ownership boundary is fixed: Kikan object types and grant fixtures are `kikan-en` code.
-
-- `kikan-en/src/Kikan/En/Schema.hs` — proposed home for the Kikan schema (`kikanSchema`,
-  `kikanGraph`) containing `agent`, sink-target objects, `workspace`, and `intention` delegation.
-  If the bootstrapped package uses a different module tree, keep the same responsibility in the
-  nearest equivalent schema module.
-- `kikan-en/src/Kikan/En/Conformance/Agent.hs` — proposed home for agent grant-tuple fixtures,
-  object-id fixtures, and helper values used by the conformance executable.
-- `kikan-en/app` or `kikan-en/src/Kikan/En/Server.hs` — proposed wrapper around `en-server` or the
-  `en-servant` application wiring so Kikan can serve the Kikan schema without modifying `en-server`
-  itself.
-- `en-core/src/En/Schema/Builder.hs` — the reusable schema constructors: `object`, `relation`,
-  `permission`, `subject`, `userset`, `this`, `computed`, `arrow`, `anyOf`, `allOf`, `minus`,
-  `caveated`, `caveat`/`caveatWith`, `parameter`, the comparison/predicate combinators. Used to
-  author the new object types from `kikan-en`.
-- `en-core/src/En/Tuple.hs` — `Tuple{object, relation, subject, caveat}`,
-  `ObjectRef{objectType, objectId}`, `Subject = SubjectId ObjectRef | SubjectSet ObjectRef RelationName | SubjectWildcard ObjectType`,
-  `TupleCaveat{name, payload}`, `CaveatPayload`, `CaveatContext`, `CaveatValue`.
-- `en-core/src/En/Check.hs` — `check :: ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckDecision`
-  (the embedded gate, requires `ConsistencyStore`, `TupleStore`, `Error EnError` effects).
-- `en-core/src/En/Revision.hs` — `data Consistency = MinimizeLatency | AtLeastAsFresh ConsistencyToken | AtExactSnapshot ConsistencyToken | FullyConsistent`,
-  `newtype ConsistencyToken`.
-- `en-core/src/En/Decision.hs` — `CheckDecision = Allowed | Denied | Conditional [CaveatObligation]`.
-- `en-servant/src/En/Servant/API.hs` — the HTTP wire types and API: `/tuples` (POST write / DELETE),
-  `/check`, `/batch-check`, `/lookup`, `/expand`; the wire DTOs `CheckRequestWire`,
-  `CheckResponseWire`, `SubjectWire`, `ObjectRefWire`, `ConsistencyWire`, `CaveatContextWire`,
-  `WriteTuplesRequestWire`, etc. **Read by** the shikigami integration contract (M4/M5).
-- `en-client/src/En/Client.hs` — the typed Haskell client (`EnClient{ check, writeTuples, … }`) for
-  the standalone service; an alternative to raw HTTP for a Haskell consumer.
-
-### Terms of art defined
-
-- **Sink** — an agent *output*: the thing it produces. The five kinds are kawa digest, kizashi
-  signal, rei action, danwa conversation, channel egress (see `SinkKind` above).
-- **Work tool / ToolEnv** — the agent's *execution* surface: read/write/edit a file, run a shell
-  command, fetch a URL, scoped to *some* environment (the "ToolEnv"). This is gap #1 in the gap
-  analysis; its concrete tool targets are defined by the shikigami/shikumi plan **"Built-in agent
-  work tools and ToolEnv execution seam"** (a named dependency — see Interfaces and Dependencies).
-- **Grant** — a relationship tuple that authorizes an agent for an action on an object. Written by
-  a human/operator (the relationship's birthplace), read by the runtime via `check`.
-- **Caveat** — a bounded condition on a tuple, evaluated against request context at query time. Used
-  here for **autonomy-leveled** and **time-bounded** delegation (the `within_autonomy` caveat).
-- **Consistency token** — an opaque string returned by a write; presenting it on a later read with
-  `AtLeastAsFresh` guarantees the read observes that write (read-your-writes). Needed because `en`
-  is a standalone multi-writer service.
+Shomei is `mori://shinzui/shomei`. Its tagged 0.1.0.0 source already supports OAuth2
+`client_credentials`, allowed-scope ceilings, signed JWTs, JWKS publication, and local
+`verifyToken`. Kikan-En should follow the downstream verifier and cache pattern in
+`mori://shinzui/shomei` at `examples/microservice-auth-stack/src/Downstream/Service.hs`. The
+machine token’s `sub` authenticates Shikigami; the action request’s validated `agent_…` value is
+the En subject. The two values are intentionally logged separately.
 
 
 ## Plan of Work
 
-The work is primarily in `kikan-en`: scaffold a thin Haskell package/application that depends on
-the reusable `en-*` packages, define the Kikan schema with the agent-authorization vocabulary,
-define the grant-tuple shapes, and prove — through a conformance harness and a live HTTP transcript
-— that per-action checks behave correctly and that on-behalf-of resolves. The `shikigami`-side
-wiring (swapping `checkGrant`'s body, extending it to tool execution) is a downstream
-**dependency/integration** contract this plan specifies precisely but does not implement here.
+### Milestone 1 — Rebase the existing Kikan host without changing policy
 
-No Kikan product object types should be added to `shinzui/en`. If work in `en` is discovered to be
-necessary, it must be a generic engine/API capability, covered by its own `en` plan or a clearly
-separate prerequisite milestone.
+First make the existing repository build against the exact current En source. Add `en-biscuit` to
+Kikan-En’s sibling package set. Replace the stale `En.Servant.Seam.Env` construction with one
+request-time `ActiveSchema` whose graph is `kikanGraph`, whose source/origin clearly identify the
+built-in Kikan schema, and whose `runPorts` threads that snapshot’s schema hash into the current
+PostgreSQL interpreters. Supply current check, lookup, lookup-subjects, watch, evaluation budget,
+deadline, batch, and mint fields. Keep production authorization data in PostgreSQL; use
+`En.Store.InMemory` only in tests.
 
-### Milestone 1 — The agent-authorization vocabulary (schema)
+Replace `Justfile`’s old `to_regclass`/raw-SQL migration probes with the current pg-migrate
+component: build or invoke `en-migrate`, run `up`, and expose `verify`. Do not edit an applied En
+migration or copy its SQL into Kikan-En. This follows local ADR 1.
 
-Scope: add the object types, relations, permissions, and the caveated delegation to the Kikan schema
-in `kikan-en` so `en` can model every agent sink and the work-tool surface. At the end,
-`compileSchema kikanSchema` succeeds inside the `kikan-en` package.
+At the end, the old Kikan conformance assertions still pass, the server starts on `/v1`, and a
+plain check response includes both the decision and `checkedAt`. Record the exact En commit in
+Kikan-En’s dependency documentation and Mori metadata; there is no release bound to choose yet.
 
-Create or edit the Kikan schema module in `kikan-en`, preferably
-`src/Kikan/En/Schema.hs` unless the bootstrapped package establishes another module layout. Define
-`kikanSchema` and `kikanGraph` there using `En.Schema.Builder`. Add:
 
-- An **`agent`** object type with no relations: `Schema.object "agent" []`. (Like `user`, it is only
-  ever a *subject*. Declaring it makes `Schema.subject "agent"` legal as an allowed subject.)
-- A **`kawa_source`** object: `relation "digester" [subject "agent"] this`, and
-  `permission "can_dispatch" (computed "digester")`. (Backs `SKawaDigest`.)
-- A **`kizashi_recipient`** object: `relation "signaler" [subject "agent"] this`,
-  `permission "can_dispatch" (computed "signaler")`. (Backs `SKizashiSignal`.)
-- A **`danwa_thread`** object: `relation "attacher" [subject "agent"] this`,
-  `permission "can_dispatch" (computed "attacher")`. (Backs `SDanwaConversation`.)
-- A **`channel_egress`** object: `relation "egress_actor" [subject "agent"] this`,
-  `permission "can_dispatch" (computed "egress_actor")`. (Backs `SChannelEgress`.)
-- A **`workspace`** object (the work-tool target) with three graded relations and three permissions:
-  `relation "reader" [subject "agent"] this`, `relation "writer" [subject "agent"] this`,
-  `relation "executor" [subject "agent"] this`; then
-  `permission "can_read" (anyOf (computed "reader") [computed "writer", computed "executor"])`,
-  `permission "can_write" (anyOf (computed "writer") [computed "executor"])`,
-  `permission "can_bash" (computed "executor")`. (Graded so a `writer` implies `can_read`, an
-  `executor` implies all three. Backs the work-tool surface — read/write/edit/bash.)
-- Define or extend the **`intention`** object with the on-behalf-of path: add
-  `relation "act_delegate" [subject "agent"] (caveated "within_autonomy" this)` and
-  `permission "can_act" (computed "act_delegate")`. Define the `within_autonomy` caveat in
-  `kikan-en` if it is not already provided by a shared Kikan schema module. Its parameters are
-  `requested_autonomy`, `autonomy`, `current_time`, and `until`; its predicate is
-  `requested_autonomy <= autonomy && current_time <= until`. (Backs `SReiAction`, with
-  autonomy/time bounds.)
+### Milestone 2 — Add closed actions and immutable capability targets
 
-Acceptance: from `/Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en`, the Kikan package builds,
-and evaluating `kikanGraph` (which is `either (error . show) id (compileSchema kikanSchema)`) does
-not error.
+Create `kikan-en-contract` as a small Cabal package with no server or PostgreSQL dependency. In
+`Kikan.En.Action`, define smart constructors and JSON codecs for `AgentPrincipal`, `RequestId`,
+`CapabilityTarget`, `CapabilityToolTarget`, `SinkTarget`, and the closed `AgentAction` sum. Unknown
+JSON action tags fail decoding; object ids are produced only by constructors.
 
-### Milestone 2 — Grant-tuple shapes, object-id scheme, and idempotence
+The action mapping is total:
 
-Scope: pin the exact tuple every grant becomes, and the object-id scheme, as named fixtures the
-conformance harness reuses; and confirm writes are idempotent. At the end, a `kikan-en` module
-exports the agent subjects, target objects, and grant tuples.
-
-Create `src/Kikan/En/Conformance/Agent.hs` in `kikan-en` (or the equivalent module selected by the
-package layout) and add it to the `kikan-en` cabal file. Export:
-
-- Agent subjects, e.g. `triageAgent = ObjectRef (ObjectType "agent") "triage"`,
-  `repoBot = ObjectRef (ObjectType "agent") "repo-bot"`.
-- Target objects, e.g. `acctRecipient = ObjectRef (ObjectType "kizashi_recipient") "acct-9931"`,
-  `otherRecipient = ObjectRef (ObjectType "kizashi_recipient") "acct-0001"`,
-  `shikigamiSource = ObjectRef (ObjectType "kawa_source") "shinzui/shikigami"`,
-  `kikanWorkspace = ObjectRef (ObjectType "workspace") "shinzui/kikan"`,
-  `intention42 = ObjectRef (ObjectType "intention") "42"`,
-  `zendeskEgress = ObjectRef (ObjectType "channel_egress") "zendesk/ticket-4815"`.
-- Grant tuples, e.g.
-  `(kizashi_recipient:acct-9931, signaler, agent:triage)`,
-  `(kawa_source:shinzui/shikigami, digester, agent:triage)`,
-  `(workspace:shinzui/kikan, writer, agent:repo-bot)`,
-  `(channel_egress:zendesk/ticket-4815, egress_actor, agent:triage)`,
-  and the delegation `(intention:42, act_delegate, agent:triage)` with caveat
-  `TupleCaveat (CaveatName "within_autonomy") (CaveatPayload {autonomy = ValueEnum "act", until = ValueTimestamp <T>})`
-  (create a local helper such as `autonomyCaveat` in `Kikan.En.Schema` or
-  `Kikan.En.Conformance.Agent`).
-
-Idempotence is a property of the store, not the fixtures: `en-postgres`'s `writeTuples` issues
-`INSERT … ON CONFLICT DO NOTHING` against the `relation_tuple_live_unique` unique index (over live
-rows), so re-writing an identical grant is a no-op and produces exactly one live edge. M2.2 records
-this and the acceptance test in M4 demonstrates it (write the same grant twice; `expand` shows one
-edge; `check` is `Allowed`). Revocation is `deleteTuples` on the same tuple.
-
-Acceptance: the `kikan-en` package compiles the new module; the grant fixtures type-check as
-`[Tuple]`.
-
-### Milestone 3 — Per-action and on-behalf-of conformance (embedded `check`)
-
-Scope: prove, with the in-memory store, that `check` is **per object** and that the autonomy/time
-caveat governs the `act` path. At the end, a conformance harness runs green and fails if the schema
-or rewrite rules regress.
-
-Add scenarios to a `kikan-en` conformance executable, preferably `app/kikan-en-conformance/Main.hs`
-or `test/Kikan/En/ConformanceSpec.hs` depending on the package scaffold. Reuse the generic `en`
-in-memory interpreters. If the current `en` in-memory store runners are not exposed from a reusable
-module, first move or expose that generic test support from `en` in a separate prerequisite change;
-do not put Kikan policy back into `en-core`. Assert, with the agent grant fixtures from M2 loaded:
-
-- **Per-object allow vs deny (each sink kind).** With `(kizashi_recipient:acct-9931, signaler,
-  agent:triage)` granted:
-  `check(agent:triage, can_dispatch, kizashi_recipient:acct-9931) == Allowed`, and
-  `check(agent:triage, can_dispatch, kizashi_recipient:acct-0001) == Denied` (same agent, same
-  permission, **different object** — the granularity the static table cannot express). Repeat the
-  allow/deny pair for `kawa_source`, `danwa_thread`, and `channel_egress`.
-- **Graded tool permissions.** With `(workspace:shinzui/kikan, writer, agent:repo-bot)` granted:
-  `can_read == Allowed`, `can_write == Allowed`, `can_bash == Denied` (writer implies read+write but
-  not bash); and all three `Denied` against `workspace:other`.
-- **On-behalf-of within bounds.** With the delegation tuple + `within_autonomy {autonomy=act,
-  until=2026-07-01}` and request context `{requested_autonomy=act, current_time=2026-06-23}`:
-  `check(agent:triage, can_act, intention:42) == Allowed`.
-- **On-behalf-of denied (expired / over-budget).** Same delegation, context
-  `{requested_autonomy=act, current_time=2026-08-01}` → `Denied` (time bound exceeded); and context
-  `{requested_autonomy=admin, current_time=2026-06-23}` → `Denied` (autonomy budget exceeded). Define
-  local helpers such as `requestContext`, `expiredContext`, and `adminContext` in `kikan-en`.
-- **Unrelated agent denied.** `check(agent:other, can_dispatch, kizashi_recipient:acct-9931) ==
-  Denied`.
-
-Acceptance: `cabal run kikan-en-conformance` (or the selected test executable) prints all
-assertions passing and exits 0.
-
-### Milestone 4 — The live HTTP `check` contract
-
-Scope: reproduce, against a running Kikan authorization server backed by the reusable `en` HTTP
-surface, the **exact** write-then-check the runtime will perform, so the shikigami integration has a
-concrete wire transcript to code against. At the end, a reader can paste two `curl`s and see
-`AllowedWire` on the granted object and `DeniedWire` on an ungranted one, plus the on-behalf-of
-pair.
-
-There is nothing to build in `shinzui/en` for this milestone beyond depending on its existing HTTP
-surface. `kikan-en` must provide a way to run `en-server` or an equivalent `en-servant` application
-with the Kikan schema loaded. The runtime sends, for a **sink dispatch** (e.g. a kizashi signal to
-recipient `acct-9931` by agent `triage`):
-
-```json
-{
-  "consistency": {"tag": "AtLeastAsFreshWire", "contents": "<token-from-grant-write>"},
-  "context": {"values": {}},
-  "subject": {"tag": "SubjectIdWire", "contents": {"objectType": "agent", "objectId": "triage"}},
-  "permission": "can_dispatch",
-  "object": {"objectType": "kizashi_recipient", "objectId": "acct-9931"}
-}
+```text
+ConnectCapability       -> can_connect  on capability_provider:<capability>@<revision>
+DiscoverCapabilityTools -> can_discover on capability_provider:<capability>@<revision>
+InvokeCapabilityTool    -> can_invoke   on capability_tool:<capability>@<revision>/<logical-name>
+ReadWorkspace           -> can_read     on workspace:<workspace-id>
+WriteWorkspace          -> can_write    on workspace:<workspace-id>
+ExecuteWorkspace        -> can_bash     on workspace:<workspace-id>
+DispatchKawa            -> can_dispatch on kawa_source:<source-id>
+DispatchKizashi         -> can_dispatch on kizashi_recipient:<recipient-id>
+ActOnIntention          -> can_act      on intention:<intention-id>
+AttachDanwa             -> can_dispatch on danwa_thread:<thread-id>
+DispatchChannel         -> can_dispatch on channel_egress:<provider>/<conversation-key>
 ```
 
-For a **tool invocation** (agent `repo-bot` running a write tool in `shinzui/kikan`), the same shape
-with `subject.objectId = "repo-bot"`, `permission = "can_write"`,
-`object = {"objectType": "workspace", "objectId": "shinzui/kikan"}`.
+Extend `Kikan.En.Schema` with `capability_provider` and `capability_tool`. A provider has explicit
+`connector` and `discoverer` relations; a tool has an explicit `invoker` relation and may carry a
+non-authorizing `provider` relationship for audit/expansion. `can_invoke` is computed only from
+`invoker`; never arrow from provider connection. Keep the existing workspace, sink, and intention
+vocabulary.
 
-For the **on-behalf-of** rei action, `permission = "can_act"`,
-`object = {"objectType": "intention", "objectId": "42"}`, and `context.values` carries the autonomy
-context:
+Update fixtures to use current Meibo-style agent ids. Add sibling-revision, sibling-tool,
+sibling-capability, and sibling-agent denials. Add constructor tests for empty names, separators
+that would make the encoding ambiguous, malformed principals, mismatched action/target pairs, and
+unknown action JSON.
 
-```json
-"context": {"values": {
-  "requested_autonomy": {"tag": "ValueEnumWire", "contents": "act"},
-  "current_time": {"tag": "ValueTimestampWire", "contents": "2026-06-27T00:00:00Z"}
-}}
-```
 
-The grant is written first via `POST /tuples` (shape per `WriteTuplesRequestWire`, exactly like the
-smoke test in the `Justfile`), and its returned `token` is fed into `AtLeastAsFreshWire` so the
-check observes the just-written grant (read-your-writes). The response is
-`{"decision": {"tag": "AllowedWire"}}` or `{"tag": "DeniedWire"}`.
+### Milestone 3 — Serve a narrow authenticated check-and-mint contract
 
-Acceptance: see Concrete Steps — the transcript shows `AllowedWire` for the granted object and
-`DeniedWire` for an ungranted object, and the on-behalf-of `Allowed`/`Denied` pair.
+Add `Kikan.En.Action.Api` and mount `POST /v1/agent-actions/authorize`. The request carries a
+validated agent principal, one closed action/target value, caveat context only for actions that
+need it, and a request id. It does not accept raw En subject types, raw permission strings, an
+audience, a TTL, or a caller-asserted decision.
 
-### Milestone 5 — The shikigami integration contract (downstream)
+Add a host-owned Shomei JWT verifier with a refresh-ahead, single-flight JWKS cache and a bounded
+last-known-good interval, following the Shomei downstream example. A verifiable token without the
+`kikan-en:authorize-agent-action` scope receives 403. Missing/invalid tokens receive 401. When no
+sufficiently fresh JWKS is available, answer 503 rather than mislabeling a valid token as bad.
+Never log the bearer token.
 
-Scope: specify precisely what changes in `shinzui/shikigami` so the next contributor (working in that
-repo) can do the swap. **No `shinzui/en` code changes for M5**; it is the contract.
+The handler maps the validated request through `Kikan.En.Action`, constructs an En
+`MintGrantRequestWire`, fixes `audience = "shikigami"`, uses the host’s 30-second default and
+60-second maximum, and delegates to En’s check-then-mint handler. The allowed wire response carries
+only the issued Biscuit, expiry, revocation ids, and `checkedAt`; it does not echo unsigned copies
+of the subject, action, resource, or schema hash. Those coordinates are signed inside the Biscuit
+and are recovered by verification. Return typed deny, invalid-request, and unavailable problem
+responses; do not collapse a store outage into an ordinary deny.
 
-The contract (to be implemented in
-`/Users/shinzui/Keikaku/bokuno/shikigami/shikigami-core/src/Shikigami/Sink/Permission.hs` and a new
-tool-permission call site):
+Create `kikan-en-client` with `authorizeAgentAction` derived from the shared Kikan API type. It
+depends on `kikan-en-contract` and the transport client packages, not on `Kikan.En.Server`,
+`en-postgres`, or Kikan’s internal schema module. Expose a verifier wrapper that builds
+`En.Biscuit.Verify.VerifyRequest` from the original `AuthorizeActionRequest`, the issued proof, an
+issuer public-key set, accepted schema hashes, and the current clock. The high-level client returns
+`AuthorizedAction` only after that verification succeeds; a 200 response with an invalid proof is
+a fail-closed client error, not an allow.
 
-1. Keep `AgentIdentity` but treat `agentName` as the shomei-verified `agent:<name>` loginId tail.
-2. Replace `defaultGrantTable` + the `Map`-lookup body of `checkGrant` with an `en` `check` call
-   (HTTP via `http-client`, mirroring shikigami's existing wire-DTO approach, or `En.Client`):
-   - **Sink path** — generalize `checkGrant` to take the sink's **target object**, not just its
-     kind. Map `SinkKind` → `(permission, objectType)`:
-     `SKawaDigest → ("can_dispatch","kawa_source")`,
-     `SKizashiSignal → ("can_dispatch","kizashi_recipient")`,
-     `SReiAction → ("can_act","intention")`,
-     `SDanwaConversation → ("can_dispatch","danwa_thread")`,
-     `SChannelEgress → ("can_dispatch","channel_egress")`. The object id is the sink's destination
-     (the kawa source, the recipient, the intention id, the thread id, the `provider/conversationKey`).
-   - **Tool path** — a **new** call at tool execution: map the tool's verb →
-     `(permission, "workspace")` (`read → can_read`, `write|edit → can_write`, `bash → can_bash`),
-     object id = the `ToolEnv` workspace identity. This is the second call site gap #7 requires.
-   - **On-behalf-of** — for `SReiAction`, pass `context = {requested_autonomy, current_time}` and use
-     the shomei `act.sub` for attribution in the recorded outcome.
-   - **Consistency** — use `MinimizeLatency` for ordinary checks; use `AtLeastAsFresh token` only
-     immediately after the runtime itself wrote a grant.
-3. Map the `en` decision to the existing `Either Denied ()`: `Allowed → Right ()`; `Denied` and
-   `Conditional _ → Left (Denied reason)`. The existing "record denial, skip the sink, never crash"
-   behavior is preserved.
 
-The renamed/generalized signature (illustrative) is
-`checkAction :: AgentIdentity -> Permission -> ObjectRef -> IO (Either Denied ())`, with thin
-wrappers `checkSink :: AgentIdentity -> SinkKind -> SinkTarget -> IO (Either Denied ())` and
-`checkTool :: AgentIdentity -> ToolVerb -> WorkspaceId -> IO (Either Denied ())`. This milestone is
-marked **dependency/integration**: it is completed in the shikigami repo, tracked there, and
-referenced from this plan's Progress as the hand-off.
+### Milestone 4 — Prove the public contract and proof lifecycle
+
+Use En’s public in-memory store for unit/conformance tests and PostgreSQL for live service tests.
+The matrix must show exact provider revision, tool, capability, agent, sink, and workspace
+allow/deny behavior. Mint a real Biscuit for one allowed tool. Verify it successfully, then prove
+wrong subject, operation, resource, audience, schema hash, expiry, token bytes, and revocation id
+all fail closed with distinct typed errors.
+
+Write a provider/tool relationship, mint a proof, delete the relationship, and show a new mint is
+denied. Then document that the old proof remains locally valid only until its expiry unless the
+verifier consults a revocation list; assert its expiry is at most 60 seconds after minting. This is
+the explicit revocation bound required by the improvement request.
+
+Run a live Shomei fixture or signed-JWKS stub so the endpoint’s 401, 403, 503, and allowed paths are
+tested through WAI/HTTP. Generate the Kikan OpenAPI document from the same API types and add a
+golden/round-trip check so client and server cannot drift.
+
+
+### Milestone 5 — Gate Shikigami at the actual IO boundaries
+
+Add an `ActionAuthorizer` dependency to Shikigami’s composition root. Its production interpreter
+uses `kikan-en-client` plus a Shomei `client_credentials` token for the closed scope. Tests use an
+in-memory fake that returns real-shaped allowed/denied/unavailable results and, where proof
+verification is under test, real signed Biscuits.
+
+Keep `Capability.Catalog.resolveCapabilityOverlays` pure and retain its existing local admission
+callback as an additional gate. Wrap each `CapabilityProvider.acquire` so it authorizes
+`ConnectCapability` for the exact descriptor before any network connection or discovery. When a
+provider performs separate discovery, authorize `DiscoverCapabilityTools` before that operation.
+Wrap every leased `SomeTool` before registry composition so its `run` callback authorizes
+`InvokeCapabilityTool` for the descriptor’s logical tool name and locally verifies the returned
+proof immediately before invoking the underlying callback. The model-facing `overlay__…` name is
+presentation only and is never used as the authorization resource id.
+
+For sinks, retain lifecycle admission and `checkGrant`. After both succeed, derive the exact target
+from the fully resolved `SinkIntent` and call the Kikan authorizer. Do this before enqueue and again
+before publish, minting a fresh short-lived proof each time rather than storing a Biscuit in the
+journal or outbox. On denial, preserve the current `DeniedOutcome`/no-delivery behavior. On Kikan
+unavailability or proof-verification failure, produce a distinct fail-closed outcome that an
+operator can distinguish from a policy denial without exposing credentials or token bytes.
+
+Log only bounded audit coordinates: Shomei caller id, Meibo agent principal, action, canonical
+resource, request id, decision, `checkedAt`, schema hash, and expiry. Do not log the Biscuit,
+Shomei JWT, tool arguments/results, provider credentials, or sink payload.
+
+
+### Milestone 6 — End-to-end validation and durable hand-off
+
+Run Kikan-En with PostgreSQL migrations applied and a real or fixture Shomei issuer. Register one
+fake capability provider revision with two logical tools in Shikigami. Grant connection and one
+tool to one agent. Demonstrate that acquisition succeeds, the granted tool runs, the sibling tool
+does not run, and another agent cannot reuse the proof. Revoke the tool relationship and show the
+next invocation is denied. Repeat the exact-target contrast for one sink, including the enqueue to
+publish revocation window.
+
+Update Kikan-En’s user/operator docs, Shikigami’s capability/sink docs, dependency metadata, and
+Mori registry descriptions. Before completion, inspect each owning repository’s current ADR
+contract and distill stable identity, proof, TTL/revocation, and gate-composition decisions there.
+Do not create a Kikan policy ADR in En merely because this coordinating plan lives here.
 
 
 ## Concrete Steps
 
-All implementation commands run from the repository root
-`/Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en` inside that project's Nix dev shell. Enter it
-first:
+Resolve the repositories through Mori rather than relying on remembered checkout paths:
 
 ```bash
-cd /Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en
-nix develop            # or rely on direnv; provides GHC, cabal, just, psql, curl, jq
+mori registry show shinzui/en --full
+mori registry show shinzui/kikan-en --full
+mori registry show shinzui/shikigami --full
+mori registry show shinzui/shomei --full
+mori path mori://shinzui/kikan-en/repos/kikan-en
+mori path mori://shinzui/shikigami/repos/shikigami
 ```
 
-### Build and run the Kikan conformance (M1–M3)
+Before changing dependency bounds or pins, repeat the release check. As of 2026-08-26 the expected
+result is no En tags, a 404 for the En Hackage package, and Shomei 0.1.0.0 tags at the recorded
+commit:
 
 ```bash
-cabal build all
-cabal run kikan-en-conformance
+git ls-remote --tags https://github.com/shinzui/en.git
+curl -fsSL https://hackage.haskell.org/package/en-core/en-core.cabal
+git ls-remote --tags https://github.com/shinzui/shomei.git
 ```
 
-Expected (after M1–M3; existing lines plus the new agent assertions):
+In the Kikan-En checkout, preserve unrelated working-tree changes, update the packages and host,
+then build the old behavior before adding the new behavior:
+
+```bash
+git status --short
+nix develop -c cabal build all --enable-tests
+nix develop -c cabal test all
+nix develop -c cabal run kikan-en-conformance
+```
+
+Apply the canonical En migration plan, never the old copied SQL probes:
+
+```bash
+nix develop -c just process-up
+nix develop -c just create-database
+nix develop -c cabal run en-migrate -- verify
+nix develop -c cabal run en-migrate -- up
+```
+
+After M2–M4, run all contract, client, server, conformance, and black-box tests and regenerate the
+OpenAPI artifact with the repository’s new named target:
+
+```bash
+nix develop -c cabal build all --enable-tests
+nix develop -c cabal test all
+nix develop -c cabal run kikan-en-conformance
+nix develop -c cabal run kikan-en-openapi
+git diff --exit-code -- docs/api/openapi.json
+```
+
+In the Shikigami checkout, first prove the current baseline, then run the focused capability and
+sink suites followed by the whole project:
+
+```bash
+git status --short
+nix develop -c cabal build all --enable-tests
+nix develop -c cabal test shikigami-core-test
+nix develop -c cabal test all
+```
+
+The implementation commits in Kikan-En and Shikigami must use Conventional Commits and carry the
+cross-repository plan and intention trailers. Mori cannot yet resolve plan artifacts, but the
+intended canonical plan URI is still the durable reference:
 
 ```text
-ok - triage can dispatch the granted kizashi recipient
-ok - triage cannot dispatch an ungranted kizashi recipient
-ok - repo-bot writer can read and write the workspace
-ok - repo-bot writer cannot bash the workspace
-ok - triage can act on intention 42 within autonomy
-ok - triage cannot act on intention 42 after expiry
-ok - unrelated agent is denied
-```
+feat(authz): authorize exact capability tool invocations
 
-If the bootstrapped project uses a different executable name, use that name consistently in the
-cabal file and in this plan before implementation starts.
-
-### Run the unit/property test suite
-
-```bash
-cabal test all
-```
-
-Expected: all `kikan-en` tests pass, including any schema compilation and grant-shape assertions.
-
-### Bring up Postgres + the Kikan authorization server and reproduce the HTTP `check` (M4)
-
-```bash
-just process-up         # start local process-compose Postgres (detached)
-just run-migrations     # idempotent: applies relation_tuple + history-index migrations
-```
-
-Start the Kikan authorization server pointed at the Kikan schema. The preferred implementation is a
-`kikan-en` executable or `just` target that wires the Haskell `kikanSchema` into the reusable
-`en-server`/`en-servant` machinery. If that wrapper does not exist yet, create it in `kikan-en`
-rather than modifying `shinzui/en`. For local proof only, an `.en` text schema can express the
-non-caveated subset of the model:
-
-```bash
-cat > /tmp/kikan-agent.en <<'EOF'
-object user {}
-object agent {}
-
-object kawa_source       { relation digester:    agent  permission can_dispatch = digester }
-object kizashi_recipient { relation signaler:     agent  permission can_dispatch = signaler }
-object danwa_thread      { relation attacher:     agent  permission can_dispatch = attacher }
-object channel_egress    { relation egress_actor: agent  permission can_dispatch = egress_actor }
-
-object workspace {
-  relation reader:   agent
-  relation writer:   agent
-  relation executor: agent
-  permission can_read  = reader | writer | executor
-  permission can_write = writer | executor
-  permission can_bash  = executor
-}
-EOF
-
-EN_DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" \
-EN_SCHEMA_PATH=/tmp/kikan-agent.en \
-  cabal run kikan-en-server &      # serves on http://localhost:${EN_PORT:-8080}
-```
-
-Note: the `.en` text-schema parser may not yet express **caveats**; the on-behalf-of (`can_act`)
-case is therefore proven by the embedded harness (M3) and by an in-Haskell server schema. If the
-text parser supports caveats, add the `intention` object with `act_delegate` + `within_autonomy`;
-otherwise prove `can_act` via `cabal run kikan-en-conformance`. (Confirm parser caveat support in
-`shinzui/en`'s `en-core/src/En/Schema/Parse.hs`; record the finding in Surprises.)
-
-Write a grant, capture the token, and check the **granted** object then an **ungranted** one:
-
-```bash
-url="http://localhost:${EN_PORT:-8080}"
-
-token=$(curl -sS -X POST "$url/tuples" -H 'content-type: application/json' -d '{
-  "tuples":[{"object":{"objectType":"kizashi_recipient","objectId":"acct-9931"},
-             "relation":"signaler",
-             "subject":{"tag":"SubjectIdWire","contents":{"objectType":"agent","objectId":"triage"}},
-             "caveat":null}]}' | jq -r '.token')
-
-# Granted object → AllowedWire
-curl -sS -X POST "$url/check" -H 'content-type: application/json' -d "{
-  \"consistency\":{\"tag\":\"AtLeastAsFreshWire\",\"contents\":\"$token\"},
-  \"context\":{\"values\":{}},
-  \"subject\":{\"tag\":\"SubjectIdWire\",\"contents\":{\"objectType\":\"agent\",\"objectId\":\"triage\"}},
-  \"permission\":\"can_dispatch\",
-  \"object\":{\"objectType\":\"kizashi_recipient\",\"objectId\":\"acct-9931\"}}" | jq '.decision.tag'
-
-# Ungranted object → DeniedWire
-curl -sS -X POST "$url/check" -H 'content-type: application/json' -d "{
-  \"consistency\":{\"tag\":\"AtLeastAsFreshWire\",\"contents\":\"$token\"},
-  \"context\":{\"values\":{}},
-  \"subject\":{\"tag\":\"SubjectIdWire\",\"contents\":{\"objectType\":\"agent\",\"objectId\":\"triage\"}},
-  \"permission\":\"can_dispatch\",
-  \"object\":{\"objectType\":\"kizashi_recipient\",\"objectId\":\"acct-0001\"}}" | jq '.decision.tag'
-```
-
-Expected:
-
-```text
-"AllowedWire"
-"DeniedWire"
-```
-
-Idempotence check (write the same grant twice; second write is a no-op; check still allows):
-
-```bash
-curl -sS -X POST "$url/tuples" -H 'content-type: application/json' -d '{
-  "tuples":[{"object":{"objectType":"kizashi_recipient","objectId":"acct-9931"},
-             "relation":"signaler",
-             "subject":{"tag":"SubjectIdWire","contents":{"objectType":"agent","objectId":"triage"}},
-             "caveat":null}]}' | jq -r '.token'   # returns a token; no duplicate edge created
-```
-
-Tear down when finished:
-
-```bash
-just process-down
-```
-
-### Workspace tool check transcript (M4)
-
-```bash
-url="http://localhost:${EN_PORT:-8080}"
-wtoken=$(curl -sS -X POST "$url/tuples" -H 'content-type: application/json' -d '{
-  "tuples":[{"object":{"objectType":"workspace","objectId":"shinzui/kikan"},
-             "relation":"writer",
-             "subject":{"tag":"SubjectIdWire","contents":{"objectType":"agent","objectId":"repo-bot"}},
-             "caveat":null}]}' | jq -r '.token')
-
-for perm in can_read can_write can_bash; do
-  printf '%s ' "$perm"
-  curl -sS -X POST "$url/check" -H 'content-type: application/json' -d "{
-    \"consistency\":{\"tag\":\"AtLeastAsFreshWire\",\"contents\":\"$wtoken\"},
-    \"context\":{\"values\":{}},
-    \"subject\":{\"tag\":\"SubjectIdWire\",\"contents\":{\"objectType\":\"agent\",\"objectId\":\"repo-bot\"}},
-    \"permission\":\"$perm\",
-    \"object\":{\"objectType\":\"workspace\",\"objectId\":\"shinzui/kikan\"}}" | jq -c '.decision.tag'
-done
-```
-
-Expected:
-
-```text
-can_read "AllowedWire"
-can_write "AllowedWire"
-can_bash "DeniedWire"
+ExecPlan: mori://shinzui/en/plans/27-per-action-authorization-for-agent-tool-and-sink-dispatch
+Intention: intention_01kw4y7s4jet8ad44mf6mqa8cr
 ```
 
 
 ## Validation and Acceptance
 
-The change is effective beyond compilation when all of the following are observable:
+The plan is complete only when all of these behaviors are observable through public boundaries:
 
-1. **Per-object granularity (the core claim).** With a grant for one specific object, `check`
-   returns `Allowed` for that object and `Denied` for a *different* object of the same type under the
-   same agent and permission. Demonstrated by `cabal run kikan-en-conformance` (the
-   "granted/ungranted kizashi recipient" assertions) and by the live `curl` transcript
-   (`"AllowedWire"` then `"DeniedWire"`).
-2. **Both surfaces covered.** Both a **sink** permission (`can_dispatch` on `kizashi_recipient`,
-   `kawa_source`, `danwa_thread`, `channel_egress`) and a **tool** permission (`can_read`/`can_write`/
-   `can_bash` on `workspace`) decide correctly — proving gap #7's "call at tool *and* sink dispatch".
-3. **Graded tools.** A `writer` grant yields `can_read=Allowed`, `can_write=Allowed`,
-   `can_bash=Denied`, proving per-verb granularity, not all-or-nothing.
-4. **On-behalf-of resolution.** With the caveated delegation, `can_act` is `Allowed` within the
-   autonomy/time budget and `Denied` once `current_time > until` or `requested_autonomy > autonomy`.
-   Demonstrated by the M3 conformance assertions using the local `kikan-en` request-context helpers.
-5. **Read-your-writes.** A `check` issued with `AtLeastAsFresh <write-token>` observes a grant
-   written milliseconds earlier (the live transcript depends on this).
-6. **Repository-boundary non-regression.** `git diff` in `shinzui/en` shows no Kikan policy
-   implementation changes beyond this relocation note, and `cabal test all` in `kikan-en` passes.
-   If a generic `en` prerequisite was required, its own tests in `shinzui/en` must also pass.
+1. Kikan-En builds against the recorded En commit, uses `en-migrate`, serves under `/v1`, and the
+   pre-existing sink/workspace/intention conformance matrix remains green.
+2. A request without a Shomei bearer token receives 401; one without the closed machine scope
+   receives 403; insufficiently fresh JWKS state receives 503; none reaches En.
+3. One agent granted `can_connect` on one capability revision may acquire it. A sibling revision
+   and another agent are denied.
+4. One agent granted `can_invoke` on one logical tool may invoke it. Another advertised tool from
+   the same provider and the same logical name under another capability are denied. Provider
+   connection or discovery alone never grants invocation.
+5. An allow returns a Biscuit with the exact subject, operation, resource, schema hash,
+   consistency token, audience, expiry, and request id. The client verifies it locally only for
+   the exact dispatch.
+6. Expired, tampered, wrong-subject, wrong-operation, wrong-resource, wrong-audience,
+   wrong-schema, and revoked proofs fail closed and never run the wrapped IO action.
+7. Relationship deletion prevents the next mint. An already-issued proof expires within 60
+   seconds, and the documentation states that bounded window explicitly.
+8. Shikigami keeps the C11 database gate and adds C13 at capability acquisition, tool invocation,
+   sink enqueue, and sink publish. A denial or outage produces no provider connection, tool call,
+   or sink delivery.
+9. The generated OpenAPI artifact matches the public client, all focused and full test suites
+   pass, and logs contain decision coordinates but no credentials, proof bytes, tool payloads, or
+   sink payloads.
 
-Test commands and their pass criteria: `cabal run kikan-en-conformance` exits 0 with every assertion
-line printed `ok`; `cabal test all` in `kikan-en` reports all suites passed; the `curl` transcript
-prints the exact decision tags shown above.
+Record concise output from the successful conformance run and end-to-end run in Progress and
+Outcomes & Retrospective while implementing. A compile-only result is not acceptance.
 
 
 ## Idempotence and Recovery
 
-- **Schema edits (M1)** are pure additions to a Haskell value in `kikan-en`; re-running the build recompiles
-  deterministically. If `compileSchema` throws (e.g. a permission references a missing relation),
-  the error names the offending `objectType#relation`; fix the builder call and rebuild.
-- **Tuple writes (grants)** are idempotent: `en-postgres.writeTuples` uses `INSERT … ON CONFLICT DO
-  NOTHING` against the `relation_tuple_live_unique` unique index, so writing the same grant any
-  number of times yields exactly one live edge and a fresh token each time. Re-running the M4
-  `curl`s is safe.
-- **Revocation / rollback** is `DELETE /tuples` (or `tupleStore.deleteTuples`) on the same tuple; it
-  soft-deletes (stamps `deleted_xid`) so point-in-time reads remain correct. Deleting a
-  never-written tuple is a no-op.
-- **Migrations** are idempotent: `just run-migrations` checks `to_regclass` before applying each
-  file and prints "already applied" otherwise.
-- **Server startup** fails fast and non-zero if `EN_SCHEMA_PATH` cannot be read/parsed/validated, so
-  a bad schema never serves traffic; fix the file and restart.
-- A **denied** decision at the consumer (shikigami) is recorded and the action skipped — never a
-  crash — preserving the existing fail-closed-but-keep-running behavior.
+Schema values and contract types are pure, additive Haskell changes and can be rebuilt repeatedly.
+Relationship writes remain idempotent under En’s live-tuple uniqueness rule. Revocation deletes
+the exact relationship; deleting an absent relationship is a no-op.
+
+Database setup is forward-only through pg-migrate. `en-migrate up` may be retried and concurrent
+callers serialize on the migration lock. Never edit an applied migration or repair a real database
+by dropping it. Add a new migration and use `en-migrate verify` before deployment.
+
+JWKS refresh keeps the last valid key set only within the configured maximum staleness. Cold-start
+failure and expiry of that window fail closed with unavailable. Biscuit issuer rotation is staged:
+publish/trust the new public key first, switch the Kikan issuer second, and retain the old public
+key until every proof it signed has exceeded the 60-second maximum lifetime.
+
+The client may retry unavailable authorization before any protected IO occurs. It must not retry a
+policy denial as though it were an outage, and it must generate or preserve a request id so repeated
+attempts remain attributable. A provider or sink action is never retried merely because local proof
+verification failed; obtain a fresh decision and verify it first.
+
+Rollback is fail-closed. Removing the production action authorizer or its configuration must not
+fall back to `emptyCapabilityRuntime`, static grants, declaration authority, or unchecked IO.
+Disable affected capability/sink execution until the authorizer is restored. Existing short-lived
+proofs die at their bounded expiry without a cleanup migration.
 
 
 ## Interfaces and Dependencies
 
-### `en` interfaces this plan relies on from `kikan-en`
+`kikan-en-contract` must expose an interface equivalent to:
 
-- Schema authoring — `En.Schema.Builder` (`en-core/src/En/Schema/Builder.hs`):
-  `object :: Text -> [SchemaRelation] -> Either EnError SchemaObject`,
-  `relation :: Text -> [SubjectSpec] -> Rewrite -> SchemaRelation`,
-  `permission :: Text -> PermissionRewrite -> SchemaRelation`,
-  `subject :: Text -> SubjectSpec`, `this :: Rewrite`, and the `RewriteExpr` combinators
-  `computed`, `arrow`, `anyOf`, `allOf`, `minus`, `caveated`; caveats via
-  `caveatWith :: Text -> [ParameterSpec] -> CaveatPredicate -> Either EnError CaveatSpec`,
-  `parameter`, `ctxParam`, `payloadParam`, `cmpLe`, `predAnd`; assembled with
-  `buildWithCaveats :: [CaveatSpec] -> [SchemaObject] -> Either EnError Schema`.
-- Tuples — `En.Tuple` (`en-core/src/En/Tuple.hs`):
-  `Tuple{object :: ObjectRef, relation :: RelationName, subject :: Subject, caveat :: Maybe TupleCaveat}`,
-  `ObjectRef{objectType :: ObjectType, objectId :: Text}`,
-  `Subject = SubjectId ObjectRef | SubjectSet ObjectRef RelationName | SubjectWildcard ObjectType`,
-  `TupleCaveat{name :: CaveatName, payload :: CaveatPayload}`.
-- The gate — `En.Check`
-  (`check :: ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckDecision`,
-  effects `ConsistencyStore`, `TupleStore`, `Error EnError`).
-- Decision — `En.Decision.CheckDecision = Allowed | Denied | Conditional [CaveatObligation]`.
-- Consistency — `En.Revision.Consistency = MinimizeLatency | AtLeastAsFresh ConsistencyToken | AtExactSnapshot ConsistencyToken | FullyConsistent`.
-- Compilation — `En.Reachability.compileSchema :: Schema -> Either EnError ReachabilityGraph`.
-- In-memory test interpreters — use reusable `en` in-memory `TupleStore` and `ConsistencyStore`
-  interpreters. If they are currently only available through `En.Conformance.Kikan`, expose or move
-  the generic interpreters in a separate `shinzui/en` prerequisite instead of importing Kikan
-  conformance modules as production dependencies.
-- HTTP surface (consumer-facing) — `En.Servant.API`: API `/tuples` (POST/DELETE), `/check`,
-  `/batch-check`, `/lookup`, `/expand`; DTOs `CheckRequestWire{consistency, context, subject,
-  permission, object}`, `CheckResponseWire{decision :: CheckDecisionWire}`,
-  `SubjectWire = SubjectIdWire ObjectRefWire | …`, `ObjectRefWire{objectType, objectId}`,
-  `ConsistencyWire = MinimizeLatencyWire | AtLeastAsFreshWire Text | …`,
-  `CaveatContextWire{values :: Map Text CaveatValueWire}`,
-  `WriteTuplesRequestWire{tuples :: [TupleWire]}`,
-  `WriteTuplesResponseWire{token :: Text}`. Typed client alternative: `En.Client.EnClient`.
+```haskell
+data AgentAction
+  = ConnectCapability CapabilityTarget
+  | DiscoverCapabilityTools CapabilityTarget
+  | InvokeCapabilityTool CapabilityToolTarget
+  | ReadWorkspace WorkspaceTarget
+  | WriteWorkspace WorkspaceTarget
+  | ExecuteWorkspace WorkspaceTarget
+  | DispatchSink SinkTarget
+  | ActOnIntention IntentionTarget AutonomyContext
 
-### Types/signatures that must exist at the end of each milestone
+data AuthorizeActionRequest = AuthorizeActionRequest
+  { principal :: AgentPrincipal
+  , action :: AgentAction
+  , requestId :: RequestId
+  }
 
-- M1: a `kikan-en` module such as `Kikan.En.Schema` exports `kikanSchema`; it includes object types
-  `agent`, `kawa_source`, `kizashi_recipient`,
-  `danwa_thread`, `channel_egress`, `workspace`, and the extended `intention`; permissions
-  `can_dispatch` (per sink object), `can_read`/`can_write`/`can_bash` (workspace), `can_act`
-  (intention). `compileSchema kikanSchema` is `Right _`.
-- M2: a `kikan-en` module such as `Kikan.En.Conformance.Agent` exports the agent subjects, target
-  `ObjectRef`s, and `agentGrantTuples :: [Tuple]` (including the caveated delegation).
-- M3: a `kikan-en` conformance entrypoint, for example `kikan-en-conformance`, whose assertions
-  encode the allow/deny matrix and the on-behalf-of pair.
-- M4: a reproducible HTTP transcript (the `curl`s above) demonstrating the wire contract.
-- M5: the shikigami contract — `checkAction :: AgentIdentity -> RelationName -> ObjectRef -> IO (Either Denied ())`
-  plus `checkSink`/`checkTool` wrappers and the SinkKind/ToolVerb → (permission, objectType) maps.
+data AuthorizedAction = AuthorizedAction
+  { principal :: AgentPrincipal
+  , action :: AgentAction
+  , resource :: CanonicalResource
+  , requestId :: RequestId
+  , schemaHash :: SchemaHash
+  , checkedAt :: ConsistencyToken
+  , expiresAt :: UTCTime
+  , proof :: DecisionProof
+  }
 
-### Cross-plan / cross-repo dependencies
+data IssuedActionProof = IssuedActionProof
+  { proof :: DecisionProof
+  , expiresAt :: UTCTime
+  , revocationIds :: [RevocationId]
+  , checkedAt :: ConsistencyToken
+  }
 
-- **`shomei` — scoped service tokens for agent actors** (kikan project-status gap #6, contract C11 in
-  `shinzui/kikan → docs/architecture/evolution/trust-grants.md`). Prerequisite for a *verified* agent
-  `sub` → `agent:<name>` loginId and for the `act` (on-behalf-of) claim. The issuance path exists
-  (`POST /auth/service-token`, `shinzui/shomei → docs/user/service-tokens.md`); wiring shikigami to
-  obtain and present these tokens is tracked under shomei/shikigami, not here. Until then the
-  conformance harness uses literal `agent:<name>` subjects.
-- **`shikigami` — "Built-in agent work tools and ToolEnv execution seam"** (the shikumi/shikigami
-  plan for gap #1). Defines the **tool targets** — the `ToolEnv` workspace identity that becomes the
-  `workspace:<id>` object id and the tool verbs that map to `can_read`/`can_write`/`can_bash`. This
-  plan models the targets; that plan supplies them and is where the **tool-execution** `check` call
-  site lives. The sink `check` call site lives in shikigami's sink dispatcher / run plans
-  (`shinzui/shikigami → docs/plans/3-sink-dispatcher-permission-gate-and-kawa-stub.md` and the
-  run-orchestration plan).
-- **`shikigami` — `Shikigami.Sink.Permission`** (the consumer being upgraded; full path
-  `/Users/shinzui/Keikaku/bokuno/shikigami/shikigami-core/src/Shikigami/Sink/Permission.hs`). M5 is
-  implemented there.
+data AuthorizeActionError
+  = ActionDenied Denial
+  | ActionRequestInvalid Problem
+  | ActionAuthorizationUnavailable Problem
+```
 
-### Build/test tooling
+Constructors for principals, capability ids/revisions, logical tool names, and sink targets must be
+smart constructors. The actual record access syntax follows the owning repository’s prelude and
+generic-lens conventions; the shapes above define semantics, not permission to add partial record
+construction.
 
-In `/Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en`, use `nix develop` (GHC + cabal + just +
-psql + curl + jq), `cabal build all`, `cabal run kikan-en-conformance`, and `cabal test all`. The
-project should depend on the local `en-*` packages through the workspace/cabal/Nix configuration
-rather than copying their code. Use `just process-up` / `just run-migrations` /
-`just process-down` if the bootstrapped `kikan-en` justfile exposes those targets; otherwise add
-equivalent targets that start Postgres, run the reusable `en` migrations, and launch the Kikan
-authorization server.
+`kikan-en-client` must expose an interface equivalent to:
+
+```haskell
+authorizeAgentAction
+  :: KikanEnClient
+  -> ShomeiAccessToken
+  -> AuthorizeActionRequest
+  -> IO (Either AuthorizeActionError AuthorizedAction)
+
+verifyIssuedAction
+  :: ActionProofVerifier
+  -> UTCTime
+  -> AuthorizeActionRequest
+  -> IssuedActionProof
+  -> IO (Either ActionProofError AuthorizedAction)
+```
+
+Kikan-En consumes En at exact commit
+`51edaab17473f7b9310f8802ccffd23bac5e4a9e` until a real En release is verified. It consumes the
+Shomei JWT verification vocabulary from the 0.1.0.0 tags at
+`65551cb120336b53695c0dd30ebe0e473d6efcb2`; do not claim a Hackage bound while the authoritative
+registry returns 404. Re-run both registry/tag checks immediately before implementation and update
+this section if a release appears.
+
+Shikigami’s integration consumes only `kikan-en-contract` and `kikan-en-client`. Its current
+capability descriptor, provider, lease, tool registry, Meibo principal, C11 grant store, sink
+intent, and outbox publisher stay owned by `mori://shinzui/shikigami`. MCP transport and credential
+resolution remain outside this plan; a future MCP provider automatically inherits these checks by
+registering through the already-gated capability provider/lease boundary.
+
 
 ## Revision Notes
 
-- 2026-06-29: Revised the plan to move implementation ownership from `shinzui/en` to the newly
-  bootstrapped `/Users/shinzui/Keikaku/bokuno/kikan-project/kikan-en` repository. The change keeps
-  `shinzui/en` as the reusable ReBAC engine and moves Kikan schema, fixtures, conformance, and
-  service wiring into the thin Kikan wrapper project.
+- 2026-06-29: Relocated Kikan-specific schema, fixtures, conformance, and service work from En to
+  the newly bootstrapped `mori://shinzui/kikan-en` project.
+- 2026-08-26: Refreshed the plan against current En, Kikan-En, Shikigami, and Shomei source before
+  implementation. Marked the already-delivered Kikan foundation as historical progress; replaced
+  the stale raw `/check`, static-grant replacement, agent-name, raw MCP-server, and workspace-only
+  assumptions with the current `/v1/grants` Biscuit proof, preserved C11 database gate, verified
+  Meibo principals, immutable capability overlays, exact provider/tool actions, authenticated
+  public client contract, and current migration/host seams. The revision implements
+  `mori://shinzui/kikan-en/okf/improvement-requests/concepts/IR-3` without putting Kikan policy in
+  En.
