@@ -35,6 +35,7 @@ import GHC.Clock (getMonotonicTimeNSec)
 import Network.HTTP.Types (Status (..), hContentType, methodGet, status200)
 import Network.Wai (Middleware, Request (..), responseLBS, responseStatus)
 import Numeric (showFFloat)
+import Servant.Health.Paths qualified as Health
 
 data RequestStats = RequestStats
   { count :: !Int,
@@ -89,9 +90,11 @@ metricsRoute (Metrics ref) caches inner request respond
 -- mint an unbounded number of time series by requesting random paths that 404.
 pathGroup :: Request -> Text
 pathGroup request =
-  case dropVersion (pathInfo request) of
-    segment : _ | Set.member segment knownPaths -> segment
-    _ -> "other"
+  if rawPathInfo request `elem` Health.healthRawPaths
+    then "health"
+    else case dropVersion (pathInfo request) of
+      segment : _ | Set.member segment knownPaths -> segment
+      _ -> "other"
   where
     dropVersion ("v1" : rest) = rest
     dropVersion path = path
@@ -102,11 +105,10 @@ knownPaths =
     [ "batch-check",
       "check",
       "expand",
-      "healthz",
+      "health",
       "lookup",
       "metrics",
       "openapi.json",
-      "readyz",
       "relationships"
     ]
 

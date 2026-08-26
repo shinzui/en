@@ -35,7 +35,6 @@ executable en-server
   main-is:        Main.hs
   other-modules:
     Config
-    Health
     Maintenance
     Metrics
     Middleware
@@ -59,6 +58,7 @@ executable en-server
     , hasql-pool       ^>=1.4
     , http-types
     , ram
+    , servant-health   ^>=0.1
     , text
     , time
     , unix

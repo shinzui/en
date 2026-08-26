@@ -75,7 +75,7 @@ the failure the shared body type otherwise makes invisible.
 - [x] (2026-08-26 00:23Z) Milestone 3 — Added the `servant-health:testkit` contract test,
       watched it fail against a deliberately swapped wiring, then restored the correct
       order and passed all four cases under the threaded runtime.
-- [ ] Milestone 4 — Delete `en-server/app/Health.hs` and every reference to `/healthz` and
+- [x] (2026-08-26 00:25Z) Milestone 4 — Deleted `en-server/app/Health.hs` and every reference to `/healthz` and
       `/readyz`: the middleware layer in `en-server/app/Main.hs`, the auth and rate-limit
       exemptions in `en-server/app/Middleware.hs`, the metrics path list in
       `en-server/app/Metrics.hs`, the log exclusion in `en-server/app/Observability.hs`, the
@@ -158,6 +158,13 @@ the failure the shared body type otherwise makes invisible.
   # Correct wiring
   All 4 tests passed (0.00s)
   ```
+
+- Discovery (2026-08-26, Milestone 4): **an obsolete probe path reaches authentication
+  before routing, so an unauthenticated request correctly returns 401 rather than exposing
+  whether the route exists.** Supplying the development bearer key reaches Servant and
+  proves both obsolete paths return the RFC 9457 404. The new paths remain reachable
+  without credentials and the process-compose readiness state is `Ready` at
+  `/health/ready`.
 
 (Add further entries as work proceeds.)
 
@@ -800,11 +807,17 @@ in a single response and is useless to an operator.
 Bring PostgreSQL back, wait for the pool, and confirm readiness returns to `200` with
 `failingSince` back to `null`.
 
-The old paths must be gone:
+The old paths must be gone. When authentication is enabled, supply a valid bearer key so
+the request reaches routing; without one the outer authentication middleware correctly
+answers 401 before Servant can answer 404:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/healthz   # 404
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/readyz    # 404
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H 'Authorization: Bearer <development-key>' \
+  http://127.0.0.1:8080/healthz   # 404
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H 'Authorization: Bearer <development-key>' \
+  http://127.0.0.1:8080/readyz    # 404
 ```
 
 And the probes must remain reachable without credentials — start the server with

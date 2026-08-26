@@ -34,6 +34,7 @@ import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Network.HTTP.Types (HeaderName, Status (..))
 import Network.Wai (Middleware, Request (..), mapResponseHeaders, responseStatus)
+import Servant.Health.Paths qualified as Health
 import System.IO (stdout)
 
 -- | Correlation id, accepted from an upstream proxy or minted here.
@@ -49,7 +50,7 @@ callerHeaderName = "X-En-Caller"
 -- paths with nothing to correlate.
 isProbePath :: Request -> Bool
 isProbePath request =
-  pathInfo request `elem` [["healthz"], ["readyz"]]
+  rawPathInfo request `elem` Health.healthRawPaths
 
 -- | Attach a request id to the request (for the logger and handlers) and to the
 -- response (for the client).

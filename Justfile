@@ -32,7 +32,7 @@ start-server: run-migrations
 # Wait for the process-compose en-server to be healthy, then run the HTTP smoke test
 #
 # process-compose owns the server (see process-compose.yaml); this waits on the same
-# /healthz the orchestrator's readiness probe uses rather than spawning a second
+# /health/live the orchestrator's liveness probe uses rather than spawning a second
 # server on the same port.
 [group("services")]
 start-and-test: process-up
@@ -40,11 +40,11 @@ start-and-test: process-up
     url="${EN_SERVER_URL:-http://localhost:${EN_PORT:-8080}}"; \
     ready=0; \
     for _ in $(seq 1 60); do \
-      if curl -fsS -o /dev/null "$url/healthz" 2>/dev/null; then ready=1; break; fi; \
+      if curl -fsS -o /dev/null "$url/health/live" 2>/dev/null; then ready=1; break; fi; \
       sleep 2; \
     done; \
     if [ "$ready" -ne 1 ]; then \
-      echo "en-server never answered GET /healthz with 200; last log lines:" >&2; \
+      echo "en-server never answered GET /health/live with 200; last log lines:" >&2; \
       process-compose --unix-socket {{processComposeSocket}} process logs en-server --tail 20 >&2 || true; \
       exit 1; \
     fi; \

@@ -51,7 +51,6 @@ import Hasql.Pool qualified as Pool
 import Hasql.Pool.Config qualified as Pool.Config
 import Hasql.Session (Session)
 import Hasql.Session qualified as Session
-import Health (healthRoutes)
 import Maintenance (describeMaintenance, runMaintenanceLoop)
 import Metrics (metricsMiddleware, metricsRoute, newMetrics)
 import Middleware (authMiddleware, describeRateLimit, rateLimitMiddleware)
@@ -409,7 +408,7 @@ runServe serverConfig loadedSchema pool config = do
   -- Outermost first. Authentication precedes logging so a log line can name a
   -- verified caller, and precedes rate limiting so buckets are per-caller. Request
   -- ids sit inside the limiter, so a throttled request costs no UUID. The metrics
-  -- layer wraps the health routes, so probes are counted; it cannot see the 401/403/429
+  -- layer wraps the servant application, so probes are counted; it cannot see the 401/403/429
   -- the outer middlewares short-circuit, which stay countable at the proxy.
   --
   -- Serves `appWithOpenApi`, not `app`: the former adds GET /v1/openapi.json and the
@@ -420,7 +419,6 @@ runServe serverConfig loadedSchema pool config = do
           . requestIdMiddleware
           . requestLogger
           . metricsMiddleware metrics
-          . healthRoutes checkReady
           . metricsRoute
             metrics
             [ ("tuple_read", cacheStats tupleReadCache),

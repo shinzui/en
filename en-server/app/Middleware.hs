@@ -39,6 +39,7 @@ import En.Servant.Problem
 import GHC.Clock (getMonotonicTimeNSec)
 import Network.HTTP.Types (HeaderName, hAuthorization, methodPost)
 import Network.Wai (Middleware, Request (..), Response)
+import Servant.Health.Paths qualified as Health
 
 -- | What a key is allowed to do. 'ReadOnly' keys are rejected on write routes.
 data KeyRole = ReadOnly | ReadWrite
@@ -71,7 +72,7 @@ anonymousCaller = "anonymous"
 -- cannot conveniently carry credentials. @/metrics@ is deliberately not exempt.
 isExemptPath :: Request -> Bool
 isExemptPath request =
-  pathInfo request `elem` [["healthz"], ["readyz"]]
+  rawPathInfo request `elem` Health.healthRawPaths
 
 -- | Routes that mutate the relationship graph, and so require a 'ReadWrite' key.
 --
