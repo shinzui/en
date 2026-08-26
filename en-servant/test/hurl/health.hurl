@@ -6,3 +6,12 @@ header "Content-Type" contains "application/json"
 jsonpath "$.status" == "ok"
 jsonpath "$.check" == "all"
 jsonpath "$.failingSince" exists
+
+# Readiness is also public and reports the database-backed check.
+GET {{base_url}}/health/ready
+HTTP 200
+[Asserts]
+header "Content-Type" contains "application/json"
+jsonpath "$.status" == "ok"
+jsonpath "$.check" == "all"
+jsonpath "$.failingSince" exists

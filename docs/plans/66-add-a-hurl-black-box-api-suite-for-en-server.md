@@ -65,7 +65,7 @@ point at any environment.
 - [x] (2026-08-25T19:17:14-07:00) Milestone 1 — Make Hurl available as a project tool (`pkgs.hurl` in the dev shell) and
       create the suite skeleton: directory, `README.md`, `vars.env`, `run.sh`, and a `just
       hurl` target. One trivial `health.hurl` proves the runner works end to end.
-- [ ] Milestone 2 — Cover the read surface in resource-family files: `health.hurl`,
+- [x] (2026-08-25T19:20:08-07:00) Milestone 2 — Cover the read surface in resource-family files: `health.hurl`,
       `openapi.hurl`, `checks.hurl`, `lookups.hurl`, `expands.hurl`, `schema.hurl`. Every
       file independent; every block asserting status, media type, and stable fields.
 - [ ] Milestone 3 — Cover failures: malformed bodies, unknown routes, unknown relations,
@@ -152,6 +152,17 @@ point at any environment.
   carries every one of them forward verbatim precisely so clients need not change. `detail`
   prose is explicitly request-specific and editable. A suite asserting prose would break on
   every wording improvement and would give a false sense of contract coverage.
+  Date: 2026-08-25
+
+- Decision: Inject the local-development credential into the safe runner with Hurl's
+  `--secret` option, allowing `EN_API_KEY` to override the repository's existing demo key,
+  and allow `EN_SERVER_URL` to override the tracked `base_url` default.
+  Rationale: five of the six safe resource families exercise authenticated reads, but the
+  standard forbids putting credentials in `vars.env`. The repository already publishes the
+  non-production demo key in `process-compose.yaml` and `just test-server`; passing it through
+  `--secret` preserves diagnostic redaction while keeping `just hurl` useful after
+  `just process-up`. Environment overrides let the same read-only runner target an ephemeral
+  CI service or a local alternate port without editing tracked files.
   Date: 2026-08-25
 
 (Add further entries as work proceeds.)
