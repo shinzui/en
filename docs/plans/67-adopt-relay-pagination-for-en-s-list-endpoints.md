@@ -59,7 +59,7 @@ rather than forcing four endpoints into a shape that fits two of them.
       written verdict for each of the four endpoints: convert, convert with a recorded
       deviation, or exempt with a reason. Record every verdict in the Decision Log before
       writing any conversion code.
-- [ ] Milestone 2 — Prove the database order for `POST /v1/relationships/query` is total and
+- [x] (2026-08-26T02:49:42Z) Milestone 2 — Prove the database order for `POST /v1/relationships/query` is total and
       served by the existing `relation_tuple` primary-key index; add no migration unless
       `EXPLAIN` disproves that index contract.
 - [ ] Milestone 3 — Convert the first endpoint end to end — route type, handler, hasql keyset
@@ -141,6 +141,22 @@ rather than forcing four endpoints into a shape that fits two of them.
   `authorization rejected: Timeout`. This predates pagination code and is retained as baseline
   evidence rather than treated as an EP-67 regression.
 
+- Discovery (2026-08-26, Milestone 2): **the existing primary key is the exact keyset index;
+  a migration would be redundant.** The converted order is consistency token ascending and
+  `relation_tuple.id` ascending. The token is constant within one walk, so the database order
+  reduces to the unique, non-null `id` primary key. A rolled-back 50,000-row fixture with an
+  object-type-only filter produced:
+
+  ```text
+  Limit
+    ->  Index Scan using relation_tuple_pkey on relation_tuple
+          Index Cond: (id > 0)
+          Filter: ((object_type = 'ep67-probe'::text) AND ...)
+  ```
+
+  The probe used the least selective legal filter shape and still avoided a sort; the
+  transaction was rolled back, leaving no fixture rows. No append-only migration is needed.
+
 (Add further entries as work proceeds.)
 
 
@@ -219,6 +235,14 @@ rather than forcing four endpoints into a shape that fits two of them.
   detail in `RelayPageError.code` and `.message`; pagination-specific failures keep the released
   Relay codes. The exemption is exact to this route and this status—its 412, 422, 500, and 503
   responses remain problem documents.
+  Date: 2026-08-26
+
+- Decision: Do not add a pagination migration; use `relation_tuple_pkey` for the total order.
+  Rationale: `relation_tuple.id` is a non-null `bigserial PRIMARY KEY`, the existing relationship
+  query already orders and seeks on it, and `EXPLAIN` over 50,000 rolled-back rows selected an
+  index scan on `relation_tuple_pkey` even for the broad object-type-only filter. The consistency
+  token is a constant first cursor key that pins the walk but contributes no varying database
+  order. Adding another `(id)` index would duplicate the primary key without changing a plan.
   Date: 2026-08-26
 
 (Add further entries as work proceeds; Milestone 1's four verdicts belong here.)
