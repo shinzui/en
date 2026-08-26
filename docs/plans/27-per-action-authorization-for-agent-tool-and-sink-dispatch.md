@@ -59,8 +59,10 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
 - [x] 2026-08-26 — Refresh discovery: re-read the current En, Kikan-En, Shikigami, and Shomei
   sources through Mori; verified the released/tagged dependency state; reviewed relevant local
   ADRs; and replaced the June implementation assumptions in this plan.
-- [ ] M1 — Rebase Kikan-En’s host and migration commands on the current En seam at commit
-  `51edaab17473f7b9310f8802ccffd23bac5e4a9e`, preserving the already-working policy behavior.
+- [x] 2026-08-26 — M1: verified Kikan-En’s independently-landed rebase on En commit
+  `51edaab17473f7b9310f8802ccffd23bac5e4a9e`. `cabal build all --enable-tests`, the unit
+  suite, the 16-case conformance executable, `en-migrate up`/`verify`, the live `/v1` Hurl
+  suite, and the stateful relationship-adoption flow all pass.
 - [ ] M2 — Add the closed action vocabulary, canonical capability-provider/tool targets, and
   corresponding Kikan schema relations and conformance fixtures.
 - [ ] M3 — Add a Shomei-authenticated, proof-minting Kikan action endpoint plus small public
@@ -120,6 +122,14 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   `65551cb120336b53695c0dd30ebe0e473d6efcb2`, although the corresponding Hackage package URL is
   not yet published. Kikan-En must therefore use that exact upstream tag/commit rather than invent
   a version bound.
+  Date: 2026-08-26.
+
+- Discovery: the coordinating En development shell exports its own `EN_DATABASE_URL`, and port
+  8080 was already occupied. Those ambient values can redirect Kikan-En’s otherwise-correct local
+  lifecycle to En’s PostgreSQL socket or another HTTP server. The isolated validation command was
+  `env -u EN_DATABASE_URL KIKAN_EN_CI_PORT=18080 nix develop -c just ci`; it completed with one
+  applied migration, zero pending migrations, seven safe Hurl requests, and five stateful
+  relationship requests passing.
   Date: 2026-08-26.
 
 
