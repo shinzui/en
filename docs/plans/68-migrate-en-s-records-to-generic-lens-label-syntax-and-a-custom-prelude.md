@@ -61,8 +61,10 @@ artifact is identical" is the only acceptance criterion that means anything.
       its test suite. The golden wire suite passed after every production-module slice, the
       full repository build and all eight suites passed, and the generated OpenAPI document
       retained the baseline SHA-256 byte for byte.
-- [ ] Milestone 4 — `en-postgres` (9 modules), including the integration test and the lookup
-      spike.
+- [x] (2026-08-25 21:35-0700) Milestone 4 — Migrated `en-postgres` (9 modules), including
+      the integration test and lookup spike. The real ephemeral-PostgreSQL integration suite,
+      all eight repository suites, and the full build passed; embedded SQL remained outside
+      rewrite ranges and OpenAPI retained the baseline SHA-256.
 - [ ] Milestone 5 — `en-core` (36 modules), the largest package and the one every other
       depends on.
 - [ ] Milestone 6 — Remove `OverloadedRecordDot` and `NoFieldSelectors` from every cabal
@@ -141,6 +143,18 @@ artifact is identical" is the only acceptance criterion that means anything.
   Aeson options do not expose the `Generic` representation needed by generic-lens. Their
   packages' exported selectors and record updates remain the behavior-preserving access
   surface; wrapping them would be an unrelated interface change.
+
+- Discovery (2026-08-25, Milestone 4): **multiline SQL can be protected mechanically without
+  weakening the conversion.** The PostgreSQL sweep tracked GHC multiline-string state and
+  skipped every line in an embedded SQL literal, then used compilation to find Haskell lines
+  skipped because they also contained ordinary strings. The real database suite passed after
+  the conversion, so the resulting coverage did not require rewriting or reformatting SQL.
+
+- Discovery (2026-08-25, Milestone 4): **the PostgreSQL interpreter expanded the early
+  `Generic` support set again.** `TokenMetadata`, `StoreCursor`, `TupleRowId`, `TuplePage`,
+  `UsersetQuery`, `TupleFilter`, `RelationshipFilter`, `TupleWriteRequest`, and `ObjectRef`
+  gained stock `Generic` instances when their migrated consumers first needed them. As in
+  Milestone 2, these instances change neither representation nor behavior.
 
 (Add further entries as work proceeds.)
 
