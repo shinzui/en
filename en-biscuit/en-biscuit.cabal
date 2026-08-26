@@ -50,6 +50,7 @@ library
     , effectful
     , effectful-core
     , en-core
+    , generic-lens     >=2.2  && <2.4
     , text
     , time
 
@@ -64,6 +65,7 @@ executable en-verify-grant
     , containers
     , en-biscuit
     , en-core
+    , generic-lens     >=2.2  && <2.4
     , text
     , time
 
@@ -81,5 +83,6 @@ test-suite en-biscuit-tests
     , effectful-core
     , en-biscuit
     , en-core
+    , generic-lens     >=2.2 && <2.4
     , text
     , time

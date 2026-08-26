@@ -81,18 +81,17 @@ import Auth.Biscuit
   )
 import Auth.Biscuit.Datalog.AST (Query)
 import Auth.Biscuit.Datalog.Executor (Bindings)
-import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
+import Data.Generics.Labels ()
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Time (UTCTime)
 import En.Biscuit.Grant (Audience (..), RequestId (..), RevocationId (..))
 import En.Biscuit.Keys (IssuerKeySet, selectIssuerKey)
+import En.Prelude hiding (op)
 import En.Revision (ConsistencyToken (..), SchemaHash (..))
 import En.Schema (ObjectType (..), RelationName (..))
 import En.Tuple (ObjectRef (..), Subject (..))
@@ -135,6 +134,7 @@ data VerifyRequest m = VerifyRequest
     --     pass @const (pure False)@ if you do not maintain a revocation set.
     revokedBlockIds :: Set ByteString -> m Bool
   }
+  deriving stock (Generic)
 
 -- | The scope a verified grant authorizes.
 data VerifiedScope
@@ -142,7 +142,7 @@ data VerifiedScope
     VerifiedObject ObjectRef
   | -- | A scoped grant: any of these containers.
     VerifiedContainers [ObjectRef]
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | The facts recovered from a successfully verified token, so a handler can log
 -- or propagate them without re-parsing.
@@ -156,7 +156,7 @@ data VerifiedGrant = VerifiedGrant
     expiresAt :: UTCTime,
     requestId :: Maybe RequestId
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | Why a token was rejected. Every constructor is a fail-closed rejection.
 data EnBiscuitVerifyError
@@ -205,7 +205,7 @@ verifyGrant keySet token request = do
           -- token's built-in block revocation ids before any block is
           -- decoded, so every token is revocable regardless of whether it
           -- carries an application-level en_revocation_id.
-          isRevoked = request.revokedBlockIds,
+          isRevoked = (request ^. #revokedBlockIds),
           getPublicKey = selectIssuerKey keySet
         }
       token
@@ -218,7 +218,7 @@ verifyGrant keySet token request = do
       case extractAndCheck biscuit request of
         Left err -> pure (Left err)
         Right (grant, mRevocationId) -> do
-          appRevoked <- maybe (pure False) request.revoked mRevocationId
+          appRevoked <- maybe (pure False) (request ^. #revoked) mRevocationId
           if appRevoked
             then pure (Left Revoked)
             else do
@@ -258,12 +258,12 @@ extractAndCheck biscuit request = do
 
   (operation, scope) <- resolveScope biscuit
 
-  assertThat (request.now < expiresAt) Expired
-  assertThat (subject == request.expectedSubject) WrongSubject
-  assertThat (audience == request.expectedAudience) WrongAudience
-  assertThat (schemaHash `Set.member` request.acceptedSchemaHashes) UnacceptedSchemaHash
-  assertThat (operation == request.operation) OperationNotAuthorized
-  assertThat (resourceInScope request.resource scope) ResourceNotInScope
+  assertThat ((request ^. #now) < expiresAt) Expired
+  assertThat (subject == (request ^. #expectedSubject)) WrongSubject
+  assertThat (audience == (request ^. #expectedAudience)) WrongAudience
+  assertThat (schemaHash `Set.member` (request ^. #acceptedSchemaHashes)) UnacceptedSchemaHash
+  assertThat (operation == (request ^. #operation)) OperationNotAuthorized
+  assertThat (resourceInScope (request ^. #resource) scope) ResourceNotInScope
 
   pure
     ( VerifiedGrant
@@ -321,10 +321,10 @@ runRestrictions ::
   VerifyRequest m ->
   m (Either EnBiscuitVerifyError ())
 runRestrictions biscuit request = do
-  let RelationName operationText = request.operation
-      ObjectRef (ObjectType resourceType) resourceId = request.resource
-      Audience serviceText = request.serviceName
-      nowValue = request.now
+  let RelationName operationText = (request ^. #operation)
+      ObjectRef (ObjectType resourceType) resourceId = (request ^. #resource)
+      Audience serviceText = (request ^. #serviceName)
+      nowValue = (request ^. #now)
       ambient =
         [authorizer|
               operation({operationText});
@@ -351,7 +351,7 @@ data Attenuation = Attenuation
     -- | Restrict the token to expire no later than this time.
     narrowedExpiry :: Maybe UTCTime
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | An attenuation that narrows nothing; set the fields you want to restrict.
 noAttenuation :: Attenuation
@@ -380,10 +380,10 @@ attenuationBlock :: Attenuation -> Block
 attenuationBlock attenuation =
   mconcat $
     catMaybes
-      [ serviceCheck <$> attenuation.narrowedService,
-        operationCheck <$> attenuation.narrowedOperation,
-        resourceCheck <$> attenuation.narrowedResource,
-        expiryCheck <$> attenuation.narrowedExpiry
+      [ serviceCheck <$> (attenuation ^. #narrowedService),
+        operationCheck <$> (attenuation ^. #narrowedOperation),
+        resourceCheck <$> (attenuation ^. #narrowedResource),
+        expiryCheck <$> (attenuation ^. #narrowedExpiry)
       ]
   where
     serviceCheck (Audience aud) = [block|check if service($s), $s == {aud};|]

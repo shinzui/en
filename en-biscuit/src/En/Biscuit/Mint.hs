@@ -58,10 +58,9 @@ module En.Biscuit.Mint
 where
 
 import Auth.Biscuit (SecretKey, getRevocationIds, mkBiscuitWith, serializeB64)
-import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString)
-import Data.List.NonEmpty (NonEmpty)
-import Data.Time (NominalDiffTime, UTCTime, addUTCTime)
+import Data.Generics.Labels ()
+import Data.Time (NominalDiffTime, addUTCTime)
 import Effectful (Eff, IOE, (:>))
 import Effectful.Error.Static (runErrorNoCallStack)
 import En.Biscuit.Grant
@@ -72,11 +71,12 @@ import En.Biscuit.Grant
     grantBlock,
   )
 import En.Biscuit.Keys (IssuerKeyId (..))
-import En.Check (CheckOutcome (..), check)
+import En.Check (check)
 import En.Decision (CaveatObligation, CheckDecision (..))
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError)
+import En.Prelude
 import En.Reachability (ReachabilityGraph)
 import En.Revision (Consistency)
 import En.Tuple (CaveatContext)
@@ -100,6 +100,7 @@ data MintConfig m = MintConfig
     --     tests.
     now :: m UTCTime
   }
+  deriving stock (Generic)
 
 -- | A freshly minted token and the metadata an issuer needs to track it. All
 -- mint functions return this so a caller can record what it just handed out — in
@@ -117,7 +118,7 @@ data MintedGrant = MintedGrant
     --     an application-level revocation id.
     revocationIds :: NonEmpty ByteString
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | Why a grant did not produce a token. Every constructor is a non-mint.
 data EnBiscuitMintError
@@ -198,13 +199,13 @@ mintScopedGrantWithExpiry config expiry maxContainers grant
   | n > maxContainers = pure (Left (LookupScopeTooLarge maxContainers n))
   | otherwise = signGrant config expiry (ScopedGrant (withScopedExpiry expiry grant))
   where
-    n = length grant.containers
+    n = length (grant ^. #containers)
 
 -- | The token expiry the non-explicit mint functions use: @now + defaultTtl@.
 resolveExpiry :: (Monad m) => MintConfig m -> m UTCTime
 resolveExpiry config = do
-  t <- config.now
-  pure (addUTCTime config.defaultTtl t)
+  t <- (config ^. #now)
+  pure (addUTCTime (config ^. #defaultTtl) t)
 
 -- | Run @en.check@ for the grant's subject/permission/object and mint on
 -- 'Allowed'. Engine errors become 'EngineError' (the token is not minted); the
@@ -224,45 +225,52 @@ mintCheckedObjectGrant ::
 mintCheckedObjectGrant config graph consistency context grant = do
   outcome <-
     runErrorNoCallStack @EnError
-      (check graph consistency context grant.subject grant.permission grant.object)
+      ( check
+          graph
+          consistency
+          context
+          (grant ^. #subject)
+          (grant ^. #permission)
+          (grant ^. #object)
+      )
   case outcome of
     Left enErr -> pure (Left (EngineError enErr))
     -- 'checked.checkedAt' names the snapshot this decision was made at, and is
     -- not necessarily 'grant.consistencyToken', which the caller chose. Stamping
     -- the grant with it is the right thing and is deliberately not done here:
     -- see docs/plans/57-mint-biscuit-grants-over-http.md.
-    Right checked -> mintObjectGrant config checked.decision grant
+    Right checked -> mintObjectGrant config (checked ^. #decision) grant
 
 -- | Rebuild an 'EnGrant' with a new expiry. Record /construction/ (not update)
 -- so no @-Wambiguous-fields@ from the field name shared with 'EnScopedGrant'.
 withObjectExpiry :: UTCTime -> EnGrant -> EnGrant
 withObjectExpiry expiry g =
   EnGrant
-    { subject = g.subject,
-      permission = g.permission,
-      object = g.object,
-      consistencyToken = g.consistencyToken,
-      schemaHash = g.schemaHash,
+    { subject = (g ^. #subject),
+      permission = (g ^. #permission),
+      object = (g ^. #object),
+      consistencyToken = (g ^. #consistencyToken),
+      schemaHash = (g ^. #schemaHash),
       expiresAt = expiry,
-      audience = g.audience,
-      requestId = g.requestId,
-      revocationId = g.revocationId
+      audience = (g ^. #audience),
+      requestId = (g ^. #requestId),
+      revocationId = (g ^. #revocationId)
     }
 
 -- | Rebuild an 'EnScopedGrant' with a new expiry. See 'withObjectExpiry'.
 withScopedExpiry :: UTCTime -> EnScopedGrant -> EnScopedGrant
 withScopedExpiry expiry g =
   EnScopedGrant
-    { subject = g.subject,
-      permission = g.permission,
-      objectType = g.objectType,
-      containers = g.containers,
-      consistencyToken = g.consistencyToken,
-      schemaHash = g.schemaHash,
+    { subject = (g ^. #subject),
+      permission = (g ^. #permission),
+      objectType = (g ^. #objectType),
+      containers = (g ^. #containers),
+      consistencyToken = (g ^. #consistencyToken),
+      schemaHash = (g ^. #schemaHash),
       expiresAt = expiry,
-      audience = g.audience,
-      requestId = g.requestId,
-      revocationId = g.revocationId
+      audience = (g ^. #audience),
+      requestId = (g ^. #requestId),
+      revocationId = (g ^. #revocationId)
     }
 
 -- | Encode a grant to facts and sign them into a serialized Biscuit under the
@@ -279,7 +287,7 @@ signGrant config expiry grant =
   case grantBlock grant of
     Left err -> pure (Left (GrantEncodingError err))
     Right blk -> do
-      biscuit <- liftIO (mkBiscuitWith (Just keyId) config.issuerSecretKey blk)
+      biscuit <- liftIO (mkBiscuitWith (Just keyId) (config ^. #issuerSecretKey) blk)
       pure
         ( Right
             MintedGrant
@@ -289,4 +297,4 @@ signGrant config expiry grant =
               }
         )
   where
-    IssuerKeyId keyId = config.issuerKeyId
+    IssuerKeyId keyId = (config ^. #issuerKeyId)

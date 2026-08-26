@@ -67,8 +67,8 @@ where
 
 import Auth.Biscuit (Block, block)
 import Auth.Biscuit.Datalog.AST (renderBlock)
-import Data.Text (Text)
-import Data.Time (UTCTime)
+import Data.Generics.Labels ()
+import En.Prelude
 import En.Revision (ConsistencyToken (..), SchemaHash (..))
 import En.Schema (ObjectType (..), RelationName (..))
 import En.Tuple (ObjectRef (..), Subject (..))
@@ -76,17 +76,17 @@ import En.Tuple (ObjectRef (..), Subject (..))
 -- | The service (or set of services) a grant is intended for. Verifiers reject a
 -- token whose 'Audience' does not match their own.
 newtype Audience = Audience Text
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Generic, Eq, Ord, Show)
 
 -- | An optional correlation id tying a grant back to the request that produced
 -- the @en@ decision.
 newtype RequestId = RequestId Text
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Generic, Eq, Ord, Show)
 
 -- | An optional revocation id, so a verifier can reject a specific token even
 -- before its expiry (via a revocation list).
 newtype RevocationId = RevocationId Text
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Generic, Eq, Ord, Show)
 
 -- | A grant for a single concrete object: @subject@ may perform @permission@ on
 -- @object@. This is the Biscuit counterpart of a successful @en.check@.
@@ -101,7 +101,7 @@ data EnGrant = EnGrant
     requestId :: Maybe RequestId,
     revocationId :: Maybe RevocationId
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | A grant scoped to a set of containers: @subject@ may perform @permission@ on
 -- objects of @objectType@ that live inside any of @containers@. This is the
@@ -119,7 +119,7 @@ data EnScopedGrant = EnScopedGrant
     requestId :: Maybe RequestId,
     revocationId :: Maybe RevocationId
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | Either kind of grant. Minting and verification are defined over this sum.
 data EnBiscuitGrant
@@ -142,40 +142,40 @@ data EnBiscuitError
 -- Returns 'Left' 'UnsupportedSubject' for non-concrete subjects.
 grantBlock :: EnBiscuitGrant -> Either EnBiscuitError Block
 grantBlock (ObjectGrant g) = do
-  subjectB <- subjectFact g.subject
-  let RelationName perm = g.permission
-      (objType, objId) = objectRefParts g.object
+  subjectB <- subjectFact (g ^. #subject)
+  let RelationName perm = (g ^. #permission)
+      (objType, objId) = objectRefParts (g ^. #object)
       rightB = [block|en_right({objType}, {objId}, {perm});|]
   pure $
     mconcat
       [ subjectB,
         rightB,
         metaFacts
-          g.consistencyToken
-          g.schemaHash
-          g.expiresAt
-          g.audience
-          g.requestId
-          g.revocationId
+          (g ^. #consistencyToken)
+          (g ^. #schemaHash)
+          (g ^. #expiresAt)
+          (g ^. #audience)
+          (g ^. #requestId)
+          (g ^. #revocationId)
       ]
 grantBlock (ScopedGrant g) = do
-  subjectB <- subjectFact g.subject
-  let RelationName perm = g.permission
-      ObjectType objType = g.objectType
+  subjectB <- subjectFact (g ^. #subject)
+  let RelationName perm = (g ^. #permission)
+      ObjectType objType = (g ^. #objectType)
       scopedRightB = [block|en_scoped_right({objType}, {perm});|]
-      containerB = mconcat (containerFact <$> g.containers)
+      containerB = mconcat (containerFact <$> (g ^. #containers))
   pure $
     mconcat
       [ subjectB,
         scopedRightB,
         containerB,
         metaFacts
-          g.consistencyToken
-          g.schemaHash
-          g.expiresAt
-          g.audience
-          g.requestId
-          g.revocationId
+          (g ^. #consistencyToken)
+          (g ^. #schemaHash)
+          (g ^. #expiresAt)
+          (g ^. #audience)
+          (g ^. #requestId)
+          (g ^. #revocationId)
       ]
 
 -- | Render a grant to its Datalog fact text, exactly as it appears in the signed

@@ -42,22 +42,20 @@ import Auth.Biscuit
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as Char8
 import Data.Char (isSpace)
+import Data.Generics.Labels ()
 import Data.Set qualified as Set
-import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Time (getCurrentTime)
 import En.Biscuit.Grant (Audience (..), RequestId (..))
 import En.Biscuit.Keys (IssuerKeySet, parseIssuerKeySetText, selectIssuerKey)
 import En.Biscuit.Verify
-  ( Attenuation (..),
-    EnBiscuitVerifyError (..),
-    VerifiedGrant (..),
+  ( EnBiscuitVerifyError (..),
     VerifiedScope (..),
     VerifyRequest (..),
     attenuateGrant,
     noAttenuation,
     verifyGrant,
   )
+import En.Prelude hiding (op)
 import En.Revision (SchemaHash (..))
 import En.Schema (ObjectType (..), RelationName (..))
 import En.Tuple (ObjectRef (..), Subject (..))
@@ -76,6 +74,7 @@ data Args = Args
     schemaHash :: !SchemaHash,
     attenuateService :: !(Maybe Audience)
   }
+  deriving stock (Generic)
 
 main :: IO ()
 main = do
@@ -87,35 +86,35 @@ main = do
 
   let request svc =
         VerifyRequest
-          { expectedSubject = args.subject,
-            expectedAudience = args.audience,
-            operation = args.operation,
-            resource = args.resource,
+          { expectedSubject = (args ^. #subject),
+            expectedAudience = (args ^. #audience),
+            operation = (args ^. #operation),
+            resource = (args ^. #resource),
             serviceName = svc,
-            acceptedSchemaHashes = Set.singleton args.schemaHash,
+            acceptedSchemaHashes = Set.singleton (args ^. #schemaHash),
             now = now,
             revoked = const (pure False),
             revokedBlockIds = const (pure False)
           }
 
   -- 1. Verify the token as received.
-  verifyGrant keySet token (request args.service) >>= \case
+  verifyGrant keySet token (request (args ^. #service)) >>= \case
     Left err -> die ("REJECTED: " <> show err)
     Right grant ->
       putStrLn
         ( "verified: subject="
-            <> T.unpack (renderSubject grant.subject)
+            <> T.unpack (renderSubject (grant ^. #subject))
             <> " operation="
-            <> T.unpack (renderOperation grant.operation)
+            <> T.unpack (renderOperation (grant ^. #operation))
             <> " resource="
-            <> T.unpack (renderScope grant.scope)
+            <> T.unpack (renderScope (grant ^. #scope))
             <> " expires="
-            <> show grant.expiresAt
-            <> maybe "" (\(RequestId r) -> " requestId=" <> T.unpack r) grant.requestId
+            <> show (grant ^. #expiresAt)
+            <> maybe "" (\(RequestId r) -> " requestId=" <> T.unpack r) (grant ^. #requestId)
         )
 
   -- 2. Offline attenuation demonstration, if asked.
-  case args.attenuateService of
+  case (args ^. #attenuateService) of
     Nothing -> pure ()
     Just narrowedSvc -> demonstrateAttenuation keySet token request narrowedSvc
 
@@ -129,7 +128,7 @@ demonstrateAttenuation ::
   IO ()
 demonstrateAttenuation keySet token request narrowedSvc = do
   open <- either (die . ("could not re-parse token as Open: " <>)) pure =<< parseOpen keySet token
-  narrowed <- attenuateGrant noAttenuation {narrowedService = Just narrowedSvc} open
+  narrowed <- attenuateGrant (noAttenuation & #narrowedService ?~ narrowedSvc) open
   let narrowedToken = serializeB64 narrowed
 
   -- The narrowed service must still verify.

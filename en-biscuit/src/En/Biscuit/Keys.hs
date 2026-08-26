@@ -47,14 +47,14 @@ import Auth.Biscuit
     parseSecretKeyHex,
     serializePublicKeyHex,
   )
+import Data.Generics.Labels ()
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe)
 import Data.Ord (Down (..))
-import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
+import En.Prelude
 import Text.Read (readMaybe)
 
 -- | The integer identifier stamped into a minted token's Biscuit envelope and
@@ -73,7 +73,7 @@ data IssuerKeySet = IssuerKeySet
     --     key ids). 'Nothing' means such tokens are rejected.
     legacyKey :: Maybe PublicKey
   }
-  deriving stock (Eq, Show)
+  deriving stock (Generic, Eq, Show)
 
 -- | A keyset trusting exactly one key id and no legacy key.
 singleKey :: IssuerKeyId -> PublicKey -> IssuerKeySet
@@ -96,16 +96,16 @@ singleKey keyId public =
 selectIssuerKey :: IssuerKeySet -> Maybe Int -> PublicKey
 selectIssuerKey keySet mRootKeyId =
   case mRootKeyId of
-    Nothing -> fromMaybe fallback keySet.legacyKey
+    Nothing -> fromMaybe fallback (keySet ^. #legacyKey)
     Just rootKeyId ->
-      fromMaybe fallback (Map.lookup (IssuerKeyId rootKeyId) keySet.keysById)
+      fromMaybe fallback (Map.lookup (IssuerKeyId rootKeyId) (keySet ^. #keysById))
   where
     -- The highest-id trusted key: deterministic and independent of the token,
     -- so an attacker cannot choose it. Falls back to the legacy key only if the
     -- id map is somehow empty, which the constructors forbid.
-    fallback = case Map.lookupMax keySet.keysById of
+    fallback = case Map.lookupMax (keySet ^. #keysById) of
       Just (_, public) -> public
-      Nothing -> case keySet.legacyKey of
+      Nothing -> case (keySet ^. #legacyKey) of
         Just public -> public
         Nothing -> error "En.Biscuit.Keys.selectIssuerKey: empty IssuerKeySet"
 
@@ -154,9 +154,9 @@ renderIssuerKeySetText keySet =
   where
     keyedEntries =
       [ T.pack (show n) <> ":" <> hexOf public
-      | (IssuerKeyId n, public) <- sortOn (Down . fst) (Map.toList keySet.keysById)
+      | (IssuerKeyId n, public) <- sortOn (Down . fst) (Map.toList (keySet ^. #keysById))
       ]
-    legacyEntry = case keySet.legacyKey of
+    legacyEntry = case (keySet ^. #legacyKey) of
       Nothing -> []
       Just public -> ["legacy:" <> hexOf public]
     hexOf = decodeUtf8 . serializePublicKeyHex

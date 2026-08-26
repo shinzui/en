@@ -45,15 +45,14 @@ import Auth.Biscuit
   )
 import Auth.Biscuit.Datalog.AST (Query)
 import Auth.Biscuit.Datalog.Executor (Bindings)
-import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Generics.Labels ()
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
@@ -81,7 +80,6 @@ import En.Biscuit.Keys
 import En.Biscuit.Mint
   ( EnBiscuitMintError (..),
     MintConfig (..),
-    MintedGrant (..),
     mintCheckedObjectGrant,
     mintObjectGrant,
     mintScopedGrant,
@@ -105,6 +103,7 @@ import En.Decision (CaveatObligation (..), CheckDecision (..))
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
 import En.Error (EnError)
+import En.Prelude hiding (op)
 import En.Revision (Consistency (..), ConsistencyToken (..), SchemaHash (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
 import En.Tuple (CaveatContext (..), ObjectRef (..), Subject (..))
@@ -310,7 +309,7 @@ mintAllowedTest = do
       config = MintConfig {issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
   result <- mintObjectGrant config Allowed sampleObjectGrant
   bytes <- case result of
-    Right b -> pure b.token
+    Right b -> pure (b ^. #token)
     Left e -> die ("mint allowed: expected a token, got " <> show e)
   biscuit <- either (die . show) pure (parseB64 public bytes)
   -- One authorization proves en_right + consistency token + schema hash are
@@ -364,7 +363,7 @@ mintScopedTest = do
           }
   ok <- mintScopedGrant config 5 grant
   bytes <- case ok of
-    Right b -> pure b.token
+    Right b -> pure (b ^. #token)
     Left e -> die ("mint scoped: expected a token, got " <> show e)
   biscuit <- either (die . show) pure (parseB64 public bytes)
   auth <-
@@ -383,7 +382,7 @@ mintScopedTest = do
   tooBig <- mintScopedGrant config 1 grant
   assertEqual "mint scoped rejects oversized scope" (Left (LookupScopeTooLarge 1 2)) tooBig
 
-  emptyScope <- mintScopedGrant config 5 grant {containers = []}
+  emptyScope <- mintScopedGrant config 5 (grant & #containers .~ [])
   assertEqual "mint scoped rejects empty scope" (Left EmptyLookupScope) emptyScope
 
 -- | The @effectful@ convenience runs @en.check@: it mints on 'Allowed' and
@@ -413,7 +412,7 @@ mintCheckedTest = do
         emptyCtx
         allowedGrant
   bytes <- case allowed of
-    Right b -> pure b.token
+    Right b -> pure (b ^. #token)
     Left e -> die ("mint checked allowed: expected a token, got " <> show e)
   biscuit <- either (die . show) pure (parseB64 public bytes)
   auth <- authorizeBiscuit biscuit [authorizer|allow if en_right("space", "project-x", "view");|]
@@ -443,7 +442,7 @@ keyIdRoundTripTest = do
   let public = toPublic secret
       config = MintConfig {issuerSecretKey = secret, issuerKeyId = IssuerKeyId 7, defaultTtl = 3600, now = pure sampleExpiry}
   minted <- either (die . show) pure =<< mintObjectGrant config Allowed sampleObjectGrant
-  case parseB64 public minted.token of
+  case parseB64 public (minted ^. #token) of
     Right _ -> pure ()
     Left e ->
       die ("key id round-trip: token minted under key id 7 must verify with the matching public key, got " <> show e)
@@ -468,7 +467,7 @@ verifyObjectTests = do
             revocationId = Just (RevocationId "rev-1")
           }
   minted <- either (die . show) pure =<< mintObjectGrant config Allowed grant
-  let token = minted.token
+  let token = (minted ^. #token)
 
   let ok =
         mkVerifyRequest
@@ -483,21 +482,23 @@ verifyObjectTests = do
 
   valid <- verifyGrant (keySetFor public) token ok
   case valid of
-    Right VerifiedGrant {subject = s, operation = op} -> do
+    Right verified -> do
+      let s = verified ^. #subject
+          op = verified ^. #operation
       assertEqual "verify: recovered subject" aliceSubject s
       assertEqual "verify: recovered operation" (RelationName "view") op
     Left e -> die ("verify valid: expected success, got " <> show e)
 
   assertVerifyError "wrong audience" WrongAudience
-    =<< verifyGrant (keySetFor public) token ok {expectedAudience = Audience "other-service"}
+    =<< verifyGrant (keySetFor public) token (ok & #expectedAudience .~ Audience "other-service")
   assertVerifyError "wrong subject" WrongSubject
-    =<< verifyGrant (keySetFor public) token ok {expectedSubject = SubjectId (ObjectRef (ObjectType "user") "bob")}
+    =<< verifyGrant (keySetFor public) token (ok & #expectedSubject .~ SubjectId (ObjectRef (ObjectType "user") "bob"))
   assertVerifyError "wrong resource" ResourceNotInScope
-    =<< verifyGrant (keySetFor public) token ok {resource = ObjectRef (ObjectType "document") "other"}
+    =<< verifyGrant (keySetFor public) token (ok & #resource .~ ObjectRef (ObjectType "document") "other")
   assertVerifyError "unaccepted schema" UnacceptedSchemaHash
-    =<< verifyGrant (keySetFor public) token ok {acceptedSchemaHashes = Set.singleton (SchemaHash "sha-zzz")}
+    =<< verifyGrant (keySetFor public) token (ok & #acceptedSchemaHashes .~ Set.singleton (SchemaHash "sha-zzz"))
   assertVerifyError "revoked" Revoked
-    =<< verifyGrant (keySetFor public) token ok {revoked = \r -> pure (r == RevocationId "rev-1")}
+    =<< verifyGrant (keySetFor public) token (ok & #revoked .~ \r -> pure (r == RevocationId "rev-1"))
 
   -- Expired needs a request clock after expiry (now + defaultTtl = 01:00Z).
   let expiredReq =
@@ -536,7 +537,7 @@ verifyScopedTests = do
             revocationId = Nothing
           }
   minted <- either (die . show) pure =<< mintScopedGrant config 5 grant
-  let token = minted.token
+  let token = (minted ^. #token)
 
   inScope <-
     verifyGrant (keySetFor public) token $
@@ -581,8 +582,8 @@ keyRotationTest = do
         MintConfig {issuerSecretKey = secret, issuerKeyId = keyId, defaultTtl = 3600, now = pure sampleExpiry}
   mintedA <- either (die . show) pure =<< mintObjectGrant (configFor secretA (IssuerKeyId 1)) Allowed forgeableObjectGrant
   mintedB <- either (die . show) pure =<< mintObjectGrant (configFor secretB (IssuerKeyId 2)) Allowed forgeableObjectGrant
-  let ta = mintedA.token
-      tb = mintedB.token
+  let ta = (mintedA ^. #token)
+      tb = (mintedB ^. #token)
 
   -- Overlap window: one keyset trusts both keys. Constructed once, used twice.
   let overlap =
@@ -656,7 +657,7 @@ blockRevocationTest = do
 
   -- A token carrying no application revocation id.
   minted <- either (die . show) pure =<< mintObjectGrant config Allowed (forgeableObjectGrantWith Nothing)
-  let token = minted.token
+  let token = (minted ^. #token)
 
   assertVerified "block revocation: token with no en_revocation_id verifies with an empty revocation set"
     =<< verifyGrant (keySetFor public) token roadmapRequest
@@ -664,22 +665,25 @@ blockRevocationTest = do
     =<< verifyGrant
       (keySetFor public)
       token
-      roadmapRequest {revokedBlockIds = fromRevocationList minted.revocationIds}
+      ( roadmapRequest
+          & #revokedBlockIds
+          .~ fromRevocationList (minted ^. #revocationIds)
+      )
 
   -- Attenuation appends a block, so the child has one more revocation id than
   -- the parent. Revoking only that added id must kill the child, not the parent.
   grantBlk <- either (die . show) pure (grantBlock (ObjectGrant (forgeableObjectGrantWith Nothing)))
   parentBiscuit <- mkBiscuitWith (Just 1) secret grantBlk
-  childBiscuit <- attenuateGrant noAttenuation {narrowedService = Just (Audience "billing-service")} parentBiscuit
+  childBiscuit <- attenuateGrant (noAttenuation & #narrowedService ?~ Audience "billing-service") parentBiscuit
   let parentToken = serializeB64 parentBiscuit
       childToken = serializeB64 childBiscuit
       addedBlockId = NE.last (getRevocationIds childBiscuit)
       revokeAdded = fromRevocationList [addedBlockId]
 
   assertVerifyError "block revocation: revoking the attenuation block kills the child" Revoked
-    =<< verifyGrant (keySetFor public) childToken roadmapRequest {revokedBlockIds = revokeAdded}
+    =<< verifyGrant (keySetFor public) childToken (roadmapRequest & #revokedBlockIds .~ revokeAdded)
   assertVerified "block revocation: revoking only the child's added block leaves the parent valid"
-    =<< verifyGrant (keySetFor public) parentToken roadmapRequest {revokedBlockIds = revokeAdded}
+    =<< verifyGrant (keySetFor public) parentToken (roadmapRequest & #revokedBlockIds .~ revokeAdded)
 
 -- | The key-material text codec the server config (EP-57) consumes. A keyset
 -- round-trips through render/parse, a signing-key entry parses to its id and
@@ -811,6 +815,7 @@ attenuationTests = do
 -- | A stand-in for a verified Shomei principal. @en-biscuit@ does not depend on
 -- Shomei; the real host maps @Shomei.Servant.Auth.AuthUser@ the same way.
 newtype AuthenticatedUser = AuthenticatedUser {authUserId :: Text}
+  deriving stock (Generic)
 
 -- | The whole coupling between authentication and authorization: a verified user
 -- id becomes an en subject.
@@ -827,7 +832,7 @@ shomeiFlowTest = do
       config = MintConfig {issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
 
   -- Gateway: verified Shomei identity -> en subject -> mint.
-  let AuthenticatedUser {authUserId = gatewayUserId} = AuthenticatedUser {authUserId = "alice"}
+  let gatewayUserId = AuthenticatedUser {authUserId = "alice"} ^. #authUserId
       subject = subjectFromUserId gatewayUserId
       grant =
         EnGrant
@@ -842,7 +847,7 @@ shomeiFlowTest = do
             revocationId = Nothing
           }
   minted <- either (die . show) pure =<< mintObjectGrant config Allowed grant
-  let token = minted.token
+  let token = (minted ^. #token)
 
   let requestFor authenticated =
         mkVerifyRequest
@@ -888,7 +893,7 @@ attenuationForgedRightTest = do
   assertBool "forged en_right: an un-annotated query must not see the holder block" (Set.null scoped)
 
   assertVerifyError "forged en_right: widened resource" ResourceNotInScope
-    =<< verifyGrant (keySetFor public) forgedObject (roadmapRequest {resource = ObjectRef (ObjectType "document") "secret"})
+    =<< verifyGrant (keySetFor public) forgedObject (roadmapRequest & #resource .~ ObjectRef (ObjectType "document") "secret")
   -- The genuine request must still succeed: had the forged fact been visible,
   -- two `en_right` rows would make extraction ambiguous and surface
   -- MalformedGrant rather than a verified grant.
@@ -946,7 +951,7 @@ attenuationForgedRevocationTest = do
       [block|en_revocation_id("rev-clean");|]
   let revokesRev1 r = pure (r == RevocationId "rev-1")
   assertVerifyError "forged revocation: shadowing does not evade revocation" Revoked
-    =<< verifyGrant (keySetFor public) shadowed roadmapRequest {revoked = revokesRev1}
+    =<< verifyGrant (keySetFor public) shadowed (roadmapRequest & #revoked .~ revokesRev1)
 
   -- Planting: the authority names no revocation id, so the verifier must never
   -- consult the caller's revocation check at all.
@@ -958,7 +963,7 @@ attenuationForgedRevocationTest = do
   asked <- newIORef []
   let recordAsk r = modifyIORef' asked (r :) >> pure False
   assertVerified "planted revocation: the token still verifies"
-    =<< verifyGrant (keySetFor public) planted roadmapRequest {revoked = recordAsk}
+    =<< verifyGrant (keySetFor public) planted (roadmapRequest & #revoked .~ recordAsk)
   consulted <- readIORef asked
   assertEqual "planted revocation: the forged id never reached the revocation check" [] consulted
 
@@ -1000,7 +1005,7 @@ attenuationForgedSubjectTest = do
 
   let mallory = SubjectId (ObjectRef (ObjectType "user") "mallory")
   assertVerifyError "forged subject: mallory cannot use alice's grant" WrongSubject
-    =<< verifyGrant (keySetFor public) token roadmapRequest {expectedSubject = mallory}
+    =<< verifyGrant (keySetFor public) token (roadmapRequest & #expectedSubject .~ mallory)
   assertVerified "forged subject: alice's own request still verifies"
     =<< verifyGrant (keySetFor public) token roadmapRequest
 
