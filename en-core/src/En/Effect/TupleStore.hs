@@ -63,12 +63,12 @@ import Relay.Pagination (Connection, CursorError, PageRequest)
 newtype StoreCursor = StoreCursor
   { cursorEncoding :: Text
   }
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Eq, Generic, Ord, Show)
 
 newtype TupleRowId = TupleRowId
   { rowIdEncoding :: Text
   }
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Eq, Generic, Ord, Show)
 
 data PageState
   = Exhausted
@@ -102,7 +102,7 @@ data UsersetQuery = UsersetQuery
     queryLimit :: !Int,
     queryCursor :: !(Maybe StoreCursor)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | How a filter constrains a tuple's subject relation.
 --
@@ -135,7 +135,7 @@ data TupleFilter = TupleFilter
     subjectId :: !(Maybe Text),
     subjectRelation :: !SubjectRelationFilter
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | A filter over stored tuples, for the operator-facing read and delete-by-filter
 -- operations.
@@ -166,7 +166,7 @@ data RelationshipFilter = RelationshipFilter
     subjectRelation :: !SubjectRelationFilter,
     caveatName :: !(Maybe CaveatName)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | The filter constraining nothing. Illegal on its own — 'validateRelationshipFilter'
 -- rejects it — and useful only as the base a caller overrides fields on.
@@ -305,7 +305,7 @@ data TupleWriteRequest = TupleWriteRequest
     writes :: ![Tuple],
     deletes :: ![Tuple]
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 -- | The filter matching exactly one tuple's identity, and nothing else.
 --

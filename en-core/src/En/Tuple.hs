@@ -24,7 +24,7 @@ data ObjectRef = ObjectRef
   { objectType :: !ObjectType,
     objectId :: !Text
   }
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Eq, Generic, Ord, Show)
 
 -- | The subject of a tuple: either a concrete object id, or a userset
 -- (@object#relation@) which expands to that relation's members.

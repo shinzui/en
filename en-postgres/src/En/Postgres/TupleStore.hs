@@ -21,17 +21,14 @@ import Data.Aeson.KeyMap qualified as AesonKeyMap
 import Data.Aeson.Types qualified as Aeson
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.Functor.Contravariant ((>$<))
+import Data.Generics.Labels ()
 import Data.Int (Int64)
-import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isJust)
 import Data.Scientific (floatingOrInteger)
 import Data.Set qualified as Set
-import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Time (getCurrentTime)
 import Data.Word (Word64)
-import Effectful (Eff, IOE, liftIO, (:>))
+import Effectful (Eff, IOE, (:>))
 import Effectful.Dispatch.Dynamic (interpret_)
 import Effectful.Error.Static (Error, throwError)
 import En.Effect.TupleStore
@@ -58,7 +55,6 @@ import En.Postgres.Revision
   ( ConsistencyConfig (..),
     OptimizedRevisionCache,
     OptimizedRevisionConfig,
-    PgSnapshot (..),
     TokenPayload (..),
     encodeToken,
     lookupOptimizedRevisionCache,
@@ -68,6 +64,7 @@ import En.Postgres.Revision
     revisionToPgSnapshot,
     storeOptimizedRevisionCache,
   )
+import En.Prelude hiding (index, indexed)
 import En.RelationshipPagination (relationshipSortFingerprint)
 import En.Revision
   ( ConsistencyToken (..),
@@ -143,7 +140,7 @@ interpretTupleStorePostgres config readOptimizedRevision =
       cursorId <- resolveCursor cursor
       orThrow =<< runSession (readObjectRelationSession revision object relation limit cursorId)
     ReadStartingWithUser revision query -> do
-      cursorId <- resolveCursor query.queryCursor
+      cursorId <- resolveCursor (query ^. #queryCursor)
       orThrow =<< runSession (readStartingWithUserSession revision query cursorId)
     ReadAllTuples revision limit cursor -> do
       cursorId <- resolveCursor cursor
@@ -174,9 +171,9 @@ interpretTupleStorePostgres config readOptimizedRevision =
     OptimizedRevision ->
       readOptimizedRevision
     OldestRetainedXid ->
-      orThrow =<< runSession (oldestRetainedXidSession config.gcWindow)
+      orThrow =<< runSession (oldestRetainedXidSession (config ^. #gcWindow))
     AdvanceGcHorizon ->
-      orThrow =<< runSession (advanceGcHorizonSession config.gcWindow)
+      orThrow =<< runSession (advanceGcHorizonSession (config ^. #gcWindow))
     ReapDeletedTuples horizon ->
       orThrow =<< runSession (reapDeletedTuplesSession horizon)
   where
@@ -267,18 +264,18 @@ applyTupleWritesSession :: ConsistencyConfig -> TupleWriteRequest -> Session (Ei
 applyTupleWritesSession config request = do
   Session.script beginScript
   anchor <- Session.statement schemaHashText anchorTransactionStatement
-  failure <- firstPreconditionFailure request.preconditions
+  failure <- firstPreconditionFailure (request ^. #preconditions)
   case failure of
     Just description -> do
       Session.script rollbackScript
       pure (Left description)
     Nothing -> do
-      batchDeleteTuples anchor.xid request.deletes
-      batchTouchTuples anchor.xid (dedupeWrites request.writes)
+      batchDeleteTuples (anchor ^. #xid) (request ^. #deletes)
+      batchTouchTuples (anchor ^. #xid) (dedupeWrites (request ^. #writes))
       Session.script commitScript
       pure (Right anchor)
   where
-    SchemaHash schemaHashText = config.schemaHash
+    SchemaHash schemaHashText = (config ^. #schemaHash)
 
 -- | Keep the last write for each identity, in request order.
 --
@@ -304,12 +301,12 @@ dedupeWrites tuples =
 -- predicate, which compares @coalesce(subject_relation, '')@.
 tupleIdentity :: Tuple -> (Text, Text, Text, Text, Text, Text)
 tupleIdentity tuple =
-  let (subjectObject, subjectRelation) = flattenSubject tuple.subject
-   in ( unObjectType tuple.object.objectType,
-        tuple.object.objectId,
-        unRelationName tuple.relation,
-        unObjectType subjectObject.objectType,
-        subjectObject.objectId,
+  let (subjectObject, subjectRelation) = flattenSubject (tuple ^. #subject)
+   in ( unObjectType (tuple ^. #object . #objectType),
+        (tuple ^. #object . #objectId),
+        unRelationName (tuple ^. #relation),
+        unObjectType (subjectObject ^. #objectType),
+        (subjectObject ^. #objectId),
         maybe "" unRelationName subjectRelation
       )
 
@@ -477,9 +474,9 @@ pruneTransactionsBatchSession horizon batch =
 
 readStartingWithUserSession :: Revision -> UsersetQuery -> Int64 -> Session TuplePage
 readStartingWithUserSession revision query cursorId = do
-  let limitPlusOne = fromIntegral (max 0 query.queryLimit + 1)
+  let limitPlusOne = fromIntegral (max 0 (query ^. #queryLimit) + 1)
   rows <- Session.statement (readParams revision query limitPlusOne cursorId) readStartingWithUserStatement
-  pure (pageFromRows cursorId query.queryLimit rows)
+  pure (pageFromRows cursorId (query ^. #queryLimit) rows)
 
 readObjectRelationSession :: Revision -> ObjectRef -> RelationName -> Int -> Int64 -> Session TuplePage
 readObjectRelationSession revision object relation limit cursorId = do
@@ -503,6 +500,7 @@ data RelationshipPageRow = RelationshipPageRow
   { snapshotToken :: !Text,
     tupleRow :: !TupleRow
   }
+  deriving stock (Generic)
 
 relationshipSortSpec :: SortSpec RelationshipPageRow
 relationshipSortSpec =
@@ -510,13 +508,13 @@ relationshipSortSpec =
     ( KeyColumn
         { columnExpr = "snapshot_token",
           sortDir = Asc,
-          extract = (.snapshotToken),
+          extract = view #snapshotToken,
           codec = textKey
         }
         :| [ KeyColumn
                { columnExpr = "id",
                  sortDir = Asc,
-                 extract = (.tupleRow.pageKey),
+                 extract = view (#tupleRow . #pageKey),
                  codec = int8Key
                }
            ]
@@ -540,7 +538,7 @@ relationshipPageSession revision token relationshipFilter pageRequest
   | otherwise =
       case paginate relationshipSortSpec pageRequest baseQuery relationshipPageRowDecoder of
         Left cursorError -> pure (Left cursorError)
-        Right statement -> Right . fmap (.tupleRow) <$> Session.statement () statement
+        Right statement -> Right . fmap (view #tupleRow) <$> Session.statement () statement
   where
     actualFingerprint = sortSpecFingerprint relationshipSortSpec
     baseQuery = relationshipPageBase revision token relationshipFilter
@@ -551,22 +549,22 @@ relationshipPageBase revision (ConsistencyToken token) relationshipFilter =
     <> Snippet.param token
     <> "::text AS snapshot_token, id, object_type, object_id, relation, subject_type, subject_id, subject_relation, caveat_name, caveat_payload, created_xid::text, deleted_xid::text "
     <> "FROM relation_tuple WHERE pg_visible_in_snapshot(created_xid, "
-    <> Snippet.param revision.revisionEncoding
+    <> Snippet.param (revision ^. #revisionEncoding)
     <> "::text::pg_snapshot) AND (deleted_xid IS NULL OR NOT pg_visible_in_snapshot(deleted_xid, "
-    <> Snippet.param revision.revisionEncoding
+    <> Snippet.param (revision ^. #revisionEncoding)
     <> "::text::pg_snapshot))"
     <> foldMap (" AND " <>) (relationshipFilterSnippets relationshipFilter)
 
 relationshipFilterSnippets :: RelationshipFilter -> [Snippet]
 relationshipFilterSnippets relationshipFilter =
   concat
-    [ column "object_type" (unObjectType <$> relationshipFilter.objectType),
-      column "object_id" relationshipFilter.objectId,
-      column "relation" (unRelationName <$> relationshipFilter.relation),
-      column "subject_type" (unObjectType <$> relationshipFilter.subjectType),
-      column "subject_id" relationshipFilter.subjectId,
-      subjectRelation relationshipFilter.subjectRelation,
-      column "caveat_name" (unCaveatName <$> relationshipFilter.caveatName)
+    [ column "object_type" (unObjectType <$> relationshipFilter ^. #objectType),
+      column "object_id" (relationshipFilter ^. #objectId),
+      column "relation" (unRelationName <$> relationshipFilter ^. #relation),
+      column "subject_type" (unObjectType <$> relationshipFilter ^. #subjectType),
+      column "subject_id" (relationshipFilter ^. #subjectId),
+      subjectRelation (relationshipFilter ^. #subjectRelation),
+      column "caveat_name" (unCaveatName <$> relationshipFilter ^. #caveatName)
     ]
   where
     column name =
@@ -608,7 +606,7 @@ windowStartXmin :: Revision -> Either EnError Word64
 windowStartXmin revision =
   case revisionToPgSnapshot revision of
     Left err -> Left (MalformedConsistencyToken ("watch window start is not a PostgreSQL snapshot: " <> err))
-    Right snapshot -> Right snapshot.xmin
+    Right snapshot -> Right (snapshot ^. #xmin)
 
 -- | Match and retire in one transaction, returning the count and the anchor.
 --
@@ -623,11 +621,11 @@ deleteRelationshipsSession :: ConsistencyConfig -> RelationshipFilter -> Session
 deleteRelationshipsSession config relationshipFilter = do
   Session.script beginScript
   anchor <- Session.statement schemaHashText anchorTransactionStatement
-  count <- Session.statement () (deleteRelationshipsStatement anchor.xid relationshipFilter)
+  count <- Session.statement () (deleteRelationshipsStatement (anchor ^. #xid) relationshipFilter)
   Session.script commitScript
   pure (count, anchor)
   where
-    SchemaHash schemaHashText = config.schemaHash
+    SchemaHash schemaHashText = (config ^. #schemaHash)
 
 -- | The @WHERE@ fragments a filter contributes, numbered from @start@, paired with the
 -- encoder that binds their values.
@@ -667,13 +665,13 @@ compileFilter start relationshipFilter =
     clauses :: [(Int -> Text, Maybe Text)]
     clauses =
       concat
-        [ column "object_type" (unObjectType <$> relationshipFilter.objectType),
-          column "object_id" relationshipFilter.objectId,
-          column "relation" (unRelationName <$> relationshipFilter.relation),
-          column "subject_type" (unObjectType <$> relationshipFilter.subjectType),
-          column "subject_id" relationshipFilter.subjectId,
-          subjectRelationClause relationshipFilter.subjectRelation,
-          column "caveat_name" (unCaveatName <$> relationshipFilter.caveatName)
+        [ column "object_type" (unObjectType <$> relationshipFilter ^. #objectType),
+          column "object_id" (relationshipFilter ^. #objectId),
+          column "relation" (unRelationName <$> relationshipFilter ^. #relation),
+          column "subject_type" (unObjectType <$> relationshipFilter ^. #subjectType),
+          column "subject_id" (relationshipFilter ^. #subjectId),
+          subjectRelationClause (relationshipFilter ^. #subjectRelation),
+          column "caveat_name" (unCaveatName <$> relationshipFilter ^. #caveatName)
         ]
 
     column name =
@@ -728,7 +726,7 @@ readRelationshipsStatement revision relationshipFilter limitPlusOne cursorId =
                "LIMIT $3"
              ]
     encoder =
-      constTextParam revision.revisionEncoding
+      constTextParam (revision ^. #revisionEncoding)
         <> constInt8Param cursorId
         <> constInt8Param limitPlusOne
         <> filterEncoder
@@ -754,7 +752,7 @@ countRelationshipsStatement revision relationshipFilter =
           "  AND (deleted_xid IS NULL OR NOT pg_visible_in_snapshot(deleted_xid, $1::pg_snapshot))"
         ]
           <> fmap ("  AND " <>) predicates
-    encoder = constTextParam revision.revisionEncoding <> filterEncoder
+    encoder = constTextParam (revision ^. #revisionEncoding) <> filterEncoder
 
 -- | Soft-delete every live row the filter matches, returning how many.
 --
@@ -841,8 +839,8 @@ readChangesStatement start end startXmin relationshipFilter limitPlusOne cursorI
                "LIMIT $5"
              ]
     encoder =
-      constTextParam start.revisionEncoding
-        <> constTextParam end.revisionEncoding
+      constTextParam (start ^. #revisionEncoding)
+        <> constTextParam (end ^. #revisionEncoding)
         -- As in 'reapDeletedTuplesStatement': hasql has no @xid8@ encoder, and an
         -- @xid8@ does not fit a signed @int8@ near wraparound, so it travels as text.
         <> constTextParam (Text.pack (show startXmin))
@@ -881,13 +879,13 @@ changePageFromRows cursorId limit rows =
           _ : _ ->
             case reverse visibleRows of
               [] -> HasMore (StoreCursor (Text.pack (show cursorId)))
-              (lastRow, _, _) : _ -> HasMore (StoreCursor lastRow.rowId.rowIdEncoding)
+              (lastRow, _, _) : _ -> HasMore (StoreCursor (lastRow ^. #rowId . #rowIdEncoding))
    in ChangePage {changes = concatMap classify visibleRows, state = pageState}
   where
     classify (row, createdInWindow, deletedInWindow)
       | deletedInWindow && createdInWindow = []
-      | deletedInWindow = [TupleChange {kind = ChangeDelete, tuple = row.tuple, rowId = row.rowId}]
-      | otherwise = [TupleChange {kind = ChangeTouch, tuple = row.tuple, rowId = row.rowId}]
+      | deletedInWindow = [TupleChange {kind = ChangeDelete, tuple = (row ^. #tuple), rowId = (row ^. #rowId)}]
+      | otherwise = [TupleChange {kind = ChangeTouch, tuple = (row ^. #tuple), rowId = (row ^. #rowId)}]
 
 -- | Answer a point-membership question with one indexed read.
 --
@@ -914,14 +912,14 @@ pageFromRows cursorId limit rows =
           _ : _ ->
             case visibleRows of
               [] -> HasMore (StoreCursor (Text.pack (show cursorId)))
-              _ -> HasMore (StoreCursor (last visibleRows).rowId.rowIdEncoding)
+              _ -> HasMore (StoreCursor (last visibleRows ^. #rowId . #rowIdEncoding))
    in TuplePage {rows = visibleRows, state = pageState}
 
 data Anchor = Anchor
   { xid :: !Text,
     snapshot :: !Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Generic, Show)
 
 tokenFromAnchor :: ConsistencyConfig -> Anchor -> Either Text ConsistencyToken
 tokenFromAnchor config anchor = do
@@ -929,8 +927,8 @@ tokenFromAnchor config anchor = do
   pure
     ( encodeToken
         TokenPayload
-          { datastoreId = config.datastoreId,
-            schemaHash = config.schemaHash,
+          { datastoreId = (config ^. #datastoreId),
+            schemaHash = (config ^. #schemaHash),
             revision = Revision snapshot,
             expiresAt = Nothing
           }
@@ -956,19 +954,21 @@ tokenFromAnchor config anchor = do
 -- empty and this reduces to filtering our own xid out of @xip@.
 writeVisibleSnapshot :: Anchor -> Either Text Text
 writeVisibleSnapshot anchor =
-  case (parsePgSnapshot anchor.snapshot, parseWord64 anchor.xid) of
+  case (parsePgSnapshot (anchor ^. #snapshot), parseWord64 (anchor ^. #xid)) of
     (Right snapshot, Just xid) ->
-      let raisedXmax = max snapshot.xmax (succBounded xid)
-          gap = [txid | txid <- [snapshot.xmax .. raisedXmax - 1], txid /= xid]
+      let raisedXmax = max (snapshot ^. #xmax) (succBounded xid)
+          gap = [txid | txid <- [(snapshot ^. #xmax) .. raisedXmax - 1], txid /= xid]
        in Right
             ( renderPgSnapshot
-                snapshot
-                  { xmax = raisedXmax,
-                    xip = filter (/= xid) snapshot.xip <> gap
-                  }
+                ( snapshot
+                    & #xmax
+                    .~ raisedXmax
+                    & #xip
+                    .~ (filter (/= xid) (snapshot ^. #xip) <> gap)
+                )
             )
     (Left err, _) -> Left ("write anchor snapshot did not parse: " <> err)
-    (_, Nothing) -> Left ("write anchor xid did not parse: " <> anchor.xid)
+    (_, Nothing) -> Left ("write anchor xid did not parse: " <> anchor ^. #xid)
 
 succBounded :: Word64 -> Word64
 succBounded value
@@ -1191,18 +1191,19 @@ data TupleInsertParams = TupleInsertParams
     caveatName :: !(Maybe Text),
     caveatPayload :: !(Maybe LazyByteString.ByteString)
   }
+  deriving stock (Generic)
 
 tupleInsertParams :: Text -> Tuple -> TupleInsertParams
 tupleInsertParams createdXid tuple =
-  let (subjectObject, subjectRelation) = flattenSubject tuple.subject
-      (maybeCaveatName, maybePayload) = flattenCaveat tuple.caveat
+  let (subjectObject, subjectRelation) = flattenSubject (tuple ^. #subject)
+      (maybeCaveatName, maybePayload) = flattenCaveat (tuple ^. #caveat)
    in TupleInsertParams
         { createdXid = createdXid,
-          objectType = unObjectType tuple.object.objectType,
-          objectId = tuple.object.objectId,
-          relation = unRelationName tuple.relation,
-          subjectType = unObjectType subjectObject.objectType,
-          subjectId = subjectObject.objectId,
+          objectType = unObjectType (tuple ^. #object . #objectType),
+          objectId = (tuple ^. #object . #objectId),
+          relation = unRelationName (tuple ^. #relation),
+          subjectType = unObjectType (subjectObject ^. #objectType),
+          subjectId = (subjectObject ^. #objectId),
           subjectRelation = unRelationName <$> subjectRelation,
           caveatName = unCaveatName <$> maybeCaveatName,
           caveatPayload = Aeson.encode . caveatPayloadToJson <$> maybePayload
@@ -1224,20 +1225,21 @@ data BatchParams = BatchParams
     caveatNames :: ![Maybe Text],
     caveatPayloads :: ![Maybe LazyByteString.ByteString]
   }
+  deriving stock (Generic)
 
 batchParams :: Text -> [Tuple] -> BatchParams
 batchParams writeXid tuples =
   let rows = tupleInsertParams writeXid <$> tuples
    in BatchParams
         { writeXid = writeXid,
-          objectTypes = (\row -> row.objectType) <$> rows,
-          objectIds = (\row -> row.objectId) <$> rows,
-          relations = (\row -> row.relation) <$> rows,
-          subjectTypes = (\row -> row.subjectType) <$> rows,
-          subjectIds = (\row -> row.subjectId) <$> rows,
-          subjectRelations = (\row -> row.subjectRelation) <$> rows,
-          caveatNames = (\row -> row.caveatName) <$> rows,
-          caveatPayloads = (\row -> row.caveatPayload) <$> rows
+          objectTypes = (\row -> (row ^. #objectType)) <$> rows,
+          objectIds = (\row -> (row ^. #objectId)) <$> rows,
+          relations = (\row -> (row ^. #relation)) <$> rows,
+          subjectTypes = (\row -> (row ^. #subjectType)) <$> rows,
+          subjectIds = (\row -> (row ^. #subjectId)) <$> rows,
+          subjectRelations = (\row -> (row ^. #subjectRelation)) <$> rows,
+          caveatNames = (\row -> (row ^. #caveatName)) <$> rows,
+          caveatPayloads = (\row -> (row ^. #caveatPayload)) <$> rows
         }
 
 -- | The @FROM@ clause every batch statement rebuilds its rowset from.
@@ -1473,31 +1475,31 @@ batchDeleteTupleStatement =
 -- no inferable type, so it cannot simply be sent and ignored.
 batchColumnsEncoder :: Encoders.Params BatchParams
 batchColumnsEncoder =
-  ((\params -> params.objectTypes) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.objectIds) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.relations) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.subjectTypes) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.subjectIds) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.subjectRelations) >$< Encoders.param (Encoders.nonNullable nullableTextArrayEncoder))
-    <> ((\params -> params.caveatNames) >$< Encoders.param (Encoders.nonNullable nullableTextArrayEncoder))
-    <> ((\params -> params.caveatPayloads) >$< Encoders.param (Encoders.nonNullable nullableJsonbArrayEncoder))
+  ((\params -> (params ^. #objectTypes)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #objectIds)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #relations)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #subjectTypes)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #subjectIds)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #subjectRelations)) >$< Encoders.param (Encoders.nonNullable nullableTextArrayEncoder))
+    <> ((\params -> (params ^. #caveatNames)) >$< Encoders.param (Encoders.nonNullable nullableTextArrayEncoder))
+    <> ((\params -> (params ^. #caveatPayloads)) >$< Encoders.param (Encoders.nonNullable nullableJsonbArrayEncoder))
 
 -- | 'batchColumnsEncoder' plus the write transaction's xid as @$9@.
 batchWriteEncoder :: Encoders.Params BatchParams
 batchWriteEncoder =
   batchColumnsEncoder
-    <> ((\params -> params.writeXid) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #writeXid)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
 
 -- | The six identity arrays, @$1@–@$6@, plus the write transaction's xid as @$7@.
 batchDeleteEncoder :: Encoders.Params BatchParams
 batchDeleteEncoder =
-  ((\params -> params.objectTypes) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.objectIds) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.relations) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.subjectTypes) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.subjectIds) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.subjectRelations) >$< Encoders.param (Encoders.nonNullable nullableTextArrayEncoder))
-    <> ((\params -> params.writeXid) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+  ((\params -> (params ^. #objectTypes)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #objectIds)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #relations)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #subjectTypes)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #subjectIds)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #subjectRelations)) >$< Encoders.param (Encoders.nonNullable nullableTextArrayEncoder))
+    <> ((\params -> (params ^. #writeXid)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
 
 -- | A 'TupleFilter' flattened for the wire.
 --
@@ -1514,34 +1516,35 @@ data TupleFilterParams = TupleFilterParams
     subjectRelationMode :: !Text,
     subjectRelationName :: !(Maybe Text)
   }
+  deriving stock (Generic)
 
 tupleFilterParams :: TupleFilter -> TupleFilterParams
 tupleFilterParams tupleFilter =
   TupleFilterParams
-    { objectType = unObjectType tupleFilter.objectType,
-      objectId = tupleFilter.objectId,
-      relation = unRelationName <$> tupleFilter.relation,
-      subjectType = unObjectType <$> tupleFilter.subjectType,
-      subjectId = tupleFilter.subjectId,
+    { objectType = unObjectType (tupleFilter ^. #objectType),
+      objectId = (tupleFilter ^. #objectId),
+      relation = unRelationName <$> (tupleFilter ^. #relation),
+      subjectType = unObjectType <$> (tupleFilter ^. #subjectType),
+      subjectId = (tupleFilter ^. #subjectId),
       subjectRelationMode = mode,
       subjectRelationName = name
     }
   where
     (mode, name) =
-      case tupleFilter.subjectRelation of
+      case (tupleFilter ^. #subjectRelation) of
         AnySubjectRelation -> ("any", Nothing)
         NoSubjectRelation -> ("none", Nothing)
         ExactSubjectRelation relationName -> ("exact", Just (unRelationName relationName))
 
 tupleFilterEncoder :: Encoders.Params TupleFilterParams
 tupleFilterEncoder =
-  ((\params -> params.objectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.objectId) >$< Encoders.param (Encoders.nullable Encoders.text))
-    <> ((\params -> params.relation) >$< Encoders.param (Encoders.nullable Encoders.text))
-    <> ((\params -> params.subjectType) >$< Encoders.param (Encoders.nullable Encoders.text))
-    <> ((\params -> params.subjectId) >$< Encoders.param (Encoders.nullable Encoders.text))
-    <> ((\params -> params.subjectRelationMode) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.subjectRelationName) >$< Encoders.param (Encoders.nullable Encoders.text))
+  ((\params -> (params ^. #objectType)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #objectId)) >$< Encoders.param (Encoders.nullable Encoders.text))
+    <> ((\params -> (params ^. #relation)) >$< Encoders.param (Encoders.nullable Encoders.text))
+    <> ((\params -> (params ^. #subjectType)) >$< Encoders.param (Encoders.nullable Encoders.text))
+    <> ((\params -> (params ^. #subjectId)) >$< Encoders.param (Encoders.nullable Encoders.text))
+    <> ((\params -> (params ^. #subjectRelationMode)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #subjectRelationName)) >$< Encoders.param (Encoders.nullable Encoders.text))
 
 -- | Find one live row the filter matches and hold an exclusive lock on it until
 -- the write transaction ends.
@@ -1612,14 +1615,15 @@ data ReadParams = ReadParams
     limit :: !Int64,
     cursor :: !Int64
   }
+  deriving stock (Generic)
 
 readParams :: Revision -> UsersetQuery -> Int64 -> Int64 -> ReadParams
 readParams revision query limitPlusOne cursorId =
-  let keys = subjectKeys query.querySubjects
+  let keys = subjectKeys (query ^. #querySubjects)
    in ReadParams
-        { revision = revision.revisionEncoding,
-          objectType = unObjectType query.queryType,
-          relation = unRelationName query.queryRelation,
+        { revision = (revision ^. #revisionEncoding),
+          objectType = unObjectType (query ^. #queryType),
+          relation = unRelationName (query ^. #queryRelation),
           subjectTypes = (\(subjectType, _, _) -> subjectType) <$> keys,
           subjectIds = (\(_, subjectId, _) -> subjectId) <$> keys,
           subjectRelations = (\(_, _, subjectRelation) -> subjectRelation) <$> keys,
@@ -1635,13 +1639,14 @@ data ObjectReadParams = ObjectReadParams
     limit :: !Int64,
     cursor :: !Int64
   }
+  deriving stock (Generic)
 
 objectReadParams :: Revision -> ObjectRef -> RelationName -> Int64 -> Int64 -> ObjectReadParams
 objectReadParams revision object relation limitPlusOne cursorId =
   ObjectReadParams
-    { revision = revision.revisionEncoding,
-      objectType = unObjectType object.objectType,
-      objectId = object.objectId,
+    { revision = (revision ^. #revisionEncoding),
+      objectType = unObjectType (object ^. #objectType),
+      objectId = (object ^. #objectId),
       relation = unRelationName relation,
       limit = limitPlusOne,
       cursor = cursorId
@@ -1668,23 +1673,24 @@ readObjectRelationStatement =
 
 readObjectRelationEncoder :: Encoders.Params ObjectReadParams
 readObjectRelationEncoder =
-  ((\params -> params.revision) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.objectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.objectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.relation) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.limit) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
-    <> ((\params -> params.cursor) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+  ((\params -> (params ^. #revision)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #objectType)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #objectId)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #relation)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #limit)) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+    <> ((\params -> (params ^. #cursor)) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
 
 data AllReadParams = AllReadParams
   { revision :: !Text,
     limit :: !Int64,
     cursor :: !Int64
   }
+  deriving stock (Generic)
 
 allReadParams :: Revision -> Int64 -> Int64 -> AllReadParams
 allReadParams revision limitPlusOne cursorId =
   AllReadParams
-    { revision = revision.revisionEncoding,
+    { revision = (revision ^. #revisionEncoding),
       limit = limitPlusOne,
       cursor = cursorId
     }
@@ -1711,9 +1717,9 @@ readAllTuplesStatement =
     ORDER BY id ASC
     LIMIT $2
     """
-    ( ((\params -> params.revision) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-        <> ((\params -> params.limit) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
-        <> ((\params -> params.cursor) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+    ( ((\params -> (params ^. #revision)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+        <> ((\params -> (params ^. #limit)) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+        <> ((\params -> (params ^. #cursor)) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
     )
     (Decoders.rowList tupleRowDecoder)
 
@@ -1726,14 +1732,15 @@ data ProbeParams = ProbeParams
     subjectIds :: ![Text],
     subjectRelations :: ![Text]
   }
+  deriving stock (Generic)
 
 probeParams :: Revision -> ObjectRef -> RelationName -> [Subject] -> ProbeParams
 probeParams revision object relation subjects =
   let keys = subjectKeys subjects
    in ProbeParams
-        { revision = revision.revisionEncoding,
-          objectType = unObjectType object.objectType,
-          objectId = object.objectId,
+        { revision = (revision ^. #revisionEncoding),
+          objectType = unObjectType (object ^. #objectType),
+          objectId = (object ^. #objectId),
           relation = unRelationName relation,
           subjectTypes = (\(subjectType, _, _) -> subjectType) <$> keys,
           subjectIds = (\(_, subjectId, _) -> subjectId) <$> keys,
@@ -1768,13 +1775,13 @@ probeTuplesStatement =
 
 probeEncoder :: Encoders.Params ProbeParams
 probeEncoder =
-  ((\params -> params.revision) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.objectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.objectId) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.relation) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.subjectTypes) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.subjectIds) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.subjectRelations) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+  ((\params -> (params ^. #revision)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #objectType)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #objectId)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #relation)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #subjectTypes)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #subjectIds)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #subjectRelations)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
 
 readStartingWithUserStatement :: Statement ReadParams [TupleRow]
 readStartingWithUserStatement =
@@ -1799,14 +1806,14 @@ readStartingWithUserStatement =
 
 readStartingWithUserEncoder :: Encoders.Params ReadParams
 readStartingWithUserEncoder =
-  ((\params -> params.revision) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.objectType) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.relation) >$< Encoders.param (Encoders.nonNullable Encoders.text))
-    <> ((\params -> params.subjectTypes) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.subjectIds) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.subjectRelations) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
-    <> ((\params -> params.limit) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
-    <> ((\params -> params.cursor) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+  ((\params -> (params ^. #revision)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #objectType)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #relation)) >$< Encoders.param (Encoders.nonNullable Encoders.text))
+    <> ((\params -> (params ^. #subjectTypes)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #subjectIds)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #subjectRelations)) >$< Encoders.param (Encoders.nonNullable textArrayEncoder))
+    <> ((\params -> (params ^. #limit)) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
+    <> ((\params -> (params ^. #cursor)) >$< Encoders.param (Encoders.nonNullable Encoders.int8))
 
 textArrayEncoder :: Encoders.Value [Text]
 textArrayEncoder =
@@ -1923,14 +1930,14 @@ flattenCaveat :: Maybe TupleCaveat -> (Maybe CaveatName, Maybe CaveatPayload)
 flattenCaveat =
   \case
     Nothing -> (Nothing, Nothing)
-    Just tupleCaveat -> (Just tupleCaveat.name, Just tupleCaveat.payload)
+    Just tupleCaveat -> (Just (tupleCaveat ^. #name), Just (tupleCaveat ^. #payload))
 
 subjectKeys :: [Subject] -> [(Text, Text, Text)]
 subjectKeys =
   fmap
     ( \subject ->
         let (objectRef, subjectRelation) = flattenSubject subject
-         in (unObjectType objectRef.objectType, objectRef.objectId, maybe "" unRelationName subjectRelation)
+         in (unObjectType (objectRef ^. #objectType), objectRef ^. #objectId, maybe "" unRelationName subjectRelation)
     )
 
 caveatPayloadToJson :: CaveatPayload -> Aeson.Value
