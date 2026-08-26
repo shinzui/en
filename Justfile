@@ -29,26 +29,26 @@ process-down:
 start-server: run-migrations
   EN_DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" cabal run en-server
 
-# Wait for the process-compose en-server to be healthy, then run the HTTP smoke test
+# Wait for the process-compose en-server to be ready, then run the safe Hurl suite
 #
-# process-compose owns the server (see process-compose.yaml); this waits on the same
-# /health/live the orchestrator's liveness probe uses rather than spawning a second
-# server on the same port.
+# process-compose owns the server (see process-compose.yaml); polling readiness keeps
+# startup races out of the Hurl assertions without hiding them behind global retries.
+# Start services, wait for readiness, and run the safe black-box suite
 [group("services")]
 start-and-test: process-up
   @set -eu; \
     url="${EN_SERVER_URL:-http://localhost:${EN_PORT:-8080}}"; \
     ready=0; \
     for _ in $(seq 1 60); do \
-      if curl -fsS -o /dev/null "$url/health/live" 2>/dev/null; then ready=1; break; fi; \
+      if curl -fsS -o /dev/null "$url/health/ready" 2>/dev/null; then ready=1; break; fi; \
       sleep 2; \
     done; \
     if [ "$ready" -ne 1 ]; then \
-      echo "en-server never answered GET /health/live with 200; last log lines:" >&2; \
+      echo "en-server never answered GET /health/ready with 200; last log lines:" >&2; \
       process-compose --unix-socket {{processComposeSocket}} process logs en-server --tail 20 >&2 || true; \
       exit 1; \
     fi; \
-    just test-server
+    just hurl
 
 # `en-migrate new` writes the file and appends it to the manifest atomically, so a
 # migration can never exist unregistered -- there is no second step to forget.
@@ -94,29 +94,6 @@ verify-migrations:
 [group("database")]
 migration-status:
   DATABASE_URL="${EN_DATABASE_URL:-$PG_CONNECTION_STRING}" cabal run -v0 en-migrate -- status
-
-# Run a write-token-check HTTP smoke test against a running en-server
-[group("testing")]
-test-server:
-  @set -eu; \
-    url="${EN_SERVER_URL:-http://localhost:${EN_PORT:-8080}}"; \
-    auth="Authorization: Bearer ${EN_API_KEY:-dev-secret-0123456789}"; \
-    curl -fsS -X POST "$url/v1/relationships/delete" \
-      -H "$auth" \
-      -H 'content-type: application/json' \
-      -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}]}' >/dev/null; \
-    token=$(curl -fsS -X POST "$url/v1/relationships" \
-      -H "$auth" \
-      -H 'content-type: application/json' \
-      -d '{"tuples":[{"object":{"objectType":"space","objectId":"project-x"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"alice"},"caveat":null}]}' \
-      | jq -r '.token'); \
-    decision=$(curl -sS -X POST "$url/v1/check" \
-      -H "$auth" \
-      -H 'content-type: application/json' \
-      -d "{\"consistency\":{\"mode\":\"atLeastAsFresh\",\"token\":\"$token\"},\"context\":{\"values\":{}},\"subject\":{\"kind\":\"id\",\"objectType\":\"user\",\"objectId\":\"alice\"},\"permission\":\"view\",\"object\":{\"objectType\":\"space\",\"objectId\":\"project-x\"}}" \
-      | jq -r '.decision.result'); \
-    test "$decision" = "allowed"; \
-    echo "server smoke test passed: $decision"
 
 # Run the safe black-box API suite against an already-running en-server
 [group("testing")]

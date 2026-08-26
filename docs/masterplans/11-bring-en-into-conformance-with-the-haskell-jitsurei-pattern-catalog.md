@@ -189,7 +189,7 @@ searched for the catalog's own decisions; the catalog publishes standards, not A
 | 61 | Adopt RFC 9457 problem details and close the API conformance audit | docs/plans/61-adopt-rfc-9457-problem-details-and-close-the-api-conformance-audit.md | None | EP-63 | Complete |
 | 64 | Serve Kubernetes health probes from servant-health | docs/plans/64-serve-kubernetes-health-probes-from-servant-health.md | EP-61 | EP-63 | Complete |
 | 65 | Instrument en with OpenTelemetry and a conformant production request log | docs/plans/65-instrument-en-with-opentelemetry-and-a-conformant-production-request-log.md | EP-64 | EP-63 | Complete |
-| 66 | Add a Hurl black-box API suite for en-server | docs/plans/66-add-a-hurl-black-box-api-suite-for-en-server.md | EP-61, EP-64 | EP-65 | In Progress |
+| 66 | Add a Hurl black-box API suite for en-server | docs/plans/66-add-a-hurl-black-box-api-suite-for-en-server.md | EP-61, EP-64 | EP-65 | Complete |
 | 67 | Adopt Relay pagination for en's list endpoints | docs/plans/67-adopt-relay-pagination-for-en-s-list-endpoints.md | EP-61 | EP-66 | Not Started |
 | 68 | Migrate en's records to generic-lens label syntax and a custom prelude | docs/plans/68-migrate-en-s-records-to-generic-lens-label-syntax-and-a-custom-prelude.md | EP-63 | EP-61, EP-64, EP-65, EP-66, EP-67 | Not Started |
 
@@ -357,9 +357,9 @@ checklist; this is the at-a-glance view of the initiative.
 - [x] EP-65: OpenTelemetry provider lifetimes owned in `main`, exporting over OTLP
 - [x] EP-65: Servant route naming, with the middleware stack in the required order
 - [x] EP-65: The request logger conformed — bounded fields, trace correlation, probe exclusion
-- [ ] EP-66: Hurl available as a project tool and the suite skeleton runnable
-- [ ] EP-66: Resource-family files covering health, OpenAPI, and the read surface
-- [ ] EP-66: Opt-in mutating and perimeter scenarios, wired into CI without hiding failures
+- [x] EP-66: Hurl available as a project tool and the suite skeleton runnable
+- [x] EP-66: Resource-family files covering health, OpenAPI, and the read surface
+- [x] EP-66: Opt-in mutating and perimeter scenarios, wired into CI without hiding failures
 - [ ] EP-67: Relay cohort resolving; the total database order and its migration
 - [ ] EP-67: The four list endpoints converted to `Connection` / `RelayPageError`
 - [ ] EP-67: Conformance tests proving no row is skipped or duplicated; consumers notified
@@ -447,6 +447,13 @@ between child plans. Concise evidence.
   secrets. Disabled telemetry omitted both identifiers rather than logging zeros. The
   standalone-versus-embedded ownership boundary and the load-bearing Servant fork are recorded
   in [ADR 5](../adr/0005-telemetry-configuration-and-provider-lifetimes-belong-to-the-standalone-host.md).
+
+- Discovery (2026-08-25, EP-66): **expand's bespoke pagination silently accepts inputs its
+  sibling list endpoints reject.** `limit: 0` returns a 200 empty page and a malformed cursor
+  decodes as offset zero, while lookup reports `invalid_cursor`. EP-66 records the live
+  evidence without changing Haskell because EP-67 already owns replacing all three cursor
+  contracts with typed Relay cursors; EP-67 must include zero-size and malformed-cursor Hurl
+  cases in its cutover.
 
 
 ## Decision Log
@@ -592,4 +599,14 @@ Collector-backed checks proved route naming and exact span/log correlation. The 
 OpenAPI artifact is unchanged, seven full-suite tests pass, and the known concurrent Biscuit
 timeout still passes in isolation.
 
-EP-66 is now the next child in initiative order whose hard dependencies are all complete.
+EP-66 is complete. The repository now supplies Hurl 8.0.1 through its Nix shell and carries a
+six-family, 15-request read-only suite against the live packaged server. Opt-in flows prove
+token-pinned write visibility and the authentication perimeter with separate read-write and
+read-only keys. The old curl smoke recipe is retired; `just start-and-test` gates on readiness,
+GitHub Actions retains server logs on failure and always tears services down, and deliberate
+assertion and connection failures proved the gate cannot go falsely green. OpenAPI, workflow
+parsing, and the Nix formatting gates pass; the existing concurrent Biscuit timeout and
+default-package `nix flake check` failure reproduce exactly as recorded by EP-65, with Biscuit
+passing in isolation.
+
+EP-67 is now the next child in initiative order whose hard dependencies are all complete.

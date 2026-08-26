@@ -1,0 +1,30 @@
+name: Hurl black-box API
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  live-api:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Start en-server and run the safe Hurl suite
+        run: nix develop --accept-flake-config -c just start-and-test
+      - name: Retain en-server logs on failure
+        if: failure()
+        run: >-
+          nix develop --accept-flake-config -c
+          process-compose --unix-socket .dev/process-compose.sock
+          process logs en-server --tail 100
+      - name: Stop local services
+        if: always()
+        run: nix develop --accept-flake-config -c just process-down

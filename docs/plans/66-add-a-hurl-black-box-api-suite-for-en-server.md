@@ -76,7 +76,7 @@ point at any environment.
 - [x] (2026-08-25T19:26:41-07:00) Milestone 4 — Add the opt-in `relationships.hurl` write flow (write, read back, delete)
       and the opt-in `perimeter/perimeter.hurl` suite covering authentication boundaries
       against a separately configured server.
-- [ ] Milestone 5 — Wire the suite into the repository's normal task interface and into CI
+- [x] (2026-08-25T19:30:41-07:00) Milestone 5 — Wire the suite into the repository's normal task interface and into CI
       without hiding failures; retire or reduce `just test-server`; document the suite's
       fixture contract in its `README.md`.
 
@@ -123,6 +123,13 @@ point at any environment.
   offset zero. `lookup` rejects the same invented cursor as `invalid_cursor`. EP-67 is already
   responsible for replacing all three bespoke cursor contracts with typed Relay cursors, so
   this suite records the asymmetry without changing Haskell under a test-only plan.
+
+- Discovery (2026-08-25, Milestone 5): **the runner fails honestly for both contract and
+  process failures.** Temporarily changing the healthy status assertion to
+  `__intentional_failure__` produced exit 4 and reported `actual: string <ok>` beside the
+  expected value. With the port-18080 server stopped, all six safe families failed with
+  connection errors and `just hurl` exited 3. Restoring the assertion and targeting the
+  authenticated port-18081 server returned `Succeeded files: 6 (100.0%)` across 15 requests.
 
 (Add further entries as work proceeds.)
 
@@ -195,12 +202,50 @@ point at any environment.
   supplied to the public check instead of hiding consistency with a retry.
   Date: 2026-08-25
 
+- Decision: Retire `just test-server` and make `just start-and-test` orchestrate the safe Hurl
+  suite after polling `/health/ready`.
+  Rationale: `relationships.hurl` strictly supersedes the old curl pipeline's delete, write,
+  token capture, and check flow, while the safe Hurl runner adds the non-mutating contract
+  coverage CI should execute by default. Keeping both would duplicate a smoke contract with
+  different fixture identities and no clear owner. Readiness, rather than liveness, is the
+  correct orchestration gate because the suite immediately exercises PostgreSQL-backed reads.
+  Date: 2026-08-25
+
 (Add further entries as work proceeds.)
 
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+The plan is complete. `en-servant/test/hurl/` now carries six independent safe resource
+families (15 live requests), an idempotent four-request write flow, and a five-request
+authentication-perimeter flow. Every body-bearing response pins its media type and stable
+wire fields; failure cases pin machine codes rather than prose. `flake.module.nix` supplies
+Hurl and hurlfmt 8.0.1 reproducibly, `just hurl` targets an already-running server, and
+`just start-and-test` owns local orchestration through the readiness gate.
+
+The old curl-and-jq `just test-server` recipe is gone. The new GitHub Actions workflow starts
+the packaged executable and PostgreSQL through process-compose, runs the safe suite, prints
+server logs on failure, and tears services down under `always()`. The suite README documents
+the schema assumptions, independent default families, secret injection, unique stateful
+fixture, re-run behavior, and perimeter prerequisites.
+
+Validation covered more than the green path: every safe file passed independently; the write
+flow passed twice consecutively at its captured consistency token; the perimeter suite passed
+against distinct read-write and read-only credentials without echoing them; a deliberately
+false assertion exited non-zero with the actual and expected values; and a stopped server made
+all families fail at the socket boundary. `just openapi`, workflow YAML parsing, and the Nix
+pre-commit and tree-format checks pass. As at the EP-65 baseline, `cabal test all` passes seven
+suites and only the Biscuit suite times out under concurrent load; `cabal test en-biscuit`
+passes in isolation. The broader `nix flake check` reaches the same pre-existing default-package
+failure recorded by EP-65: `cabal2nix` is pointed at a multi-package root with no root `.cabal`
+file. The one substantive contract discovery—expand's
+permissive zero-limit and malformed-cursor behavior—is handed to EP-67, which already owns the
+Relay pagination cutover.
+
+ADR distillation found no new project architecture decision. The durable production-store
+boundary remains in ADR 3, health ownership remains in ADR 4, and the black-box suite's layout,
+fixtures, and CI lifecycle are test-operational details fully owned by the catalog standard,
+this plan, and the suite README.
 
 
 ## Context and Orientation
