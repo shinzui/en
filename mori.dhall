@@ -185,5 +185,13 @@ in  Schema.Project::{
         , description = Some
             "What en provides today, one concept per capability, with evidence"
         }
+      , Schema.OkfBundle::{
+        , name = "reviews"
+        , path = "docs/reviews"
+        , profile = Some "docs/reviews/profile.dhall"
+        , okfVersion = "0.2"
+        , description = Some
+            "Commit-pinned reviews of en's correctness, security, performance, design, test coverage, documentation, and operability"
+        }
       ]
     }
