@@ -216,7 +216,7 @@ resolveExpiry config = do
 -- before building both the signed fact and 'MintedGrant', so HTTP metadata can
 -- never claim fractional precision that verification cannot recover.
 biscuitTimestamp :: UTCTime -> UTCTime
-biscuitTimestamp = posixSecondsToUTCTime . fromInteger . floor . utcTimeToPOSIXSeconds
+biscuitTimestamp = posixSecondsToUTCTime . fromInteger . round . utcTimeToPOSIXSeconds
 
 -- | Run @en.check@ for the grant's subject/permission/object and mint on
 -- 'Allowed'. Engine errors become 'EngineError' (the token is not minted); the

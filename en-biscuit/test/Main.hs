@@ -339,12 +339,12 @@ mintExpiryPrecisionTest = do
   let public = toPublic secret
       config = MintConfig {issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
       fractionalExpiry = addUTCTime 3600.75 sampleExpiry
-      signedExpiry = addUTCTime 3600 sampleExpiry
+      signedExpiry = addUTCTime 3601 sampleExpiry
   result <- mintObjectGrantWithExpiry config fractionalExpiry Allowed sampleObjectGrant
   minted <- either (die . ("fractional expiry mint failed: " <>) . show) pure result
   assertEqual "mint metadata uses the signed whole-second expiry" signedExpiry (minted ^. #expiresAt)
   biscuit <- either (die . show) pure (parseB64 public (minted ^. #token))
-  auth <- authorizeBiscuit biscuit [authorizer|allow if en_expires_at(2026-07-01T01:00:00Z);|]
+  auth <- authorizeBiscuit biscuit [authorizer|allow if en_expires_at(2026-07-01T01:00:01Z);|]
   case auth of
     Right _ -> pure ()
     Left e -> die ("fractional expiry was not normalized in the signed fact: " <> show e)
