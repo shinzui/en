@@ -72,16 +72,27 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   generated OpenAPI operation, bounded audit events, and the public proof-verifying
   `kikan-en-client`. Missing/invalid authentication, insufficient scope, and unavailable keys
   fail closed before En.
-- [x] 2026-08-27 — M4: verified real Shomei-signed JWTs through an HTTP JWKS stub for the
+- [x] 2026-08-26 — M4: verified real Shomei-signed JWTs through an HTTP JWKS stub for the
   401/403/503/200 matrix; verified real En Biscuits for exact and mismatched coordinates,
   expiry, tampering, and revocation; wrote and deleted a mutable exact-tool relationship to prove
   immediate next-mint denial and the old proof’s bounded residual lifetime; and generated/golden-
   checked the action OpenAPI including typed 400/401/403/500/503 problem responses. All three test
   suites and the 24-case conformance executable pass.
-- [ ] M5 — Integrate Shikigami’s capability-provider acquisition, exact tool invocation, and sink
-  enqueue/publish boundaries while retaining the shipped C11 grant gate.
-- [ ] M6 — Run the cross-repository end-to-end matrix, update operator/consumer documentation,
-  refresh Mori metadata, and distill durable decisions into the owning repositories’ ADR corpora.
+- [x] 2026-08-26 — M5: `mori://shinzui/shikigami` Git commit
+  `9d60e4ebf3b02b2775dd3ae4e5e82c02534f37f9` (commit-level URI pending Mori coverage)
+  added the production Shomei/Kikan authorizer, fail-closed grouped trust configuration, exact
+  provider and logical-tool checks at the actual IO callbacks, and fresh exact-target C13 checks
+  after lifecycle/C11 at both sink enqueue and publish. Denial, authorization outage, and proof
+  rejection perform no protected IO and proof bytes are never retained.
+- [x] 2026-08-26 — M6: the combined public-boundary matrix is green: Kikan’s authenticated HTTP
+  and real-Biscuit lifecycle tests, its contract/client suites and 24-case conformance executable,
+  plus Shikigami’s exact provider/tool no-callback tests, sink enqueue/publish revocation tests,
+  all 599 core tests, all 29 agent tests, all 81 worker tests, and every package/executable build.
+  `mori://shinzui/kikan-en` Git commit `82d6d163a6d1fd1abd9a94c94afa033dc0f6ee75`
+  (commit-level URI pending Mori coverage) documents the consumer hand-off;
+  `mori://shinzui/shikigami` Git commit `9d60e4ebf3b02b2775dd3ae4e5e82c02534f37f9`
+  (commit-level URI pending Mori coverage) adds ADR 0036 and the operator
+  runbook; both repositories’ Mori metadata was refreshed.
 
 
 ## Surprises & Discoveries
@@ -165,11 +176,36 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   Biscuit Datalog dates round to whole seconds while En’s pre-existing `MintedGrant` metadata
   retained the issuer clock’s fractional seconds. The latter made a genuine HTTP response fail
   the client’s signed-metadata comparison. Kikan-En now accepts canonical prefixed hashes and
-  normalizes its public expiry to Biscuit precision; En commits
-  `mori://shinzui/en/commits/da3e0b7df886625b23846a0f20779112b0ba75dd` and
-  `mori://shinzui/en/commits/07e0d2650cbdaa893b854c57c9fbc940a5b679f0` make the generic
-  mint result report that same signed precision.
-  Date: 2026-08-27.
+  normalizes its public expiry to Biscuit precision; `mori://shinzui/en` Git commits
+  `da3e0b7df886625b23846a0f20779112b0ba75dd` and
+  `07e0d2650cbdaa893b854c57c9fbc940a5b679f0` (commit-level URIs pending Mori coverage) make
+  the generic mint result report that same signed precision.
+  Date: 2026-08-26.
+
+- Discovery: Shikumi's rank-2 `SomeTool.run` callback does not carry `IOE` in its public effect
+  row. Its own static dispatcher establishes `unsafeEff_` as the sanctioned bridge for immediate
+  IO at that boundary, so Shikigami could place the authorization call directly before the leased
+  callback without widening the public tool effect type.
+  Date: 2026-08-26.
+
+- Discovery: current capability providers return an immutable, already-described lease and have
+  no separate discovery IO callback. Connection and every logical tool invocation are gated now;
+  the Shikigami ADR explicitly requires a future discovery callback to add
+  `DiscoverCapabilityTools` at that new IO boundary.
+  Date: 2026-08-26.
+
+- Discovery: two legacy sink placeholders were not valid closed authorization targets: the
+  default Kizashi recipient contained a reserved separator, and a fresh Danwa intent could carry
+  an empty topic before it had a conversation id. The operator default is now the separator-free
+  `recipient_default`; fresh Danwa uses its nonempty topic as the stable pre-IO target and refuses
+  an empty value before enqueue.
+  Date: 2026-08-26.
+
+- Discovery: Shikigami's disabled directory correctly refuses a test-only `VerifiedIdentity`.
+  Runtime C13 sink tests therefore had to admit `agent_heartbeat` through a real active Meibo
+  snapshot before exercising the external boundary, proving the action principal comes from the
+  admitted directory identity rather than a manifest name.
+  Date: 2026-08-26.
 
 
 ## Decision Log
@@ -267,18 +303,53 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   configured.
   Date: 2026-08-26.
 
+- Decision: Install a deny-all `ActionAuthorizer` whenever the grouped Shikigami action trust
+  configuration is disabled or absent. Keep the allow-all implementation explicitly test-only,
+  and keep the current one-off composition roots fail closed because they do not construct the
+  grouped production authorizer.
+  Rationale: removing or partially configuring C13 must never fall back to declaration authority,
+  the static C11 test store, or an unchecked callback.
+  Date: 2026-08-26.
+
+- Decision: Consume and verify a new proof inside each authorization call, retain only bounded
+  decision coordinates, and never place proof bytes in a workflow journal, outbox row, failure
+  value, or log.
+  Rationale: enqueue authority must not become publish authority, tool authority must be fresh at
+  the callback, and a verifier diagnostic must not accidentally make a bearer proof durable.
+  Date: 2026-08-26.
+
+- Decision: Derive sink authorization only after routing has produced the exact durable target.
+  Kawa uses the configured source, Kizashi the resolved/default recipient, Rei the intention and
+  current autonomy context, an existing Danwa conversation its id, a fresh Danwa conversation its
+  nonempty topic, and channel egress its channel plus resolved conversation key.
+  Rationale: authorizing a sink kind or unresolved placeholder would recreate the coarse grant
+  that C13 exists to narrow.
+  Date: 2026-08-26.
+
 
 ## Outcomes & Retrospective
 
-The 2026-06-29 foundation succeeded: Kikan policy moved out of En, the schema compiles, the
-embedded conformance matrix proves per-object behavior, and a PostgreSQL-backed Kikan server was
-built. The original plan stopped at a document-only Shikigami hand-off, so no runtime dispatch
-uses it yet.
+The coordinated implementation is complete. Kikan policy remains outside En, while En's generic
+Biscuit layer now supplies the signed, bounded decision primitive. Kikan-En exposes a closed,
+Shomei-authenticated action endpoint and a client that turns an HTTP allow into authority only
+after locally verifying the proof against the original coordinates. Its real JWT, HTTP,
+PostgreSQL relationship lifecycle, expiry, tampering, mismatch, and revocation evidence is green.
 
-This 2026-08-26 refresh converts that stale hand-off into executable remaining work. It reuses
-En’s since-shipped proof layer, preserves Shikigami’s since-shipped identity and grant gates, and
-targets the since-shipped capability-overlay provider boundary. No production implementation or
-ADR was changed during the refresh.
+Shikigami now composes that public client with its existing controls instead of replacing them.
+Provider acquisition and each logical tool callback receive fresh exact checks. Sink enqueue and
+publish retain lifecycle and C11 first, then independently authorize the fully resolved C13 target.
+Tests demonstrate denial and outage before provider acquisition, denial before a leased tool body,
+no outbox row on enqueue refusal, and no downstream HTTP after publish-time revocation. The full
+Shikigami matrix passes with 599 core, 29 agent, and 81 worker tests, and
+`cabal build all --enable-tests` builds every package and executable.
+
+The remaining operational constraint is intentional: an already-issued Biscuit can remain valid
+until its signed expiry, bounded by Kikan's 60-second ceiling, unless a verifier consults its
+revocation id. No Shikigami path stores the proof, and each protected boundary asks again. Durable
+consumer guidance lives in Kikan's hand-off documentation and in `mori://shinzui/shikigami` at
+`docs/adr/0036-external-agent-actions-require-fresh-exact-authorization.md` and
+`docs/operations/action-authorization.md`; artifact-level Mori URIs for those two files are
+pending registry coverage.
 
 
 ## Context and Orientation
@@ -716,3 +787,6 @@ registering through the already-gated capability provider/lease boundary.
   public client contract, and current migration/host seams. The revision implements
   `mori://shinzui/kikan-en/okf/improvement-requests/concepts/IR-3` without putting Kikan policy in
   En.
+- 2026-08-26: Completed M5 and M6. Recorded Shikigami's exact IO-boundary integration, combined
+  public-boundary validation, durable ADR/runbook hand-off, refreshed Mori metadata, and the final
+  proof-lifecycle and fail-closed decisions.
