@@ -72,8 +72,12 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   generated OpenAPI operation, bounded audit events, and the public proof-verifying
   `kikan-en-client`. Missing/invalid authentication, insufficient scope, and unavailable keys
   fail closed before En.
-- [ ] M4 — Prove the public client, denial taxonomy, Biscuit verification, expiry, tamper
-  resistance, revocation bound, and live HTTP behavior.
+- [x] 2026-08-27 — M4: verified real Shomei-signed JWTs through an HTTP JWKS stub for the
+  401/403/503/200 matrix; verified real En Biscuits for exact and mismatched coordinates,
+  expiry, tampering, and revocation; wrote and deleted a mutable exact-tool relationship to prove
+  immediate next-mint denial and the old proof’s bounded residual lifetime; and generated/golden-
+  checked the action OpenAPI including typed 400/401/403/500/503 problem responses. All three test
+  suites and the 24-case conformance executable pass.
 - [ ] M5 — Integrate Shikigami’s capability-provider acquisition, exact tool invocation, and sink
   enqueue/publish boundaries while retaining the shipped C11 grant gate.
 - [ ] M6 — Run the cross-repository end-to-end matrix, update operator/consumer documentation,
@@ -155,6 +159,17 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   client decodes them; M4 must either move the route to a typed multi-response combinator or add
   equivalent explicit OpenAPI response documentation before acceptance.
   Date: 2026-08-26.
+
+- Discovery: the first live proof lifecycle exposed two unit-fixture blind spots. En schema hashes
+  use an algorithm prefix such as `sha256:…`, which the initial contract validator rejected, and
+  Biscuit Datalog dates round to whole seconds while En’s pre-existing `MintedGrant` metadata
+  retained the issuer clock’s fractional seconds. The latter made a genuine HTTP response fail
+  the client’s signed-metadata comparison. Kikan-En now accepts canonical prefixed hashes and
+  normalizes its public expiry to Biscuit precision; En commits
+  `mori://shinzui/en/commits/da3e0b7df886625b23846a0f20779112b0ba75dd` and
+  `mori://shinzui/en/commits/07e0d2650cbdaa893b854c57c9fbc940a5b679f0` make the generic
+  mint result report that same signed precision.
+  Date: 2026-08-27.
 
 
 ## Decision Log
