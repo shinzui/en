@@ -55,7 +55,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8)
-import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
+import Data.Time (UTCTime (..), addUTCTime, fromGregorian, secondsToDiffTime)
 import Effectful (Eff, IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import En.Biscuit.Grant
@@ -82,6 +82,7 @@ import En.Biscuit.Mint
     MintConfig (..),
     mintCheckedObjectGrant,
     mintObjectGrant,
+    mintObjectGrantWithExpiry,
     mintScopedGrant,
   )
 import En.Biscuit.Verify
@@ -117,6 +118,7 @@ main = do
   unsupportedSubjectTest
   injectionSafetyTest
   mintAllowedTest
+  mintExpiryPrecisionTest
   mintFailClosedTest
   mintScopedTest
   mintCheckedTest
@@ -327,6 +329,25 @@ mintAllowedTest = do
   case auth of
     Right _ -> pure ()
     Left e -> die ("mint allowed: token missing expected facts or expiry: " <> show e)
+
+-- | Biscuit Datalog dates carry whole seconds. The metadata returned beside a
+-- token must report the same normalized value a verifier recovers from the
+-- signed fact, even when the issuer clock has subsecond precision.
+mintExpiryPrecisionTest :: IO ()
+mintExpiryPrecisionTest = do
+  secret <- loadSecret
+  let public = toPublic secret
+      config = MintConfig {issuerSecretKey = secret, issuerKeyId = IssuerKeyId 1, defaultTtl = 3600, now = pure sampleExpiry}
+      fractionalExpiry = addUTCTime 3600.75 sampleExpiry
+      signedExpiry = addUTCTime 3600 sampleExpiry
+  result <- mintObjectGrantWithExpiry config fractionalExpiry Allowed sampleObjectGrant
+  minted <- either (die . ("fractional expiry mint failed: " <>) . show) pure result
+  assertEqual "mint metadata uses the signed whole-second expiry" signedExpiry (minted ^. #expiresAt)
+  biscuit <- either (die . show) pure (parseB64 public (minted ^. #token))
+  auth <- authorizeBiscuit biscuit [authorizer|allow if en_expires_at(2026-07-01T01:00:00Z);|]
+  case auth of
+    Right _ -> pure ()
+    Left e -> die ("fractional expiry was not normalized in the signed fact: " <> show e)
 
 -- | 'Denied', 'Conditional', and (below) engine errors never mint a token.
 mintFailClosedTest :: IO ()

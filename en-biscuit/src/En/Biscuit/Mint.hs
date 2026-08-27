@@ -61,6 +61,7 @@ import Auth.Biscuit (SecretKey, getRevocationIds, mkBiscuitWith, serializeB64)
 import Data.ByteString (ByteString)
 import Data.Generics.Labels ()
 import Data.Time (NominalDiffTime, addUTCTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Effectful (Eff, IOE, (:>))
 import Effectful.Error.Static (runErrorNoCallStack)
 import En.Biscuit.Grant
@@ -166,7 +167,9 @@ mintObjectGrantWithExpiry config expiry decision grant =
   case decision of
     Denied -> pure (Left DecisionDenied)
     Conditional obligations -> pure (Left (DecisionConditional obligations))
-    Allowed -> signGrant config expiry (ObjectGrant (withObjectExpiry expiry grant))
+    Allowed ->
+      let signedExpiry = biscuitTimestamp expiry
+       in signGrant config signedExpiry (ObjectGrant (withObjectExpiry signedExpiry grant))
 
 -- | Mint a container-scoped grant from a bounded list of containers the caller
 -- already derived (e.g. from @en.lookup@). Expiry is stamped as @now + defaultTtl@.
@@ -197,7 +200,9 @@ mintScopedGrantWithExpiry ::
 mintScopedGrantWithExpiry config expiry maxContainers grant
   | n == 0 = pure (Left EmptyLookupScope)
   | n > maxContainers = pure (Left (LookupScopeTooLarge maxContainers n))
-  | otherwise = signGrant config expiry (ScopedGrant (withScopedExpiry expiry grant))
+  | otherwise =
+      let signedExpiry = biscuitTimestamp expiry
+       in signGrant config signedExpiry (ScopedGrant (withScopedExpiry signedExpiry grant))
   where
     n = length (grant ^. #containers)
 
@@ -206,6 +211,12 @@ resolveExpiry :: (Monad m) => MintConfig m -> m UTCTime
 resolveExpiry config = do
   t <- (config ^. #now)
   pure (addUTCTime (config ^. #defaultTtl) t)
+
+-- Biscuit's Datalog date value is encoded at whole-second precision. Normalize
+-- before building both the signed fact and 'MintedGrant', so HTTP metadata can
+-- never claim fractional precision that verification cannot recover.
+biscuitTimestamp :: UTCTime -> UTCTime
+biscuitTimestamp = posixSecondsToUTCTime . fromInteger . floor . utcTimeToPOSIXSeconds
 
 -- | Run @en.check@ for the grant's subject/permission/object and mint on
 -- 'Allowed'. Engine errors become 'EngineError' (the token is not minted); the
