@@ -67,8 +67,11 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   constructor-enforced canonical targets, capability provider/tool schema relations, Meibo-style
   fixtures, and exact revision/tool/capability/agent denials. Both package test suites pass and
   the conformance executable now reports 24 passing cases.
-- [ ] M3 — Add a Shomei-authenticated, proof-minting Kikan action endpoint plus small public
-  `kikan-en-contract` and `kikan-en-client` packages.
+- [x] 2026-08-26 — M3: added the shared `/v1/agent-actions/authorize` route, bounded Shomei JWKS
+  verifier, closed machine scope, En check-and-mint adapter, 30-second/60-second issuer policy,
+  generated OpenAPI operation, bounded audit events, and the public proof-verifying
+  `kikan-en-client`. Missing/invalid authentication, insufficient scope, and unavailable keys
+  fail closed before En.
 - [ ] M4 — Prove the public client, denial taxonomy, Biscuit verification, expiry, tamper
   resistance, revocation bound, and live HTTP behavior.
 - [ ] M5 — Integrate Shikigami’s capability-provider acquisition, exact tool invocation, and sink
@@ -138,6 +141,19 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   `docs/adr/README.md` requires four-digit filenames and Status/Context/Decision/Consequences
   headings without frontmatter, so M2 recorded the new durable contract boundary as ADR 0004
   rather than introducing an OKF profile incidentally.
+  Date: 2026-08-26.
+
+- Discovery: En's grant handler supports an explicit consistency mode, so the action adapter can
+  request `FullyConsistent` for every mint without adding another store interface. This makes a
+  relationship deletion visible to the next proof request rather than accepting the ordinary
+  optimized-read staleness window.
+  Date: 2026-08-26.
+
+- Discovery: Servant's ordinary `Post` combinator keeps the shared contract and derived client
+  small, but its generated OpenAPI response list does not describe every typed problem thrown by
+  the handler. Runtime 401/403/400/500/503 bodies are stable `ActionProblem` JSON and the public
+  client decodes them; M4 must either move the route to a typed multi-response combinator or add
+  equivalent explicit OpenAPI response documentation before acceptance.
   Date: 2026-08-26.
 
 
@@ -219,6 +235,21 @@ fixtures belong to `mori://shinzui/kikan-en`; the consuming runtime edits belong
   constructors make mismatches unrepresentable in Haskell, explicit target-kind checks make them
   fail JSON decoding, and duplicating Meibo’s directory lookup or minting rules in a transport
   package would create a second identity authority.
+  Date: 2026-08-26.
+
+- Decision: Use a fully consistent En read for every action proof mint, even though Kikan's legacy
+  check endpoints retain their caller-selected consistency behavior.
+  Rationale: the public contract promises that deleting an exact relationship prevents the next
+  mint immediately. The proof's short expiry bounds only already-issued allows; it must not also
+  absorb optimized-read lag on new decisions.
+  Date: 2026-08-26.
+
+- Decision: Treat the action signing key and Shomei issuer, audience, and JWKS URL as one grouped
+  host configuration. When the entire group is absent, retain the existing loopback En routes but
+  make action authorization unavailable; reject partial groups at startup.
+  Rationale: this preserves local administration and migration diagnostics without silently
+  exposing an unauthenticated action route or minting proofs with only half of the trust boundary
+  configured.
   Date: 2026-08-26.
 
 
