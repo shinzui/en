@@ -38,7 +38,7 @@ import En.LookupSubjects qualified as LookupSubjects
 import En.Postgres.Database (Database)
 import En.Prelude
 import En.Reachability (ReachabilityGraph)
-import En.Revision (Consistency)
+import En.Revision (Consistency, ConsistencyToken)
 import En.Schema (RelationName)
 import En.Servant.Problem
   ( ProblemDetails,
@@ -102,6 +102,9 @@ data Env es = Env
     --     it twice could straddle a reload.
     readActiveSchema :: !(IO ActiveSchema),
     checkOperation :: !(ReachabilityGraph -> Consistency -> CaveatContext -> Subject -> RelationName -> ObjectRef -> Eff es CheckOutcome),
+    -- | Optional owner generation at the exact check token; unsupported hosts
+    --     return Nothing. A live owner must fail on missing or invalid history.
+    grantGenerationOperation :: !(ConsistencyToken -> Eff es (Maybe Text)),
     lookupWithDeadlineOperation :: !(Lookup.Deadline (Eff es) -> ReachabilityGraph -> Consistency -> Lookup.LookupRequest -> Eff es Lookup.LookupPage),
     -- | Takes a 'Lookup.Deadline', not a deadline of its own: the two traversals poll the
     --     same kind of live clock, and one @deadlineMillis@ ceiling governs both.

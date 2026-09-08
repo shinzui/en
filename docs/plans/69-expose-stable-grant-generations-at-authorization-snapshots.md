@@ -19,7 +19,7 @@ Consumers need to tell whether grants changed between independent authorization 
 
 - [x] (2026-09-08) Inspect both mutation paths and their existing `en_transaction` anchors; design commit-ordered generation history.
 - [x] (2026-09-08) Add the migration, snapshot reader and bounded retention primitive. Migration and PostgreSQL integration tests prove rollback, commit ordering, historical reads and unrelated-write stability. The actual Koyomi/En HTTPS gate also verifies all 96 grant/revocation transactions receive generations.
-- [ ] Attach attributable generation metadata to actual check responses, update wire/OpenAPI/client fixtures and prove missing/stale metadata fails explicitly.
+- [x] (2026-09-08) Attach optional `grantGeneration` metadata through the server seam at the exact checked token, with retention validation before and after lookup. Live PostgreSQL hosts fail unavailable for absent history. Owner wire/example tests, server/client builds and regenerated OpenAPI pass. The actual Koyomi HTTPS gate proves historical generations after revocation and explicit unavailability after deleting disposable history; consumer protocol/TLS tests reject mixed, malformed or missing generations before validated evidence.
 - [ ] Integrate history pruning into bounded owner maintenance with correct counts and retention safety.
 - [ ] Verify the actual owner service and Koyomi's evidence adapter, including cursor writes and intervening revocation.
 
@@ -35,7 +35,7 @@ Both `applyTupleWritesSession` and `deleteRelationshipsSession` in `en-postgres/
 
 ## Outcomes & Retrospective
 
-The storage milestone passes owner migration/PostgreSQL acceptance, the all-package build, formatting and the real consumer service gate. Its initial test fixture needed an explicit xid8-to-bigint cast for the existing retention horizon; the test now reads the durable horizon before pruning. Implementation of wire metadata, maintenance and consumer evidence remains in progress. No consumer may treat schema-only values or unrelated PostgreSQL transaction positions as stable grant generations. Storage primitives alone do not complete this plan; live wire metadata, maintenance and consumer acceptance are mandatory.
+The storage milestone passes owner migration/PostgreSQL acceptance, the all-package build, formatting and the real consumer service gate. Its initial test fixture needed an explicit xid8-to-bigint cast for the existing retention horizon; the test now reads the durable horizon before pruning. Wire metadata now passes owner and consumer acceptance. Maintenance and consumer evidence remain in progress. No consumer may treat schema-only values or unrelated PostgreSQL transaction positions as stable grant generations. Storage and wire primitives alone do not complete this plan; maintenance and final consumer evidence acceptance are mandatory.
 
 ## Context and Orientation
 
@@ -84,3 +84,5 @@ Keep existing migration bytes unchanged. Tests use ephemeral databases or the co
 ## Interfaces and Dependencies
 
 Use existing Hasql sessions and the released pg-migrate API already selected by this owner; no new dependency bounds are needed. `En.Postgres.GrantGeneration` must expose an opaque `GrantGeneration`, a text renderer, `grantGenerationAtSession :: Revision -> Session (Maybe GrantGeneration)`, and a bounded horizon-based pruning session. Only the authoritative owner may derive this generation. The final HTTP contract must carry its association with `checkedAt`, and Koyomi must validate datastore/schema binding before making authorization evidence.
+
+Revision (2026-09-08): Delivered exact-snapshot response generations and fail-closed consumer validation. The additive optional JSON field preserves legacy decoding; embedded hosts must add `grantGenerationOperation` to `Env`, and source constructors must initialize `CheckResponseWire.grantGeneration`. Unsupported hosts explicitly return `Nothing`. Validation: `cabal build en-server en-example en-servant en-client`, `cabal test en-servant en-example`, OpenAPI regeneration, formatting, and the actual Koyomi owner/protocol/TLS gates passed. No dependency pins changed.

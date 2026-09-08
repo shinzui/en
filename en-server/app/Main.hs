@@ -31,6 +31,7 @@ import En.Lookup qualified as Lookup
 import En.LookupSubjects qualified as LookupSubjects
 import En.Postgres.Database (Database, runDatabasePool, runSession)
 import En.Postgres.Datastore (resolveDatastoreIdSession)
+import En.Postgres.GrantGeneration qualified as GrantGeneration
 import En.Postgres.Revision (ConsistencyConfig (..), OptimizedRevisionCache, OptimizedRevisionConfig (..), newOptimizedRevisionCache, runConsistencyStorePostgres)
 import En.Postgres.TupleStore (runTupleStorePostgres, runTupleStorePostgresWithOptimizedRevisionCacheHandle)
 import En.Postgres.Watch qualified as Watch
@@ -346,6 +347,7 @@ runServeApplication serverConfig loadedSchema pool config (tracerProvider, otelM
           { runPorts = runAppIO,
             readActiveSchema = readIORef activeSchemaRef,
             checkOperation,
+            grantGenerationOperation = GrantGeneration.grantGenerationForToken,
             lookupWithDeadlineOperation,
             lookupSubjectsWithDeadlineOperation,
             -- The feed reads the store and mints its own cursors; there is no

@@ -294,6 +294,9 @@
           },
           "decision": {
             "$ref": "#/components/schemas/CheckDecisionWire"
+          },
+          "grantGeneration": {
+            "type": "string"
           }
         },
         "required": [

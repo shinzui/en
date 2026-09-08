@@ -542,7 +542,7 @@ instance ToSchema CheckDecisionWire where
 instance ToSchema CheckResponseWire where
   declareNamedSchema _ = do
     decision <- declareSchemaRef (Proxy @CheckDecisionWire)
-    pure (NamedSchema (Just "CheckResponseWire") (objectSchema [("decision", decision), ("checkedAt", textRef)]))
+    pure (NamedSchema (Just "CheckResponseWire") (partialObjectSchema [("decision", decision), ("checkedAt", textRef)] [("grantGeneration", textRef)]))
 
 instance ToSchema MintGrantRequestWire where
   declareNamedSchema _ = do

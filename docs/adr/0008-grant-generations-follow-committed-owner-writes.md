@@ -47,8 +47,16 @@ the generation. Direct administrative tuple changes that bypass owner mutation
 APIs are outside this contract. Missing/corrupt generation state must fail a write
 or metadata read rather than silently weakening the evidence.
 
-Storage is the first milestone of ExecPlan 69. Attaching generation metadata to
-check responses, integrating bounded pruning into maintenance, and proving the
-consumer evidence path remain required before the complete capability is ready.
+Single-check responses now carry optional `grantGeneration` metadata. The live
+PostgreSQL host resolves the exact `checkedAt` token under the captured schema,
+reads its visible generation, and validates retention again afterward. Missing
+history fails unavailable. Embedded hosts without this capability explicitly
+return `Nothing`; the JSON field is omitted, preserving legacy wire decoding.
+Adding `Env.grantGenerationOperation` and `CheckResponseWire.grantGeneration`
+requires source updates for embedded hosts and response constructors.
+
+Storage and wire milestones of ExecPlan 69 are implemented. Integrating bounded
+pruning into maintenance and proving the final consumer evidence path remain
+required before the complete capability is ready.
 No existing `en1` token format changes, and a generation is neither a signature nor
 permission that can be cached and reused without reauthorization.

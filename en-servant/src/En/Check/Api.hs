@@ -183,17 +183,18 @@ instance FromJSON CheckRequestWire where
 -- read and that read is guaranteed to observe everything this one observed.
 data CheckResponseWire = CheckResponseWire
   { decision :: !CheckDecisionWire,
-    checkedAt :: !Text
+    checkedAt :: !Text,
+    grantGeneration :: !(Maybe Text)
   }
   deriving stock (Generic, Eq, Show)
 
 instance ToJSON CheckResponseWire where
-  toJSON wire = Aeson.object ["decision" .= (wire ^. #decision), "checkedAt" .= (wire ^. #checkedAt)]
-  toEncoding wire = pairs ("decision" .= (wire ^. #decision) <> "checkedAt" .= (wire ^. #checkedAt))
+  toJSON wire = Aeson.object (["decision" .= (wire ^. #decision), "checkedAt" .= (wire ^. #checkedAt)] <> foldMap (\value -> ["grantGeneration" .= value]) (wire ^. #grantGeneration))
+  toEncoding wire = pairs ("decision" .= (wire ^. #decision) <> "checkedAt" .= (wire ^. #checkedAt) <> foldMap ("grantGeneration" .=) (wire ^. #grantGeneration))
 
 instance FromJSON CheckResponseWire where
   parseJSON = withObject "CheckResponseWire" \o ->
-    CheckResponseWire <$> o .: "decision" <*> o .: "checkedAt"
+    CheckResponseWire <$> o .: "decision" <*> o .: "checkedAt" <*> o .:? "grantGeneration"
 
 data BatchCheckPairWire = BatchCheckPairWire
   { subject :: !SubjectWire,
@@ -399,7 +400,7 @@ instance AsUnion MintGrantResponses MintGrantResult where
 -- * Handlers
 
 checkHandler :: Env es -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
-checkHandler env@Env {checkOperation} request = enHandler do
+checkHandler env@Env {checkOperation, grantGenerationOperation} request = enHandler do
   active <- activeSchema env
   consistency <- orInvalid (consistencyFromWire (request ^. #consistency))
   context <- orInvalid (contextFromWire (request ^. #context))
@@ -418,7 +419,8 @@ checkHandler env@Env {checkOperation} request = enHandler do
           object
       )
   let ConsistencyToken checkedAt = (outcome ^. #checkedAt)
-  pure CheckResponseWire {decision = decisionToWire (outcome ^. #decision), checkedAt}
+  grantGeneration <- engine env active (grantGenerationOperation (outcome ^. #checkedAt))
+  pure CheckResponseWire {decision = decisionToWire (outcome ^. #decision), checkedAt, grantGeneration}
 
 batchCheckHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) => Env es -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
 batchCheckHandler env@Env {maxBatchSize} request = enHandler do

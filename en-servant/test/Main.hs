@@ -19,7 +19,7 @@ import Data.Text qualified as Text
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Effectful (Eff, IOE, runEff)
-import Effectful.Error.Static (Error, runErrorNoCallStack)
+import Effectful.Error.Static (Error, runErrorNoCallStack, throwError)
 import En.Biscuit.Grant (Audience (..))
 import En.Biscuit.Keys (parseSigningKeyText, singleKey)
 import En.Biscuit.Verify (VerifyRequest (..), verifyGrant)
@@ -153,6 +153,7 @@ main = do
                 . runConsistencyStoreInMemory,
             readActiveSchema = pure testActiveSchema,
             checkOperation = check,
+            grantGenerationOperation = const (pure Nothing),
             lookupWithDeadlineOperation = Lookup.lookupWithDeadline,
             lookupSubjectsWithDeadlineOperation = LookupSubjects.lookupSubjectsWithDeadline,
             watchOperation = stubWatch,
@@ -270,11 +271,16 @@ main = do
             permission = "view",
             object = ObjectRefWire {objectType = "space", objectId = "project-x"}
           }
-  assertEqual "cached check endpoint returns Allowed first" (Right (EnOk CheckResponseWire {decision = AllowedWire, checkedAt = testCheckedAt})) =<< runHandler (checkEndpoint checkRequest)
+  assertEqual "cached check endpoint returns Allowed first" (Right (EnOk CheckResponseWire {decision = AllowedWire, checkedAt = testCheckedAt, grantGeneration = Nothing})) =<< runHandler (checkEndpoint checkRequest)
   checkStatsAfterFirst <- cacheStats (cachedCheckEnv ^. #cacheDecisions)
-  assertEqual "cached check endpoint returns Allowed second" (Right (EnOk CheckResponseWire {decision = AllowedWire, checkedAt = testCheckedAt})) =<< runHandler (checkEndpoint checkRequest)
+  assertEqual "cached check endpoint returns Allowed second" (Right (EnOk CheckResponseWire {decision = AllowedWire, checkedAt = testCheckedAt, grantGeneration = Nothing})) =<< runHandler (checkEndpoint checkRequest)
   checkStatsAfterSecond <- cacheStats (cachedCheckEnv ^. #cacheDecisions)
   assertBool "cached check endpoint uses decision cache" ((checkStatsAfterSecond ^. #hits) > (checkStatsAfterFirst ^. #hits))
+
+  let generationEnv = env {grantGenerationOperation = \token -> if token == ConsistencyToken testCheckedAt then pure (Just "gg1_7") else throwError (StoreError "wrong metadata snapshot")}
+  assertEqual "check metadata receives the exact decision snapshot" (Right (EnOk CheckResponseWire {decision = AllowedWire, checkedAt = testCheckedAt, grantGeneration = Just "gg1_7"})) =<< runHandler (checkHandler generationEnv checkRequest)
+  unavailableGeneration <- runHandler (checkHandler (env {grantGenerationOperation = const (throwError (StoreError "generation unavailable"))}) checkRequest)
+  assertBool "metadata failure is unavailable rather than a decision" (case unavailableGeneration of Right (EnUnavailable _) -> True; _ -> False)
 
   {- E3, the headline property: a read's token is accepted as a later read's
   freshness bound. Check, take the token the response says it was decided at, and
@@ -643,7 +649,8 @@ toJsonMatchesToSchema = do
   conforms "CaveatObligationWire" obligation
   conforms "CheckDecisionWire/allowed" AllowedWire
   conforms "CheckDecisionWire/conditional" (ConditionalWire [obligation])
-  conforms "CheckResponseWire" CheckResponseWire {decision = AllowedWire, checkedAt = "tok"}
+  conforms "CheckResponseWire" CheckResponseWire {decision = AllowedWire, checkedAt = "tok", grantGeneration = Nothing}
+  conforms "CheckResponseWire/generation" CheckResponseWire {decision = AllowedWire, checkedAt = "tok", grantGeneration = Just "gg1_7"}
   conforms "MintGrantRequestWire" mintRequest
   conforms "MintGrantResponseWire" MintGrantResponseWire {token = "en.tok", expiresAt = noon, revocationIds = ["ab"], checkedAt = "tok"}
   conforms "BatchCheckPairWire" batchPair
@@ -1690,7 +1697,8 @@ wireContractTests = do
     "CaveatObligationWire"
     "{\"caveat\":\"business_hours\",\"missingContext\":[\"now\"]}"
     CaveatObligationWire {caveat = "business_hours", missingContext = ["now"]}
-  golden "CheckResponseWire" "{\"decision\":{\"result\":\"allowed\"},\"checkedAt\":\"tok\"}" CheckResponseWire {decision = AllowedWire, checkedAt = "tok"}
+  golden "CheckResponseWire" "{\"decision\":{\"result\":\"allowed\"},\"checkedAt\":\"tok\"}" CheckResponseWire {decision = AllowedWire, checkedAt = "tok", grantGeneration = Nothing}
+  golden "CheckResponseWire/generation" "{\"decision\":{\"result\":\"allowed\"},\"checkedAt\":\"tok\",\"grantGeneration\":\"gg1_7\"}" CheckResponseWire {decision = AllowedWire, checkedAt = "tok", grantGeneration = Just "gg1_7"}
 
   golden
     "BatchCheckPairWire"
@@ -1977,7 +1985,7 @@ wireContractTests = do
         subject = aliceSubject,
         caveat = Just businessHoursCaveat
       }
-  roundTrip "CheckResponseWire/conditional" CheckResponseWire {decision = conditionalDecision, checkedAt = "tok"}
+  roundTrip "CheckResponseWire/conditional" CheckResponseWire {decision = conditionalDecision, checkedAt = "tok", grantGeneration = Nothing}
   where
     noon = UTCTime (fromGregorian 2026 7 7) (secondsToDiffTime (12 * 3600))
     projectX = ObjectRefWire {objectType = "space", objectId = "project-x"}

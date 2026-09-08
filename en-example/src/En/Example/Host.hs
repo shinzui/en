@@ -138,6 +138,7 @@ mkEnv cStore tStore =
       runPorts = \_active -> runEff . runErrorNoCallStack . tStore . cStore,
       readActiveSchema = pure exampleActiveSchema,
       checkOperation = check,
+      grantGenerationOperation = const (pure Nothing),
       lookupWithDeadlineOperation = Lookup.lookupWithDeadline,
       lookupSubjectsWithDeadlineOperation = LookupSubjects.lookupSubjectsWithDeadline,
       -- This host serves its own guarded routes, not `EnAPI`, so nothing here can reach
