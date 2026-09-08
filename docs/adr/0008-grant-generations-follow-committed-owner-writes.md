@@ -55,8 +55,15 @@ return `Nothing`; the JSON field is omitted, preserving legacy wire decoding.
 Adding `Env.grantGenerationOperation` and `CheckResponseWire.grantGeneration`
 requires source updates for embedded hosts and response constructors.
 
-Storage and wire milestones of ExecPlan 69 are implemented. Integrating bounded
-pruning into maintenance and proving the final consumer evidence path remain
-required before the complete capability is ready.
+Storage and wire milestones of ExecPlan 69 are implemented. The scheduled owner
+worker now prunes generations after advancing the durable horizon and completing
+tuple/transaction cleanup. Each statement respects the existing row limit; the
+worker reports `generationsPruned` and includes these statements in its batch
+count. Locked victims can remain for the next pass. PostgreSQL tests prove
+concurrent pruning skips locked rows, rollback restores deletions, retry drains
+eligible rows and the retained floor survives. The actual scheduled-service gate
+reclaims 96 obsolete generations with matching logs and verifies fresh decisions
+against the retained floor. The final consumer evidence path remains required
+before the capability is ready.
 No existing `en1` token format changes, and a generation is neither a signature nor
 permission that can be cached and reused without reauthorization.

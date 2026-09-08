@@ -37,6 +37,7 @@ import Effectful (Eff)
 import En.Effect.TupleStore qualified as TupleStore
 import En.Error (EnError)
 import En.Postgres.Database (runSession)
+import En.Postgres.GrantGeneration (pruneGrantGenerationsBatchSession)
 import En.Postgres.TupleStore (pruneTransactionsBatchSession, reapDeletedTuplesBatchSession)
 import En.Prelude
 import En.Servant.Seam (AppEffects)
@@ -91,7 +92,8 @@ runMaintenanceLoop config runApp
         Nothing -> False
 
 -- | One pass: advance the horizon, drain the reap backlog, drain the prune backlog,
--- and report. A database error at any step abandons the pass; the next one starts over,
+-- prune obsolete grant generations while preserving their retained floor, and
+-- report. A database error at any step abandons the pass; the next one starts over,
 -- and whatever the failed pass committed stays committed.
 --
 -- The horizon is fixed by 'TupleStore.advanceGcHorizon', which advances the durable
@@ -112,21 +114,26 @@ runPass config runApp =
           drain (pruneTransactionsBatchSession horizon) >>= \case
             Left err -> logLine ("prune failed at horizon " <> render horizon <> ": " <> err)
             Right (pruned, pruneBatches) ->
-              logLine $
-                "horizon="
-                  <> render horizon
-                  <> " reaped="
-                  <> render reaped
-                  <> " pruned="
-                  <> render pruned
-                  <> " batches="
-                  <> render (reapBatches + pruneBatches)
+              drain (pruneGrantGenerationsBatchSession horizon) >>= \case
+                Left err -> logLine ("generation prune failed at horizon " <> render horizon <> ": " <> err)
+                Right (generationsPruned, generationBatches) ->
+                  logLine $
+                    "horizon="
+                      <> render horizon
+                      <> " reaped="
+                      <> render reaped
+                      <> " pruned="
+                      <> render pruned
+                      <> " generationsPruned="
+                      <> render generationsPruned
+                      <> " batches="
+                      <> render (reapBatches + pruneBatches + generationBatches)
   where
     render :: (Show a) => a -> Text
     render = Text.pack . show
 
-    -- Repeat the batch until it comes back short, which means the backlog is drained.
-    -- A full batch is never evidence of completion: the next one may still find rows.
+    -- Repeat until a short batch. SKIP LOCKED can leave victims held by another
+    -- worker; the next scheduled pass retries them. A full batch always continues.
     drain :: (Int -> Session Int64) -> IO (Either Text (Int64, Int))
     drain session = go 0 0
       where

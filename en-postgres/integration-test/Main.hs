@@ -2393,6 +2393,15 @@ runGrantGenerationScenario database connection = do
   retained <- snapshot
   horizonText <- textQuery "SELECT horizon::text FROM en_gc_horizon"
   horizon <- case readDec (Text.unpack horizonText) of [(value, "")] -> pure value; _ -> fail "invalid horizon fixture"
+  lockedPruner <- acquire database
+  runSessionOrFail lockedPruner (Session.script "BEGIN; SELECT generation FROM en_grant_generation WHERE generation=0 FOR UPDATE;")
+  sql "BEGIN; SET LOCAL statement_timeout='1s';"
+  skipped <- runSessionOrFail connection (pruneGrantGenerationsBatchSession horizon 1)
+  remaining <- textQuery "SELECT string_agg(generation::text, ',' ORDER BY generation) FROM en_grant_generation"
+  unless (skipped == 1 && remaining == "0,2,3") (fail "concurrent generation pruner did not skip the locked victim or preserve the floor")
+  sql "ROLLBACK;"
+  runSessionOrFail lockedPruner (Session.script "ROLLBACK;")
+  Connection.release lockedPruner
   counts <- sequence [runSessionOrFail connection (pruneGrantGenerationsBatchSession horizon 1) | _ <- [1 :: Int .. 4]]
   unless (counts == [1, 1, 1, 0]) (fail "generation pruning was not bounded or lost its floor")
   expect retained (Just "gg1_3")
@@ -2400,4 +2409,4 @@ runGrantGenerationScenario database connection = do
   _ <- runSessionOrFail connection (pruneGrantGenerationsBatchSession horizon 1)
   expect retained (Just "gg1_3")
   snapshot >>= flip expect (Just "gg1_4")
-  putStrLn "PASS: grant generations preserve commit order, rollback, unrelated-write stability, exact history and bounded retention floor"
+  putStrLn "PASS: grant generations preserve commit order, rollback, unrelated-write stability, exact history, concurrent pruning rollback and bounded retention floor"

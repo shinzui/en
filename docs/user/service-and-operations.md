@@ -625,7 +625,10 @@ transaction id still protected by `EN_GC_WINDOW` — and then deletes, in batche
 `EN_MAINTENANCE_BATCH_SIZE`:
 
 - soft-deleted `relation_tuple` rows whose `deleted_xid` is behind the horizon, and
-- `en_transaction` rows whose `xid` is behind the horizon.
+- `en_transaction` rows whose `xid` is behind the horizon, and
+- obsolete `en_grant_generation` rows below the horizon, preserving the greatest
+  generation below it and every row at or above it. The preserved floor keeps
+  generation metadata available for every retained snapshot.
 
 A consistency token that still validates can always be resolved. The horizon is a
 durable high-water mark (`en_gc_horizon`): each pass advances it and reaps at the
@@ -636,11 +639,17 @@ the mark never moves backwards.
 Each pass logs one line:
 
 ```text
-maintenance: horizon=27332 reaped=38510 pruned=0 batches=40
+maintenance: horizon=27332 reaped=38510 pruned=0 generationsPruned=2000 batches=43
 ```
 
 A pass that fails — most plausibly because PostgreSQL is restarting — logs
 `maintenance: pass failed: …` and the schedule continues.
+
+`generationsPruned` counts only deleted generation rows; `batches` includes all
+three cleanup stages and their final short/empty statements. Generation pruning
+uses `SKIP LOCKED`, so another worker may hold remaining victims when a batch
+returns short. The next scheduled pass retries them. The bound is per statement,
+not a total pass duration or a query-scan bound.
 
 Every batch is its own transaction. This bounds the row locks and the write-ahead log a
 single statement produces, and it makes the pass interruptible: `SIGTERM` during a pass
