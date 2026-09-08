@@ -46,6 +46,7 @@ import En.Lookup (LookupCursor (..), LookupLimit (..), LookupObject (..), Lookup
 import En.Lookup qualified as Lookup
 import En.Migrations (enMigrationPlan)
 import En.Postgres.Database (Database, runDatabaseConnection)
+import En.Postgres.GrantGeneration (grantGenerationAtSession, grantGenerationText, pruneGrantGenerationsBatchSession)
 import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgSnapshot, parsePgSnapshot, renderPgSnapshot, retainedHistoryVisible, runConsistencyStorePostgres, tokenMetadataFromPayload, transactionVisible)
 import En.Postgres.TupleStore (pruneTransactionsBatchSession, reapDeletedTuplesBatchSession, runTupleStorePostgres)
 import En.Postgres.Watch qualified as Watch
@@ -72,6 +73,8 @@ main = do
   result <- Pg.with \database -> do
     migrateDatabase database
     connection <- acquire database
+    runGrantGenerationScenario database connection
+    resetSchema connection
     runTupleStoreScenario connection
     runProbeScenario connection
     runTouchSemanticsScenario connection
@@ -133,7 +136,7 @@ resetSchema :: Connection.Connection -> IO ()
 resetSchema connection =
   Connection.use
     connection
-    (Session.script "TRUNCATE relation_tuple, en_transaction RESTART IDENTITY; UPDATE en_gc_horizon SET horizon = 0;")
+    (Session.script "TRUNCATE relation_tuple, en_transaction, en_grant_generation RESTART IDENTITY; UPDATE en_grant_generation_head SET generation=0; INSERT INTO en_grant_generation (generation,created_xid) VALUES (0,pg_current_xact_id()); UPDATE en_gc_horizon SET horizon = 0;")
     >>= \case
       Right () -> pure ()
       Left err -> fail ("Could not reset schema: " <> show err)
@@ -2347,3 +2350,54 @@ userSubject =
 wildcardUserSubject :: Set.Set AllowedSubject
 wildcardUserSubject =
   Set.singleton AllowedSubject {objectType = ObjectType "user", relation = Nothing, wildcard = True}
+
+-- A later commit must get the later grant generation even with the earlier XID.
+runGrantGenerationScenario :: Pg.Database -> Connection.Connection -> IO ()
+runGrantGenerationScenario database connection = do
+  let sql = runSessionOrFail connection . Session.script
+      textQuery query = runSessionOrFail connection (Session.statement () (Statement.preparable query Encoders.noParams (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.text)))))
+      snapshot = Revision <$> textQuery "SELECT pg_current_snapshot()::text"
+      expect revision expected = do
+        actual <- runSessionOrFail connection (grantGenerationAtSession revision)
+        unless (fmap grantGenerationText actual == expected) (fail "grant generation differs at exact snapshot")
+      anchor = "INSERT INTO en_transaction (xid,snapshot,schema_hash) VALUES (pg_current_xact_id(),pg_current_snapshot(),'generation-test');"
+  initial <- snapshot
+  expect initial (Just "gg1_0")
+  origin <- textQuery "SELECT created_xid::text FROM en_grant_generation WHERE generation=0"
+  expect (Revision (origin <> ":" <> origin <> ":")) Nothing
+  sql "CREATE TEMP TABLE grant_generation_noise (id int); INSERT INTO grant_generation_noise VALUES (1);"
+  afterNoise <- snapshot
+  unless (initial /= afterNoise) (fail "unrelated write did not advance PostgreSQL snapshot fixture")
+  expect afterNoise (Just "gg1_0")
+  earlier <- acquire database
+  runSessionOrFail earlier (Session.script ("BEGIN; " <> anchor))
+  sql ("BEGIN; " <> anchor <> " COMMIT;")
+  firstCommit <- snapshot
+  expect firstCommit (Just "gg1_1")
+  expect initial (Just "gg1_0")
+  runSessionOrFail earlier (Session.script "COMMIT;")
+  Connection.release earlier
+  secondCommit <- snapshot
+  expect secondCommit (Just "gg1_2")
+  expect firstCommit (Just "gg1_1")
+  sql ("BEGIN; INSERT INTO grant_generation_noise VALUES (3); " <> anchor <> " ROLLBACK;")
+  snapshot >>= flip expect (Just "gg1_2")
+  sql ("BEGIN; " <> anchor <> " UPDATE en_transaction SET schema_hash='same' WHERE xid=pg_current_xact_id(); COMMIT;")
+  snapshot >>= flip expect (Just "gg1_3")
+  failed <- Connection.use connection (Session.script ("BEGIN; INSERT INTO grant_generation_noise VALUES (2); DELETE FROM en_grant_generation_head; " <> anchor <> " COMMIT;"))
+  case failed of Right _ -> fail "missing generation head allowed a commit"; Left _ -> pure ()
+  snapshot >>= flip expect (Just "gg1_3")
+  noiseCount <- textQuery "SELECT count(*)::text FROM grant_generation_noise"
+  unless (noiseCount == "1") (fail "failed generation stamp committed transaction data")
+  sql "UPDATE en_gc_horizon SET horizon=pg_snapshot_xmin(pg_current_snapshot())::text::bigint;"
+  retained <- snapshot
+  horizonText <- textQuery "SELECT horizon::text FROM en_gc_horizon"
+  horizon <- case readDec (Text.unpack horizonText) of [(value, "")] -> pure value; _ -> fail "invalid horizon fixture"
+  counts <- sequence [runSessionOrFail connection (pruneGrantGenerationsBatchSession horizon 1) | _ <- [1 :: Int .. 4]]
+  unless (counts == [1, 1, 1, 0]) (fail "generation pruning was not bounded or lost its floor")
+  expect retained (Just "gg1_3")
+  sql ("BEGIN; " <> anchor <> " COMMIT;")
+  _ <- runSessionOrFail connection (pruneGrantGenerationsBatchSession horizon 1)
+  expect retained (Just "gg1_3")
+  snapshot >>= flip expect (Just "gg1_4")
+  putStrLn "PASS: grant generations preserve commit order, rollback, unrelated-write stability, exact history and bounded retention floor"

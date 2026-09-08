@@ -35,6 +35,7 @@ library
   exposed-modules:
     En.Postgres.Database
     En.Postgres.Datastore
+    En.Postgres.GrantGeneration
     En.Postgres.Revision
     En.Postgres.TupleStore
     En.Postgres.Watch
