@@ -63,7 +63,10 @@ count. Locked victims can remain for the next pass. PostgreSQL tests prove
 concurrent pruning skips locked rows, rollback restores deletions, retry drains
 eligible rows and the retained floor survives. The actual scheduled-service gate
 reclaims 96 obsolete generations with matching logs and verifies fresh decisions
-against the retained floor. The final consumer evidence path remains required
-before the capability is ready.
+against the retained floor. The final consumer gate now also proves real calendar
+HTTP pagination through the En-backed evidence port: cursor writes preserve
+generations, revocation invalidates saved pages, and downgrade/regrant cannot
+revive old detailed cursors. ExecPlan 69 is complete. Production identity and
+directory integration remain outside this owner capability.
 No existing `en1` token format changes, and a generation is neither a signature nor
 permission that can be cached and reused without reauthorization.
