@@ -16,23 +16,6 @@
         "type": "github"
       }
     },
-    "biscuit-haskell-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1787662906,
-        "narHash": "sha256-BtqFq5O48892O2y4M+FyC4npA0mxRo9Zv2jJrWjfCIY=",
-        "owner": "shinzui",
-        "repo": "biscuit-haskell",
-        "rev": "8c0b3c5a13ce4a310737c0336f2ae167a1597588",
-        "type": "github"
-      },
-      "original": {
-        "owner": "shinzui",
-        "repo": "biscuit-haskell",
-        "rev": "8c0b3c5a13ce4a310737c0336f2ae167a1597588",
-        "type": "github"
-      }
-    },
     "flake-compat": {
       "flake": false,
       "locked": {
@@ -85,23 +68,6 @@
       "original": {
         "owner": "numtide",
         "repo": "flake-utils",
-        "type": "github"
-      }
-    },
-    "generic-lens-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1756320688,
-        "narHash": "sha256-uohw91rUxAqyfQmi30XDyCU0VrU6IXiQOZd/EcA5tIs=",
-        "owner": "kcsongor",
-        "repo": "generic-lens",
-        "rev": "93e921156783173762d91c1e398c089eecf7849f",
-        "type": "github"
-      },
-      "original": {
-        "owner": "kcsongor",
-        "ref": "2.3.0.0",
-        "repo": "generic-lens",
         "type": "github"
       }
     },
@@ -294,23 +260,6 @@
         "type": "github"
       }
     },
-    "otel-servant-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1787763893,
-        "narHash": "sha256-oi3E1KjZLdI7Ezahz/3khwS5uxoLNwrPCzRIO1m7/80=",
-        "owner": "shinzui",
-        "repo": "hs-opentelemetry-instrumentation-servant",
-        "rev": "7a6f692e85295f965cd1827f9354c28af9e62742",
-        "type": "github"
-      },
-      "original": {
-        "owner": "shinzui",
-        "repo": "hs-opentelemetry-instrumentation-servant",
-        "rev": "7a6f692e85295f965cd1827f9354c28af9e62742",
-        "type": "github"
-      }
-    },
     "pg-migrate-src": {
       "flake": false,
       "locked": {
@@ -381,66 +330,26 @@
         "type": "github"
       }
     },
-    "relay-pagination-src_2": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1784929570,
-        "narHash": "sha256-furwgc+CeAOrQC5IuQRl0oMLmbt3OZsLrpGxSMxXt0Q=",
-        "owner": "shinzui",
-        "repo": "relay-pagination",
-        "rev": "224163d11c97afe13366e9c440450a25f448599c",
-        "type": "github"
-      },
-      "original": {
-        "owner": "shinzui",
-        "ref": "v0.1.1.0",
-        "repo": "relay-pagination",
-        "type": "github"
-      }
-    },
     "root": {
       "inputs": {
-        "biscuit-haskell-src": "biscuit-haskell-src",
         "flake-parts": [
           "haskell-nix-dev",
           "flake-parts"
         ],
-        "generic-lens-src": "generic-lens-src",
         "haskell-nix": "haskell-nix",
         "haskell-nix-dev": "haskell-nix-dev",
         "nixpkgs": [
           "haskell-nix-dev",
           "nixpkgs"
         ],
-        "otel-servant-src": "otel-servant-src",
         "pre-commit-hooks": [
           "haskell-nix-dev",
           "pre-commit-hooks"
         ],
-        "relay-pagination-src": "relay-pagination-src_2",
-        "servant-health-src": "servant-health-src",
-        "servant-openapi-hs-src": "servant-openapi-hs-src_2",
         "treefmt-nix": [
           "haskell-nix-dev",
           "treefmt-nix"
         ]
-      }
-    },
-    "servant-health-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1784932186,
-        "narHash": "sha256-YD45ki9RaoIqjxhDCf+XCS9H3a+SLZsR7lD5hwm7ImQ=",
-        "owner": "shinzui",
-        "repo": "servant-health",
-        "rev": "c70bffdd59e9336700dde304dac1328d3cb62f6a",
-        "type": "github"
-      },
-      "original": {
-        "owner": "shinzui",
-        "ref": "v0.1.0.0",
-        "repo": "servant-health",
-        "type": "github"
       }
     },
     "servant-openapi-hs-src": {
@@ -455,23 +364,6 @@
       },
       "original": {
         "owner": "shinzui",
-        "repo": "servant-openapi-hs",
-        "type": "github"
-      }
-    },
-    "servant-openapi-hs-src_2": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1784742636,
-        "narHash": "sha256-GgK9nkn1SpncCqyO06x9JKw9w4qj3zaL0U7TWMWFXAM=",
-        "owner": "shinzui",
-        "repo": "servant-openapi-hs",
-        "rev": "181ca609688af3cad994a73988492605c71bc2d0",
-        "type": "github"
-      },
-      "original": {
-        "owner": "shinzui",
-        "ref": "v5.1.0",
         "repo": "servant-openapi-hs",
         "type": "github"
       }

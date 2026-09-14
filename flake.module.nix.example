@@ -31,11 +31,20 @@
 
     # Define your OWN default package build here. nix/haskell.nix emits
     # `packages.default = callCabal2nix ...` only when nix.builtin-package is
-    # true; set that var False (e.g. when you need a haskell-nix overlay for
-    # patched private deps) and define packages.default below — otherwise the two
+    # true; set that var False (e.g. when you build on the shared haskell-nix
+    # patches) and define packages.default below — otherwise the two
     # definitions collide and flake-parts fails to evaluate:
     #
     #   packages.default = (pkgs.haskell.packages.ghc9124.override { ... }).my-package;
+    #
+    # With nix.haskell-nix = true, `inputs.haskell-nix` is the shared patch registry.
+    # Compose its extension ahead of your own overrides:
+    #
+    #   packages.default = (pkgs.haskell.packages.ghc9124.override {
+    #     overrides = pkgs.lib.composeExtensions
+    #       (inputs.haskell-nix.lib.haskellExtension pkgs.haskell.lib.compose pkgs)
+    #       (hself: _hsuper: { my-package = hself.callCabal2nix "my-package" ./. { }; });
+    #   }).my-package;
 
     # Override formatter details without editing the managed nix/treefmt.nix
     # (flake-parts merges treefmt.* options across modules):
@@ -51,5 +60,6 @@
   # To pull in a brand-new flake input you must add it to flake.nix's top-level
   # `inputs` (a Nix requirement — inputs cannot be declared from an imported
   # module). That is the one edit that will conflict on a future migration;
-  # resolve it with "accept new" and re-add your input line.
+  # resolve it with "accept new" and re-add your input line. (haskell-nix is
+  # module-owned: set nix.haskell-nix = true instead of adding it by hand.)
 }

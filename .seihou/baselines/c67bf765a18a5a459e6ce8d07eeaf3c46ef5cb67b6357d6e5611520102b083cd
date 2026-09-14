@@ -30,3 +30,4 @@ db/
 .mina/
 CLAUDE.local.md
 .seihou/manifest.json.tmp
+.envrc.local
