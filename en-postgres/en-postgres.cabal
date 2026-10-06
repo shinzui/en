@@ -1,6 +1,6 @@
 cabal-version: 3.0
-name:          en-postgres
-version:       0.1.0.0
+name: en-postgres
+version: 0.1.0.0
 synopsis:
   PostgreSQL implementations of en's store effects + revisions
 
@@ -10,19 +10,24 @@ description:
   reads via pg_visible_in_snapshot, the revision partial order, and the
   quantized "optimized revision".
 
-license:       MIT
-author:        Nadeem Bitar
-maintainer:    nadeem@gmail.com
-category:      Security, Authorization, Database
+license: MIT
+author: Nadeem Bitar
+maintainer: nadeem@gmail.com
+category: Security, Authorization, Database
 
 common warnings
   ghc-options:
-    -Wall -Wcompat -Widentities -Wincomplete-record-updates
-    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wpartial-fields
+    -Wredundant-constraints
     -Werror=missing-fields
 
 common shared
-  default-language:   GHC2024
+  default-language: GHC2024
   default-extensions:
     DeriveAnyClass
     DuplicateRecordFields
@@ -30,8 +35,8 @@ common shared
     OverloadedStrings
 
 library
-  import:          warnings, shared
-  hs-source-dirs:  src
+  import: warnings, shared
+  hs-source-dirs: src
   exposed-modules:
     En.Postgres.Database
     En.Postgres.Datastore
@@ -41,85 +46,88 @@ library
     En.Postgres.Watch
 
   build-depends:
-    , aeson
-    , base                      >=4.19 && <5
-    , bytestring
-    , containers
-    , effectful
-    , effectful-core
-    , en-core
-    , en-migrations
-    , generic-lens              >=2.2  && <2.4
-    , hasql
-    , hasql-dynamic-statements
-    , hasql-pool                ^>=1.4
-    , relay-pagination          >=0.1  && <0.2
-    , relay-pagination-hasql    >=0.1  && <0.2
-    , scientific
-    , text
-    , time
+    aeson,
+    base >=4.19 && <5,
+    bytestring,
+    containers,
+    effectful,
+    effectful-core,
+    en-core,
+    en-migrations,
+    generic-lens >=2.2 && <2.4,
+    hasql,
+    hasql-dynamic-statements,
+    hasql-pool ^>=1.4,
+    relay-pagination >=0.1 && <0.2,
+    relay-pagination-hasql >=0.1 && <0.2,
+    scientific,
+    text,
+    time,
 
 test-suite en-postgres-revision-tests
-  import:         warnings, shared
-  type:           exitcode-stdio-1.0
+  import: warnings, shared
+  type: exitcode-stdio-1.0
   hs-source-dirs: test
-  main-is:        Main.hs
+  main-is: Main.hs
   build-depends:
-    , base
-    , effectful
-    , effectful-core
-    , en-core
-    , en-postgres
-    , generic-lens    >=2.2 && <2.4
-    , hasql
-    , text
-    , time
+    base,
+    effectful,
+    effectful-core,
+    en-core,
+    en-postgres,
+    generic-lens >=2.2 && <2.4,
+    hasql,
+    text,
+    time,
 
 test-suite en-postgres-integration-tests
-  import:         warnings, shared
-  type:           exitcode-stdio-1.0
+  import: warnings, shared
+  type: exitcode-stdio-1.0
   hs-source-dirs: integration-test
-  main-is:        Main.hs
-
+  main-is: Main.hs
   -- The write-race scenario runs two guarded revokes on two connections at once.
   -- Without -threaded, the first thread's blocking libpq call parks the whole
   -- runtime and the second never reaches the lock it is supposed to contend for.
-  ghc-options:    -threaded
+  ghc-options: -threaded
   build-depends:
-    , base
-    , containers
-    , effectful
-    , effectful-core
-    , en-core
-    , en-migrations
-    , en-postgres
-    , ephemeral-pg
-    , generic-lens    >=2.2      && <2.4
-    , hasql
-    , pg-migrate      ^>=1.1.0.0
-    , text
-    , time
+    base,
+    containers,
+    directory,
+    effectful,
+    effectful-core,
+    en-core,
+    en-migrations,
+    en-postgres,
+    ephemeral-pg >=0.3.1 && <0.4,
+    generic-lens >=2.2 && <2.4,
+    hasql,
+    pg-migrate ^>=1.1.0.0,
+    text,
+    time,
+    unix,
 
 executable en-lookup-spike
-  import:         warnings, shared
+  import: warnings, shared
   hs-source-dirs: lookup-spike
-  main-is:        Main.hs
+  main-is: Main.hs
   build-depends:
-    , base
-    , en-core
-    , ephemeral-pg
-    , generic-lens  >=2.2 && <2.4
-    , hasql
-    , text
+    base,
+    directory,
+    en-core,
+    ephemeral-pg >=0.3.1 && <0.4,
+    generic-lens >=2.2 && <2.4,
+    hasql,
+    text,
+    unix,
 
 benchmark en-postgres-bench
-  import:         warnings, shared
-  type:           exitcode-stdio-1.0
+  import: warnings, shared
+  type: exitcode-stdio-1.0
   hs-source-dirs: bench
-  main-is:        Main.hs
-  ghc-options:    -fproc-alignment=64
+  main-is: Main.hs
+  ghc-options: -fproc-alignment=64
   build-depends:
-    , base
-    , en-core
-    , en-postgres
-    , tasty-bench
+    base,
+    en-core,
+    en-postgres,
+    tasty-bench,

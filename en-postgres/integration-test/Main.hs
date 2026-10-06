@@ -15,6 +15,7 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.List (nub, sort, sortOn)
 import Data.Map.Strict qualified as Map
+import Data.Monoid qualified as EphemeralMonoid
 import Data.Set qualified as Set
 import Data.Text qualified as Text
 import Data.Word (Word64)
@@ -67,10 +68,12 @@ import Hasql.Session qualified as Session
 import Hasql.Statement (Statement)
 import Hasql.Statement qualified as Statement
 import Numeric (readDec)
+import System.Directory qualified as EphemeralDirectory
+import System.Posix.User qualified as EphemeralUser
 
 main :: IO ()
 main = do
-  result <- Pg.with \database -> do
+  result <- withEphemeralPg \database -> do
     migrateDatabase database
     connection <- acquire database
     runGrantGenerationScenario database connection
@@ -116,7 +119,7 @@ acquire database =
 -- tests proved en worked against a schema no real database had. Migrating here
 -- makes that drift structurally impossible.
 --
--- @Pg.with@ is kept rather than @Database.PostgreSQL.Migrate.Test.withMigratedDatabase@
+-- @withEphemeralPg@ is kept rather than @Database.PostgreSQL.Migrate.Test.withMigratedDatabase@
 -- because four scenarios need the 'Pg.Database' handle to open additional concurrent
 -- connections, and that helper yields only one connection.
 migrateDatabase :: Pg.Database -> IO ()
@@ -2410,3 +2413,13 @@ runGrantGenerationScenario database connection = do
   expect retained (Just "gg1_3")
   snapshot >>= flip expect (Just "gg1_4")
   putStrLn "PASS: grant generations preserve commit order, rollback, unrelated-write stability, exact history, concurrent pruning rollback and bounded retention floor"
+
+-- | Stable per-user root lets the next invocation reap abandoned clusters.
+-- See mori://shinzui/ephemeral-pg/docs/guides (temporary-roots-and-stale-cleanup.md; artifact URI pending).
+withEphemeralPg :: (Pg.Database -> IO a) -> IO (Either Pg.StartError a)
+withEphemeralPg action = do
+  uid <- EphemeralUser.getEffectiveUserID
+  let root = "/tmp/ephpg-en-" <> show uid
+  EphemeralDirectory.createDirectoryIfMissing True root
+  let config = Pg.defaultConfig {Pg.temporaryRoot = EphemeralMonoid.Last (Just root)}
+  Pg.withConfig config action

@@ -11,6 +11,7 @@ import Data.Functor.Contravariant ((>$<))
 import Data.Generics.Labels ()
 import Data.Int (Int64)
 import Data.List (sort)
+import Data.Monoid qualified as EphemeralMonoid
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Data.Traversable (for)
@@ -24,7 +25,9 @@ import Hasql.Errors qualified as Hasql
 import Hasql.Session qualified as Session
 import Hasql.Statement (Statement)
 import Hasql.Statement qualified as Statement
+import System.Directory qualified as EphemeralDirectory
 import System.Environment (getArgs)
+import System.Posix.User qualified as EphemeralUser
 import Text.Read (readMaybe)
 
 data Scenario = Scenario
@@ -77,7 +80,7 @@ data Percentiles = Percentiles
 main :: IO ()
 main = do
   activityRows <- activityRowsFromArgs
-  result <- Pg.with \database ->
+  result <- withEphemeralPg \database ->
     bracket (acquire database) Connection.release \connection -> do
       runScript connection resetSql
       run connection populateActivitiesStatement (activityRows, maxSpaceId)
@@ -578,3 +581,13 @@ fixed value =
   where
     rounded :: Double
     rounded = fromIntegral (round (value * 100) :: Int64) / 100
+
+-- | Stable per-user root lets the next invocation reap abandoned clusters.
+-- See mori://shinzui/ephemeral-pg/docs/guides (temporary-roots-and-stale-cleanup.md; artifact URI pending).
+withEphemeralPg :: (Pg.Database -> IO a) -> IO (Either Pg.StartError a)
+withEphemeralPg action = do
+  uid <- EphemeralUser.getEffectiveUserID
+  let root = "/tmp/ephpg-en-" <> show uid
+  EphemeralDirectory.createDirectoryIfMissing True root
+  let config = Pg.defaultConfig {Pg.temporaryRoot = EphemeralMonoid.Last (Just root)}
+  Pg.withConfig config action
