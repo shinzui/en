@@ -47,11 +47,13 @@ import Data.Text qualified as Text
 import Data.Text.Encoding (decodeUtf8)
 import Data.Time (NominalDiffTime, addUTCTime)
 import Effectful qualified
+import Effectful.Error.Static (Error, catchError, throwError)
 import En.Biscuit.Grant (Audience (..), EnGrant (..), RequestId (..))
 import En.Biscuit.Mint (MintConfig (..), MintedGrant (..), mintObjectGrantWithExpiry)
 import En.Check (BatchPair (..), CheckDecision (..), CheckOutcome (..), checkMany)
 import En.Effect.ConsistencyStore (ConsistencyStore)
 import En.Effect.TupleStore (TupleStore)
+import En.Error (EnError (..))
 import En.Prelude hiding ((.=))
 import En.Revision (Consistency, ConsistencyToken (..))
 import En.Schema (RelationName (..))
@@ -128,7 +130,7 @@ data CheckRoutes mode = CheckRoutes
   deriving stock (Generic)
 
 checkRoutesServer ::
-  (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) =>
+  (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es, Error EnError Effectful.:> es) =>
   Env es ->
   CheckRoutes (AsServerT Handler)
 checkRoutesServer env =
@@ -399,7 +401,7 @@ instance AsUnion MintGrantResponses MintGrantResult where
 
 -- * Handlers
 
-checkHandler :: Env es -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
+checkHandler :: (Error EnError Effectful.:> es) => Env es -> CheckRequestWire -> Handler (EnResult CheckResponseWire)
 checkHandler env@Env {checkOperation, grantGenerationOperation} request = enHandler do
   active <- activeSchema env
   consistency <- orInvalid (consistencyFromWire (request ^. #consistency))
@@ -419,8 +421,20 @@ checkHandler env@Env {checkOperation, grantGenerationOperation} request = enHand
           object
       )
   let ConsistencyToken checkedAt = (outcome ^. #checkedAt)
-  grantGeneration <- engine env active (grantGenerationOperation (outcome ^. #checkedAt))
+  grantGeneration <- engine env active (postCheckMetadata (grantGenerationOperation (outcome ^. #checkedAt)))
   pure CheckResponseWire {decision = decisionToWire (outcome ^. #decision), checkedAt, grantGeneration}
+
+-- A token minted by the completed check cannot be a client input fault. Keep
+-- schema/evaluation errors typed; only metadata token faults become unavailable.
+postCheckMetadata :: (Error EnError Effectful.:> es) => Effectful.Eff es a -> Effectful.Eff es a
+postCheckMetadata action =
+  action `catchError` \_ err -> case err of
+    ConsistencyTokenExpired _ -> unavailable
+    InvalidConsistencyToken _ -> unavailable
+    MalformedConsistencyToken _ -> unavailable
+    _ -> throwError err
+  where
+    unavailable = throwError (StoreError "post-check generation metadata unavailable")
 
 batchCheckHandler :: (ConsistencyStore Effectful.:> es, TupleStore Effectful.:> es) => Env es -> BatchCheckRequestWire -> Handler (EnResult BatchCheckResponseWire)
 batchCheckHandler env@Env {maxBatchSize} request = enHandler do

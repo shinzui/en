@@ -282,6 +282,15 @@ main = do
   unavailableGeneration <- runHandler (checkHandler (env {grantGenerationOperation = const (throwError (StoreError "generation unavailable"))}) checkRequest)
   assertBool "metadata failure is unavailable rather than a decision" (case unavailableGeneration of Right (EnUnavailable _) -> True; _ -> False)
 
+  Foldable.forM_ [ConsistencyTokenExpired "retention raced", InvalidConsistencyToken "owner mismatch", MalformedConsistencyToken "bad metadata"] \metadataError -> do
+    let metadataEnv = env {grantGenerationOperation = const (throwError metadataError)}
+    Foldable.forM_ [checkRequest, checkRequest & #consistency .~ FullyConsistentWire] \request -> do
+      result <- runHandler (checkHandler metadataEnv request)
+      assertBool "post-check token failures are retryable unavailable" (case result of Right (EnUnavailable _) -> True; _ -> False)
+    let initialEnv = env {checkOperation = \_ _ _ _ _ _ -> throwError metadataError}
+    result <- runHandler (checkHandler initialEnv checkRequest)
+    assertBool "initial token failures remain client errors" (case result of Right (EnClientError _) -> True; _ -> False)
+
   {- E3, the headline property: a read's token is accepted as a later read's
   freshness bound. Check, take the token the response says it was decided at, and
   ask for a lookup at least as fresh as it. The chain closes, which is what a caller

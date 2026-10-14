@@ -1,5 +1,6 @@
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE MultilineStrings #-}
 
 module Main (main) where
@@ -46,8 +47,8 @@ import En.Error (EnError (..))
 import En.Lookup (LookupCursor (..), LookupLimit (..), LookupObject (..), LookupPage (..), LookupRequest (..), LookupState (..))
 import En.Lookup qualified as Lookup
 import En.Migrations (enMigrationPlan)
-import En.Postgres.Database (Database, runDatabaseConnection)
-import En.Postgres.GrantGeneration (grantGenerationAtSession, grantGenerationText, pruneGrantGenerationsBatchSession)
+import En.Postgres.Database (Database (..), runDatabaseConnection)
+import En.Postgres.GrantGeneration (grantGenerationAtSession, grantGenerationForToken, grantGenerationText, pruneGrantGenerationsBatchSession)
 import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgSnapshot, parsePgSnapshot, renderPgSnapshot, retainedHistoryVisible, runConsistencyStorePostgres, tokenMetadataFromPayload, transactionVisible)
 import En.Postgres.TupleStore (pruneTransactionsBatchSession, reapDeletedTuplesBatchSession, runTupleStorePostgres)
 import En.Postgres.Watch qualified as Watch
@@ -76,6 +77,7 @@ main = do
   result <- withEphemeralPg \database -> do
     migrateDatabase database
     connection <- acquire database
+    runGenerationMetadataScenario connection
     runGrantGenerationScenario database connection
     resetSchema connection
     runTupleStoreScenario connection
@@ -2353,6 +2355,57 @@ userSubject =
 wildcardUserSubject :: Set.Set AllowedSubject
 wildcardUserSubject =
   Set.singleton AllowedSubject {objectType = ObjectType "user", relation = Nothing, wildcard = True}
+
+-- Count the real database interpreter, including sessions dispatched by retention.
+runGenerationMetadataScenario :: Connection.Connection -> IO ()
+runGenerationMetadataScenario connection = do
+  valid <- either (fail . show) pure (Schema.validateSchema checkSchema)
+  let config = ConsistencyConfig (DatastoreId "test-datastore") (Schema.schemaHash valid) "24 hours"
+      sql = runSessionOrFail connection . Session.script
+      mint = runPgOrFail connection config do
+        resolved <- ConsistencyStore.resolveConsistency FullyConsistent
+        ConsistencyStore.mintToken (resolved ^. #revision)
+      counted after action = do
+        counter <- newIORef (0 :: Int)
+        result <-
+          runEff
+            . runDatabaseConnection connection
+            . interpose
+              ( \env -> \case
+                  op@(RunSession _) -> do
+                    result <- passthrough env op
+                    liftIO (modifyIORef' counter (+ 1))
+                    n <- liftIO (readIORef counter)
+                    liftIO (after n)
+                    pure result
+              )
+            . runErrorNoCallStack
+            . runTupleStorePostgres config
+            . runConsistencyStorePostgres config
+            $ action
+        n <- readIORef counter
+        pure (result, n)
+      expect token value sessions = do
+        (result, count) <- counted (const (pure ())) (grantGenerationForToken token)
+        assertEqual "generation metadata exact value" (Right (Just value)) result
+        assertEqual "generation metadata database sessions" sessions count
+  sql "INSERT INTO en_transaction (xid,snapshot,schema_hash) SELECT created_xid,pg_current_snapshot(),'generation-test' FROM en_grant_generation WHERE generation=0;"
+  historical <- mint
+  -- Noise changes the snapshot but must not change the generation.
+  sql "CREATE TEMP TABLE generation_metadata_noise (n int); INSERT INTO generation_metadata_noise VALUES (1);"
+  current <- mint
+  expect historical "gg1_0" 3
+  expect current "gg1_0" 3
+  sql "BEGIN; DELETE FROM en_grant_generation;"
+  (missing, missingCount) <- counted (const (pure ())) (grantGenerationForToken current)
+  assertEqual "missing generation history fails" (Left (StoreError "grant generation history unavailable")) missing
+  assertEqual "missing history session count" 2 missingCount
+  sql "ROLLBACK;"
+  -- Advance the real horizon precisely after the generation read (session two).
+  (raced, _) <- counted (\n -> when (n == 2) (sql "UPDATE en_gc_horizon SET horizon=9223372036854775807;")) (grantGenerationForToken current)
+  assertBool "post-read retention race fails closed" (case raced of Left (ConsistencyTokenExpired _) -> True; _ -> False)
+  sql "UPDATE en_gc_horizon SET horizon=0;"
+  putStrLn "PASS: generation metadata current/historical=3 sessions, missing=2, post-read retention race fails closed"
 
 -- A later commit must get the later grant generation even with the earlier XID.
 runGrantGenerationScenario :: Pg.Database -> Connection.Connection -> IO ()

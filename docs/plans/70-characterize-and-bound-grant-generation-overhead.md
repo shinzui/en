@@ -16,6 +16,11 @@ provenance:
       at: 2026-10-14T03:26:01Z
       mode: "update"
       note: "Correct sparse-history lookup bounds, baseline enforcement, failure-session expectations, and reproducible validation steps."
+    - model: "gpt-6.1-sol"
+      harness: "codex-cli"
+      at: 2026-10-14T04:12:16Z
+      mode: "implement"
+      note: "Implement session and race contracts, reproducible measurement spike, and bounded generation lookup."
   reviews:
     - model: "gpt-6-astra"
       harness: "codex-cli"
@@ -52,8 +57,10 @@ correctness assertion or declared performance envelope fails.
 
 ## Progress
 
-- [ ] Milestone 1: add deterministic database-session and error-surface tests, then capture the
-      current three-session post-check baseline.
+- [x] Milestone 1 (2026-10-13): measured current/historical success at three database
+      sessions and missing history at two; the real post-read horizon race fails closed.
+      Focused PostgreSQL/Servant suites pass after mapping post-check token faults to 503,
+      while initial token faults retain 400.
 - [ ] Milestone 2: add the isolated PostgreSQL generation-performance spike and record unoptimized
       fresh-read, historical-read, concurrent-write, storage, and pruning measurements.
 - [ ] Milestone 3: remove avoidable check-path sessions and bound historical lookup work while
@@ -63,6 +70,12 @@ correctness assertion or declared performance envelope fails.
 
 
 ## Surprises & Discoveries
+
+Implementation baseline (2026-10-13): the new real-interpreter test printed
+`current/historical=3 sessions, missing=2`. Before the orchestration fix, the
+Servant test failed with `post-check token failures are retryable unavailable`.
+The metadata fixture needs a retained transaction anchor; without one, the existing
+horizon fallback follows the current snapshot and expires its historical token.
 
 Review on 2026-10-13 confirmed the motivating read path and error mapping against the working tree.
 `grantGenerationForToken` performs three sessions on success, but only two when its generation
