@@ -1,6 +1,6 @@
-cabal-version:      3.0
-name:               en-migrations
-version:            0.1.0.0
+cabal-version: 3.0
+name: en-migrations
+version: 0.1.0.0
 synopsis:
   pg-migrate-managed PostgreSQL schema for en's relationship tuples
 
@@ -11,22 +11,27 @@ description:
   garbage-collection horizon high-water mark. SQL is embedded at compile time
   from an ordered manifest and applied by the @en-migrate@ executable.
 
-license:            MIT
-author:             Nadeem Bitar
-maintainer:         nadeem@gmail.com
-category:           Security, Authorization, Database
+license: MIT
+author: Nadeem Bitar
+maintainer: nadeem@gmail.com
+category: Security, Authorization, Database
 extra-source-files:
   migrations/*.sql
   migrations/manifest
 
 common warnings
   ghc-options:
-    -Wall -Wcompat -Widentities -Wincomplete-record-updates
-    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wpartial-fields
+    -Wredundant-constraints
     -Werror=missing-fields
 
 common shared
-  default-language:   GHC2024
+  default-language: GHC2024
   default-extensions:
     DeriveAnyClass
     DuplicateRecordFields
@@ -34,46 +39,45 @@ common shared
     OverloadedStrings
 
 library
-  import:             warnings, shared
-  hs-source-dirs:     src
+  import: warnings, shared
+  hs-source-dirs: src
   default-extensions: TemplateHaskell
-  exposed-modules:    En.Migrations
-  other-modules:      En.Migrations.Internal.Definition
+  exposed-modules: En.Migrations
+  other-modules: En.Migrations.Internal.Definition
   build-depends:
-    , base              >=4.19     && <5
-    , bytestring
-    , containers
-    , en-core
-    , pg-migrate        ^>=1.1.0.0
-    , pg-migrate-embed  ^>=1.1.0.0
+    base >=4.19 && <5,
+    bytestring,
+    containers,
+    en-core,
+    pg-migrate ^>=1.2.0.0,
+    pg-migrate-embed ^>=1.2.0.0,
 
 executable en-migrate
-  import:             warnings, shared
-  hs-source-dirs:     app
-  main-is:            Main.hs
-
+  import: warnings, shared
+  hs-source-dirs: app
+  main-is: Main.hs
   -- pg-migrate-cli's option records each declare a field named `output`, and the
   -- library exports them ambiguously; without this, commandOutputFormat's record
   -- patterns do not resolve. pg-migrate's own examples/basic does the same.
   default-extensions: DuplicateRecordFields
   build-depends:
-    , aeson
-    , base
-    , bytestring
-    , en-core
-    , en-migrations
-    , generic-lens          >=2.2      && <2.4
-    , hasql                 >=1.10     && <1.11
-    , optparse-applicative
-    , pg-migrate            ^>=1.1.0.0
-    , pg-migrate-cli        ^>=1.1.0.0
-    , text
+    aeson,
+    base,
+    bytestring,
+    en-core,
+    en-migrations,
+    generic-lens >=2.2 && <2.4,
+    hasql >=1.10 && <1.11,
+    optparse-applicative,
+    pg-migrate ^>=1.2.0.0,
+    pg-migrate-cli ^>=1.2.0.0,
+    text,
 
 test-suite en-migrations-tests
-  import:         warnings, shared
-  type:           exitcode-stdio-1.0
+  import: warnings, shared
+  type: exitcode-stdio-1.0
   hs-source-dirs: test
-  main-is:        Main.hs
+  main-is: Main.hs
   build-depends:
-    , base
-    , en-migrations
+    base,
+    en-migrations,

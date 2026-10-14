@@ -101,7 +101,7 @@ test-suite en-postgres-integration-tests
     ephemeral-pg >=0.3.1 && <0.4,
     generic-lens >=2.2 && <2.4,
     hasql,
-    pg-migrate ^>=1.1.0.0,
+    pg-migrate ^>=1.2.0.0,
     text,
     time,
     unix,
