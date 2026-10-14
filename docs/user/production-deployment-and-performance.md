@@ -228,6 +228,32 @@ policy and scenario keys; it rejects incomplete artifacts and p95 regressions
 above 25%. Complete JSON artifacts include raw samples and full EXPLAIN trees,
 even when a performance gate fails.
 
+The final reference run at one million rows measured read p95 of 0.042 ms
+(fresh), 0.060 ms (distance 32), and 0.117 ms (midpoint and floor), versus
+68.648/136.501 ms for the original midpoint/floor scan. Historical cases used
+20 iterations and 23 total index seeks; the sparse 63-bit span used 63 iterations
+and 66 seeks. Dense span doubling added one iteration.
+
+| Retained rows | Writers | Trigger-enabled commits/s | Commit p95 ms | Disabled counterfactual commits/s | Disabled commit p95 ms |
+| --- | --- | --- | --- | --- | --- |
+| 1,000 | 1 | 10,749 | 0.049 | 15,959 | 0.014 |
+| 1,000 | 8 | 21,868 | 0.327 | 25,168 | 0.203 |
+| 1,000 | 32 | 21,705 | 1.530 | 26,427 | 0.241 |
+| 1,000,000 | 1 | 7,588 | 0.069 | 10,042 | 0.052 |
+| 1,000,000 | 8 | 19,157 | 0.342 | 23,949 | 0.193 |
+| 1,000,000 | 32 | 18,492 | 3.324 | 23,682 | 0.470 |
+
+Pruning 10k/100k/1m rows used 11/101/1,001 statements, including the final empty
+batch, with p95 2.868/2.135/13.034 ms. At one million rows the first batch took
+2.072 ms and the final empty batch 11.488 ms. The corresponding first/midpoint/
+empty EXPLAIN buffer curve remains in the complete JSON; a batch limit is not a
+buffer or wall-time promise.
+
+Repeated same-host comparisons also flagged unchanged write workloads, and
+fresh-read deltas are measured in microseconds. Retain the reported relative
+failures and investigate host load and fixed SQL overhead; meeting the absolute
+limits does not silently waive the 25% comparison rule.
+
 The reference host on 2026-10-13 was an Apple M1 Max running Darwin 25.6.0,
 PostgreSQL 18.6 and GHC 9.12.4 (-O1). The disposable cluster used 12 MiB shared
 buffers, 4 MiB work_mem, random_page_cost 1 and JIT enabled, with fsync,

@@ -73,20 +73,43 @@ correctness assertion or declared performance envelope fails.
 - [ ] Milestone 4: repeat the full measurement matrix, document the supported operating envelope,
       update durable architecture context, and pass owner and Koyomi acceptance.
 
-Implementation checkpoint (2026-10-13): Milestone 3's two-session metadata path,
-shared engine/schema invocation, lazy scalar fallback, dense/sparse/empty/Int64-limit
-lookup, concurrent pruning and deferred-lock lifetime tests pass. The complete
-matching 48-cell baseline is `/tmp/en70-before-final.json`; candidate artifacts are
-`/tmp/en70-after.json`, `/tmp/en70-after-repeat.json`, and `/tmp/en70-after-scalar.json`.
-Absolute latency and search-work gates pass, but saved-baseline relative p95 gates
-remain unresolved while the user considers noisy reference-host comparisons.
-The live consumer gate passed against En `943f162` and
-`mori://shinzui/koyomi` revision `73bad36e968946efaaacd854d32b877d7aa35bcc`
-(with unrelated documentation edits in its working tree). Final-candidate validation
-is repeated after the pure snapshot benchmark repair; Milestone 4 remains open.
+Final implementation checkpoint (2026-10-13): all code, documentation and deterministic
+validation is complete at En `cf7b7b48efc81c380cd8d6bab143a3e01662d846`.
+Milestone 4 remains open only because the hard saved-baseline 25% p95 comparison
+fails in reference-host runs; the user has been asked whether to retain that rule or
+accept the absolute/work limits while reporting all deltas. Do not infer a waiver.
+The final default full matrix (`/tmp/en70-final.json`) is complete, correctness-valid
+and passes every declared absolute latency and search-work limit. Matching baseline
+is `/tmp/en70-before-final.json`; failed comparisons and all raw samples/plans remain
+outside the repository for diagnosis. The user explicitly accepted tiny-table scans.
+
+Required focused tests, `cabal build all`, the unchanged pure benchmark gate,
+`just openapi`, and formatting pass. The actual owner gate passed again against
+`cf7b7b4` and `mori://shinzui/koyomi` revision
+`73bad36e968946efaaacd854d32b877d7aa35bcc` (unrelated documentation edits in its
+working tree). No consumer files were changed. The gate used a temporary exported
+shell function to normalize current Mori's two-line `path` output for its older script:
+
+```bash
+# From the Mori-resolved Koyomi checkout:
+nix develop -c bash -c 'mori() { if [[ "$1" == path ]]; then command mori "$@" | tail -n 1; else command mori "$@"; fi; }; export -f mori; just test-en-owner'
+```
+
+The consumer controller was absent before this task. Its disposable databases and
+En process were cleaned by the gate; with no remaining client connections, the
+controller started by this task was stopped from the consumer checkout.
 
 
 ## Surprises & Discoveries
+
+Final reference evidence (2026-10-13): `en-grant-generation-spike --json /tmp/en70-final.json`
+exits zero at clean source `cf7b7b4`, with all 48 cells complete. Million-row head/32/mid/floor
+p95 is 0.042/0.060/0.117/0.117 ms. Enabled writer widths 1/8/32 at one million rows
+measure 7,588/19,157/18,492 commits/s and p95 0.069/0.342/3.324 ms. Prune p95 at
+10k/100k/1m is 2.868/2.135/13.034 ms; each mutation respects 1,000 rows, with exactly
+one floor survivor. Every committed XID has one generation and rollback XIDs have none.
+The final consumer gate again proves cursor continuity, revocation, downgrade/regrant
+and missing-history unavailable against the committed candidate.
 
 Pure benchmark discovery (2026-10-13): the unchanged `comparePgSnapshot` gate
 failed at 922 ns versus its committed 80.4 ns baseline. INLINE and -O2 experiments
@@ -220,7 +243,26 @@ nix develop -c cabal test en-postgres:en-postgres-integration-tests en-servant -
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Implemented the isolated spike and bounded generation lookup, reduced metadata
+sessions from three to two, preserved exact snapshots and fail-closed retention,
+and corrected post-check token errors to retryable unavailable. The live consumer,
+all required En checks, and the final full absolute/work envelope pass. No migration
+or wire-format change was needed. Tiny-table scans are intentionally acceptable.
+
+The final million-row midpoint/floor p95 is 0.117/0.117 ms versus the matching
+unoptimized baseline's 68.648/136.501 ms; fresh/distance-32 p95 is 0.042/0.060 ms.
+The lookup uses 20 iterations/23 seeks at one million rows, and 63/66 at the large
+sparse numeric span. Enabled-write capacity is reference evidence, documented for
+all widths/history sizes together with durability settings and storage/pruning costs.
+The singleton serialization point remains required and has a coordinated lock-lifetime
+proof. The existing pure snapshot benchmark regression was repaired without changing
+its baseline; ADR 7 documents the small record-pattern exception, and ADR 8 records
+the final lookup and operating constraints.
+
+The plan is not fully accepted yet. Relative comparisons still fail: final fresh p95
+rose from 0.032 to 0.042 ms, distance-32 from 0.032 to 0.060 ms, and unchanged disabled
+write cells also vary beyond 25%. Do not call those failures passes. The requested
+scope decision on this noisy relative gate is the only remaining completion item.
 
 
 ## Context and Orientation
