@@ -250,9 +250,14 @@ empty EXPLAIN buffer curve remains in the complete JSON; a batch limit is not a
 buffer or wall-time promise.
 
 Repeated same-host comparisons also flagged unchanged write workloads, and
-fresh-read deltas are measured in microseconds. Retain the reported relative
-failures and investigate host load and fixed SQL overhead; meeting the absolute
-limits does not silently waive the 25% comparison rule.
+fresh-read deltas are measured in microseconds. On 2026-10-14 the user accepted
+the measured head/distance-32 increase from 0.032/0.032 ms to 0.042/0.060 ms
+in exchange for bounded historical lookup and the historical latency improvement.
+ExecPlan 70 is complete using the passing correctness, session/search bounds and
+absolute latency gates. The strict 25% comparison and its failures remain
+diagnostics; this acceptance neither re-records the baseline nor waives future
+regressions. Investigate host load and fixed SQL overhead when interpreting new
+relative failures; do not assume every failure is timing noise.
 
 The reference host on 2026-10-13 was an Apple M1 Max running Darwin 25.6.0,
 PostgreSQL 18.6 and GHC 9.12.4 (-O1). The disposable cluster used 12 MiB shared

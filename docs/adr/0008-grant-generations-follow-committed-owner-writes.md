@@ -92,6 +92,15 @@ The lazy scalar fallback avoids executing recursive work on fresh/distance-32
 reads. Empty/no-visible history returns absence and fails unavailable at the
 public metadata boundary.
 
+On 2026-10-14 the user accepted the measured recent-lookup overhead as the cost
+of bounded historical work: million-row head/distance-32 p95 increased from
+0.032/0.032 ms to 0.042/0.060 ms, while midpoint/floor fell from
+68.648/136.501 ms to 0.117/0.117 ms. Correctness, deterministic session/search
+bounds and declared absolute latency limits remain hard acceptance criteria.
+The spike's strict 25% relative comparison remains diagnostic evidence, including
+its nonzero exit status; this candidate's recorded tradeoff does not waive future
+regressions or change the separate pure benchmark gate. ExecPlan 70 is complete.
+
 Decode the token minted by the check, read its generation, then validate that
 same metadata once. This uses two database sessions and preserves the post-read
 retention defense. Run both actions under one engine invocation and one captured

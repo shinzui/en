@@ -70,14 +70,16 @@ correctness assertion or declared performance envelope fails.
       reads use 20 iterations/23 seeks; the 63-bit sparse span uses 63/66. Dense
       doubling adds one iteration. Exact-history, rollback, deferred-lock lifetime,
       concurrent pruning, and post-read retention gates pass.
-- [ ] Milestone 4: repeat the full measurement matrix, document the supported operating envelope,
-      update durable architecture context, and pass owner and Koyomi acceptance.
+- [x] Milestone 4 (2026-10-14): full matrix, operating envelope, ADRs, owner and
+      Koyomi acceptance are complete. The user explicitly accepted the measured
+      recent-lookup regression and closed the plan on the passing absolute latency,
+      search-work and correctness gates; relative comparison failures remain recorded.
 
 Final implementation checkpoint (2026-10-13): all code, documentation and deterministic
 validation is complete at En `cf7b7b48efc81c380cd8d6bab143a3e01662d846`.
-Milestone 4 remains open only because the hard saved-baseline 25% p95 comparison
-fails in reference-host runs; the user has been asked whether to retain that rule or
-accept the absolute/work limits while reporting all deltas. Do not infer a waiver.
+Closure (2026-10-14): the user explicitly accepted the measured regression and
+requested plan closure. The saved-baseline 25% p95 comparison remains a diagnostic,
+with its failures preserved; it is no longer a hard completion criterion for this plan.
 The final default full matrix (`/tmp/en70-final.json`) is complete, correctness-valid
 and passes every declared absolute latency and search-work limit. Matching baseline
 is `/tmp/en70-before-final.json`; failed comparisons and all raw samples/plans remain
@@ -115,8 +117,8 @@ Pure benchmark discovery (2026-10-13): the unchanged `comparePgSnapshot` gate
 failed at 922 ns versus its committed 80.4 ns baseline. INLINE and -O2 experiments
 were insufficient. Record-pattern field projections in three hot predicates restored
 81.8 ns; all three pure benchmarks pass without re-recording the baseline. ADR 7
-now records this measured narrow exception. Re-run correctness and the live consumer
-gate against this final change before closure.
+now records this measured narrow exception. Correctness and the live consumer
+gate were rerun successfully against this final change before closure.
 
 Prototype discovery (2026-10-13): PostgreSQL selected repeated scans for a sparse
 43-row fixture. An indexed-minimum/equality alternative did not improve that choice.
@@ -133,7 +135,9 @@ substantial Spotlight, terminal and Finder CPU activity on the shared host. Pres
 all failure artifacts instead of re-recording a slower baseline. A paired 200-sample
 diagnostic measured million-row old/new head p50 0.023/0.029 ms and p95 0.042/0.055 ms
 for the initial CTE candidate; the scalar candidate passes correctness and work bounds.
-The comparison policy remains unchanged pending the user's scope decision.
+The user accepted the measured tradeoff on 2026-10-14. The strict comparison tool
+remains unchanged, but its relative failures are diagnostic evidence rather than
+an outstanding completion blocker. Do not attribute every relative failure to noise.
 
 Full baseline (2026-10-13): Apple M1 Max, Darwin 25.6.0, GHC 9.12.4 (-O1),
 PostgreSQL 18.6. Ephemeral settings: shared_buffers 12 MiB, work_mem 4 MiB,
@@ -240,6 +244,17 @@ nix develop -c cabal test en-postgres:en-postgres-integration-tests en-servant -
   the narrow exception; the existing revision/integration suites verify behavior.
   Date: 2026-10-13
 
+- Decision: Accept the measured recent-lookup regression and close this plan using
+  correctness, deterministic session/search bounds and the declared absolute latency limits.
+  Rationale: The user explicitly accepted the tradeoff: million-row head/distance-32 p95
+  increases from 0.032/0.032 ms to 0.042/0.060 ms, while midpoint/floor improves from
+  68.648/136.501 ms to 0.117/0.117 ms. The metadata session count also falls from three
+  to two, although total request latency was not measured. Preserve all relative deltas
+  and the strict comparison tool as diagnostics; unchanged write variability does not
+  justify claiming all failures are noise. This acceptance does not waive future
+  regressions or change the existing pure benchmark gate or its baseline.
+  Date: 2026-10-14
+
 
 ## Outcomes & Retrospective
 
@@ -259,10 +274,11 @@ proof. The existing pure snapshot benchmark regression was repaired without chan
 its baseline; ADR 7 documents the small record-pattern exception, and ADR 8 records
 the final lookup and operating constraints.
 
-The plan is not fully accepted yet. Relative comparisons still fail: final fresh p95
-rose from 0.032 to 0.042 ms, distance-32 from 0.032 to 0.060 ms, and unchanged disabled
-write cells also vary beyond 25%. Do not call those failures passes. The requested
-scope decision on this noisy relative gate is the only remaining completion item.
+The plan is complete and accepted as of 2026-10-14. Relative comparisons still fail:
+final fresh p95 rose from 0.032 to 0.042 ms, distance-32 from 0.032 to 0.060 ms,
+and unchanged disabled write cells also vary beyond 25%. These diagnostic failures
+remain failures; the user explicitly accepted the measured tradeoff instead of
+changing or re-recording the baseline. All remaining hard acceptance criteria pass.
 
 
 ## Context and Orientation
@@ -513,10 +529,13 @@ revise this plan and ADR 8 with a different bounded design.
 
 
 Run the full spike again after the read-path changes and render before/after deltas for every matrix
-cell. A regression is actionable when the same-host post-change p95 is more than 25 percent slower
-than its pre-change counterpart in any matching cell; investigate rather than
-re-recording the slower number. Concurrent-write results are capacity evidence, not permission to
-weaken commit order. Report how commit latency changes with accumulated history, including index
+cell. A same-host post-change p95 more than 25 percent slower than its pre-change
+counterpart in any matching cell requires investigation and a recorded disposition,
+rather than re-recording the slower number. The user accepted the measured recent-read
+tradeoff on 2026-10-14; correctness, session/search bounds and absolute latency remain
+hard completion gates. Preserve relative failures as diagnostics. Concurrent-write results
+are capacity evidence, not permission to weaken commit order. Report how commit latency
+changes with accumulated history, including index
 and storage costs; do not require it to be mathematically independent of table size. Verify from the
 trigger and coordinated transaction tests that the singleton lock is acquired during the deferred
 trigger and held through commit. If avoidable work extends
@@ -576,9 +595,13 @@ nix develop -c cabal run en-grant-generation-spike -- --compare "$grant_results_
 ```
 
 The comparison exits zero only when correctness matches, declared latency limits pass, and
-unintended same-host regressions stay within 25 percent. The executable must explain a nonzero result
+same-host regressions stay within 25 percent. The executable must explain a nonzero result
 with the failing scenario and measured values. `--compare` runs the candidate matrix once, then
 compares it with the saved baseline; it does not require a separate after-run first.
+For this accepted candidate, a nonzero comparison due solely to the recorded relative
+regressions is expected diagnostic evidence. Completion requires the default full run
+to pass correctness, search-work and absolute latency limits, alongside the recorded
+comparison disposition; do not treat a failed comparison as a passing command.
 
 Run the full En validation:
 
@@ -637,7 +660,9 @@ The following observable statements define completion:
    the numeric-span seek bound in Milestone 3, with dense doubling and sparse-key evidence.
    The result note includes
    the host and PostgreSQL version so another operator can reproduce rather than misapply the
-   absolute numbers.
+   absolute numbers. Before/after relative deltas are retained and investigated; the
+   user accepted this candidate's recorded tradeoff on 2026-10-14, so its relative
+   comparison failures do not block completion.
 
 5. Concurrent-write measurements report both production-trigger and disposable trigger-disabled
    results at widths 1, 8, and 32. Production runs prove exactly one generation per commit, none per
@@ -716,10 +741,11 @@ raw samples, correctness assertions, and complete EXPLAIN plans. `--compare` req
 environment, settings, sample policy, schema version, and scenario keys (source revision and
 baseline/candidate mode are expected to differ). It prints deltas and exits nonzero on incomplete
 artifacts, missing scenarios, correctness differences, declared limit failures, or p95 regressions
-over 25 percent. Apply that regression gate to every timed cell without exempting improved reads;
+over 25 percent. Apply that diagnostic to every timed cell without exempting improved reads;
 report throughput/storage/buffer deltas as characterization. Write a complete artifact atomically
 even when a performance gate fails, and distinguish it from an interrupted or correctness-invalid
-run.
+run. The strict comparison exit status is retained; the explicit acceptance decision
+above makes the recorded relative failures non-blocking for this plan's closure.
 
 Keep `GrantGeneration` opaque and retain:
 
@@ -755,3 +781,5 @@ repaired result-directory and consumer working-directory instructions. Implement
 remain open; no production code was changed during this review.
 
 Revision note (2026-10-13, implementation): Implemented executable session/race contracts, the isolated performance matrix, and inline bounded lookup. Accepted the user's direction to allow tiny-table scans; documented reference settings and investigated relative timing failures without treating them as passes.
+
+Revision note (2026-10-14, closure): The user explicitly accepted the measured recent-lookup regression. Recorded the tradeoff in ADR 8 and the deployment guide, retained the strict relative comparison as diagnostic evidence, and closed Milestone 4 using the existing passing correctness, session/search bounds, absolute latency and consumer validation.
