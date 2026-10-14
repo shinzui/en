@@ -11,6 +11,7 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Lazy (ByteString)
 import Data.Foldable qualified as Foldable
 import Data.Generics.Labels ()
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List qualified as List
 import Data.Map.Strict qualified as Map
 import Data.OpenApi (ToSchema, validateToJSON)
@@ -279,6 +280,17 @@ main = do
 
   let generationEnv = env {grantGenerationOperation = \token -> if token == ConsistencyToken testCheckedAt then pure (Just "gg1_7") else throwError (StoreError "wrong metadata snapshot")}
   assertEqual "check metadata receives the exact decision snapshot" (Right (EnOk CheckResponseWire {decision = AllowedWire, checkedAt = testCheckedAt, grantGeneration = Just "gg1_7"})) =<< runHandler (checkHandler generationEnv checkRequest)
+  engineInvocations <- newIORef (0 :: Int)
+  schemaReads <- newIORef (0 :: Int)
+  let countedGenerationEnv = case generationEnv of
+        Env {runPorts = runOriginal, readActiveSchema = readOriginal} ->
+          generationEnv
+            { runPorts = \active action -> modifyIORef' engineInvocations (+ 1) >> runOriginal active action,
+              readActiveSchema = modifyIORef' schemaReads (+ 1) >> readOriginal
+            }
+  _ <- runHandler (checkHandler countedGenerationEnv checkRequest)
+  assertEqual "decision and generation use one engine invocation" 1 =<< readIORef engineInvocations
+  assertEqual "decision and generation capture one active schema" 1 =<< readIORef schemaReads
   unavailableGeneration <- runHandler (checkHandler (env {grantGenerationOperation = const (throwError (StoreError "generation unavailable"))}) checkRequest)
   assertBool "metadata failure is unavailable rather than a decision" (case unavailableGeneration of Right (EnUnavailable _) -> True; _ -> False)
 

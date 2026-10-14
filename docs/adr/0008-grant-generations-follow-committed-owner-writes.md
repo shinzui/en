@@ -70,3 +70,45 @@ revive old detailed cursors. ExecPlan 69 is complete. Production identity and
 directory integration remain outside this owner capability.
 No existing `en1` token format changes, and a generation is neither a signature nor
 permission that can be cached and reused without reauthorization.
+
+## Performance and retained-history lookup — 2026-10-13
+
+[ExecPlan 70](../plans/70-characterize-and-bound-grant-generation-overhead.md)
+measured the former descending visibility scan growing linearly with historical
+distance: at one million rows it filtered about 500k/1m entries for midpoint/floor
+snapshots. Preserve commit order and retention, and replace that scan with one
+SQL statement using a bounded fast path and recursive numeric bisection.
+
+Visible generations form a prefix because generation N+1 cannot take the
+singleton lock until N's transaction finishes. The search tries at most 33 newest
+rows, then seeks a successor at each overflow-safe midpoint. A missing key reduces
+the upper interval; it is not an invisible generation. Each iteration halves the
+interval or better. Nonnegative Int64 keys cap the search at 64 iterations even
+with sparse retained history. Endpoint seeks plus one seek per iteration bound
+logical search work; B-tree traversal and PostgreSQL's chosen physical plan have
+their own costs. Tiny-table scans are acceptable. The performance spike verifies
+index plans on larger fixtures, and operators must keep statistics current.
+The lazy scalar fallback avoids executing recursive work on fresh/distance-32
+reads. Empty/no-visible history returns absence and fails unavailable at the
+public metadata boundary.
+
+Decode the token minted by the check, read its generation, then validate that
+same metadata once. This uses two database sessions and preserves the post-read
+retention defense. Run both actions under one engine invocation and one captured
+active schema. Token faults discovered only in metadata become retryable 503;
+initial client-token faults retain 400. Embedded hosts still explicitly omit the
+optional generation field.
+
+The singleton is acquired by the deferred trigger and remains held through
+commit. Coordinated real transactions verify this lock lifetime, inverted XID
+allocation, xip snapshots and rollback. The critical section contains only the
+counter update and history insert after the existing once-per-XID check; retain
+this deliberate serialization point. No migration bytes or persistent schema
+artifacts change for the inline lookup.
+
+The million-row reference fixture occupied about 89 bytes per generation,
+including both indexes. Pruning bounds deleted rows and acquired locks, not
+buffers or wall time, and normal vacuum is still needed. Test-host capacity and
+latency are documented in the deployment guide together with the disposable
+cluster's non-durable settings. Operators must measure their own durability,
+network and hardware class rather than treat those numbers as service guarantees.

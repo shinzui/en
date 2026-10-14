@@ -167,6 +167,77 @@ Operationally:
 - Keep tuple cardinality bounded by modeling only relationship facts, not every
   high-volume domain object fact.
 
+## Grant-generation overhead
+
+A PostgreSQL single check attaches `grantGeneration` at its exact `checkedAt`
+snapshot. This adds two database sessions after the decision: one generation
+lookup and one retention-horizon validation. The decoder performs no database
+read. Decision-cache hits still pay these two sessions. The final validation is
+required: if maintenance advances retention during the read, the response fails
+with retryable HTTP 503. Initial invalid client tokens retain HTTP 400.
+
+Generation visibility follows successful owner commit order. The lookup tries
+at most the newest 33 rows, then bisects the interval of retained generation
+numbers using a successor seek at each midpoint. Gaps from pruning are supported.
+For numeric span `S`, at most `ceiling(log2(S)) + 1` steps are needed, capped at 64
+for nonnegative `Int64` keys. There is one seek per step, plus two endpoint seeks
+and the fixed fast path. This bounds search steps, not B-tree buffer visits.
+All steps share one SQL statement snapshot. PostgreSQL may choose scans for tiny
+tables; keep statistics current with normal vacuum/analyze and use the spike's
+EXPLAIN gate to verify index plans on larger histories.
+
+Each committed owner transaction stores a generation row with a bigint counter,
+an xid8, a primary-key index and a unique XID index. The reference million-row
+fixture occupied 89,292,800 bytes: 44,318,720 table bytes and 44,974,080 index bytes,
+about 89 bytes per generation before dead-row growth. PostgreSQL page allocation,
+index fill and vacuum history affect actual storage. Retention maintenance keeps
+the greatest generation below the horizon and all rows at or above it. It deletes
+older rows in `SKIP LOCKED` batches (default 1,000), preserving locked victims for
+a later pass. The row limit bounds mutations and locks; it does not bound scanned
+buffers or elapsed time. Vacuum still matters after deletion.
+
+The deferred generation trigger locks a singleton counter through commit.
+Concurrent owner grant commits therefore serialize at this point, even when
+transaction IDs were allocated in the opposite order. Rollbacks produce no
+counter increment or history row. This serialization is part of the safety
+contract. Database activity outside the owner anchor path does not advance the
+counter.
+
+Run the isolated spike on the hardware class you intend to deploy:
+
+```bash
+nix develop -c cabal run en-grant-generation-spike -- --smoke
+nix develop -c cabal run en-grant-generation-spike -- --json /tmp/en-generation.json
+```
+
+The full matrix measures 1k/10k/100k/500k/1m histories, fresh/distance-32/midpoint/
+floor reads, sparse numeric spans, widths 1/8/32, storage and pruning. It uses
+real migrations in a disposable database and accepts no external database URL.
+Synthetic fixtures characterize visibility lookup; real transactions separately
+prove commit ordering and rollback. Trigger-disabled writes are a disposable
+counterfactual, never a supported En configuration. Smoke uses at most 10,000
+rows, ten read samples and one measured round of ten transactions per writer.
+It cannot satisfy the full performance gate.
+
+To compare a change on the same host, capture the old executable's full result
+with `--baseline --json /tmp/en-generation-before.json`, then run the candidate
+with `--compare /tmp/en-generation-before.json --json /tmp/en-generation-after.json`.
+Baseline mode reports final limit failures while retaining every correctness
+assertion. Comparison requires matching environment, database settings, workload
+policy and scenario keys; it rejects incomplete artifacts and p95 regressions
+above 25%. Complete JSON artifacts include raw samples and full EXPLAIN trees,
+even when a performance gate fails.
+
+The reference host on 2026-10-13 was an Apple M1 Max running Darwin 25.6.0,
+PostgreSQL 18.6 and GHC 9.12.4 (-O1). The disposable cluster used 12 MiB shared
+buffers, 4 MiB work_mem, random_page_cost 1 and JIT enabled, with fsync,
+full_page_writes and synchronous_commit disabled. These settings and local
+socket timings are reproducibility evidence, not universal latency or durable
+production throughput promises. Use production durability and network costs
+when setting deployment capacity. The full spike enforces fresh/distance-32 p95
+below 5 ms and midpoint/floor p95 below 25 ms at one million rows, in addition to
+the search-work bounds.
+
 ## Consistency Modes
 
 Every read takes a `Consistency` value. Choose it per request.

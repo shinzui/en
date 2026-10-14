@@ -1,7 +1,7 @@
 cabal-version: 3.0
-name:          en-biscuit
-version:       0.1.0.0
-synopsis:      Optional Biscuit decision-token integration for en
+name: en-biscuit
+version: 0.1.0.0
+synopsis: Optional Biscuit decision-token integration for en
 description:
   An optional integration layer that turns a successful en authorization
   decision into a short-lived, attenuable Biscuit token that downstream
@@ -11,19 +11,24 @@ description:
   verification helpers; this initial version only establishes the package and
   dependency wiring.
 
-license:       MIT
-author:        Nadeem Bitar
-maintainer:    nadeem@gmail.com
-category:      Security, Authorization
+license: MIT
+author: Nadeem Bitar
+maintainer: nadeem@gmail.com
+category: Security, Authorization
 
 common warnings
   ghc-options:
-    -Wall -Wcompat -Widentities -Wincomplete-record-updates
-    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wpartial-fields
+    -Wredundant-constraints
     -Werror=missing-fields
 
 common shared
-  default-language:   GHC2024
+  default-language: GHC2024
   default-extensions:
     DeriveAnyClass
     DuplicateRecordFields
@@ -31,8 +36,8 @@ common shared
     OverloadedStrings
 
 library
-  import:          warnings, shared
-  hs-source-dirs:  src
+  import: warnings, shared
+  hs-source-dirs: src
   exposed-modules:
     En.Biscuit
     En.Biscuit.Grant
@@ -41,46 +46,46 @@ library
     En.Biscuit.Verify
 
   build-depends:
-    , base             >=4.19 && <5
-    , biscuit-haskell
-    , bytestring
-    , containers
-    , effectful
-    , effectful-core
-    , en-core
-    , generic-lens     >=2.2  && <2.4
-    , text
-    , time
+    base >=4.19 && <5,
+    biscuit-haskell,
+    bytestring,
+    containers,
+    effectful,
+    effectful-core,
+    en-core,
+    generic-lens >=2.2 && <2.4,
+    text,
+    time,
 
 executable en-verify-grant
-  import:         warnings, shared
+  import: warnings, shared
   hs-source-dirs: app
-  main-is:        VerifyGrant.hs
+  main-is: VerifyGrant.hs
   build-depends:
-    , base             >=4.19 && <5
-    , biscuit-haskell
-    , bytestring
-    , containers
-    , en-biscuit
-    , en-core
-    , generic-lens     >=2.2  && <2.4
-    , text
-    , time
+    base >=4.19 && <5,
+    biscuit-haskell,
+    bytestring,
+    containers,
+    en-biscuit,
+    en-core,
+    generic-lens >=2.2 && <2.4,
+    text,
+    time,
 
 test-suite en-biscuit-tests
-  import:         warnings, shared
-  type:           exitcode-stdio-1.0
+  import: warnings, shared
+  type: exitcode-stdio-1.0
   hs-source-dirs: test
-  main-is:        Main.hs
+  main-is: Main.hs
   build-depends:
-    , base
-    , biscuit-haskell
-    , bytestring
-    , containers
-    , effectful
-    , effectful-core
-    , en-biscuit
-    , en-core
-    , generic-lens     >=2.2 && <2.4
-    , text
-    , time
+    base,
+    biscuit-haskell,
+    bytestring,
+    containers,
+    effectful,
+    effectful-core,
+    en-biscuit,
+    en-core,
+    generic-lens >=2.2 && <2.4,
+    text,
+    time,

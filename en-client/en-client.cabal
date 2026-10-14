@@ -1,25 +1,30 @@
 cabal-version: 3.0
-name:          en-client
-version:       0.1.0.0
-synopsis:      Haskell client for the standalone en authorization service
+name: en-client
+version: 0.1.0.0
+synopsis: Haskell client for the standalone en authorization service
 description:
   A typed Haskell client for the standalone en service (check / lookup / expand /
   write), for consumers that talk to en over HTTP rather than embedding en-core.
   Mirrors shomei-client.
 
-license:       MIT
-author:        Nadeem Bitar
-maintainer:    nadeem@gmail.com
-category:      Security, Authorization
+license: MIT
+author: Nadeem Bitar
+maintainer: nadeem@gmail.com
+category: Security, Authorization
 
 common warnings
   ghc-options:
-    -Wall -Wcompat -Widentities -Wincomplete-record-updates
-    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wpartial-fields
+    -Wredundant-constraints
     -Werror=missing-fields
 
 common shared
-  default-language:   GHC2024
+  default-language: GHC2024
   default-extensions:
     DeriveAnyClass
     DuplicateRecordFields
@@ -27,16 +32,16 @@ common shared
     OverloadedStrings
 
 library
-  import:          warnings, shared
-  hs-source-dirs:  src
+  import: warnings, shared
+  hs-source-dirs: src
   exposed-modules: En.Client
   build-depends:
-    , base                      >=4.19 && <5
-    , en-core
-    , en-servant
-    , generic-lens              >=2.2  && <2.4
-    , relay-pagination-servant  >=0.1  && <0.2
-    , servant
-    , servant-client
-    , servant-client-core
-    , text
+    base >=4.19 && <5,
+    en-core,
+    en-servant,
+    generic-lens >=2.2 && <2.4,
+    relay-pagination-servant >=0.1 && <0.2,
+    servant,
+    servant-client,
+    servant-client-core,
+    text,

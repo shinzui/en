@@ -408,20 +408,18 @@ checkHandler env@Env {checkOperation, grantGenerationOperation} request = enHand
   context <- orInvalid (contextFromWire (request ^. #context))
   subject <- orInvalid (subjectFromWire (request ^. #subject))
   object <- orInvalid (objectRefFromWire (request ^. #object))
-  outcome <-
-    engine
-      env
-      active
-      ( checkOperation
-          (active ^. #graph)
-          consistency
-          context
-          subject
-          (RelationName (request ^. #permission))
-          object
-      )
+  (outcome, grantGeneration) <- engine env active do
+    outcome <-
+      checkOperation
+        (active ^. #graph)
+        consistency
+        context
+        subject
+        (RelationName (request ^. #permission))
+        object
+    generation <- postCheckMetadata (grantGenerationOperation (outcome ^. #checkedAt))
+    pure (outcome, generation)
   let ConsistencyToken checkedAt = (outcome ^. #checkedAt)
-  grantGeneration <- engine env active (postCheckMetadata (grantGenerationOperation (outcome ^. #checkedAt)))
   pure CheckResponseWire {decision = decisionToWire (outcome ^. #decision), checkedAt, grantGeneration}
 
 -- A token minted by the completed check cannot be a client input fault. Keep

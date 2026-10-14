@@ -8,6 +8,7 @@ module Main (main) where
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
 import Control.Exception (finally)
+import Control.Monad (replicateM_)
 import Data.Either (isRight)
 import Data.Foldable (traverse_)
 import Data.Functor.Contravariant ((>$<))
@@ -48,7 +49,7 @@ import En.Lookup (LookupCursor (..), LookupLimit (..), LookupObject (..), Lookup
 import En.Lookup qualified as Lookup
 import En.Migrations (enMigrationPlan)
 import En.Postgres.Database (Database (..), runDatabaseConnection)
-import En.Postgres.GrantGeneration (grantGenerationAtSession, grantGenerationForToken, grantGenerationText, pruneGrantGenerationsBatchSession)
+import En.Postgres.GrantGeneration (grantGenerationAtSession, grantGenerationForToken, grantGenerationLookupSql, grantGenerationText, pruneGrantGenerationsBatchSession)
 import En.Postgres.Revision (ConsistencyConfig (..), PgSnapshot (..), comparePgSnapshot, parsePgSnapshot, renderPgSnapshot, retainedHistoryVisible, runConsistencyStorePostgres, tokenMetadataFromPayload, transactionVisible)
 import En.Postgres.TupleStore (pruneTransactionsBatchSession, reapDeletedTuplesBatchSession, runTupleStorePostgres)
 import En.Postgres.Watch qualified as Watch
@@ -79,6 +80,7 @@ main = do
     connection <- acquire database
     runGenerationMetadataScenario connection
     runGrantGenerationScenario database connection
+    runBoundedHistoryScenario database connection
     resetSchema connection
     runTupleStoreScenario connection
     runProbeScenario connection
@@ -2372,8 +2374,8 @@ runGenerationMetadataScenario connection = do
             . runDatabaseConnection connection
             . interpose
               ( \env -> \case
-                  op@(RunSession _) -> do
-                    result <- passthrough env op
+                  operation@(RunSession _) -> do
+                    result <- passthrough env operation
                     liftIO (modifyIORef' counter (+ 1))
                     n <- liftIO (readIORef counter)
                     liftIO (after n)
@@ -2394,18 +2396,18 @@ runGenerationMetadataScenario connection = do
   -- Noise changes the snapshot but must not change the generation.
   sql "CREATE TEMP TABLE generation_metadata_noise (n int); INSERT INTO generation_metadata_noise VALUES (1);"
   current <- mint
-  expect historical "gg1_0" 3
-  expect current "gg1_0" 3
+  expect historical "gg1_0" 2
+  expect current "gg1_0" 2
   sql "BEGIN; DELETE FROM en_grant_generation;"
   (missing, missingCount) <- counted (const (pure ())) (grantGenerationForToken current)
   assertEqual "missing generation history fails" (Left (StoreError "grant generation history unavailable")) missing
-  assertEqual "missing history session count" 2 missingCount
+  assertEqual "missing history session count" 1 missingCount
   sql "ROLLBACK;"
-  -- Advance the real horizon precisely after the generation read (session two).
-  (raced, _) <- counted (\n -> when (n == 2) (sql "UPDATE en_gc_horizon SET horizon=9223372036854775807;")) (grantGenerationForToken current)
+  -- Advance the real horizon precisely after the generation read (session one).
+  (raced, _) <- counted (\n -> when (n == 1) (sql "UPDATE en_gc_horizon SET horizon=9223372036854775807;")) (grantGenerationForToken current)
   assertBool "post-read retention race fails closed" (case raced of Left (ConsistencyTokenExpired _) -> True; _ -> False)
   sql "UPDATE en_gc_horizon SET horizon=0;"
-  putStrLn "PASS: generation metadata current/historical=3 sessions, missing=2, post-read retention race fails closed"
+  putStrLn "PASS: generation metadata current/historical=2 sessions, missing=1, post-read retention race fails closed"
 
 -- A later commit must get the later grant generation even with the earlier XID.
 runGrantGenerationScenario :: Pg.Database -> Connection.Connection -> IO ()
@@ -2465,7 +2467,81 @@ runGrantGenerationScenario database connection = do
   _ <- runSessionOrFail connection (pruneGrantGenerationsBatchSession horizon 1)
   expect retained (Just "gg1_3")
   snapshot >>= flip expect (Just "gg1_4")
+  -- Execute the deferred trigger explicitly, then prove its singleton lock is
+  -- retained through COMMIT by observing another grant committer waiting.
+  deferred <- acquire database
+  contender <- acquire database
+  runSessionOrFail deferred (Session.script ("BEGIN; " <> anchor <> " SET CONSTRAINTS en_transaction_grant_generation IMMEDIATE;"))
+  beforeLockedCommit <- snapshot
+  expect beforeLockedCommit (Just "gg1_4")
+  runSessionOrFail contender (Session.script ("SET application_name='en-generation-contender'; BEGIN; " <> anchor))
+  committed <- newEmptyMVar
+  _ <- forkIO do
+    result <- Connection.use contender (Session.script "COMMIT;")
+    putMVar committed result
+  let waitForLock attempts = do
+        waiting <- textQuery "SELECT count(*)::text FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.application_name='en-generation-contender' AND NOT l.granted"
+        if waiting /= "0" then pure () else if attempts <= (0 :: Int) then fail "grant commit did not wait for deferred trigger lock" else threadDelay 1000 >> waitForLock (attempts - 1)
+  waitForLock 1000
+  pending <- tryReadMVar committed
+  assertBool "singleton lock remains held until commit" (case pending of Nothing -> True; _ -> False)
+  runSessionOrFail deferred (Session.script "COMMIT;")
+  result <- takeMVar committed
+  assertBool "waiting grant commit succeeds" (isRight result)
+  expect beforeLockedCommit (Just "gg1_4")
+  snapshot >>= flip expect (Just "gg1_6")
+  Connection.release deferred
+  Connection.release contender
   putStrLn "PASS: grant generations preserve commit order, rollback, unrelated-write stability, exact history, concurrent pruning rollback and bounded retention floor"
+
+-- Compare both algorithms in one SQL snapshot while a concurrent pruner leaves
+-- locked-victim holes. Synthetic IDs exercise search shape, not commit ordering.
+runBoundedHistoryScenario :: Pg.Database -> Connection.Connection -> IO ()
+runBoundedHistoryScenario database connection = do
+  let sql = runSessionOrFail connection . Session.script
+      original = "SELECT generation FROM en_grant_generation WHERE pg_visible_in_snapshot(created_xid,$1::pg_snapshot) ORDER BY generation DESC LIMIT 1"
+      sameStatement =
+        Statement.preparable
+          ("SELECT (" <> original <> ") IS NOT DISTINCT FROM (" <> grantGenerationLookupSql <> ")")
+          (Encoders.param (Encoders.nonNullable Encoders.text))
+          (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.bool)))
+      compareAt rank = do
+        let boundary = Text.pack (show (1000000000 + rank + 1 :: Int64))
+        same <- runSessionOrFail connection (Session.statement (boundary <> ":" <> boundary <> ":") sameStatement)
+        assertBool "bounded search agrees with reference in one snapshot" same
+  sql "CREATE TEMP TABLE saved_generation_history AS TABLE en_grant_generation; TRUNCATE en_grant_generation; INSERT INTO en_grant_generation SELECT g,(1000000000+g)::text::xid8 FROM generate_series(0,1999) g; ANALYZE en_grant_generation;"
+  traverse_ compareAt [-1 .. 1999]
+  locked <- acquire database
+  runSessionOrFail locked (Session.script "BEGIN; SELECT generation FROM en_grant_generation WHERE generation=0 FOR UPDATE;")
+  worker <- acquire database
+  firstBatch <- newEmptyMVar
+  proceed <- newEmptyMVar
+  done <- newEmptyMVar
+  _ <- forkIO do
+    first <- runSessionOrFail worker (pruneGrantGenerationsBatchSession 1000000900 17)
+    putMVar firstBatch first
+    takeMVar proceed
+    let drain = runSessionOrFail worker (pruneGrantGenerationsBatchSession 1000000900 17) >>= \n -> when (n > 0) drain
+    drain
+    putMVar done ()
+  assertEqual "concurrent search fixture batch" 17 =<< takeMVar firstBatch
+  traverse_ compareAt [899, 1000, 1900, 1999]
+  putMVar proceed ()
+  replicateM_ 20 (traverse_ compareAt [899, 1000, 1900, 1999])
+  takeMVar done
+  runSessionOrFail locked (Session.script "ROLLBACK;")
+  Connection.release locked
+  Connection.release worker
+  traverse_ compareAt [899, 1000, 1900, 1999]
+  sql "TRUNCATE en_grant_generation; INSERT INTO en_grant_generation SELECT * FROM saved_generation_history; DROP TABLE saved_generation_history;"
+  -- Missing keys and arithmetic right at bigint's maximum, including no visible
+  -- generation. Roll back the fixture so subsequent store scenarios see real rows.
+  sql "BEGIN; TRUNCATE en_grant_generation; INSERT INTO en_grant_generation SELECT g,(1000000000+g)::text::xid8 FROM generate_series(0,40) g; INSERT INTO en_grant_generation VALUES (4611686018427387903,'1000000041'),(9223372036854775807,'1000000042'); ANALYZE en_grant_generation;"
+  traverse_ compareAt [-1 .. 42]
+  sql "TRUNCATE en_grant_generation;"
+  compareAt 0
+  sql "ROLLBACK;"
+  putStrLn "PASS: bounded lookup agrees with reference for dense/sparse/empty/Int64-limit histories and concurrent pruning"
 
 -- | Stable per-user root lets the next invocation reap abandoned clusters.
 -- See mori://shinzui/ephemeral-pg/docs/guides (temporary-roots-and-stale-cleanup.md; artifact URI pending).

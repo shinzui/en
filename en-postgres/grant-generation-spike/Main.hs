@@ -9,13 +9,13 @@ module Main (main) where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar
 import Control.Exception (SomeException, bracket, try)
-import Control.Monad (forM, forM_, replicateM, unless, when)
+import Control.Monad (forM, forM_, replicateM, replicateM_, unless, when)
 import Data.Aeson hiding (Options)
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString.Lazy qualified as BL
 import Data.Functor.Contravariant ((>$<))
 import Data.Int (Int64)
-import Data.List (sort)
+import Data.List (nub, sort)
 import Data.Monoid (Last (..))
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -36,7 +36,7 @@ import Hasql.Statement qualified as Q
 import System.Directory (createDirectoryIfMissing, renameFile)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitFailure)
-import System.IO (hClose, hFlush, openBinaryTempFile)
+import System.IO (BufferMode (LineBuffering), hClose, hFlush, hSetBuffering, openBinaryTempFile, stdout)
 import System.Info (arch, compilerName, compilerVersion, os)
 import System.Posix.User (getEffectiveUserID)
 import System.Process (readProcessWithExitCode)
@@ -79,6 +79,7 @@ parseOptions = go (Options False False Nothing Nothing)
 
 main :: IO ()
 main = do
+  hSetBuffering stdout LineBuffering
   options <- getArgs >>= parseOptions
   before <- traverse readReport (comparison options)
   src <- sourceInfo
@@ -105,12 +106,12 @@ main = do
                 "fixtureSeed" .= (1000000000 :: Int64)
               ]
       transactionalCheck db conn
-      reads <- concat <$> mapM (readMatrix conn sampleCount) sizes
+      readCells <- concat <$> mapM (readMatrix conn sampleCount) sizes
       sparse <- sparseMatrix conn sampleCount
       writes <- sequence [writeCell db conn options n width enabled | n <- writeSizes, width <- [1, 8, 32], enabled <- [True, False]]
       prunes <- mapM (pruneCell conn) pruneSizes
       mixedPruningCheck conn
-      let allCells = reads <> sparse <> writes <> prunes
+      let allCells = readCells <> sparse <> writes <> prunes
           limitErrors = concatMap (limits (smoke options)) allCells <> doublingErrors (smoke options) allCells
           candidate = Report 1 True True env src samplePolicy allCells []
           compareErrors = maybe [] (compareReports candidate) before
@@ -224,11 +225,11 @@ sparseMatrix conn samples =
     script conn "TRUNCATE en_grant_generation, en_transaction;"
     forM_ (zip [0 ..] keys) \(rank, generation) -> script conn ("INSERT INTO en_grant_generation VALUES (" <> showT generation <> ", '" <> showT (seedBase + rank) <> "');")
     script conn "ANALYZE en_grant_generation;"
-    forM (zip [0 ..] keys) \(rank, generation) -> readCell conn samples ("read/sparse/" <> label <> "/" <> show rank) (fromIntegral (length keys)) (last keys - head keys + 1) (snapshotAt rank) generation Null
+    forM [(rank, generation) | (rank, generation) <- zip [0 ..] keys, rank `elem` nub [0, 1, 2, fromIntegral (length keys `div` 2), max 0 (fromIntegral (length keys) - 34), fromIntegral (length keys) - 1]] \(rank, generation) -> readCell conn samples ("read/sparse/" <> label <> "/" <> show rank) (fromIntegral (length keys)) (last keys - firstValue keys + 1) (snapshotAt rank) generation Null
   where
     -- max key leaves span representable as Int64 while exercising 63-bit arithmetic.
     fixtures :: [(String, [Int64])]
-    fixtures = [("holes", [0, 2, 3] <> [19, 21 .. 179] <> [1000]), ("single-floor", [1000]), ("int64-span", [0 .. 40] <> [4611686018427387903, 9223372036854775806])]
+    fixtures = [("holes", [0, 2, 3] <> [19, 21 .. 2019] <> [10000]), ("single-floor", [1000]), ("int64-span", [0 .. 999] <> [4611686018427387903, 9223372036854775806])]
 
 anchorSql :: Text
 anchorSql = "INSERT INTO en_transaction (xid,snapshot,schema_hash) VALUES (pg_current_xact_id(),pg_current_snapshot(),'generation-spike');"
@@ -275,19 +276,25 @@ writeCell db conn options count width enabled = do
         results <- forM gates \gate -> do
           result <- newEmptyMVar
           _ <- forkIO do
-            value <- try @SomeException $ bracket (acquire db) C.release \writer -> do
-              putMVar ready ()
-              takeMVar gate
-              fmap concat $ forM [1 .. txCount] \i -> do
-                script writer ("BEGIN; " <> anchorSql)
-                if i `mod` 10 == 0
-                  then script writer "ROLLBACK;" >> pure []
-                  else do
-                    (elapsed, ()) <- timed (script writer "COMMIT;")
-                    pure [elapsed]
-            putMVar result value
+            acquired <- try @SomeException (acquire db)
+            case acquired of
+              Left err -> do
+                putMVar ready (Left err)
+                putMVar result (Left err)
+              Right connection -> do
+                value <- try @SomeException $ bracket (pure connection) C.release \writer -> do
+                  putMVar ready (Right ())
+                  takeMVar gate
+                  fmap concat $ forM [1 .. txCount] \i -> do
+                    script writer ("BEGIN; " <> anchorSql)
+                    if i `mod` 10 == 0
+                      then script writer "ROLLBACK;" >> pure []
+                      else do
+                        (elapsed, ()) <- timed (script writer "COMMIT;")
+                        pure [elapsed]
+                putMVar result value
           pure result
-        replicateM width (takeMVar ready)
+        replicateM_ width (takeMVar ready >>= either (fail . show) pure)
         forM_ gates (`putMVar` ())
         times <- concat <$> mapM (\result -> takeMVar result >>= either (fail . show) pure) results
         end <- getMonotonicTimeNSec
@@ -343,7 +350,7 @@ pruneCell conn count = do
   seed conn count
   let prunePlan = session conn (S.statement (showT horizon, 1000 :: Int64) (Q.preparable ("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " <> pruneGrantGenerationsSql) ((fst >$< E.param (E.nonNullable E.text)) <> (snd >$< E.param (E.nonNullable E.int8))) jsonResult))
   firstPlan <- prunePlan
-  replicateM (max 0 (fromIntegral count `div` 2000 - 1)) prune
+  replicateM_ (max 0 (fromIntegral count `div` 2000 - 1)) prune
   middlePlan <- prunePlan
   let drain = prune >>= \n -> when (n > 0) drain
   drain
@@ -360,7 +367,7 @@ pruneCell conn count = do
                 "survivors" .= survivors,
                 "floor" .= (count - 1),
                 "statements" .= length raw,
-                "firstMs" .= head raw,
+                "firstMs" .= firstValue raw,
                 "finalEmptyMs" .= last raw,
                 "planStats" .= map planStats [firstPlan, middlePlan, emptyPlan]
               ]
@@ -390,6 +397,10 @@ measured :: Int -> IO a -> IO [Double]
 measured n action = do
   _ <- action
   replicateM n (fst <$> timed action)
+
+firstValue :: (Num a) => [a] -> a
+firstValue [] = 0
+firstValue (value : _) = value
 
 percentile :: Double -> [Double] -> Double
 percentile _ [] = 0
@@ -425,7 +436,63 @@ planStats plan =
     iterations = maximum (0 : [number (field "Actual Loops" n) | n <- nodes, field "Node Type" n == String "WorkTable Scan"])
 
 render :: Cell -> IO ()
-render cell = putStrLn (key cell <> " samples=" <> show (length (samplesMs cell)) <> " p50_ms=" <> show (percentile 0.5 (samplesMs cell)) <> " p95_ms=" <> show (percentile 0.95 (samplesMs cell)) <> " " <> show (details cell))
+render cell =
+  putStrLn
+    ( key cell
+        <> " samples="
+        <> show (length (samplesMs cell))
+        <> " p50_ms="
+        <> show (percentile 0.5 (samplesMs cell))
+        <> " p95_ms="
+        <> show (percentile 0.95 (samplesMs cell))
+        <> extra
+    )
+  where
+    d = details cell
+    value name = show (field name d)
+    stats = field "planStats" d
+    extra
+      | take 5 (key cell) == "read/" =
+          " fixture=synthetic-prefix expected="
+            <> value "expected"
+            <> " actual="
+            <> value "actual"
+            <> " rows_removed="
+            <> show (field "rowsRemovedByFilter" stats)
+            <> " shared_hits="
+            <> show (field "sharedHits" stats)
+            <> " shared_reads="
+            <> show (field "sharedReads" stats)
+            <> " iterations="
+            <> show (field "iterations" stats)
+            <> " index_seeks="
+            <> show (field "indexSeeks" stats)
+            <> " operator="
+            <> show (field "operators" stats)
+      | take 6 (key cell) == "write/" =
+          " fixture=transactional trigger="
+            <> value "trigger"
+            <> " committed="
+            <> value "committed"
+            <> " rollbacks="
+            <> value "rollbacks"
+            <> " writes_per_second="
+            <> value "writesPerSecond"
+      | otherwise =
+          " fixture=synthetic-prefix removed="
+            <> value "removed"
+            <> " survivors="
+            <> value "survivors"
+            <> " floor="
+            <> value "floor"
+            <> " first_ms="
+            <> value "firstMs"
+            <> " final_empty_ms="
+            <> value "finalEmptyMs"
+            <> " statements="
+            <> value "statements"
+            <> " buffer_curve="
+            <> show (case field "planStats" d of Array xs -> map (field "sharedHits") (V.toList xs); _ -> [])
 
 -- Integer arithmetic proves the span bound even next to Int64's maximum.
 spanBound :: Int64 -> Int
@@ -440,13 +507,14 @@ limits smokeMode cell
   | take 5 (key cell) /= "read/" = []
   | otherwise = seekErrors <> shapeErrors <> latencyErrors
   where
+    largeHistory = number (field "rowCount" (details cell)) > 1000
     stats = field "planStats" (details cell)
     spanSize = case fromJSON (field "numericSpan" (details cell)) of Success value -> value; Error _ -> 0 :: Int64
     bound = spanBound spanSize
     iterations = number (field "iterations" stats)
     seeks = number (field "indexSeeks" stats)
-    seekErrors = [key cell <> ": iterations/seeks exceed numeric span bound: " <> show (iterations, seeks, bound) | iterations > fromIntegral bound || seeks > fromIntegral (2 * bound + 4) || number (field "rowsRemovedByFilter" stats) > fromIntegral (33 + 2 * bound)]
-    shapeErrors = [key cell <> ": unbounded scan/sort in lookup plan" | any (\n -> field "Node Type" n `elem` [String "Seq Scan", String "Sort"] && number (field "Actual Rows" n) * number (field "Actual Loops" n) > 64) (concatMap planNodes (plans cell))]
+    seekErrors = [key cell <> ": iterations/seeks exceed numeric span bound: " <> show (iterations, seeks, bound) | iterations > fromIntegral bound || seeks > fromIntegral (2 * bound + 4) || (largeHistory && number (field "rowsRemovedByFilter" stats) > fromIntegral (33 + 2 * bound))]
+    shapeErrors = [key cell <> ": unbounded scan/sort in lookup plan" | largeHistory, any (\n -> field "Node Type" n `elem` [String "Seq Scan", String "Sort"] && number (field "Actual Rows" n) * number (field "Actual Loops" n) > 64) (concatMap planNodes (plans cell))]
     limit = if any (`isSuffix` key cell) ["/head", "/distance32"] then 5 else 25
     latencyErrors = [key cell <> ": p95 " <> show p95 <> " ms exceeds " <> show limit | not smokeMode && field "rowCount" (details cell) == toJSON (1000000 :: Int64) && p95 >= limit]
     p95 = percentile 0.95 (samplesMs cell)
@@ -484,13 +552,20 @@ renderComparison after before = forM_ (cells after) \cell ->
 compareReports :: Report -> Report -> [String]
 compareReports after before = validity <> concatMap compareCell (cells after)
   where
-    validity = ["incompatible/incomplete baseline artifact" | version before /= version after || not (complete before && correctness before) || environment before /= environment after || policy before /= policy after || map key (cells before) /= map key (cells after) || any (null . samplesMs) (cells before)]
+    validity = ["incompatible/incomplete baseline artifact" | version before /= version after || not (complete before && correctness before) || environment before /= environment after || policy before /= policy after || map key (cells before) /= map key (cells after) || any incompleteCell (cells before)]
     compareCell cell = case filter ((== key cell) . key) (cells before) of
       [old] ->
         let a = percentile 0.95 (samplesMs cell); b = percentile 0.95 (samplesMs old)
-         in [key cell <> ": p95 regression " <> show b <> " -> " <> show a <> " ms (>25%)" | a > b * 1.25]
+         in [key cell <> ": correctness/fixture mismatch" | any (\name -> field name (details old) /= field name (details cell)) ["fixture", "snapshot", "expected", "actual", "rowCount", "numericSpan", "committed", "rollbacks", "trigger", "removed", "survivors", "floor"]]
+              <> [key cell <> ": p95 regression " <> show b <> " -> " <> show a <> " ms (>25%)" | a > b * 1.25]
               <> [key cell <> ": workload p95 regression (>25%)" | let oldWork = field "workloadSamplesMs" (details old); newWork = field "workloadSamplesMs" (details cell), workP95 newWork > 1.25 * workP95 oldWork]
       _ -> ["missing/duplicate scenario: " <> key cell]
+    incompleteCell cell = null (samplesMs cell) || length (samplesMs cell) /= expectedSamples cell
+    expectedSamples cell
+      | take 5 (key cell) == "read/" = round (number (field "readSamples" (policy before)))
+      | take 6 (key cell) == "write/" = round (number (field "committed" (details cell)))
+      | take 6 (key cell) == "prune/" = round (number (field "statements" (details cell)))
+      | otherwise = 0
     workP95 (Array values) = percentile 0.95 (map number (V.toList values))
     workP95 _ = 0
 

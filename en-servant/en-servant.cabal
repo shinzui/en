@@ -1,7 +1,7 @@
 cabal-version: 3.0
-name:          en-servant
-version:       0.1.0.0
-synopsis:      Servant API and a fail-closed authorization helper for en
+name: en-servant
+version: 0.1.0.0
+synopsis: Servant API and a fail-closed authorization helper for en
 description:
   The en HTTP API (check / lookup / expand / write) as a Servant API type, plus
   requirePermission: a fail-closed Handler helper that gates host-route logic on
@@ -9,19 +9,24 @@ description:
   It is invoked by call discipline inside a handler, not enforced by the route's
   type; a handler that never calls it is never gated.
 
-license:       MIT
-author:        Nadeem Bitar
-maintainer:    nadeem@gmail.com
-category:      Security, Authorization, Web
+license: MIT
+author: Nadeem Bitar
+maintainer: nadeem@gmail.com
+category: Security, Authorization, Web
 
 common warnings
   ghc-options:
-    -Wall -Wcompat -Widentities -Wincomplete-record-updates
-    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wpartial-fields
+    -Wredundant-constraints
     -Werror=missing-fields
 
 common shared
-  default-language:   GHC2024
+  default-language: GHC2024
   default-extensions:
     BlockArguments
     DeriveAnyClass
@@ -31,8 +36,8 @@ common shared
     TypeFamilies
 
 library
-  import:          warnings, shared
-  hs-source-dirs:  src
+  import: warnings, shared
+  hs-source-dirs: src
   exposed-modules:
     En.Check.Api
     En.Expand.Api
@@ -49,76 +54,80 @@ library
     En.Tuple.Api
 
   build-depends:
-    , aeson
-    , base                      >=4.19 && <5
-    , biscuit-haskell
-    , bytestring
-    , containers
-    , effectful
-    , effectful-core
-    , en-biscuit
-    , en-core
-    , en-postgres
-    , generic-lens              >=2.2  && <2.4
-    , http-media
-    , http-types
-    , lens
-    , openapi-hs                >=5.0  && <5.1
-    , relay-pagination          >=0.1  && <0.2
-    , relay-pagination-servant  >=0.1  && <0.2
-    , servant
-    , servant-health            ^>=0.1
-    , servant-openapi-hs        >=5.1  && <5.2
-    , servant-server
-    , sop-core
-    , text
-    , time
-    , transformers
-    , wai
+    aeson,
+    base >=4.19 && <5,
+    biscuit-haskell,
+    bytestring,
+    containers,
+    effectful,
+    effectful-core,
+    en-biscuit,
+    en-core,
+    en-postgres,
+    generic-lens >=2.2 && <2.4,
+    http-media,
+    http-types,
+    lens,
+    openapi-hs >=5.0 && <5.1,
+    relay-pagination >=0.1 && <0.2,
+    relay-pagination-servant >=0.1 && <0.2,
+    servant,
+    servant-health ^>=0.1,
+    servant-openapi-hs >=5.1 && <5.2,
+    servant-server,
+    sop-core,
+    text,
+    time,
+    transformers,
+    wai,
 
 -- Writes docs/api/openapi.json. An executable rather than a test so the artifact is a
 -- deterministic build product, and a `just openapi` git-diff check catches drift.
 executable en-openapi
-  import:         warnings, shared
-  main-is:        OpenApi.hs
+  import: warnings, shared
+  main-is: OpenApi.hs
   hs-source-dirs: app
   build-depends:
-    , aeson-pretty
-    , base
-    , bytestring
-    , directory
-    , en-servant
+    aeson-pretty,
+    base,
+    bytestring,
+    directory,
+    en-servant,
 
 test-suite en-servant-tests
-  import:         warnings, shared
-  type:           exitcode-stdio-1.0
+  import: warnings, shared
+  type: exitcode-stdio-1.0
   hs-source-dirs: test
-  main-is:        Main.hs
-  ghc-options:    -threaded -rtsopts -with-rtsopts=-N
+  main-is: Main.hs
+  ghc-options:
+    -threaded
+    -rtsopts
+    -with-rtsopts=-N
+
   build-depends:
-    , aeson
-    , base
-    , biscuit-haskell
-    , bytestring
-    , containers
-    , effectful
-    , effectful-core
-    , en-biscuit
-    , en-core
-    , en-postgres
-    , en-servant
-    , generic-lens                  >=2.2  && <2.4
-    , http-types
-    , openapi-hs
-    , relay-pagination
-    , relay-pagination-conformance  >=0.1  && <0.2
-    , relay-pagination-servant
-    , servant
-    , servant-health                ^>=0.1
-    , servant-health:testkit
-    , servant-server
-    , tasty
-    , text
-    , time
-    , wai
-    , wai-extra
+    aeson,
+    base,
+    biscuit-haskell,
+    bytestring,
+    containers,
+    effectful,
+    effectful-core,
+    en-biscuit,
+    en-core,
+    en-postgres,
+    en-servant,
+    generic-lens >=2.2 && <2.4,
+    http-types,
+    openapi-hs,
+    relay-pagination,
+    relay-pagination-conformance >=0.1 && <0.2,
+    relay-pagination-servant,
+    servant,
+    servant-health ^>=0.1,
+    servant-health:testkit,
+    servant-server,
+    tasty,
+    text,
+    time,
+    wai,
+    wai-extra,

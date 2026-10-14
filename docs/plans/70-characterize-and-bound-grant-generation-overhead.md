@@ -69,8 +69,34 @@ correctness assertion or declared performance envelope fails.
 - [ ] Milestone 4: repeat the full measurement matrix, document the supported operating envelope,
       update durable architecture context, and pass owner and Koyomi acceptance.
 
+Implementation checkpoint (2026-10-13): Milestone 3's two-session metadata path,
+shared engine/schema invocation, lazy scalar fallback, dense/sparse/empty/Int64-limit
+lookup, concurrent pruning and deferred-lock lifetime tests pass. The complete
+matching 48-cell baseline is `/tmp/en70-before-final.json`; candidate artifacts are
+`/tmp/en70-after.json`, `/tmp/en70-after-repeat.json`, and `/tmp/en70-after-scalar.json`.
+Absolute latency and search-work gates pass, but saved-baseline relative p95 gates
+remain unresolved while the user considers noisy reference-host comparisons.
+Owner/full-build validation is underway; no milestone is marked complete from partial evidence.
+
 
 ## Surprises & Discoveries
+
+Prototype discovery (2026-10-13): PostgreSQL selected repeated scans for a sparse
+43-row fixture. An indexed-minimum/equality alternative did not improve that choice.
+The user explicitly accepted tiny-table scans. Retain the simpler successor query;
+large sparse fixtures contain about 1,000 rows and verify index plans, while integration
+tests compare every boundary for tiny sparse histories through bigint's maximum.
+The initial materialized fast-path CTE added 6–10 microseconds in paired measurements;
+a lazy scalar COALESCE fallback removes avoidable recursive setup.
+
+Performance comparison discovery (2026-10-13): all three full candidate runs meet
+absolute limits, but the saved-baseline 25% p95 gate flags unchanged trigger-enabled
+and disabled write cells as well as tiny-latency reads. Process observations show
+substantial Spotlight, terminal and Finder CPU activity on the shared host. Preserve
+all failure artifacts instead of re-recording a slower baseline. A paired 200-sample
+diagnostic measured million-row old/new head p50 0.023/0.029 ms and p95 0.042/0.055 ms
+for the initial CTE candidate; the scalar candidate passes correctness and work bounds.
+The comparison policy remains unchanged pending the user's scope decision.
 
 Full baseline (2026-10-13): Apple M1 Max, Darwin 25.6.0, GHC 9.12.4 (-O1),
 PostgreSQL 18.6. Ephemeral settings: shared_buffers 12 MiB, work_mem 4 MiB,
@@ -162,6 +188,12 @@ nix develop -c cabal test en-postgres:en-postgres-integration-tests en-servant -
   Rationale: The unoptimized query may exceed the final limits. Sparse retained keys also invalidate
   an assumed dense-array search. Baselines must retain correctness checks, while the candidate must
   prove a bounded number of index seeks, including sparse histories, before adoption.
+  Date: 2026-10-13
+
+- Decision: Allow PostgreSQL to select scans for tiny retained histories (at most 1,000 rows).
+  Rationale: The user explicitly directed that tiny-table scans need not be optimized. Always
+  enforce correctness and numeric-interval iteration bounds; enforce index-work/plan-shape gates
+  on larger histories. Small scan choices do not change the visibility or retention contract.
   Date: 2026-10-13
 
 
@@ -391,7 +423,8 @@ rollback, and snapshots whose `xip` list (transaction IDs still active at snapsh
 an older still-running transaction. Compare the candidate with the original visibility query for
 every dense/sparse fixture, before and during pruning, including the locked-victim holes already
 covered by `runGrantGenerationScenario`. Adopt it only when answers agree and EXPLAIN proves the
-seek/iteration bound without a hidden sequential scan, large sort, or OFFSET walk.
+seek/iteration bound without a hidden sequential scan, large sort, or OFFSET walk on histories above 1,000 rows.
+Tiny-table planner scan choices are acceptable per the user's implementation direction.
 
 If the bounded implementation needs a PostgreSQL function or index, create a new migration with
 `just make-migration`; do not edit `0002-grant-generations.sql`. Include migration upgrade tests and
@@ -653,3 +686,5 @@ failure-path session counts, specified sparse-history search and its actual seek
 baseline capture from final enforcement, made measurement/comparison policy reproducible, and
 repaired result-directory and consumer working-directory instructions. Implementation milestones
 remain open; no production code was changed during this review.
+
+Revision note (2026-10-13, implementation): Implemented executable session/race contracts, the isolated performance matrix, and inline bounded lookup. Accepted the user's direction to allow tiny-table scans; documented reference settings and investigated relative timing failures without treating them as passes.

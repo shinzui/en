@@ -1,6 +1,6 @@
 cabal-version: 3.0
-name:          en-core
-version:       0.1.0.0
+name: en-core
+version: 0.1.0.0
 synopsis:
   Schema-parametric ReBAC engine: model, reachability, check/lookup, revisions
 
@@ -12,19 +12,24 @@ description:
   types. It depends on no Servant, WAI, PostgreSQL, or HTTP library; concrete
   implementations live in en-postgres, en-servant, and en-server.
 
-license:       MIT
-author:        Nadeem Bitar
-maintainer:    nadeem@gmail.com
-category:      Security, Authorization
+license: MIT
+author: Nadeem Bitar
+maintainer: nadeem@gmail.com
+category: Security, Authorization
 
 common warnings
   ghc-options:
-    -Wall -Wcompat -Widentities -Wincomplete-record-updates
-    -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wpartial-fields
+    -Wredundant-constraints
     -Werror=missing-fields
 
 common shared
-  default-language:   GHC2024
+  default-language: GHC2024
   default-extensions:
     BlockArguments
     DeriveAnyClass
@@ -34,8 +39,8 @@ common shared
     OverloadedStrings
 
 library
-  import:          warnings, shared
-  hs-source-dirs:  src
+  import: warnings, shared
+  hs-source-dirs: src
   exposed-modules:
     En.Budget
     En.Cache
@@ -68,60 +73,60 @@ library
     En.Watch
 
   build-depends:
-    , base                  >=4.19 && <5
-    , bytestring
-    , containers
-    , effectful
-    , effectful-core
-    , generic-lens          ^>=2.3
-    , lens                  ^>=5.3
-    , relay-pagination      >=0.1  && <0.2
-    , template-haskell
-    , text
-    , time
-    , unordered-containers
+    base >=4.19 && <5,
+    bytestring,
+    containers,
+    effectful,
+    effectful-core,
+    generic-lens ^>=2.3,
+    lens ^>=5.3,
+    relay-pagination >=0.1 && <0.2,
+    template-haskell,
+    text,
+    time,
+    unordered-containers,
 
 test-suite en-core-interface-tests
-  import:         warnings, shared
-  type:           exitcode-stdio-1.0
+  import: warnings, shared
+  type: exitcode-stdio-1.0
   hs-source-dirs: test
-  main-is:        Main.hs
-  other-modules:  PreludeProbe
+  main-is: Main.hs
+  other-modules: PreludeProbe
   build-depends:
-    , base
-    , containers
-    , effectful
-    , effectful-core
-    , en-core
-    , generic-lens
-    , text
-    , time
+    base,
+    containers,
+    effectful,
+    effectful-core,
+    en-core,
+    generic-lens,
+    text,
+    time,
 
 test-suite en-core-conformance
-  import:         warnings, shared
-  type:           exitcode-stdio-1.0
+  import: warnings, shared
+  type: exitcode-stdio-1.0
   hs-source-dirs: conformance
-  main-is:        Main.hs
+  main-is: Main.hs
   build-depends:
-    , base
-    , effectful
-    , effectful-core
-    , en-core
-    , generic-lens
+    base,
+    effectful,
+    effectful-core,
+    en-core,
+    generic-lens,
 
 benchmark en-core-bench
-  import:         warnings, shared
-  type:           exitcode-stdio-1.0
+  import: warnings, shared
+  type: exitcode-stdio-1.0
   hs-source-dirs: bench
-  main-is:        Main.hs
-  ghc-options:    -fproc-alignment=64
+  main-is: Main.hs
+  ghc-options: -fproc-alignment=64
   build-depends:
-    , base
-    , containers
-    , effectful
-    , effectful-core
-    , en-core
-    , generic-lens
-    , tasty-bench
-    , text
-    , time
+    base,
+    containers,
+    effectful,
+    effectful-core,
+    en-core,
+    generic-lens,
+    tasty-bench,
+    text,
+    time,
