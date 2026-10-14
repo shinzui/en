@@ -303,7 +303,11 @@ writeCell db conn options count width enabled = do
         headValue <- query conn "SELECT generation FROM en_grant_generation_head" integerResult
         ensure (actual == if enabled then fromIntegral committed else 0) (name <> ": generation count/rollback failure")
         ensure (headValue == count - 1 + if enabled then fromIntegral committed else 0) (name <> ": head discontinuity")
-        -- UNIQUE and min/max/count establish one contiguous counter per commit.
+        anchors <- query conn "SELECT count(*) FROM en_transaction" integerResult
+        matched <- query conn "SELECT count(*) FROM en_transaction t JOIN en_grant_generation g ON g.created_xid=t.xid" integerResult
+        ensure (anchors == fromIntegral committed && matched == if enabled then anchors else 0) (name <> ": committed XID/generation bijection failed")
+        -- Unique XIDs, matching anchors, row count and head establish exactly one
+        -- contiguous counter per commit, with no rows from rolled-back XIDs.
         pure (times, fromIntegral (end - start) / 1000000)
   _ <- runRound
   results <- replicateM rounds runRound

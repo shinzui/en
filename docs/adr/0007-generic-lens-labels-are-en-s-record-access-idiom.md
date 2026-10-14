@@ -73,3 +73,19 @@ grep as proof.
 
 Local `NoFieldSelectors` pragmas remain where selector generation creates real name clashes;
 the pragma is a conflict-control tool there, not permission to restore record-dot access.
+
+## Measured hot-predicate exception — 2026-10-13
+
+[ExecPlan 70](../plans/70-characterize-and-bound-grant-generation-overhead.md)
+ran the unchanged PostgreSQL pure benchmark against its committed baseline.
+`comparePgSnapshot` measured 922 ns versus an 80.4 ns baseline after the label
+migration. Focused INLINE pragmas and module-level -O2 still measured 1.15 us and
+758 ns. Record-pattern projections in `transactionVisible`, `snapshotIncludes`
+and `hasRequiredVisibleFutureGap` restored 81.8 ns without changing their
+algorithms or the baseline. The codec benchmarks remained within their limits.
+
+Allow these three hot snapshot predicates to bind their fields with record
+patterns. Keep ordinary Generic record access as labels. This is a measured
+exception at a small pure boundary, not permission for a general access-style
+migration. Any expansion should have equivalent benchmark evidence and preserve
+behavior under the existing revision and PostgreSQL integration tests.

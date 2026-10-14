@@ -243,13 +243,17 @@ newOptimizedRevisionReader config clock readFresh = do
         storeOptimizedRevisionCache cache revision
         pure revision
 
+-- These hot snapshot predicates project fields with record patterns: label optics
+-- retained generic overhead here at -O1/-O2 (see docs/adr/0007-generic-lens-labels-are-en-s-record-access-idiom.md).
+-- The unchanged pure benchmark gates this exception.
+
 -- | Whether a transaction id is visible in a snapshot, mirroring PostgreSQL's
 -- @pg_visible_in_snapshot@ rules for committed transaction ids.
 transactionVisible :: Word64 -> PgSnapshot -> Bool
-transactionVisible txid snapshot
-  | txid < (snapshot ^. #xmin) = True
-  | txid >= (snapshot ^. #xmax) = False
-  | otherwise = txid `notElem` (snapshot ^. #xip)
+transactionVisible txid PgSnapshot {xmin, xmax, xip}
+  | txid < xmin = True
+  | txid >= xmax = False
+  | otherwise = txid `notElem` xip
 
 -- | Is every transaction id below @horizon@ visible in @snapshot@?
 --
@@ -520,16 +524,16 @@ runConsistencyStorePostgres config =
         )
 
 snapshotIncludes :: PgSnapshot -> PgSnapshot -> Bool
-snapshotIncludes candidate required =
+snapshotIncludes candidate@PgSnapshot {xip = candidateXip} required@PgSnapshot {xmax = requiredMax} =
   not (hasRequiredVisibleFutureGap candidate required)
     && all
       (\txid -> not (transactionVisible txid required))
-      (filter (< (required ^. #xmax)) (candidate ^. #xip))
+      (filter (< requiredMax) candidateXip)
 
 hasRequiredVisibleFutureGap :: PgSnapshot -> PgSnapshot -> Bool
-hasRequiredVisibleFutureGap candidate required =
-  (candidate ^. #xmax) < (required ^. #xmax)
-    && not (rangeFullyCoveredByXip (candidate ^. #xmax) (required ^. #xmax) (required ^. #xip))
+hasRequiredVisibleFutureGap PgSnapshot {xmax = candidateMax} PgSnapshot {xmax = requiredMax, xip = requiredXip} =
+  candidateMax < requiredMax
+    && not (rangeFullyCoveredByXip candidateMax requiredMax requiredXip)
 
 rangeFullyCoveredByXip :: Word64 -> Word64 -> [Word64] -> Bool
 rangeFullyCoveredByXip lower upper xip =

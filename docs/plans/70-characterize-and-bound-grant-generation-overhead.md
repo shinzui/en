@@ -40,7 +40,7 @@ If durable project context changes, update or create ADRs in docs/adr/ in the sa
 
 En now returns a grant generation with each PostgreSQL-backed authorization check so a consumer
 such as Koyomi can distinguish permission changes from unrelated database activity. That safety
-feature is complete, but it added three sequential database sessions after every single check, a
+feature was complete at this plan's start, but it added three sequential database sessions after every single check, a
 historical lookup whose cost may grow with the number of newer grant writes, one history row per
 write, and a singleton row lock that serializes grant commits. None of those costs has a dedicated
 performance measurement.
@@ -64,8 +64,12 @@ correctness assertion or declared performance envelope fails.
 - [x] Milestone 2 (2026-10-13): `en-grant-generation-spike --baseline` completed
       all 164 timed cells with correctness assertions; smoke also passed. Versioned complete
       JSON baseline is `/tmp/en70-before.json` on the reference host described below.
-- [ ] Milestone 3: remove avoidable check-path sessions and bound historical lookup work while
-      preserving exact-snapshot, commit-order, rollback, and retention behavior.
+- [x] Milestone 3 (2026-10-13): metadata succeeds in two sessions, missing history
+      fails after one, and decision/metadata share one engine/schema invocation. Full
+      matrix passes absolute latency and search-work gates: million-row historical
+      reads use 20 iterations/23 seeks; the 63-bit sparse span uses 63/66. Dense
+      doubling adds one iteration. Exact-history, rollback, deferred-lock lifetime,
+      concurrent pruning, and post-read retention gates pass.
 - [ ] Milestone 4: repeat the full measurement matrix, document the supported operating envelope,
       update durable architecture context, and pass owner and Koyomi acceptance.
 
@@ -76,10 +80,20 @@ matching 48-cell baseline is `/tmp/en70-before-final.json`; candidate artifacts 
 `/tmp/en70-after.json`, `/tmp/en70-after-repeat.json`, and `/tmp/en70-after-scalar.json`.
 Absolute latency and search-work gates pass, but saved-baseline relative p95 gates
 remain unresolved while the user considers noisy reference-host comparisons.
-Owner/full-build validation is underway; no milestone is marked complete from partial evidence.
+The live consumer gate passed against En `943f162` and
+`mori://shinzui/koyomi` revision `73bad36e968946efaaacd854d32b877d7aa35bcc`
+(with unrelated documentation edits in its working tree). Final-candidate validation
+is repeated after the pure snapshot benchmark repair; Milestone 4 remains open.
 
 
 ## Surprises & Discoveries
+
+Pure benchmark discovery (2026-10-13): the unchanged `comparePgSnapshot` gate
+failed at 922 ns versus its committed 80.4 ns baseline. INLINE and -O2 experiments
+were insufficient. Record-pattern field projections in three hot predicates restored
+81.8 ns; all three pure benchmarks pass without re-recording the baseline. ADR 7
+now records this measured narrow exception. Re-run correctness and the live consumer
+gate against this final change before closure.
 
 Prototype discovery (2026-10-13): PostgreSQL selected repeated scans for a sparse
 43-row fixture. An indexed-minimum/equality alternative did not improve that choice.
@@ -196,6 +210,13 @@ nix develop -c cabal test en-postgres:en-postgres-integration-tests en-servant -
   on larger histories. Small scan choices do not change the visibility or retention contract.
   Date: 2026-10-13
 
+- Decision: Use record-pattern projection in three pure snapshot predicates to restore
+  the existing benchmark gate, while retaining label optics elsewhere.
+  Rationale: Measured generic overhead survived INLINE and -O2. The small projection-only
+  change restores the unchanged 80 ns baseline and preserves the algorithms. ADR 7 records
+  the narrow exception; the existing revision/integration suites verify behavior.
+  Date: 2026-10-13
+
 
 ## Outcomes & Retrospective
 
@@ -219,17 +240,19 @@ writer cannot obtain that row lock until the earlier writer finishes, generation
 successful commit order even if PostgreSQL assigned transaction IDs in another order.
 
 `en-postgres/src/En/Postgres/GrantGeneration.hs` is the production database module. Its
-`grantGenerationAtSession :: Revision -> Session (Maybe GrantGeneration)` query scans generations in
-descending order and applies `pg_visible_in_snapshot` until it finds the newest generation visible
-to the supplied revision. “Fresh” below means a snapshot taken at or close to the current database
+At this plan's start, `grantGenerationAtSession :: Revision -> Session (Maybe GrantGeneration)`
+scanned generations in descending order and applied `pg_visible_in_snapshot` until it found the
+newest visible row. It now uses a lazy 33-row fast path and numeric bisection over generation keys
+in one SQL statement; the spike retains the original scan as its reference oracle. “Fresh” below means a snapshot taken at or close to the current database
 head. “Historical distance” means how many committed grant generations are newer than the supplied
 snapshot. The current query should find a fresh value near the first index entry, but an old value
 may filter many newer entries before succeeding.
 
-The same module's `grantGenerationForToken` performs the public metadata operation. It resolves the
-token through `ConsistencyStore`, executes the generation query, resolves the token again, and
-renders `gg1_<nonnegative decimal>`. `en-servant/src/En/Check/Api.hs` invokes the ordinary check and
-then invokes `grantGenerationOperation` through a second `engine` call.
+The same module's `grantGenerationForToken` performs the public metadata operation. Originally it
+resolved the token, read its generation, and resolved the token again. It now decodes the already
+checked token without a database session, reads the exact generation, validates that metadata once
+afterward, and renders `gg1_<nonnegative decimal>`. `en-servant/src/En/Check/Api.hs` now runs the
+ordinary check and `grantGenerationOperation` through one `engine` call.
 `en-server/app/Main.hs` binds that operation to the PostgreSQL implementation. Embedded hosts, such
 as `en-example/src/En/Example/Host.hs`, return `Nothing` and should remain free to do so.
 
@@ -269,7 +292,9 @@ retention. All optimizations in this plan must preserve those invariants. Update
 capacity or a changed lookup algorithm is durable architectural context.
 [ADR 1](../adr/0001-en-s-schema-is-an-append-only-pg-migrate-component.md) forbids editing an applied
 migration and requires any schema correction to be an appended pg-migrate migration. No other local
-ADR governs the performance envelope of grant generations.
+ADR governs the performance envelope of grant generations. [ADR 7](../adr/0007-generic-lens-labels-are-en-s-record-access-idiom.md)
+governs record access and now records the measured record-pattern exception for three pure
+snapshot predicates needed to restore the existing benchmark gate.
 
 Koyomi is the first consumer. Its plan
 `mori://shinzui/koyomi/plans/5-expose-authorized-calendar-http-apis-and-typed-clients` performs one
