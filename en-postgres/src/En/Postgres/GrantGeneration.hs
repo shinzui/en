@@ -6,6 +6,8 @@ module En.Postgres.GrantGeneration
   ( GrantGeneration,
     grantGenerationText,
     grantGenerationAtSession,
+    grantGenerationLookupSql,
+    pruneGrantGenerationsSql,
     grantGenerationForToken,
     pruneGrantGenerationsBatchSession,
   )
@@ -41,11 +43,7 @@ grantGenerationAtSession (Revision revision) =
   where
     lookupStatement =
       Statement.preparable
-        """
-        SELECT generation FROM en_grant_generation
-        WHERE pg_visible_in_snapshot(created_xid, $1::pg_snapshot)
-        ORDER BY generation DESC LIMIT 1
-        """
+        grantGenerationLookupSql
         (E.param (E.nonNullable E.text))
         (D.rowMaybe (D.column (D.nonNullable D.int8)))
 
@@ -58,21 +56,34 @@ pruneGrantGenerationsBatchSession horizon batch =
   where
     pruneStatement =
       Statement.preparable
-        """
-        WITH floor AS (
-          SELECT max(generation) AS generation FROM en_grant_generation
-          WHERE created_xid < $1::xid8
-        ), victims AS (
-          SELECT g.generation FROM en_grant_generation g, floor
-          WHERE g.created_xid < $1::xid8 AND g.generation < floor.generation
-          ORDER BY g.generation LIMIT $2 FOR UPDATE OF g SKIP LOCKED
-        ), removed AS (
-          DELETE FROM en_grant_generation g USING victims v
-          WHERE g.generation = v.generation RETURNING 1
-        ) SELECT count(*) FROM removed
-        """
+        pruneGrantGenerationsSql
         ((fst >$< E.param (E.nonNullable E.text)) <> (snd >$< E.param (E.nonNullable E.int8)))
         (D.singleRow (D.column (D.nonNullable D.int8)))
+
+-- | Production SQL exposed for EXPLAIN in the disposable performance spike.
+grantGenerationLookupSql :: Text
+grantGenerationLookupSql =
+  """
+  SELECT generation FROM en_grant_generation
+  WHERE pg_visible_in_snapshot(created_xid, $1::pg_snapshot)
+  ORDER BY generation DESC LIMIT 1
+  """
+
+pruneGrantGenerationsSql :: Text
+pruneGrantGenerationsSql =
+  """
+  WITH floor AS (
+    SELECT max(generation) AS generation FROM en_grant_generation
+    WHERE created_xid < $1::xid8
+  ), victims AS (
+    SELECT g.generation FROM en_grant_generation g, floor
+    WHERE g.created_xid < $1::xid8 AND g.generation < floor.generation
+    ORDER BY g.generation LIMIT $2 FOR UPDATE OF g SKIP LOCKED
+  ), removed AS (
+    DELETE FROM en_grant_generation g USING victims v
+    WHERE g.generation = v.generation RETURNING 1
+  ) SELECT count(*) FROM removed
+  """
 
 -- | Resolve metadata at the check's revision, never at a later head. Validate
 -- retention again after the read so concurrent collection cannot validate a

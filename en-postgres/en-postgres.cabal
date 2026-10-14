@@ -131,3 +131,24 @@ benchmark en-postgres-bench
     en-core,
     en-postgres,
     tasty-bench,
+
+executable en-grant-generation-spike
+  import: warnings, shared
+  hs-source-dirs: grant-generation-spike
+  main-is: Main.hs
+  ghc-options: -threaded
+  build-depends:
+    aeson,
+    base,
+    bytestring,
+    directory,
+    en-core,
+    en-migrations,
+    en-postgres,
+    ephemeral-pg >=0.3.1 && <0.4,
+    hasql,
+    pg-migrate ^>=1.2.0.0,
+    process,
+    text,
+    unix,
+    vector,

@@ -61,8 +61,9 @@ correctness assertion or declared performance envelope fails.
       sessions and missing history at two; the real post-read horizon race fails closed.
       Focused PostgreSQL/Servant suites pass after mapping post-check token faults to 503,
       while initial token faults retain 400.
-- [ ] Milestone 2: add the isolated PostgreSQL generation-performance spike and record unoptimized
-      fresh-read, historical-read, concurrent-write, storage, and pruning measurements.
+- [x] Milestone 2 (2026-10-13): `en-grant-generation-spike --baseline` completed
+      all 164 timed cells with correctness assertions; smoke also passed. Versioned complete
+      JSON baseline is `/tmp/en70-before.json` on the reference host described below.
 - [ ] Milestone 3: remove avoidable check-path sessions and bound historical lookup work while
       preserving exact-snapshot, commit-order, rollback, and retention behavior.
 - [ ] Milestone 4: repeat the full measurement matrix, document the supported operating envelope,
@@ -70,6 +71,19 @@ correctness assertion or declared performance envelope fails.
 
 
 ## Surprises & Discoveries
+
+Full baseline (2026-10-13): Apple M1 Max, Darwin 25.6.0, GHC 9.12.4 (-O1),
+PostgreSQL 18.6. Ephemeral settings: shared_buffers 12 MiB, work_mem 4 MiB,
+random_page_cost 1, jit on, fsync/full_page_writes/synchronous_commit off. These
+are disposable-test settings, not durable production capacity promises. Million-row
+read p95: head 0.049 ms, distance 32 0.036 ms, midpoint 68.212 ms, floor 137.898 ms.
+The midpoint/floor EXPLAIN filters 499,999/999,999 rows, proving linear historical
+work. Million-row storage totals 89,292,800 bytes (44,318,720 table; 44,974,080 indexes).
+Production-trigger write p95 at widths 1/8/32 is 0.092/0.371/3.878 ms, with
+6,501/17,569/17,052 commits/s. Prune p95 at 10k/100k/1m is 3.298/3.048/14.542 ms;
+each deletes at most 1,000 rows and preserves the floor. Complete plans, raw samples,
+and all counterfactual cells are in the JSON. Final latency/seek limits are explicitly
+reported as baseline failures without relaxing correctness.
 
 Implementation baseline (2026-10-13): the new real-interpreter test printed
 `current/historical=3 sessions, missing=2`. Before the orchestration fix, the
