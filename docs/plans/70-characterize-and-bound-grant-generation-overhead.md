@@ -10,6 +10,18 @@ provenance:
     model: "gpt-5.6-sol"
     harness: "codex-cli"
     at: 2026-09-14T20:58:43Z
+  revisions:
+    - model: "gpt-6-astra"
+      harness: "codex-cli"
+      at: 2026-10-14T03:26:01Z
+      mode: "update"
+      note: "Correct sparse-history lookup bounds, baseline enforcement, failure-session expectations, and reproducible validation steps."
+  reviews:
+    - model: "gpt-6-astra"
+      harness: "codex-cli"
+      at: 2026-10-14T03:28:18Z
+      verdict: "approved"
+      note: "Reviewed revised plan against source, ADRs 1/8, consumer gate, and ExecPlan requirements; focused PostgreSQL/Servant tests pass. Sparse-search prototype and performance acceptance remain implementation gates."
 ---
 
 # Characterize and bound grant-generation overhead
@@ -52,8 +64,28 @@ correctness assertion or declared performance envelope fails.
 
 ## Surprises & Discoveries
 
-(None yet. The pre-existing costs and error-classification issue that motivated the work are
-described in Context and Orientation; record implementation-time findings here with evidence.)
+Review on 2026-10-13 confirmed the motivating read path and error mapping against the working tree.
+`grantGenerationForToken` performs three sessions on success, but only two when its generation
+query returns no row: it throws before the final validation. This is a source-level observation;
+Milestone 1 must still measure the counts with the real interpreter.
+
+The existing `runGrantGenerationScenario` already proves that pruning can leave generations
+`0,2,3` while generation zero is locked. Retained generation numbers therefore need not be dense.
+A numeric binary search must handle missing keys and measure its bound against the numeric span,
+not claim a logarithmic bound in retained row count without proving it.
+
+The initial spike specification required successful baseline capture while also making final
+latency limits mandatory on every invocation. Baseline mode below resolves that conflict and keeps
+correctness mandatory. The new spike does not exist yet; this review does not constitute performance
+or implementation acceptance.
+
+Review validation on 2026-10-13: the existing command below passed both suites, including the
+grant-generation commit-order, rollback, exact-history, and concurrent-pruning scenario. No new
+session-count, retention-race, or performance tests have been implemented yet.
+
+```bash
+nix develop -c cabal test en-postgres:en-postgres-integration-tests en-servant --test-show-details=direct
+```
 
 
 ## Decision Log
@@ -98,6 +130,13 @@ described in Context and Orientation; record implementation-time findings here w
   `just make-migration`; prefer a Haskell/SQL-statement-only change when it meets the same bound.
   Date: 2026-09-14
 
+- Decision: Separate baseline characterization from final performance enforcement, and state the
+  lookup bound in terms the prototype can actually prove.
+  Rationale: The unoptimized query may exceed the final limits. Sparse retained keys also invalidate
+  an assumed dense-array search. Baselines must retain correctness checks, while the candidate must
+  prove a bounded number of index seeks, including sparse histories, before adoption.
+  Date: 2026-10-13
+
 
 ## Outcomes & Retrospective
 
@@ -114,8 +153,8 @@ transactions and therefore cannot by itself serve as a stable permission-policy 
 
 [Plan 69](69-expose-stable-grant-generations-at-authorization-snapshots.md) added a separate grant
 generation. Migration `en-migrations/migrations/0002-grant-generations.sql` owns two tables. The
-singleton `en_grant_generation_head` holds the next counter value. `en_grant_generation` records one
-counter value and the owner-write transaction ID that created it. A deferred constraint trigger on
+singleton `en_grant_generation_head` holds the last assigned counter value. `en_grant_generation`
+records one counter value and the owner-write transaction ID that created it. A deferred constraint trigger on
 `en_transaction` locks and increments the singleton immediately before commit. Because a later
 writer cannot obtain that row lock until the earlier writer finishes, generation order follows
 successful commit order even if PostgreSQL assigned transaction IDs in another order.
@@ -189,15 +228,18 @@ Koyomi project; retain the intended canonical plan URI in durable references.
 
 ### Milestone 1 — Make fixed overhead and failure semantics executable contracts
 
+
 Extend `en-postgres/integration-test/Main.hs` with a transparent interposer around the exported
 `Database` effect. Count each `RunSession` operation while running `grantGenerationForToken` against
-the real migrations and PostgreSQL interpreter. First capture the current value—three sessions—and
-record it in Surprises & Discoveries before changing production code. Add cases for a current token,
-a retained historical token, and missing history; the number must not depend on whether the decision
-cache would have supplied the preceding authorization result.
+the real migrations and PostgreSQL interpreter. Scope counting to metadata only, after fixture
+setup and the preceding check. Assert three sessions for successful current and retained historical
+tokens, and two for missing history with an otherwise valid token. Failures before the read may
+short-circuit sooner. Record these measured baselines before changing production code; the counts
+must not depend on whether the decision cache supplied the preceding authorization result.
 
-Extend `en-servant/test/Main.hs` so a metadata operation that raises `ConsistencyTokenExpired` or
-`InvalidConsistencyToken` after a completed check produces `EnUnavailable`, not `EnClientError`.
+Extend `en-servant/test/Main.hs` so a metadata operation that raises `ConsistencyTokenExpired`,
+`InvalidConsistencyToken`, or `MalformedConsistencyToken` after a completed check produces
+`EnUnavailable`, not `EnClientError`.
 The test must include `FullyConsistent`, where the request carries no client token, making it
 unambiguous that a post-check expiration is a server-side metadata race. Preserve ordinary 400
 behavior when the initial check itself rejects a malformed, mismatched, or expired client token.
@@ -208,9 +250,13 @@ Before changing production code, observe and record that the session-count test 
 that the post-check retention test fails with the current client-error classification. This
 milestone is accepted when the committed session-count test accurately locks in the three-session
 baseline, the post-check classification test passes with HTTP 503 while initial client-token errors
-remain HTTP 400, and all older integration and wire tests are green.
+remain HTTP 400, and all older integration and wire tests are green. Add a deterministic interposed
+race that advances the real durable horizon after the generation read but before final validation;
+assert that metadata fails. Retain this test through Milestone 3 so removing the last validation
+cannot accidentally satisfy only the session-count ceiling.
 
 ### Milestone 2 — Build and run the PostgreSQL characterization spike
+
 
 Add executable `en-grant-generation-spike` to `en-postgres/en-postgres.cabal` and implement it in
 `en-postgres/grant-generation-spike/Main.hs`. Reuse the lifecycle, timing, percentile, rendering,
@@ -221,6 +267,13 @@ large, repeatable visibility profiles without executing a million individual tra
 label synthetic fixtures in its output and cross-check a small fixture against generations created
 by real committed transactions.
 
+Give the new executable `ghc-options: -threaded`, as the integration-test stanza already does;
+otherwise a blocking database call can prevent the other Haskell threads from exercising contention.
+Use one connection per writer and a common start barrier. Isolate/reset fixture families, keep
+synthetic XIDs disjoint from measured real transactions, and reset the singleton to the seeded head
+before an enabled write run. Synthetic rows do not establish transactional correctness; verify that
+separately with the existing real-transaction fixture and its extensions.
+
 Measure generation lookup at retained-history sizes 1,000, 10,000, 100,000, and 1,000,000. At each
 size sample a head-visible generation, a snapshot with 32 newer generations (the bounded Koyomi-like
 sequence case), a midpoint, and the oldest retained floor. Run `ANALYZE`, discard one warm-up, take
@@ -228,32 +281,56 @@ at least 50 measured samples, and report p50, p95, rows removed by the filter, s
 operator name from `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`. A measurement is invalid if the lookup
 returns a generation other than the fixture's expected value.
 
+Measure ordinary lookup executions for latency, and collect EXPLAIN separately so instrumentation
+does not inflate those samples. Save the complete plan tree, including node loops and actual rows,
+and distinguish index-seek count from shared-buffer hits/reads. A p95 is the sorted sample at
+`ceiling (0.95 * sampleCount)`, using one-based indexing. Include dense size pairs 500,000/1,000,000
+for the doubling check and sparse fixtures with missing midpoint keys, one surviving floor, and a
+large numeric span near the nonnegative `Int64` limit. Their snapshots must preserve the committed
+visibility-prefix property; arbitrary synthetic XID permutations are not valid commit histories.
+
 Measure write overhead with real transactions at concurrency widths 1, 8, and 32 against both 1,000
 and 1,000,000 retained generations. Report completed writes per second and commit p50/p95 with the
 production trigger enabled. In the disposable database only, repeat the same workload with
 `en_transaction_grant_generation` disabled to isolate trigger overhead; never present the disabled
 result as a valid En configuration. Verify afterward that the enabled run produced one monotonically
-increasing generation per committed transaction and none for rollbacks. Also report table and index
-bytes from `pg_total_relation_size` after 1,000, 10,000, 100,000, and 1,000,000 generation rows.
+increasing generation per committed transaction and none for rollbacks. Each full write cell uses
+one discarded round and five measured rounds of 100 transactions per writer, with every tenth
+transaction rolled back. Keep transaction bodies, starting history size, and rollback schedule
+identical between enabled and disabled runs. Time COMMIT separately from the whole workload; client
+response arrival order is not proof of commit order. Use coordinated snapshots in the correctness
+fixture to establish ordering. Report total bytes with `pg_total_relation_size`, table bytes with
+`pg_table_size`, and index bytes with `pg_indexes_size` after each declared history size, using the
+[PostgreSQL size-function definitions](https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-DBSIZE).
 
 Measure pruning with backlogs 10,000, 100,000, and 1,000,000 at the production default batch size
 1,000. Report first, median, p95, and final-empty batch latency, total statements, buffers, deleted
 rows, and surviving floor. Each individual statement must delete at most the requested batch and the
 retained floor must resolve correctly after the backlog drains.
 
+As documented for [EXPLAIN ANALYZE](https://www.postgresql.org/docs/current/sql-explain.html), it
+executes a DELETE. Collect pruning plans on a separately reset copy of the fixture
+and exclude those mutations from the latency run's counts. Include a mixed horizon fixture with
+rows above the horizon and reordered XIDs, so preservation is not tested only by a single floor.
+
 Append compact baseline tables and the exact host/PostgreSQL/GHC context to this plan's Surprises &
-Discoveries. The milestone is accepted when `cabal run en-grant-generation-spike` completes the
-default matrix, renders every required field, proves its correctness assertions, and exits zero.
+Discoveries. The milestone is accepted when `cabal run en-grant-generation-spike -- --baseline`
+completes the full matrix, renders every required field, proves its correctness assertions, and
+exits zero even if the unoptimized query exceeds the final latency/lookup limits. Baseline mode
+reports those limit failures explicitly; default mode enforces them after Milestone 3.
 Support a smaller `--smoke` matrix for routine development and a `--json FILE` result artifact for
 comparison; reject unknown arguments instead of silently changing the workload.
 
 ### Milestone 3 — Remove avoidable reads and bound historical lookup work
 
+
 In `en-postgres/src/En/Postgres/GrantGeneration.hs`, separate token decoding from retained-history
 validation. The metadata path receives the `checkedAt` token minted by the just-completed check, so
-decode it to obtain the exact `Revision`, read that generation, then perform one validation after
-the read. Do not remove the final validation. Missing history, database failure, owner mismatch, or
-expiration discovered in this post-check metadata stage must become the retryable unavailable
+use `ConsistencyStore.decodeToken` to obtain `TokenMetadata`, read its exact `Revision`, then call
+`ConsistencyStore.validateToken` on that same metadata. Both operations already exist in
+`en-core/src/En/Effect/ConsistencyStore.hs`; the PostgreSQL decoder issues no database session and
+the validator reads the horizon once. Do not remove the final validation. Missing history,
+database failure, owner mismatch, or expiration discovered in this post-check metadata stage must become the retryable unavailable
 surface required by Plan 69; initial request-token validation in `En.Check.check` retains its
 existing client-error behavior.
 
@@ -265,15 +342,29 @@ distinguish post-check metadata failure from ordinary client-token failure. Avoi
 unstructured catch-all that would turn programming or schema errors into retryable faults.
 
 For historical lookup, first use the spike and `EXPLAIN` evidence to prove whether the current
-descending scan grows linearly with historical distance. If it does, replace it with a lookup whose
-work is bounded logarithmically in generation-history size. Commit order makes visibility monotone
-by generation: for a fixed snapshot, visible generations form a prefix, because generation N+1
+descending scan grows linearly with historical distance. If it does, replace it with a bounded
+search. Commit order makes visibility monotone by generation: for a fixed snapshot, visible
+generations form a prefix, because generation N+1
 cannot acquire the singleton lock until generation N's transaction finishes. Prototype an inline
-recursive-CTE or equivalent primary-key binary search over generation numbers and verify this prefix
-property with actual concurrent transactions, out-of-order XID allocation, rollback, and snapshots
-whose `xip` list contains an older still-running transaction. Adopt the new statement only when it
-returns exactly the same answer as the original visibility query throughout the fixture matrix and
-its `EXPLAIN` evidence shows logarithmic point lookups rather than a scan through every newer row.
+recursive common table expression (a SQL query that repeatedly narrows a search interval) or
+equivalent search over generation numbers. Use indexed successor/predecessor seeks to handle absent
+midpoint keys; never equate a missing key with an invisible transaction. Keep all seeks in one SQL
+statement so pruning cannot change its rows between steps. Define a strictly shrinking interval,
+overflow-safe midpoint arithmetic, and explicit empty-table/no-visible-row cases.
+
+For numeric bisection, let `S = maxGeneration - minGeneration + 1`. Require at most
+`ceiling(log2(S)) + 1` iterations and at most two index seeks per iteration, plus a fixed number of
+endpoint/fast-path seeks documented in the result. Nonnegative `Int64` keys bound this to 64
+iterations even for sparse history. This is a bound on seeks in numeric span, not a claim that
+total buffer work is logarithmic in retained rows: each B-tree seek has its own traversal cost.
+A fixed fast path may check the newest 33 rows to protect fresh and distance-32 latency.
+
+Verify the prefix property with actual concurrent transactions, out-of-order XID allocation,
+rollback, and snapshots whose `xip` list (transaction IDs still active at snapshot capture) contains
+an older still-running transaction. Compare the candidate with the original visibility query for
+every dense/sparse fixture, before and during pruning, including the locked-victim holes already
+covered by `runGrantGenerationScenario`. Adopt it only when answers agree and EXPLAIN proves the
+seek/iteration bound without a hidden sequential scan, large sort, or OFFSET walk.
 
 If the bounded implementation needs a PostgreSQL function or index, create a new migration with
 `just make-migration`; do not edit `0002-grant-generations.sql`. Include migration upgrade tests and
@@ -284,19 +375,24 @@ After optimization, the generation metadata stage must issue at most two `Databa
 operations: one generation read and one post-read horizon validation. At one million retained rows,
 the fresh and 32-newer-generation cases must have p95 below 5 ms on the reference host, and the
 oldest-floor and midpoint cases must have p95 below 25 ms. More importantly than the machine-local
-milliseconds, doubling history size must add at most a constant number of lookup steps; the JSON
-EXPLAIN record must show work proportional to the logarithm of row count. If the prototype disproves
-the monotone-prefix argument, stop before changing production SQL, record the counterexample, and
+milliseconds, doubling a dense generation span must add at most one bisection iteration (two seeks),
+and sparse cases must meet the same numeric-span bound. Update the Milestone 1 success counts to
+two sessions and the missing-history count to one, while preserving the injected horizon-race gate.
+If the prototype disproves the monotone-prefix argument, stop before changing production SQL,
+record the counterexample, and
 revise this plan and ADR 8 with a different bounded design.
 
 ### Milestone 4 — Establish the supported envelope and close integration
 
+
 Run the full spike again after the read-path changes and render before/after deltas for every matrix
 cell. A regression is actionable when the same-host post-change p95 is more than 25 percent slower
-than its pre-change counterpart outside the intentionally improved cells; investigate rather than
+than its pre-change counterpart in any matching cell; investigate rather than
 re-recording the slower number. Concurrent-write results are capacity evidence, not permission to
-weaken commit order. Confirm that commit latency is independent of accumulated history size and that
-the singleton lock is held only during the deferred trigger/commit tail. If avoidable work extends
+weaken commit order. Report how commit latency changes with accumulated history, including index
+and storage costs; do not require it to be mathematically independent of table size. Verify from the
+trigger and coordinated transaction tests that the singleton lock is acquired during the deferred
+trigger and held through commit. If avoidable work extends
 that critical section, remove it and repeat the matrix. Otherwise record the measured throughput and
 p95 at widths 1, 8, and 32 as the supported reference envelope.
 
@@ -320,11 +416,12 @@ and real Koyomi consumer gate all pass.
 ## Concrete Steps
 
 Run all En commands from `/Users/shinzui/Keikaku/bokuno/en` inside the repository development shell.
-Start with focused correctness and a quick characterization:
+Start with the existing focused correctness tests. The spike commands become available only after
+Milestone 2 adds the executable; its pre-optimization smoke run uses baseline mode:
 
 ```bash
 nix develop -c cabal test en-postgres:en-postgres-integration-tests en-servant --test-show-details=direct
-nix develop -c cabal run en-grant-generation-spike -- --smoke
+nix develop -c cabal run en-grant-generation-spike -- --baseline --smoke
 ```
 
 The smoke output must name the fixture as synthetic or transactional and include fields equivalent
@@ -337,23 +434,24 @@ generation-prune history=10000 batch=1000 removed=9999 survivors=1 batch_p95_ms=
 PASS: generation performance matrix preserved exact visibility, commit order, rollback and retained floor
 ```
 
-Capture the full baseline before production optimization and write JSON outside the repository until
-the results have been summarized in the plan:
+Capture the full baseline before production optimization. Create a results directory outside the
+repository and retain its path for the later comparison; `.dev/` is not ignored in this checkout:
 
 ```bash
-nix develop -c cabal run en-grant-generation-spike -- --json .dev/grant-generation-before.json
+grant_results_dir=$(mktemp -d "${TMPDIR:-/tmp}/en-grant-generation.XXXXXX")
+nix develop -c cabal run en-grant-generation-spike -- --baseline --json "$grant_results_dir/before.json"
 ```
 
 After implementation, repeat the full matrix on the same host and compare it with the baseline:
 
 ```bash
-nix develop -c cabal run en-grant-generation-spike -- --json .dev/grant-generation-after.json
-nix develop -c cabal run en-grant-generation-spike -- --compare .dev/grant-generation-before.json --json .dev/grant-generation-after.json
+nix develop -c cabal run en-grant-generation-spike -- --compare "$grant_results_dir/before.json" --json "$grant_results_dir/after.json"
 ```
 
 The comparison exits zero only when correctness matches, declared latency limits pass, and
 unintended same-host regressions stay within 25 percent. The executable must explain a nonzero result
-with the failing scenario and measured values.
+with the failing scenario and measured values. `--compare` runs the candidate matrix once, then
+compares it with the saved baseline; it does not require a separate after-run first.
 
 Run the full En validation:
 
@@ -370,8 +468,18 @@ gate from the returned project root:
 
 ```bash
 mori registry show shinzui/koyomi --full
-nix develop -c just test-en-owner
+koyomi_root=$(mori path mori://shinzui/koyomi | tail -n 1)
+test -f "$koyomi_root/justfile"
+(cd "$koyomi_root" && nix develop -c just test-en-owner)
 ```
+
+The current `mori path` output includes a URI line before the filesystem path, hence `tail -n 1`.
+The gate in `mori://shinzui/koyomi` (`scripts/test-en-owner.sh`, artifact URI pending) builds En
+through `mori://shinzui/en/packages/en-server`, starts the consumer's local PostgreSQL service,
+creates disposable owner/calendar databases, and runs real HTTPS checks. Confirm that its resolved
+En package belongs to this candidate checkout before counting a pass; record both source revisions.
+The script cleans up its temporary databases and En process, but leaves the consumer's shared local
+service running. Stop that service afterward only if this run started it and no other work uses it.
 
 Record the actual commands, dates, relevant result rows, and pass/fail status in Progress,
 Surprises & Discoveries, and Outcomes & Retrospective as milestones finish.
@@ -390,14 +498,17 @@ The following observable statements define completion:
    failure resolving metadata for a completed `FullyConsistent` check is HTTP 503 and retryable.
    Legacy embedded hosts still omit `grantGeneration`; the live PostgreSQL host never silently does.
 
-3. `en-grant-generation-spike --smoke` completes quickly enough for routine local use, and the full
+3. `en-grant-generation-spike --smoke` uses no more than 10,000 rows, ten read samples, and one
+   measured round of ten transactions per writer, and the full
    command measures the declared history sizes, snapshot distances, concurrency widths, storage
    sizes, and pruning backlogs. Both modes verify returned generations and retained floors rather
-   than timing unchecked SQL.
+   than timing unchecked SQL. `--baseline` alone relaxes final latency/seek limits; it never relaxes
+   correctness. Smoke measurements cannot satisfy the full performance acceptance gate.
 
 4. At one million retained generations on the reference host, fresh and 32-newer-generation reads
    have p95 below 5 ms, midpoint and oldest-floor reads have p95 below 25 ms, and JSON EXPLAIN shows
-   lookup steps growing logarithmically rather than linearly with history. The result note includes
+   the numeric-span seek bound in Milestone 3, with dense doubling and sparse-key evidence.
+   The result note includes
    the host and PostgreSQL version so another operator can reproduce rather than misapply the
    absolute numbers.
 
@@ -423,7 +534,8 @@ safe and does not touch an operator database. Synthetic XIDs and disabled trigge
 inside that disposable instance. Ensure cleanup is bracketed so an exception cannot leave a child
 database process running.
 
-Files under `.dev/` are local result artifacts and must not become authoritative baselines. The
+Files under the temporary `grant_results_dir` are local result artifacts and must not become
+authoritative baselines. Preserve the complete before-result until comparison finishes. The
 compact result tables copied into this plan must state their date and environment. If a run is
 interrupted, discard its JSON and rerun the entire relevant matrix; do not compare partial samples.
 
@@ -458,14 +570,29 @@ rendering.
 The new executable interface is:
 
 ```text
-en-grant-generation-spike [--smoke] [--json FILE] [--compare BEFORE.json]
+en-grant-generation-spike [--smoke] [--baseline] [--json FILE] [--compare BEFORE.json]
 ```
 
-Default mode runs the full matrix. `--smoke` uses at most 10,000 history rows and reduced samples but
-executes every scenario family. `--json FILE` writes a versioned machine-readable result while still
-rendering the human table. `--compare` loads a result with the same schema version and scenario keys,
-prints deltas, and exits nonzero on missing scenarios, correctness differences, declared limit
-failures, or unintended regressions over 25 percent.
+Default mode runs the full matrix and enforces correctness, seek bounds, and the declared latency
+limits. `--smoke` executes every scenario family with the smaller matrix defined above; it enforces
+correctness and the applicable seek bounds but cannot claim the million-row latency gate.
+Use 1,000/10,000-row cells, a 5,000/10,000 dense doubling pair, the same snapshot distances where
+valid, all three concurrency widths, and a 10,000-row pruning backlog in smoke mode. Sparse numeric
+span tests may use large generation values while keeping their row counts within that limit.
+`--baseline` captures pre-optimization evidence, reporting final performance-limit failures without
+failing on them. Reject `--baseline` together with `--compare`.
+
+`--json FILE` writes a versioned machine-readable result while still rendering the human table.
+Include source revision and dirty status, host/CPU/OS, GHC and PostgreSQL versions, relevant database
+settings, matrix mode, fixture seed/shape, row count and numeric span, timing units, sample counts,
+raw samples, correctness assertions, and complete EXPLAIN plans. `--compare` requires matching
+environment, settings, sample policy, schema version, and scenario keys (source revision and
+baseline/candidate mode are expected to differ). It prints deltas and exits nonzero on incomplete
+artifacts, missing scenarios, correctness differences, declared limit failures, or p95 regressions
+over 25 percent. Apply that regression gate to every timed cell without exempting improved reads;
+report throughput/storage/buffer deltas as characterization. Write a complete artifact atomically
+even when a performance gate fails, and distinguish it from an interrupted or correctness-invalid
+run.
 
 Keep `GrantGeneration` opaque and retain:
 
@@ -493,3 +620,9 @@ The existing packages are registered locally as `mori://shinzui/en/packages/en-p
 acceptance dependency is the En owner contract referenced by
 `mori://shinzui/koyomi/plans/5-expose-authorized-calendar-http-apis-and-typed-clients`; use Mori to
 resolve its checkout before running the cross-repository gate.
+
+Revision note (2026-10-13): Validated the design against current source and ADRs 1 and 8. Corrected
+failure-path session counts, specified sparse-history search and its actual seek bound, separated
+baseline capture from final enforcement, made measurement/comparison policy reproducible, and
+repaired result-directory and consumer working-directory instructions. Implementation milestones
+remain open; no production code was changed during this review.
