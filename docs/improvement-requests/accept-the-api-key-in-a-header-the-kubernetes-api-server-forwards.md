@@ -3,12 +3,13 @@ type: Improvement Request
 title: Accept the API key in a header the Kubernetes API server forwards
 description: >-
   Let a caller present its En API key as `X-En-Api-Key` in addition to `Authorization: Bearer`, so a client that reaches En through the Kubernetes API server's service proxy, which deletes the Authorization header after authenticating the caller, can authenticate without a port-forward.
-timestamp: "2026-10-22T21:28:49Z"
+timestamp: "2026-10-28T20:15:15Z"
 generated:
   by: process:claude-code
-  at: "2026-10-22T21:28:49Z"
+  at: "2026-10-28T20:15:15Z"
 requestId: IR-1
-status: proposed
+status: accepted
+targetPlan: docs/plans/71-accept-the-api-key-in-a-header-the-kubernetes-api-server-forwards.md
 origin: mori://shinzui/nagare
 acceptanceCriteria:
   - id: AC-1
