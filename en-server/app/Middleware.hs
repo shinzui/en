@@ -80,11 +80,12 @@ isExemptPath request =
 -- | Routes that mutate the relationship graph, and so require a 'ReadWrite' key.
 --
 -- Any new write route must be added here, or a read-only key silently gains write
--- access. The prefix match on @v1\/relationships@ covers both the write route and
--- its @delete@ sub-route.
+-- access. Relationship query is a read even though its filter travels in a
+-- POST body. Unknown POST routes under relationships remain denied.
 isWriteRequest :: Request -> Bool
 isWriteRequest request =
   case pathInfo request of
+    ["v1", "relationships", "query"] -> False
     "v1" : "relationships" : _ -> requestMethod request == methodPost
     _ -> False
 

@@ -82,3 +82,27 @@ executable en-server
     wai,
     warp,
     warp-tls,
+
+test-suite en-server-middleware-test
+  import: warnings, shared
+  type: exitcode-stdio-1.0
+  hs-source-dirs:
+    test
+    app
+
+  main-is: MiddlewareSpec.hs
+  other-modules: Middleware
+  build-depends:
+    base,
+    bytestring,
+    containers,
+    en-core,
+    en-servant,
+    generic-lens,
+    http-types,
+    ram,
+    servant-health,
+    tasty,
+    tasty-hunit,
+    text,
+    wai,
