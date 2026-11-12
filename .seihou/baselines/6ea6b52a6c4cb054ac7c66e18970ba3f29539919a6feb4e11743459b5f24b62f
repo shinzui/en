@@ -20,50 +20,71 @@
 {
   # `self'` is this system's own flake outputs (self'.packages.default, …) — handy
   # for wiring a Docker image around the package you build (see below).
-  perSystem = { self', pkgs, config, ... }: {
+  perSystem = { self', pkgs, config, system, ... }: {
     # Add project-specific dev-shell tools (conflict-free; reads the option
     # declared in ./nix/haskell.nix):
     #
     #   haskellProject.extraDevPackages = [ pkgs.ghciwatch pkgs.haskellPackages.hpack ];
+
+    # Explicit runtime adoption (see upgrade-haskell-runtime's qualified target):
+    # haskellProject.runtime = builtins.fromJSON (builtins.readFile ./runtime-selection.json);
+    # Declare custom ownPackages/applicationOverlays and select production recipes
+    # from config.haskellProject.applicationScope. Root/CLI scaffolds declare theirs.
+    # Never fill missing selections from defaults or override retained shared recipes.
+    # haskellProject.extraBuildInputs = [ pkgs.openssl.dev ];
+    # haskellProject.inputsFrom = [ compatibleEnvironment ];
+    # haskellProject.withHls = null;
+    # haskellProject.shellHook = "export PROJECT_SETTING=value";
 
     # Add extra package / app / check outputs:
     #
     #   packages.my-tool = pkgs.hello;
     #   apps.seed = { type = "app"; program = "${pkgs.writeShellScript "seed" "..."}"; };
 
-    # Build an OCI image for a SERVICE with dockerTools.buildLayeredImage. An
+    # Build a Docker-compatible OCI image for a SERVICE with nix2container. An
     # image is inherently project-specific — which executable, entrypoint, ports
     # and runtime libraries — so it lives here in the unmanaged flake.module.nix,
     # next to the package build, rather than in a managed file. Works whether
     # nix.builtin-package is true (wrap self'.packages.default, as shown) or
     # false (wrap the packages.default you define below).
+    # When defining your own default in THIS same perSystem attrset, merge it as
+    # `packages = { default = ...; } // pkgs.lib.optionalAttrs ... { dockerImage = ...; };`
+    # so there is only one `packages` assignment. Separate imported modules merge freely.
     #
-    # IMPORTANT — guard it to Linux. dockerTools cannot build on darwin, and an
+    # IMPORTANT — guard it to Linux. The service must use Linux binaries, and an
     # UNconditional image output makes any tool that builds every output for the
     # current system (e.g. devour-flake, as CI runs it) fail on macOS. Guard on
     # pkgs.stdenv.hostPlatform.isLinux so an aarch64-darwin eval/build still works:
     #
     #   packages = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-    #     dockerImage = pkgs.dockerTools.buildLayeredImage {
+    #     dockerImage = inputs.nix2container.packages.${system}.nix2container.buildImage {
     #       name = "en";
     #       tag = "latest";
     #       # Runtime deps the bare static-ish exe still needs: TLS roots for
     #       # outbound HTTPS, plus anything the service shells out to. Add e.g.
     #       # pkgs.tzdata for timezones, or a shared C lib your exe dlopen's.
-    #       contents = [ pkgs.cacert pkgs.coreutils pkgs.bashInteractive ];
+    #       copyToRoot = pkgs.buildEnv {
+    #         name = "en-image-root";
+    #         paths = [ pkgs.cacert pkgs.coreutils pkgs.bashInteractive ];
+    #         pathsToLink = [ "/bin" "/etc" ];
+    #       };
     #       config = {
     #         Cmd = [ "${self'.packages.default}/bin/en" ];
     #         ExposedPorts = { "8080/tcp" = { }; };
     #         Env = [ "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
     #       };
     #       # Need extra files in the image (migration scripts, a static dir)?
-    #       # Use extraCommands to copy them into the layer:
-    #       #   extraCommands = "mkdir -p app && cp -r ${./migrations} app/migrations";
+    #       # Add a pkgs.runCommand root tree to copyToRoot (a list is supported).
+    #       # Use buildImage's perms argument for image ownership and modes; extraCommands
+    #       # and fakeRootCommands are dockerTools APIs and are not supported here.
     #     };
     #   };
     #
     # Build on Linux (or in CI):  nix build .#dockerImage
-    # Load locally:               docker load < result
+    # Load into Docker:          nix run .#dockerImage.copyToDockerDaemon
+    # Push configured name/tag:  nix run .#dockerImage.copyToRegistry
+    # Export a Docker archive:   nix run .#dockerImage.copyTo -- docker-archive:/tmp/en.tar:en:latest
+    # `result` is an image description, not a tarball; copyTo materializes layers.
 
     # Define your OWN default package build here. nix/haskell.nix emits
     # `packages.default = callCabal2nix ...` only when nix.builtin-package is
@@ -96,6 +117,6 @@
   # To pull in a brand-new flake input you must add it to flake.nix's top-level
   # `inputs` (a Nix requirement — inputs cannot be declared from an imported
   # module). That is the one edit that will conflict on a future migration;
-  # resolve it with "accept new" and re-add your input line. (haskell-nix is
+  # preview it and preserve your input through the three-way merge. (haskell-nix is
   # already module-owned and available as inputs.haskell-nix; do not add it by hand.)
 }

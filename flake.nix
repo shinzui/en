@@ -2,7 +2,7 @@
   description = "**A schema-parametric, relationship-based authorization (ReBAC) toolkit for Haskell.**";
 
   # Every module-owned input is decided by the module's pins: the haskell-nix-dev,
-  # haskell-nix, and redpanda-container revisions below. Everything else `follows` them,
+  # haskell-nix, redpanda-container, and nix2container revisions below. Everything else `follows` them,
   # so this project's flake.lock is a pure function of those revs — every project on
   # this nix-haskell-flake version locks to byte-identical pins and shares one store closure
   # instead of each re-resolving `master` on its own schedule.
@@ -12,15 +12,22 @@
   # project is a no-op here and only touches inputs you added yourself. Verify with
   # `git diff flake.lock` — it should come back empty.
   #
-  # seihou-managed: to move the toolchain or the shared patches, release a new
+  # seihou-managed: to move the toolchain, shared patches, or image builder, release a new
   # nix-haskell-flake version and `seihou update nix-haskell-flake`. Editing a rev here is a
   # conflict at the next run.
   inputs = {
-    haskell-nix-dev.url = "github:shinzui/haskell-nix-dev/206ecd25bcb4a07581210bdae3e6f43c8fd179d8";
+    haskell-nix-dev.url = "github:shinzui/haskell-nix-dev/21933607e80ec4660a28a125a6f4c0707e358caf";
     nixpkgs.follows = "haskell-nix-dev/nixpkgs";
     flake-parts.follows = "haskell-nix-dev/flake-parts";
     treefmt-nix.follows = "haskell-nix-dev/treefmt-nix";
     pre-commit-hooks.follows = "haskell-nix-dev/pre-commit-hooks";
+
+    # nix2container v1.1.0; available to unmanaged service image definitions.
+    # Always locked, with the same nixpkgs as the application and toolchain.
+    nix2container = {
+      url = "github:nlewo/nix2container/e503eb81630a0c5d7ec244e08e0733650235d8f1";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     # Shared Haskell patch registry (mori://shinzui/haskell-nix), available to
     # ./flake.module.nix when project-specific package wiring needs it. Keeping every
@@ -28,7 +35,7 @@
     # unused inputs are locked but never built. Both follows keep the graph to one
     # haskell-nix-dev and nixpkgs.
     haskell-nix = {
-      url = "github:shinzui/haskell-nix/4cf6b3811d2ba90d0adbbd7307b2a72e167733c9";
+      url = "github:shinzui/haskell-nix/dedd4d81589e99d97137eb36f88423c70c7d69f5";
       inputs.haskell-nix-dev.follows = "haskell-nix-dev";
       inputs.nixpkgs.follows = "nixpkgs";
     };
