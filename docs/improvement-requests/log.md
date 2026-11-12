@@ -1,5 +1,8 @@
 # Bundle Update Log
 
+## 2026-11-12
+* **Addition**: Propose IR-2 from mori://shinzui/mori: serve several isolated tenants (schema, datastore, keys, tokens, grant generation, changes feed) from one en-server, selected by the caller's key, so the Nagare platform En can host an application's model such as Mori's registry model beside its own.
+
 ## 2026-10-28
 * **Update**: Accept IR-1 and plan it in docs/plans/71-accept-the-api-key-in-a-header-the-kubernetes-api-server-forwards.md: the change replaces only the credential-parsing body of en-server's authentication middleware, uses OpenAPI's first-class apiKey-in-header scheme, and adds no configuration or key tier. The plan fixes the agreement rule for a request that carries both headers and keeps Bearer as the default and the 401 challenge.
 
