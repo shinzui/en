@@ -11,6 +11,12 @@ provenance:
     model: "claude-fable-5-2"
     harness: "claude-code"
     at: 2026-11-12T23:20:49Z
+  revisions:
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T02:19:34Z
+      mode: "update"
+      note: "Gate G1 reduced to EP-2 M1 and EP-5 with 3 rounds; smoke benchmark elsewhere; list-bin target fixed"
 ---
 
 # Carry the tenant through logs, metrics, traces and readiness
@@ -50,7 +56,7 @@ each tenant's state".
       `/metrics` output is unchanged.
 - [ ] Milestone 3: per-tenant availability is reported by an `en_tenant_available` metric and by
       log lines on every change; the readiness behaviour is covered by tests and recorded in an
-      ADR; the A/B benchmark reports `RESULT: PASS` (gate G1).
+      ADR; `just loadbench-smoke` exits 0.
 
 
 ## Surprises & Discoveries
@@ -209,7 +215,8 @@ unused number in `docs/adr/` and the format of the existing records (front matte
 records the readiness decision from this plan's Decision Log, the consequence that a rollout
 cannot be gated on one tenant's storage, and that operators alert on `en_tenant_available`.
 
-Add the cases under Validation and run gate G1.
+Add the cases under Validation and run `just loadbench-smoke` (gate G1 itself is run only by
+EP-2 Milestone 1 and EP-5; see the MasterPlan).
 
 
 ## Concrete Steps
@@ -247,13 +254,10 @@ en_tenant_available{tenant="alpha"} 0
 en_tenant_available{tenant="beta"} 1
 ```
 
-Gate G1:
+The smoke benchmark:
 
 ```bash
-cabal run -v0 en-server-loadbench -- ab \
-  --baseline .dev/loadbench/en-server-baseline \
-  --candidate "$(cabal list-bin en-server)" \
-  --json .dev/loadbench/g1-ep75.json
+just loadbench-smoke
 treefmt
 ```
 
@@ -304,7 +308,7 @@ The A/B command ends with `RESULT: PASS`; paste the verdict table into Progress.
 
 The changes are additive in tenant mode and absent in legacy mode, so they can be committed
 milestone by milestone and each reverted alone. Tests own their PostgreSQL instances and can be
-re-run. If gate G1 regresses, look for work added to the legacy request path: legacy mode must
+re-run. If the smoke benchmark, or later gate G1, regresses, look for work added to the legacy request path: legacy mode must
 call the logger and metrics code with no tenant name and take no new branch per request beyond
 that.
 

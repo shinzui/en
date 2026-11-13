@@ -11,6 +11,12 @@ provenance:
     model: "claude-fable-5-2"
     harness: "claude-code"
     at: 2026-11-12T23:20:49Z
+  revisions:
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T02:19:34Z
+      mode: "update"
+      note: "Gate G1 reduced to EP-2 M1 and EP-5 with 3 rounds; smoke benchmark elsewhere; list-bin target fixed"
 ---
 
 # Prove tenant isolation and performance, then document tenant operations
@@ -289,7 +295,8 @@ EN_BASELINE_BIN=.dev/loadbench/en-server-baseline cabal test en-server-tenant-te
 cabal test en-server-config-tests en-server-middleware-test
 cabal run -v0 en-server-loadbench -- ab \
   --baseline .dev/loadbench/en-server-baseline \
-  --candidate "$(cabal list-bin en-server)" \
+  --candidate "$(cabal list-bin en-server:exe:en-server)" \
+  --rounds 3 \
   --json en-server/loadbench/results/g1-final.json
 ```
 
@@ -298,11 +305,11 @@ Milestone 2:
 ```bash
 cabal run -v0 en-server-loadbench -- tenants idle-neighbour \
   --baseline .dev/loadbench/en-server-baseline \
-  --candidate "$(cabal list-bin en-server)" \
+  --candidate "$(cabal list-bin en-server:exe:en-server)" \
   --json en-server/loadbench/results/g2-idle-neighbour.json
 cabal run -v0 en-server-loadbench -- tenants busy-neighbour \
   --baseline .dev/loadbench/en-server-baseline \
-  --candidate "$(cabal list-bin en-server)" \
+  --candidate "$(cabal list-bin en-server:exe:en-server)" \
   --json en-server/loadbench/results/g3-busy-neighbour.json
 ```
 

@@ -11,6 +11,12 @@ provenance:
     model: "claude-fable-5-2"
     harness: "claude-code"
     at: 2026-11-12T23:20:49Z
+  revisions:
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T02:19:34Z
+      mode: "update"
+      note: "Gate G1 reduced to EP-2 M1 and EP-5 with 3 rounds; smoke benchmark elsewhere; list-bin target fixed"
 ---
 
 # Serve tenants selected by API key, each from its own isolated stack
@@ -52,8 +58,8 @@ part of AC-6 that says a read-only key stays read-only within its tenant.
       `cabal test en-server-config-tests` covers every acceptance and rejection rule.
 - [ ] Milestone 3: requests are routed by key to per-tenant stacks;
       `cabal test en-server-tenant-tests` passes its isolation cases, including the case that
-      exercises every alpha route while beta's PostgreSQL is stopped; gate G1 passes again; the
-      ADR is written.
+      exercises every alpha route while beta's PostgreSQL is stopped; `just loadbench-smoke`
+      passes; the ADR is written.
 
 
 ## Surprises & Discoveries
@@ -227,8 +233,8 @@ Prove nothing changed in three ways. Run the existing suites. Run the Hurl black
 under Validation, which starts the
 baseline binary against a database, obtains a consistency token, stops it, starts the new binary
 against the same database, and shows the datastore id, schema hash and token all carry over
-(AC-1). Then run gate G1: the A/B benchmark of the baseline binary against the new binary must
-print `RESULT: PASS`. If it reports a regression, find and remove the cause before continuing;
+(AC-1). Then run gate G1: the A/B benchmark of the baseline binary against the new binary, with
+`--rounds 3`, must print `RESULT: PASS`. If it reports a regression, find and remove the cause before continuing;
 if it cannot be removed, stop and report to the owner as the parent MasterPlan requires.
 
 ### Milestone 2: tenant configuration
@@ -332,7 +338,8 @@ both "unknown type" and "same type, separate data". Use the typed client in
 `en-client/src/En/Client.hs` for requests, which also shows that an unmodified client works
 against a tenant. The cases are listed under Validation.
 
-Finish by running gate G1 again, and by writing the ADR
+Finish by running `just loadbench-smoke` (a functional check; gate G1 is not re-run until
+`docs/plans/76-prove-tenant-isolation-and-performance-then-document-tenant-operations.md`), and by writing the ADR
 `docs/adr/NNNN-tenancy-is-a-property-of-the-standalone-host.md`, where `NNNN` is the next unused
 number in `docs/adr/` (0009 unless another plan has taken it), in the format of the existing
 ADRs (front matter with `title`, `status`, `date`, `authors`, `related`; sections Status,
@@ -354,14 +361,15 @@ just start-and-test && just process-down
 EN_BASELINE_BIN=.dev/loadbench/en-server-baseline cabal test en-server-tenant-tests --test-options='-p upgrade'
 cabal run -v0 en-server-loadbench -- ab \
   --baseline .dev/loadbench/en-server-baseline \
-  --candidate "$(cabal list-bin en-server)" \
+  --candidate "$(cabal list-bin en-server:exe:en-server)" \
+  --rounds 3 \
   --json .dev/loadbench/g1-m1.json
 ```
 
 The last command must end with:
 
 ```text
-RESULT: PASS (6 workloads)
+RESULT: PASS (6 workloads, 3 rounds)
 ```
 
 If `.dev/loadbench/en-server-baseline` is missing, rebuild it with the commit recorded in
@@ -382,10 +390,7 @@ After Milestone 3:
 ```bash
 cabal test en-server-tenant-tests
 just openapi
-cabal run -v0 en-server-loadbench -- ab \
-  --baseline .dev/loadbench/en-server-baseline \
-  --candidate "$(cabal list-bin en-server)" \
-  --json .dev/loadbench/g1-m3.json
+just loadbench-smoke
 treefmt
 ```
 
@@ -399,7 +404,7 @@ EN_TENANT_ALPHA_API_KEYS_READ_WRITE='alpha-writer:alpha-secret-0123456789' \
 EN_TENANT_BETA_DATABASE_URL='postgresql://localhost/en_beta' \
 EN_TENANT_BETA_SCHEMA_PATH=./beta.en \
 EN_TENANT_BETA_API_KEYS_READ_WRITE='beta-writer:beta-secret-0123456789' \
-  "$(cabal list-bin en-server)"
+  "$(cabal list-bin en-server:exe:en-server)"
 ```
 
 ```text
@@ -432,7 +437,8 @@ server, starts the newly built binary against the same database, and asserts the
 id, the same hash, and that a check presenting the old token at `atLeastAsFresh` succeeds. When
 `EN_BASELINE_BIN` is unset the case prints that it was skipped; acceptance requires it to run.
 
-**Gate G1.** The A/B command prints `RESULT: PASS` after Milestone 1 and after Milestone 3.
+**Gate G1.** The A/B command prints `RESULT: PASS` after Milestone 1; `just loadbench-smoke`
+exits 0 after Milestone 3.
 Paste the verdict table into Progress as evidence.
 
 **Configuration.** `cabal test en-server-config-tests` passes; each rejection rule in Milestone 2

@@ -11,6 +11,12 @@ provenance:
     model: "claude-fable-5-2"
     harness: "claude-code"
     at: 2026-11-12T23:20:49Z
+  revisions:
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T02:19:34Z
+      mode: "update"
+      note: "Gate G1 reduced to EP-2 M1 and EP-5 with 3 rounds; smoke benchmark elsewhere; list-bin target fixed"
 ---
 
 # Give each tenant an independent lifecycle and contain its storage faults
@@ -51,8 +57,7 @@ their documentation, which the last child plan of the parent MasterPlan writes.
       that tenant's database only.
 - [ ] Milestone 3: a tenant whose storage is faulty at startup or later is unavailable alone and
       recovers alone; an expected datastore id can be pinned per tenant; readiness fails only
-      when no tenant can serve. The fault cases pass and the A/B benchmark reports
-      `RESULT: PASS` (gate G1).
+      when no tenant can serve. The fault cases pass and `just loadbench-smoke` exits 0.
 
 
 ## Surprises & Discoveries
@@ -261,7 +266,8 @@ one tenant is healthy. When none is, it returns the first tenant's `Unhealthy` v
 of partial outages; expose from `Tenant.hs` a function that returns each tenant's name and
 current health for it to use.
 
-Add the fault cases listed under Validation, then run gate G1.
+Add the fault cases listed under Validation, then run `just loadbench-smoke` (gate G1 itself is
+run only by EP-2 Milestone 1 and EP-5; see the MasterPlan).
 
 
 ## Concrete Steps
@@ -278,7 +284,7 @@ cabal test en-server-middleware-test
 By hand, with a two-tenant environment exported (see plan 73 for the variables):
 
 ```bash
-"$(cabal list-bin en-server)" check-schema --tenant alpha ./candidate.en
+"$(cabal list-bin en-server:exe:en-server)" check-schema --tenant alpha ./candidate.en
 ```
 
 ```text
@@ -288,7 +294,7 @@ team:t1#member@user:ann  (orphan: object type team is not defined)
 ```
 
 ```bash
-"$(cabal list-bin en-server)" export
+"$(cabal list-bin en-server:exe:en-server)" export
 ```
 
 ```text
@@ -308,13 +314,10 @@ en-server listening on :8080
 [tenant alpha] Datastore id: 5d0c…
 ```
 
-Gate G1, at the end:
+The smoke benchmark, at the end:
 
 ```bash
-cabal run -v0 en-server-loadbench -- ab \
-  --baseline .dev/loadbench/en-server-baseline \
-  --candidate "$(cabal list-bin en-server)" \
-  --json .dev/loadbench/g1-ep74.json
+just loadbench-smoke
 treefmt
 ```
 
@@ -361,7 +364,7 @@ All tests own their PostgreSQL instances and can be re-run. The supervisor's ret
 repeat: initialization only reads, except for minting a datastore id into a database that has
 the metadata table and no id, which is the existing first-start behaviour and does not happen
 when a pin is set. `import` remains idempotent as documented in `runImport`. Nothing here adds a
-migration. If gate G1 regresses, the likeliest cause is work added to the legacy request path;
+migration. If the smoke benchmark, or later gate G1, regresses, the likeliest cause is work added to the legacy request path;
 legacy mode must not read a slot reference or take any new branch per request.
 
 
