@@ -155,6 +155,44 @@ test-suite en-server-middleware-test
     text,
     wai,
 
+-- The configuration rules, through the pure parser in app/Config.hs.
+test-suite en-server-config-tests
+  import: warnings, shared
+  type: exitcode-stdio-1.0
+  hs-source-dirs:
+    test
+    app
+
+  main-is: ConfigSpec.hs
+  other-modules:
+    Config
+    Maintenance
+    Middleware
+    Telemetry
+
+  build-depends:
+    base,
+    biscuit-haskell,
+    bytestring,
+    containers,
+    effectful-core,
+    en-biscuit,
+    en-core,
+    en-postgres,
+    en-servant,
+    generic-lens,
+    hasql,
+    hs-opentelemetry-api >=1.0 && <1.1,
+    hs-opentelemetry-instrumentation-wai >=1.0 && <1.1,
+    hs-opentelemetry-sdk >=1.0 && <1.1,
+    http-types,
+    ram,
+    servant-health,
+    tasty,
+    tasty-hunit,
+    text,
+    wai,
+
 -- Black-box tenancy proofs: starts the built en-server (and, for the upgrade case, the
 -- baseline binary named by EN_BASELINE_BIN) against ephemeral PostgreSQL. See
 -- docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md.

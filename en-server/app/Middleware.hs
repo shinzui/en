@@ -12,7 +12,9 @@ module Middleware
     ApiKey (..),
     AuthConfig (..),
     RateLimitConfig (..),
+    TenantRoute (..),
     authMiddleware,
+    tenantAuthMiddleware,
     rateLimitMiddleware,
     describeRateLimit,
   )
@@ -39,7 +41,7 @@ import En.Servant.Problem
   )
 import GHC.Clock (getMonotonicTimeNSec)
 import Network.HTTP.Types (HeaderName, hAuthorization, methodPost)
-import Network.Wai (Middleware, Request (..), Response)
+import Network.Wai (Application, Middleware, Request (..), Response)
 import Servant.Health.Paths qualified as Health
 
 -- | What a key is allowed to do. 'ReadOnly' keys are rejected on write routes.
@@ -107,6 +109,41 @@ authMiddleware (AuthKeys keys) = \application request respond ->
             respond readOnlyKey
         | otherwise ->
             application (withCaller (key ^. #keyName) request) respond
+
+-- | A configured key paired with the application of the tenant it belongs to.
+data TenantRoute = TenantRoute
+  { routeKey :: !ApiKey,
+    -- | The tenant's stack: everything inside authentication.
+    routeApplication :: !Application
+  }
+  deriving stock (Generic)
+
+-- | Tenant mode's authentication: the key that authenticates a request also chooses the
+-- application that serves it.
+--
+-- Everything else is 'authMiddleware' unchanged: the same header parsing and
+-- constant-time comparison, the same 401 and 403, the same caller header. Probe paths go
+-- to the process's probe application without a key. Nothing but the presented secret
+-- selects a tenant -- no other header, no path segment, no body field -- and the work per
+-- request is the same single scan over the key list, because each entry already carries
+-- its tenant's application.
+tenantAuthMiddleware :: Application -> [TenantRoute] -> Application
+tenantAuthMiddleware probes routes request respond
+  | isExemptPath request = probes request respond
+  | otherwise = case authenticateRoute routes request of
+      Nothing -> respond unauthenticated
+      Just route
+        | (route ^. #routeKey . #keyRole) == ReadOnly && isWriteRequest request ->
+            respond readOnlyKey
+        | otherwise ->
+            (route ^. #routeApplication) (withCaller (route ^. #routeKey . #keyName) request) respond
+
+-- | As 'authenticate', over keys paired with their tenant's application.
+authenticateRoute :: [TenantRoute] -> Request -> Maybe TenantRoute
+authenticateRoute routes request = do
+  header <- lookup hAuthorization (requestHeaders request)
+  presented <- bearerSecret header
+  find (\route -> constEq (route ^. #routeKey . #keySecret) presented) routes
 
 -- | Constant-time credential check. Returns the matching key, if any.
 authenticate :: [ApiKey] -> Request -> Maybe ApiKey

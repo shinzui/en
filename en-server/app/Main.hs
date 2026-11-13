@@ -1,6 +1,6 @@
 module Main (main) where
 
-import Config (BiscuitConfig (..), ServerConfig (..), SharedConfig (..), Tenancy (..), TlsConfig (..), loadServerConfig, loadStoreConfig)
+import Config (BiscuitConfig (..), ServerConfig (..), SharedConfig (..), Tenancy (..), TenantConfig (..), TenantName (..), TlsConfig (..), loadServerConfig, loadStoreConfig, renderTenantName)
 import Control.Concurrent.Async (withAsync)
 import Control.Concurrent.MVar (newMVar, withMVar)
 import Control.Exception (bracket)
@@ -9,8 +9,11 @@ import Data.Aeson qualified as Aeson
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.ByteString.Lazy.Char8 qualified as LazyChar8
 import Data.Char (isSpace)
-import Data.Foldable (traverse_)
+import Data.Foldable (for_, traverse_)
 import Data.Generics.Labels ()
+import Data.IORef (readIORef)
+import Data.List (sortOn)
+import Data.List.NonEmpty qualified as NonEmpty
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Effectful (Eff, IOE, runEff, (:>))
@@ -27,11 +30,11 @@ import En.Revision (ConsistencyToken (..), Revision (..))
 import En.Schema (schemaHash)
 import En.SchemaCheck (renderTupleOrphan, validateTuplesAgainstSchema)
 import En.Servant.API (tupleFromWire, tupleToWire)
-import En.Servant.OpenApi (servedProxy)
+import En.Servant.OpenApi (probesApplication, servedProxy)
 import En.Tuple (Tuple)
 import Hasql.Pool qualified as Pool
 import Maintenance (describeMaintenance, runMaintenanceLoop)
-import Middleware (authMiddleware, describeRateLimit)
+import Middleware (AuthConfig (..), TenantRoute (..), authMiddleware, describeRateLimit, tenantAuthMiddleware)
 import Network.Wai qualified as Wai
 import Network.Wai.Handler.Warp qualified as Warp
 import Network.Wai.Handler.WarpTLS qualified as WarpTLS
@@ -40,7 +43,9 @@ import OpenTelemetry.Instrumentation.Servant (openTelemetryServantMiddleware)
 import OpenTelemetry.Instrumentation.Servant.Internal (HasEndpoint (..))
 import Relay.Pagination.Servant (RelayPage)
 import Servant.API qualified as Servant
-import System.Environment (getArgs)
+import Servant.Health (ProbeCheck)
+import Servant.Health.Check (boolCheck, newFailureTracker, safeCheck, sequenceChecks, withProbeTimeout)
+import System.Environment (getArgs, lookupEnv)
 import System.Exit (ExitCode (ExitFailure), exitSuccess, exitWith)
 import System.IO (BufferMode (BlockBuffering, LineBuffering), hSetBuffering, stderr, stdout)
 import System.Posix.Signals (Handler (Catch), installHandler, sigHUP, sigINT, sigTERM)
@@ -117,6 +122,12 @@ main = do
 -- 'loadServerConfig' fails closed without them -- correctly, for a server.
 withSubcommandStore :: (LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()) -> IO ()
 withSubcommandStore action = do
+  -- A subcommand acts on one datastore, and nothing selects one of several yet.
+  lookupEnv "EN_TENANTS" >>= \case
+    Nothing -> pure ()
+    Just _ ->
+      candidateFailure
+        "EN_TENANTS is set, so this command cannot tell which tenant to act on. Run it without EN_TENANTS, with that tenant's database and schema in EN_DATABASE_URL and EN_SCHEMA_PATH."
   (storeConfig, warnings) <- loadStoreConfig >>= either configFailure pure
   traverse_ toStderr warnings
   bracket (openStore toStderr storeConfig) (Pool.release . (^. #pool)) \opened ->
@@ -186,6 +197,95 @@ runServe serverConfig = do
                   $ (stack ^. #application)
           withMaintenance shared [stack] $
             serve (shared ^. #tls) (shared ^. #port) wrappedApp
+    Tenants tenants ->
+      withStacks shared requestLogger (NonEmpty.toList tenants) \stacks -> do
+        rejectSharedDatastores stacks
+        let stackList = map fst stacks
+        withTelemetry (shared ^. #telemetry) \(tracerProvider, otelMiddleware) -> do
+          printTenantServingLines shared stacks
+          installReloadHandler shared stackList
+          (livenessProbe, readinessProbe) <- tenantProbes stackList
+          let servantTelemetryMiddleware =
+                maybe id (\provider -> openTelemetryServantMiddleware provider servedProxy) tracerProvider
+              -- Every configured key, paired with the application of its tenant. The
+              -- key that authenticates a request is the only thing that selects a tenant.
+              routes =
+                [ TenantRoute {routeKey = key, routeApplication = stack ^. #application}
+                | (stack, config) <- stacks,
+                  AuthKeys keys <- [config ^. #auth],
+                  key <- keys
+                ]
+              wrappedApp =
+                otelMiddleware
+                  . servantTelemetryMiddleware
+                  $ tenantAuthMiddleware (probesApplication livenessProbe readinessProbe) routes
+          withMaintenance shared stackList $
+            serve (shared ^. #tls) (shared ^. #port) wrappedApp
+
+-- | Build one stack per tenant, in declaration order, and release them all afterwards.
+--
+-- Any tenant that cannot start (unreadable schema, unreachable database, missing
+-- migrations) exits 1 naming the tenant, as a single-store server does today.
+withStacks ::
+  SharedConfig ->
+  Wai.Middleware ->
+  [(TenantName, TenantConfig)] ->
+  ([(TenantStack, TenantConfig)] -> IO a) ->
+  IO a
+withStacks shared requestLogger tenants action =
+  foldr
+    ( \(name, config) inner built ->
+        bracket (buildStack shared requestLogger (Just name) config) releaseStack \stack ->
+          inner (built <> [(stack, config)])
+    )
+    action
+    tenants
+    []
+
+-- | Two tenants whose URLs differ but reach one database would share tuples, tokens and
+-- garbage collection; the datastore id is what tells.
+rejectSharedDatastores :: [(TenantStack, TenantConfig)] -> IO ()
+rejectSharedDatastores stacks =
+  case adjacentClashes (sortOn fst [(stack ^. #consistency . #datastoreId, stack ^. #name) | (stack, _) <- stacks]) of
+    [] -> pure ()
+    (a, b) : _ ->
+      configFailure $
+        "Tenants "
+          <> tenantLabel a
+          <> " and "
+          <> tenantLabel b
+          <> " reach the same database (one datastore id through different URLs). Each tenant needs its own database."
+  where
+    adjacentClashes = \case
+      (idA, a) : rest@((idB, b) : _)
+        | idA == idB -> (a, b) : adjacentClashes rest
+        | otherwise -> adjacentClashes rest
+      _ -> []
+    tenantLabel = maybe "(none)" renderTenantName
+
+-- | The process's probes in tenant mode: liveness reads every tenant's in-memory schema,
+-- readiness asks every tenant's pool, one check named @postgres:\<tenant\>@ each.
+tenantProbes :: [TenantStack] -> IO (ProbeCheck, ProbeCheck)
+tenantProbes stacks = do
+  trackLiveness <- newFailureTracker
+  trackReadiness <- newFailureTracker
+  let responsive = traverse_ (readIORef . (^. #activeSchema)) stacks >> pure True
+      liveness =
+        trackLiveness
+          ( withProbeTimeout
+              2_000_000
+              "liveness"
+              (safeCheck "liveness" (boolCheck "liveness" responsive))
+          )
+      readiness =
+        trackReadiness
+          ( sequenceChecks
+              [ safeCheck checkName (boolCheck checkName (stack ^. #checkReady))
+              | stack <- stacks,
+                let checkName = "postgres:" <> maybe "" renderTenantName (stack ^. #name)
+              ]
+          )
+  pure (liveness, readiness)
 
 -- | Run each stack's maintenance loop beside the action.
 --
@@ -217,6 +317,45 @@ installReloadHandler shared stacks = do
       (Catch (withMVar reloadGuard \() -> traverse_ (reloadStack shared) stacks))
       Nothing
   pure ()
+
+-- | Tenant mode's startup lines: the process-wide settings once, then each tenant's.
+printTenantServingLines :: SharedConfig -> [(TenantStack, TenantConfig)] -> IO ()
+printTenantServingLines shared stacks = do
+  Text.putStrLn ("en-server listening on :" <> Text.pack (show (shared ^. #port)))
+  Text.putStrLn ("Tenants: " <> Text.intercalate ", " [maybe "" renderTenantName (stack ^. #name) | (stack, _) <- stacks])
+  Text.putStrLn ("Optimized revision cache (per tenant): " <> describeMillisCache (shared ^. #optimizedRevisionTtlMs))
+  Text.putStrLn ("Tuple-read cache (per tenant): " <> describeEntryCache (shared ^. #tupleReadMaxEntries))
+  Text.putStrLn ("Decision cache (per tenant): " <> describeEntryCache (shared ^. #decisionMaxEntries))
+  Text.putStrLn ("Rate limit (per tenant and caller): " <> describeRateLimit (shared ^. #rateLimit))
+  Text.putStrLn ("Background maintenance (per tenant): " <> describeMaintenance (shared ^. #maintenance))
+  Text.putStrLn
+    ( "Lookup deadline: defaultMs="
+        <> Text.pack (show (shared ^. #deadlineDefaultMillis))
+        <> ", maxMs="
+        <> Text.pack (show (shared ^. #deadlineMaxMillis))
+        <> "; max batch size: "
+        <> Text.pack (show (shared ^. #maxBatchSize))
+    )
+  for_ stacks \(stack, config) -> do
+    let say = Text.putStrLn . ((stack ^. #logPrefix) <>)
+        poolConfig = stack ^. #store . #pool
+    say
+      ( "Connection pool: size="
+          <> Text.pack (show (poolConfig ^. #size))
+          <> ", acquisitionTimeoutMs="
+          <> Text.pack (show (poolConfig ^. #acquisitionTimeoutMs))
+          <> ", idlenessTimeoutMs="
+          <> Text.pack (show (poolConfig ^. #idlenessTimeoutMs))
+          <> ", maxLifetimeMs="
+          <> Text.pack (show (poolConfig ^. #maxLifetimeMs))
+      )
+    say ("API keys: " <> describeKeys (config ^. #auth))
+    say ("Biscuit grant minting: " <> describeMinting (config ^. #biscuit))
+    say ("Schema reload: SIGHUP" <> describeReloadSource (stack ^. #store . #schemaPath) (shared ^. #schemaReloadForce))
+  where
+    describeKeys = \case
+      AuthDisabled -> "none"
+      AuthKeys keys -> Text.intercalate ", " [key ^. #keyName | key <- keys]
 
 -- | The startup lines that describe what is being served.
 printServingLines :: SharedConfig -> TenantStack -> Maybe BiscuitConfig -> IO ()

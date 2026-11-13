@@ -20,12 +20,16 @@ module Config
     Tenancy (..),
     TenantName (..),
     TenantConfig (..),
+    renderTenantName,
+    tenantVariable,
+    tenantVariableSuffixes,
     StoreConfig (..),
     PoolConfig (..),
     TlsConfig (..),
     BiscuitConfig (..),
     loadServerConfig,
     loadStoreConfig,
+    parseServerConfig,
     validateGcWindow,
     knownVariables,
     storeVariables,
@@ -35,9 +39,11 @@ where
 import Auth.Biscuit (SecretKey)
 import Data.Bifunctor (first)
 import Data.ByteString qualified as ByteString
-import Data.Char (toLower)
+import Data.Char (isAsciiLower, isDigit, toLower, toUpper)
+import Data.Foldable (traverse_)
 import Data.Generics.Labels ()
-import Data.List (isPrefixOf)
+import Data.List (isPrefixOf, sortOn)
+import Data.List.NonEmpty qualified as NonEmpty
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes)
@@ -54,7 +60,7 @@ import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
 import Maintenance (MaintenanceConfig (..))
 import Middleware (ApiKey (..), AuthConfig (..), KeyRole (..), RateLimitConfig (..))
-import System.Environment (lookupEnv)
+import System.Environment (getEnvironment, lookupEnv)
 import Telemetry (TelemetryConfig (..))
 import Text.Read (readMaybe)
 
@@ -107,9 +113,35 @@ data StoreConfig = StoreConfig
   }
   deriving stock (Generic)
 
--- | A tenant's name, as declared in @EN_TENANTS@.
+-- | A tenant's name, as declared in @EN_TENANTS@: @[a-z][a-z0-9-]{0,30}@.
 newtype TenantName = TenantName Text
   deriving stock (Eq, Ord, Show)
+
+renderTenantName :: TenantName -> Text
+renderTenantName (TenantName name) = name
+
+-- | @EN_TENANT_\<SEGMENT\>_\<suffix\>@, where the segment is the name upper-cased with @-@
+-- replaced by @_@. Names cannot contain @_@, so two names never share a segment.
+tenantVariable :: TenantName -> String -> String
+tenantVariable (TenantName name) suffix =
+  "EN_TENANT_" <> map segmentChar (Text.unpack name) <> "_" <> suffix
+  where
+    segmentChar '-' = '_'
+    segmentChar c = toUpper c
+
+-- | Every per-tenant setting, as the suffix after @EN_TENANT_\<SEGMENT\>_@. A variable with
+-- the @EN_TENANT_@ prefix that is not one of these for a declared tenant fails startup, so a
+-- typo cannot be silently ignored.
+tenantVariableSuffixes :: [String]
+tenantVariableSuffixes =
+  [ "API_KEYS_READ_ONLY",
+    "API_KEYS_READ_WRITE",
+    "BISCUIT_ISSUER_SECRET_KEY",
+    "DATABASE_URL",
+    "GC_WINDOW",
+    "POOL_SIZE",
+    "SCHEMA_PATH"
+  ]
 
 -- | Everything that belongs to one datastore: where it lives, which schema it serves, who
 -- may call it, and whether it mints grants. Legacy mode has exactly one, read from the
@@ -133,6 +165,8 @@ data TenantConfig = TenantConfig
 -- path.
 data Tenancy
   = SingleStore !TenantConfig
+  | -- | @EN_TENANTS@ is set: each tenant in declaration order, each with its own keys.
+    Tenants !(NonEmpty (TenantName, TenantConfig))
   deriving stock (Generic)
 
 data ServerConfig = ServerConfig
@@ -203,6 +237,7 @@ knownVariables =
     "EN_SCHEMA_PATH",
     "EN_SCHEMA_RELOAD_FORCE",
     "EN_TELEMETRY_ENABLED",
+    "EN_TENANTS",
     "EN_TLS_CERT_FILE",
     "EN_TLS_KEY_FILE",
     "EN_TUPLE_READ_CACHE_MAX_ENTRIES"
@@ -222,10 +257,15 @@ storeVariables =
         || "EN_POOL_" `isPrefixOf` name
 
 -- | Snapshot the environment, then parse it. Returns the config and any warnings.
+--
+-- Per-tenant variable names are not known in advance, so every variable beginning
+-- @EN_TENANT_@ is snapshotted too; the parser rejects those that belong to no declared
+-- tenant.
 loadServerConfig :: IO (Either Text (ServerConfig, [Text]))
 loadServerConfig = do
   present <- catMaybes <$> traverse readVariable knownVariables
-  pure (parseServerConfig (Map.fromList present))
+  tenantVariables <- filter (("EN_TENANT_" `isPrefixOf`) . fst) <$> getEnvironment
+  pure (parseServerConfig (Map.fromList (present <> tenantVariables)))
   where
     readVariable name = fmap ((,) name) <$> lookupEnv name
 
@@ -266,9 +306,25 @@ parseStoreConfig environment = do
     withDefault :: forall a. String -> a -> Parser a -> Either Text a
     withDefault = withDefaultIn environment
 
+-- | Parse a snapshot of the environment. @EN_TENANTS@ selects tenant mode; without it the
+-- server is in legacy mode and reads exactly the variables it always has.
 parseServerConfig :: Map String String -> Either Text (ServerConfig, [Text])
-parseServerConfig environment = do
-  (store, storeWarnings) <- parseStoreConfig environment
+parseServerConfig environment
+  | Map.member "EN_TENANTS" environment = parseTenantServerConfig environment
+  | otherwise = do
+      rejectTenantVariablesWithoutTenants environment
+      (store, storeWarnings) <- parseStoreConfig environment
+      shared <- parseSharedConfig environment
+      (auth, authWarnings) <- parseAuth environment
+      biscuit <- parseBiscuit "EN_BISCUIT_ISSUER_SECRET_KEY" environment
+      checkMintingAuthGate auth biscuit
+      pure
+        ( ServerConfig {shared, tenancy = SingleStore TenantConfig {store, auth, biscuit}},
+          authWarnings <> storeWarnings
+        )
+
+parseSharedConfig :: Map String String -> Either Text SharedConfig
+parseSharedConfig environment = do
   port <- withDefault "EN_PORT" 8080 (bounded 1 65535)
   optimizedRevisionTtlMs <- withDefault "EN_OPTIMIZED_REVISION_CACHE_TTL_MS" 0 nonNegative
   tupleReadMaxEntries <- withDefault "EN_TUPLE_READ_CACHE_MAX_ENTRIES" 0 nonNegative
@@ -283,34 +339,208 @@ parseServerConfig environment = do
   maintenance <- parseMaintenance environment
   telemetryEnabled <- withDefault "EN_TELEMETRY_ENABLED" False boolean
   schemaReloadForce <- withDefault "EN_SCHEMA_RELOAD_FORCE" False boolean
-  (auth, authWarnings) <- parseAuth environment
-  biscuit <- parseBiscuit environment
-  checkMintingAuthGate auth biscuit
   pure
-    ( ServerConfig
-        { shared =
-            SharedConfig
-              { port,
-                optimizedRevisionTtlMs,
-                tupleReadMaxEntries,
-                decisionMaxEntries,
-                maxBatchSize,
-                deadlineDefaultMillis,
-                deadlineMaxMillis,
-                budget,
-                rateLimit,
-                maintenance,
-                telemetry = if telemetryEnabled then TelemetryEnabled else TelemetryDisabled,
-                tls,
-                schemaReloadForce
-              },
-          tenancy = SingleStore TenantConfig {store, auth, biscuit}
-        },
-      authWarnings <> storeWarnings
-    )
+    SharedConfig
+      { port,
+        optimizedRevisionTtlMs,
+        tupleReadMaxEntries,
+        decisionMaxEntries,
+        maxBatchSize,
+        deadlineDefaultMillis,
+        deadlineMaxMillis,
+        budget,
+        rateLimit,
+        maintenance,
+        telemetry = if telemetryEnabled then TelemetryEnabled else TelemetryDisabled,
+        tls,
+        schemaReloadForce
+      }
   where
     withDefault :: forall a. String -> a -> Parser a -> Either Text a
     withDefault = withDefaultIn environment
+
+-- * Tenant mode
+
+-- | The variables that configure legacy mode's one store, its keys and its issuer. Each
+-- has a per-tenant replacement, and setting one beside @EN_TENANTS@ is refused rather than
+-- applied to some or all tenants.
+legacyOnlyVariables :: [String]
+legacyOnlyVariables =
+  [ "EN_DATABASE_URL",
+    "EN_SCHEMA_PATH",
+    "EN_API_KEYS_READ_WRITE",
+    "EN_API_KEYS_READ_ONLY",
+    "EN_AUTH_DISABLED",
+    "EN_BISCUIT_ISSUER_SECRET_KEY"
+  ]
+
+parseTenantServerConfig :: Map String String -> Either Text (ServerConfig, [Text])
+parseTenantServerConfig environment = do
+  traverse_ rejectLegacyVariable legacyOnlyVariables
+  names <- parseTenantNames (Map.findWithDefault "" "EN_TENANTS" environment)
+  rejectUnknownTenantVariables names environment
+  shared <- parseSharedConfig environment
+  defaultPool <- parsePool environment
+  defaultGcWindow <- Text.pack <$> withDefaultIn environment "EN_GC_WINDOW" "24 hours" nonEmptyString
+  tenants <- traverse (\name -> (name,) <$> parseTenant environment defaultPool defaultGcWindow name) names
+  rejectSharedSecrets tenants
+  rejectSharedDatabases tenants
+  pure (ServerConfig {shared, tenancy = Tenants tenants}, [])
+  where
+    rejectLegacyVariable name
+      | Map.member name environment =
+          Left $
+            "EN_TENANTS is set, so "
+              <> Text.pack name
+              <> " must not be: in tenant mode every store, schema, key and issuer is configured per tenant with EN_TENANT_<NAME>_* variables."
+      | otherwise = Right ()
+
+parseTenantNames :: String -> Either Text (NonEmpty TenantName)
+parseTenantNames raw = do
+  names <- traverse validName (map Text.strip (Text.splitOn "," (Text.pack raw)))
+  nonEmpty <- case names of
+    [] -> Left "Invalid EN_TENANTS: expected a comma-separated list of tenant names"
+    first' : rest -> Right (first' :| rest)
+  case duplicatesOf (NonEmpty.toList nonEmpty) of
+    [] -> Right (TenantName <$> nonEmpty)
+    duplicated -> Left ("Invalid EN_TENANTS: duplicate tenant name(s) " <> Text.intercalate ", " duplicated)
+  where
+    validName name
+      | Text.null name =
+          Left ("Invalid EN_TENANTS=" <> Text.pack raw <> ": empty tenant name (check for a stray comma)")
+      | otherwise = case Text.uncons name of
+          Just (first', rest)
+            | isAsciiLower first'
+                && Text.length name <= 31
+                && Text.all (\c -> isAsciiLower c || isDigit c || c == '-') rest ->
+                Right name
+          _ ->
+            Left $
+              "Invalid EN_TENANTS: tenant name \""
+                <> name
+                <> "\" must be a lower-case letter followed by at most 30 lower-case letters, digits or '-'"
+
+-- | Every @EN_TENANT_@ variable must be one of 'tenantVariableSuffixes' for a declared tenant.
+rejectUnknownTenantVariables :: NonEmpty TenantName -> Map String String -> Either Text ()
+rejectUnknownTenantVariables names environment =
+  case filter (not . declared) (filter ("EN_TENANT_" `isPrefixOf`) (Map.keys environment)) of
+    [] -> Right ()
+    unknown : _ ->
+      Left $
+        "Unknown variable "
+          <> Text.pack unknown
+          <> ": it is not a setting of any tenant in EN_TENANTS ("
+          <> Text.intercalate ", " (renderTenantName <$> NonEmpty.toList names)
+          <> "). Per-tenant settings are EN_TENANT_<NAME>_ followed by one of "
+          <> Text.intercalate ", " (Text.pack <$> tenantVariableSuffixes)
+          <> "."
+  where
+    declared variable =
+      or [variable == tenantVariable name suffix | name <- NonEmpty.toList names, suffix <- tenantVariableSuffixes]
+
+-- | Per-tenant variables are meaningless without @EN_TENANTS@; refuse rather than ignore.
+rejectTenantVariablesWithoutTenants :: Map String String -> Either Text ()
+rejectTenantVariablesWithoutTenants environment =
+  case filter ("EN_TENANT_" `isPrefixOf`) (Map.keys environment) of
+    [] -> Right ()
+    variable : _ ->
+      Left $
+        Text.pack variable
+          <> " is set but EN_TENANTS is not. Declare the tenants with EN_TENANTS=name,... or remove the per-tenant variables."
+
+parseTenant :: Map String String -> PoolConfig -> Text -> TenantName -> Either Text TenantConfig
+parseTenant environment defaultPool defaultGcWindow name = do
+  databaseUrl <- requiredIn environment (variable "DATABASE_URL") ("a PostgreSQL connection string for tenant " <> tenant <> ".")
+  schemaPath <- requiredIn environment (variable "SCHEMA_PATH") ("the schema file tenant " <> tenant <> " serves.")
+  poolSize <- withDefaultIn environment (variable "POOL_SIZE") (defaultPool ^. #size) positive
+  gcWindow <- Text.pack <$> withDefaultIn environment (variable "GC_WINDOW") (Text.unpack defaultGcWindow) nonEmptyString
+  readWrite <- parseKeyListIn environment (variable "API_KEYS_READ_WRITE") ReadWrite
+  readOnly <- parseKeyListIn environment (variable "API_KEYS_READ_ONLY") ReadOnly
+  keys <- case readWrite <> readOnly of
+    [] ->
+      Left $
+        "Tenant "
+          <> tenant
+          <> " has no API key: set "
+          <> Text.pack (variable "API_KEYS_READ_WRITE")
+          <> " and/or "
+          <> Text.pack (variable "API_KEYS_READ_ONLY")
+          <> ". A key is the only way a request reaches its tenant."
+    keys -> Right keys
+  rejectDuplicateNames
+    (Text.pack (variable "API_KEYS_READ_WRITE") <> " and " <> Text.pack (variable "API_KEYS_READ_ONLY"))
+    keys
+  biscuit <- parseBiscuit (variable "BISCUIT_ISSUER_SECRET_KEY") environment
+  pure
+    TenantConfig
+      { store =
+          StoreConfig
+            { databaseUrl = Text.pack databaseUrl,
+              gcWindow,
+              schemaPath = Just schemaPath,
+              pool = defaultPool & #size .~ poolSize
+            },
+        auth = AuthKeys keys,
+        biscuit
+      }
+  where
+    variable = tenantVariable name
+    tenant = renderTenantName name
+
+-- | A secret selects a tenant, so it must belong to exactly one tenant and one key. The
+-- message names tenants and keys, never the secret.
+rejectSharedSecrets :: NonEmpty (TenantName, TenantConfig) -> Either Text ()
+rejectSharedSecrets tenants =
+  case clashes of
+    [] -> Right ()
+    ((tenantA, keyA), (tenantB, keyB)) : _ ->
+      Left $
+        "The same API key secret is configured for key "
+          <> keyA
+          <> " of tenant "
+          <> renderTenantName tenantA
+          <> " and key "
+          <> keyB
+          <> " of tenant "
+          <> renderTenantName tenantB
+          <> ". A secret must belong to exactly one key of one tenant."
+  where
+    owned =
+      [ (key ^. #keySecret, (name, key ^. #keyName))
+      | (name, config) <- NonEmpty.toList tenants,
+        AuthKeys keys <- [config ^. #auth],
+        key <- keys
+      ]
+    clashes = adjacentClashes (sortOn fst owned)
+    adjacentClashes = \case
+      (secretA, ownerA) : rest@((secretB, ownerB) : _)
+        | secretA == secretB -> (ownerA, ownerB) : adjacentClashes rest
+        | otherwise -> adjacentClashes rest
+      _ -> []
+
+-- | Two tenants on one database would share tuples, tokens and garbage collection. This
+-- catches the same URL text; the server also refuses two tenants that resolve to the same
+-- datastore id through different URLs.
+rejectSharedDatabases :: NonEmpty (TenantName, TenantConfig) -> Either Text ()
+rejectSharedDatabases tenants =
+  case [(a, b) | (i, (a, urlA)) <- numbered, (j, (b, urlB)) <- numbered, i < j, urlA == urlB] of
+    [] -> Right ()
+    (a, b) : _ ->
+      Left $
+        Text.pack (tenantVariable a "DATABASE_URL")
+          <> " and "
+          <> Text.pack (tenantVariable b "DATABASE_URL")
+          <> " are the same URL. Each tenant needs its own database."
+  where
+    numbered =
+      zip [0 :: Int ..] [(name, config ^. #store . #databaseUrl) | (name, config) <- NonEmpty.toList tenants]
+
+duplicatesOf :: [Text] -> [Text]
+duplicatesOf values = reverse (snd (foldl' step (Set.empty, []) values))
+  where
+    step (seen, dups) value
+      | Set.member value seen = (seen, value : dups)
+      | otherwise = (Set.insert value seen, dups)
 
 schemaWarnings :: Maybe FilePath -> [Text]
 schemaWarnings = \case
@@ -401,28 +631,30 @@ parseMaintenance environment = do
 -- startup before the port is bound.
 parseAuth :: Map String String -> Either Text (AuthConfig, [Text])
 parseAuth environment = do
-  readWrite <- parseKeyList "EN_API_KEYS_READ_WRITE" ReadWrite
-  readOnly <- parseKeyList "EN_API_KEYS_READ_ONLY" ReadOnly
+  readWrite <- parseKeyListIn environment "EN_API_KEYS_READ_WRITE" ReadWrite
+  readOnly <- parseKeyListIn environment "EN_API_KEYS_READ_ONLY" ReadOnly
   disabled <- withDefaultIn environment "EN_AUTH_DISABLED" False boolean
   case readWrite <> readOnly of
     [] | disabled -> Right (AuthDisabled, [authDisabledWarning])
     [] -> Left noKeysConfigured
     keys -> do
-      rejectDuplicateNames keys
+      rejectDuplicateNames "EN_API_KEYS_READ_WRITE and EN_API_KEYS_READ_ONLY" keys
       pure
         ( AuthKeys keys,
           [authIgnoredWarning | disabled]
         )
-  where
-    parseKeyList name role =
-      case Map.lookup name environment of
-        Nothing -> Right []
-        Just raw
-          | Text.null (Text.strip (Text.pack raw)) -> Right []
-          | otherwise ->
-              traverse
-                (parseKeyEntry name role)
-                (map Text.strip (Text.splitOn "," (Text.pack raw)))
+
+-- | A comma-separated list of @name:secret@ entries. Absent or blank is an empty list.
+parseKeyListIn :: Map String String -> String -> KeyRole -> Either Text [ApiKey]
+parseKeyListIn environment name role =
+  case Map.lookup name environment of
+    Nothing -> Right []
+    Just raw
+      | Text.null (Text.strip (Text.pack raw)) -> Right []
+      | otherwise ->
+          traverse
+            (parseKeyEntry name role)
+            (map Text.strip (Text.splitOn "," (Text.pack raw)))
 
 -- | Parse the issuer configuration for @POST \/v1\/grants@.
 --
@@ -430,16 +662,16 @@ parseAuth environment = do
 -- key lists are — disables minting ('Nothing'). A present but malformed key aborts
 -- startup: a half-configured issuer must never serve. The TTL bounds default to
 -- 300s and 3600s and the maximum must not sit below the default.
-parseBiscuit :: Map String String -> Either Text (Maybe BiscuitConfig)
-parseBiscuit environment =
-  case Map.lookup "EN_BISCUIT_ISSUER_SECRET_KEY" environment of
+parseBiscuit :: String -> Map String String -> Either Text (Maybe BiscuitConfig)
+parseBiscuit keyVariable environment =
+  case Map.lookup keyVariable environment of
     Nothing -> Right Nothing
     Just raw
       | Text.null (Text.strip (Text.pack raw)) -> Right Nothing
       | otherwise -> do
           (issuerKeyId, issuerSecretKey) <-
             first
-              (\reason -> "Invalid EN_BISCUIT_ISSUER_SECRET_KEY: " <> reason)
+              (\reason -> "Invalid " <> Text.pack keyVariable <> ": " <> reason)
               (parseSigningKeyText (Text.pack raw))
           defaultTtlSeconds <- withDefault "EN_BISCUIT_DEFAULT_TTL_SECONDS" 300 positive
           maxTtlSeconds <- withDefault "EN_BISCUIT_MAX_TTL_SECONDS" 3600 positive
@@ -537,20 +769,18 @@ parseKeyEntry envName role entry
 minimumSecretBytes :: Int
 minimumSecretBytes = 16
 
--- | Names identify callers in logs and rate-limit buckets, so they must be unique.
-rejectDuplicateNames :: [ApiKey] -> Either Text ()
-rejectDuplicateNames keys =
-  case duplicates of
+-- | Names identify callers in logs and rate-limit buckets, so they must be unique within
+-- the keys of one store (in tenant mode, a caller is the pair of tenant and key name).
+rejectDuplicateNames :: Text -> [ApiKey] -> Either Text ()
+rejectDuplicateNames scope keys =
+  case duplicatesOf (map (^. #keyName) keys) of
     [] -> Right ()
     names ->
       Left $
-        "Duplicate API key name(s) across EN_API_KEYS_READ_WRITE and EN_API_KEYS_READ_ONLY: "
+        "Duplicate API key name(s) across "
+          <> scope
+          <> ": "
           <> Text.intercalate ", " names
-  where
-    duplicates = reverse (snd (foldl' step (Set.empty, []) keys))
-    step (seen, dups) key
-      | Set.member (key ^. #keyName) seen = (seen, (key ^. #keyName) : dups)
-      | otherwise = (Set.insert (key ^. #keyName) seen, dups)
 
 -- * Variable lookup and value parsers
 

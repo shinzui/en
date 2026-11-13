@@ -26,6 +26,7 @@ module En.Servant.OpenApi
     normalizeProbeContent,
     appWithOpenApi,
     appWithOpenApiProbes,
+    probesApplication,
   )
 where
 
@@ -149,11 +150,12 @@ import Servant
     Context (..),
     Get,
     JSON,
+    NamedRoutes,
     serveWithContext,
     type (:<|>) (..),
     type (:>),
   )
-import Servant.Health (ProbeCheck)
+import Servant.Health (HealthApi, ProbeCheck, healthServer)
 import Servant.Health.Paths qualified as Health
 import Servant.OpenApi (toOpenApi)
 
@@ -350,6 +352,21 @@ appWithOpenApiProbes ::
 appWithOpenApiProbes env liveness readiness =
   problemMiddleware
     (serveWithContext servedProxy (envelopeFormatters :. EmptyContext) (serverWithProbes env liveness readiness :<|> pure enOpenApi))
+
+-- | Serve only the liveness and readiness probes, exactly as 'appWithOpenApiProbes'
+-- serves them (same paths, same wire type, same error dialect), and nothing else.
+--
+-- For a host that serves several 'Env's from one listener and so cannot attach the
+-- process's probes to any one of them; the standalone server's tenant mode is one.
+probesApplication :: ProbeCheck -> ProbeCheck -> Application
+probesApplication liveness readiness =
+  problemMiddleware
+    (serveWithContext probesProxy (envelopeFormatters :. EmptyContext) (healthServer liveness readiness))
+
+type ProbesAPI = "health" :> NamedRoutes HealthApi
+
+probesProxy :: Proxy ProbesAPI
+probesProxy = Proxy
 
 -- * Schema-construction helpers
 
