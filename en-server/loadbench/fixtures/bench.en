@@ -1,0 +1,15 @@
+object user {}
+
+object group {
+  relation member: user, group#member
+}
+
+object space {
+  relation viewer: user, group#member
+  permission view = viewer
+}
+
+object folder {
+  relation viewer: user, group#member
+  permission view = viewer
+}

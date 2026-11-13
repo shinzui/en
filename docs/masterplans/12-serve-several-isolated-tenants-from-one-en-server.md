@@ -10,6 +10,17 @@ provenance:
     model: "claude-fable-5-2"
     harness: "claude-code"
     at: 2026-11-12T23:20:49Z
+  revisions:
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T00:54:04Z
+      mode: "implement"
+      note: "EP-1 implemented; G0 evidence recorded and awaiting the owner"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T02:19:34Z
+      mode: "update"
+      note: "Gate G1 reduced to two runs of 3 rounds with the owner's agreement"
 ---
 
 # Serve several isolated tenants from one En server
@@ -186,7 +197,7 @@ per-tenant availability is reported, not gated" (plan 75). Plan 76 performs the 
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| EP-1 | Build an en-server load benchmark and record the single-tenant baseline | docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md | None | None | Not Started |
+| EP-1 | Build an en-server load benchmark and record the single-tenant baseline | docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md | None | None | Complete |
 | EP-2 | Serve tenants selected by API key, each from its own isolated stack | docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md | EP-1, gate G0 | None | Not Started |
 | EP-3 | Give each tenant an independent lifecycle and contain its storage faults | docs/plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md | EP-2 | None | Not Started |
 | EP-4 | Carry the tenant through logs, metrics, traces and readiness | docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md | EP-2, EP-3 | None | Not Started |
@@ -227,8 +238,9 @@ EP-5 reuses the two-tenant fixture for the load scenarios. Later plans extend th
 not fork it.
 
 **The load benchmark** (`en-server/loadbench/`, executable `en-server-loadbench`). Owner: EP-1,
-which defines the scenario interface, the result JSON and the A/B verdict rule. EP-2, EP-3 and
-EP-4 only *run* it (gate G1). EP-5 adds the two tenant scenarios (gates G2 and G3).
+which defines the scenario interface, the result JSON and the A/B verdict rule. EP-2 runs it
+for gate G1; EP-3 and EP-4 run only its smoke mode (`just loadbench-smoke`). EP-5 runs gate G1
+for the last time and adds the two tenant scenarios (gates G2 and G3).
 
 **The baseline binary** (`.dev/loadbench/en-server-baseline`, built from the commit recorded in
 EP-1). Owner: EP-1. It is the fixed reference for every A/B run and for EP-2's upgrade test of
@@ -266,7 +278,12 @@ configuration exists.
 
 ## Progress
 
-Planning is complete; no child plan has started. IR-2 stays `proposed` until the owner
+EP-1 is complete (2026-11-13): the benchmark, the baseline binary (commit `5361988`), the
+single-tenant baseline and the interference preview are recorded in
+`docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md` and
+`en-server/loadbench/results/`, and were reported to the owner. Gate G0 is open: EP-2 does not
+start until the owner decides, and the preview (Surprises & Discoveries) suggests G3 cannot pass
+with the design as written. IR-2 stays `proposed` until the owner
 approves gate G0; EP-2 then moves it to `in-progress` and EP-5 marks it `completed`. If G0 is
 declined, IR-2 is marked `rejected` with the benchmark evidence as its resolution. The
 initiative has five gates that are not
@@ -276,9 +293,11 @@ in the named child plan.
 - [ ] **G0, owner go/no-go (after EP-1).** EP-1 reports the single-tenant baseline and the
       in-process interference preview. The owner confirms that the preview and the stated
       shared-process limit are acceptable. If not, EP-2 to EP-5 are cancelled.
-- [ ] **G1, no single-tenant regression.** A server started without `EN_TENANTS` at the tip of
-      each of EP-2, EP-3, EP-4 and EP-5 shows no regression against the baseline binary under
-      EP-1's A/B verdict rule, on every workload.
+- [ ] **G1, no single-tenant regression.** A server started without `EN_TENANTS` shows no
+      regression against the baseline binary under EP-1's A/B verdict rule (`--rounds 3`), on
+      every workload, at two points: the end of EP-2 Milestone 1, where the legacy request path
+      changes, and EP-5, against the finished behaviour. EP-2 Milestone 3, EP-3 and EP-4 run
+      `just loadbench-smoke` instead, as a functional check rather than a gate.
 - [ ] **G2, no regression with idle neighbours.** One tenant of a two-tenant server, with the
       other tenant idle, shows no regression against the baseline binary serving the same
       workload alone (EP-5).
@@ -292,13 +311,38 @@ in the named child plan.
 If G1, G2, G3 or G4 fails and cannot be fixed within the design above, stop, record the evidence
 in Surprises & Discoveries, and report to the owner. Work is committed to `master` (the
 repository does not use feature branches by default), so every child plan keeps legacy mode
-passing G1 at its tip; if the initiative is abandoned, the commits carrying this MasterPlan's
+passing the smoke benchmark and the existing suites at its tip; if the initiative is abandoned, the commits carrying this MasterPlan's
 trailer are reverted.
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- Observation (EP-1, decisive for G0): a busy caller inside the same `en-server` process
+  costs an idle caller twenty to thirty times more than a busy second process on the same
+  machine, and a larger connection pool closes only a little of the gap. Victim throughput kept
+  under load: 2.9% shared-process vs 61% separate-processes with the default pool; 5.6% vs 67%
+  with `EN_POOL_SIZE=64`. p99 grew ×32 vs ×1.9, and ×9.2 vs ×2.0.
+  Implication: the design gives each tenant its own pool, caches and rate-limit buckets but not
+  its own share of the CPU. One process hands out capacity per in-flight request, so a tenant
+  with many concurrent requests takes most of it, where the operating system splits CPU between
+  two processes per process. Shared stop-the-world garbage collection and the single request-log
+  lock add to this. G3 ("no worse than two co-located processes") is therefore unlikely to pass
+  unless the design adds a per-tenant admission bound, such as a cap on each tenant's in-flight
+  requests. That is a design change for the owner to decide at G0, not something EP-2 can fold
+  in silently.
+  Evidence: `docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md`
+  (Outcomes), `en-server/loadbench/results/interference.json`, `interference-pool64.json`.
+
+- Observation (EP-1): on the development machine the A/B has a resolution of about ±10–17% in
+  throughput and more in p99 (self-comparison noise 9.4–16.5%). G1 and G2 can rule out large
+  regressions there, not small ones; a quiet machine is needed for a tighter claim.
+  Evidence: `en-server/loadbench/results/self-comparison.json`.
+
+- Observation (EP-1, outside this initiative): `POST /v1/lookup` does not follow a
+  self-recursive userset (`group#member` inside `group.member`) past its first level, while
+  `POST /v1/check` does, so lookup omits objects check allows. The cause is the `visited` guard in
+  `evalRelation` (`en-core/src/En/Lookup.hs`). This initiative does not change `en-core`; it
+  should be raised as its own bug report or improvement request. The benchmark fixture avoids it.
 
 
 ## Decision Log
@@ -336,6 +380,16 @@ trailer are reverted.
   documented limit. The honest, falsifiable claim is that the shared process adds no cost beyond
   what sharing the host already imposes.
   Date: 2026-11-12
+
+- Decision: Gate G1 runs twice (end of EP-2 Milestone 1, and EP-5) with 3 rounds, not at the
+  tip of every child plan with 5; the other tips run the smoke benchmark. EP-1 drops its
+  second A/B (baseline against a fresh build of the same commit).
+  Rationale: on the development machine the A/B has a resolution of about ±10–17% in
+  throughput (EP-1's self-comparison), and one full run takes about 45 minutes; four runs bought
+  little beyond the two points where the legacy request path can change. The fresh-build A/B
+  compared two binaries built from identical sources and so only repeated the self-comparison.
+  Decided with the owner, who asked whether the test was over-engineered.
+  Date: 2026-11-13
 
 - Decision: Per-tenant schema reload is `SIGHUP` reloading every tenant whose file changed; there
   is no HTTP or per-tenant signal.

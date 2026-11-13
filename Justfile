@@ -108,3 +108,19 @@ hurl:
 openapi:
   cabal run -v0 en-openapi
   git diff --exit-code -- docs/api/openapi.json
+
+# Each run starts its own ephemeral PostgreSQL and en-server processes; nothing touches
+# the process-compose services. Not part of CI: shared runners are too noisy for an A/B.
+# See docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md.
+#
+# Smoke-run every load-benchmark workload against the current en-server build
+[group("benchmark")]
+loadbench-smoke:
+  cabal build -v0 en-server:exe:en-server en-server-loadbench
+  cabal run -v0 en-server-loadbench -- run --smoke
+
+# Compare two en-server binaries under the A/B verdict rule
+[group("benchmark")]
+loadbench-ab baseline candidate:
+  cabal build -v0 en-server-loadbench
+  cabal run -v0 en-server-loadbench -- ab --baseline {{baseline}} --candidate {{candidate}}

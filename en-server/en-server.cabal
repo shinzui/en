@@ -83,6 +83,53 @@ executable en-server
     warp,
     warp-tls,
 
+-- Drives a real en-server process over HTTP against ephemeral PostgreSQL and reports
+-- throughput and latency, compares two binaries (`ab`), and previews in-process
+-- interference. Not part of the CI gate: shared runners are too noisy for a
+-- process-level A/B. See
+-- docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md.
+executable en-server-loadbench
+  import: warnings, shared
+  hs-source-dirs:
+    loadbench
+    test-support
+
+  main-is: Main.hs
+  other-modules:
+    Fixture
+    ServerHarness
+    Verdict
+    Workload
+
+  -- -A64m keeps the load generator's own minor collections rare, so its pauses do not
+  -- land inside measured latencies.
+  ghc-options:
+    -threaded
+    -rtsopts
+    "-with-rtsopts=-N -A64m"
+
+  build-depends:
+    aeson,
+    async,
+    base,
+    bytestring,
+    containers,
+    directory,
+    en-migrations,
+    ephemeral-pg >=0.3.1 && <0.4,
+    filepath,
+    hasql,
+    http-client >=0.7 && <0.8,
+    http-types,
+    network >=3.1 && <3.3,
+    pg-migrate ^>=1.2.0.0,
+    process,
+    temporary,
+    text,
+    unix,
+    vector >=0.13 && <0.14,
+    vector-algorithms >=0.9 && <0.10,
+
 test-suite en-server-middleware-test
   import: warnings, shared
   type: exitcode-stdio-1.0

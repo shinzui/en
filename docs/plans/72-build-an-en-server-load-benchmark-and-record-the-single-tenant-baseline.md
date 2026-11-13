@@ -11,6 +11,12 @@ provenance:
     model: "claude-fable-5-2"
     harness: "claude-code"
     at: 2026-11-12T23:20:49Z
+  revisions:
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T00:54:04Z
+      mode: "implement"
+      note: "Benchmark, harness, A/B verdict, baseline script and interference preview implemented; baseline recorded for gate G0"
 ---
 
 # Build an en-server load benchmark and record the single-tenant baseline
@@ -41,22 +47,121 @@ Nothing in this plan changes the `en-server` executable or any library.
 
 ## Progress
 
-- [ ] Milestone 1: `cabal run en-server-loadbench -- run --smoke` starts PostgreSQL and
+- [x] Milestone 1: `cabal run en-server-loadbench -- run --smoke` starts PostgreSQL and
       `en-server`, runs every workload with zero request errors, and prints a result table.
-- [ ] Milestone 2: `en-server-loadbench ab` compares two binaries and prints a verdict; comparing
+      (2026-11-13: six rows, zero errors, about 28 s; `run --smoke --break-auth` exits 1 naming
+      `check-cached` with `HTTP 401`; an unknown argument exits 2 with the usage text.)
+- [x] Milestone 2: `en-server-loadbench ab` compares two binaries and prints a verdict; comparing
       the baseline binary with itself prints `PASS` on every workload; the baseline binary is
       rebuilt by `en-server/loadbench/build-baseline.sh` from the recorded commit.
-- [ ] Milestone 3: `en-server-loadbench interference` reports shared-process and
+      (2026-11-13: `build-baseline.sh 5361988` built `.dev/loadbench/en-server-baseline`; the
+      self-comparison at 30-second windows printed `RESULT: PASS (6 workloads, 5 rounds)` with
+      throughput noise 9.4–16.5%, above the 10% target, see Outcomes; the `EN_POOL_SIZE=1`
+      candidate printed `REGRESSION` on every workload, `check-direct` throughput −86.2%. The
+      fresh-build A/B was dropped by decision, see Decision Log.)
+- [x] Milestone 3: `en-server-loadbench interference` reports shared-process and
       separate-process slowdown; the full baseline and the preview are recorded in this plan and
       reported to the owner for gate G0.
+      (2026-11-13: both topologies reported, plus a pool-64 diagnostic; record under Outcomes and
+      in `en-server/loadbench/results/`; reported to the owner, G0 decision pending.)
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- Observation: `lookup` does not follow a self-recursive userset past its first level, while
+  `check` does. With `relation member: user, group#member` on `group`, a space granted to an
+  outer group whose member is the user's inner group is `allowed` by `POST /v1/check` but
+  absent from `POST /v1/lookup` (the first fixture returned 10 spaces where 105 were
+  reachable).
+  Evidence: `evalRelation` in `en-core/src/En/Lookup.hs` returns an empty result for a
+  `Subproblem {subject, objectType, relation}` already in `visited` unless a recursive *arrow*
+  step is being skipped; the userset branch of `evalThis` re-enters `group#member` for the same
+  subject, which is that subproblem. This is an engine correctness defect outside this
+  initiative's scope (the MasterPlan excludes changes to `en-core`). The fixture keeps lookups to
+  one level of groups and puts the two-level grants on a separate `folder` type, so the
+  benchmark's expected answers do not change when the defect is fixed. It should be raised as
+  its own bug report or improvement request.
+
+- Observation: planner statistics dominate `lookup`. Right after seeding, `lookup` ran at about
+  500 req/s with 4 threads; after `VACUUM ANALYZE` it ran at about 2,500 req/s with 8 threads.
+  Without an explicit analyze, autovacuum decides when statistics appear, which makes rounds
+  disagree (70% round-to-round spread in an early A/B smoke run).
+  Evidence: smoke runs before and after adding `VACUUM ANALYZE` to every round.
+
+- Observation: the benchmark machine saturates `check-direct` at about 13,700 req/s with 16
+  client threads; 32 threads (the default) adds queueing latency, not throughput. `check-last-key`
+  at 32 threads came out well below `check-direct` in one short exploratory run (8,549 vs 13,712
+  req/s) but not at 8 or 16 threads; the full run below decides whether the 64-entry key scan
+  costs anything measurable.
+  Evidence: `run --threads 8|16|32 --warmup-seconds 1 --measure-seconds 4` against the baseline.
+
+- Observation: inside one process a busy caller starves an idle one far beyond what a second
+  process on the same machine does, and a bigger connection pool removes only part of it. With
+  the default pool of 10 the victim kept 2.9% of its throughput (p99 ×32) in a shared process
+  against 61% (p99 ×1.9) across two processes; with `EN_POOL_SIZE=64` it kept 5.6% (p99 ×9.2)
+  against 67% (p99 ×2.0).
+  Evidence: `interference` and `interference --server-env EN_POOL_SIZE=64`, Outcomes below. The
+  likely remaining causes are that one process shares its capacity per in-flight request (8
+  victim threads against 64 aggressor threads), where the operating system shares CPU between
+  two processes roughly per process; that the runtime's garbage collection stops every thread;
+  and that the request logger serializes every log line through one lock. The tenant design in
+  the MasterPlan gives each tenant its own pool and caches, but not its own share of CPU, so
+  gate G3 is at risk unless tenants also get an admission bound. This is the main input to G0.
+
+- Observation: `cabal list-bin en-server` is ambiguous once the package has a second executable;
+  the harness asks for `en-server:exe:en-server`.
 
 
 ## Decision Log
+
+- Decision: The second Milestone 2 acceptance check (`build-baseline.sh`, then `ab` of the
+  baseline against a freshly built `en-server` from the same commit) is dropped; it was started
+  and stopped after 15 minutes. Default measurement windows are 30 seconds, and every `ab`,
+  `run` and `interference` starts with one discarded warm-up round (`--warmup-rounds`, default
+  1, 0 with `--smoke`).
+  Rationale: the two binaries are built from identical sources, so the check only repeated the
+  self-comparison at 45 minutes' cost; the owner agreed to cut it (see the MasterPlan's Decision
+  Log, which also reduces gate G1 to two runs of 3 rounds). The first round against a freshly
+  seeded database was slower for both binaries on every workload (`write` about 3,700 against
+  8,400 req/s afterwards); 30-second windows with that round discarded brought the self-
+  comparison's throughput noise from 11–61% to 9–17%.
+  Date: 2026-11-13
+
+- Decision: Nested-group checks run against a `folder` object type, not `space`, and the
+  schema fixture gains that type.
+  Rationale: `lookup` does not follow self-recursive usersets past one level (see Surprises &
+  Discoveries). Keeping `lookup`'s answer to one level of groups makes its expected count (105)
+  independent of that defect, while `check-nested` still resolves through two levels of
+  membership.
+  Date: 2026-11-13
+
+- Decision: Every round starts with `VACUUM ANALYZE` on the database it measures, and so does
+  every interference round.
+  Rationale: without it, whether autovacuum has produced statistics yet decides `lookup`'s
+  query plan and dominates the round-to-round noise.
+  Date: 2026-11-13
+
+- Decision: Benchmark servers run with their stdout (the per-request log) sent to `/dev/null`;
+  stderr is captured. The load generator runs with `-N -A64m`.
+  Rationale: the server still formats and writes every log line, as in production, but the
+  load generator spends no CPU reading them; a large allocation area keeps the generator's own
+  minor collections out of the measured latencies. The harness keeps capturing stdout by
+  default for the tests that read log lines.
+  Date: 2026-11-13
+
+- Decision: Every benchmark server carries the same 65 keys (one read-write key first, then 64
+  read-only keys); `check-last-key` presents the 64th read-only key. Profiles are measured
+  cached-first, then plain, so `write` is the last workload against the database.
+  Rationale: one key configuration for every workload means only `check-last-key` pays for the
+  scan, and a server per profile instead of per workload keeps a round short.
+  Date: 2026-11-13
+
+- Decision: `interference` takes a `--server-env KEY=VALUE` diagnostic option applied to every
+  server it starts.
+  Rationale: the shared-process slowdown could be the shared connection pool or the shared
+  runtime; running the preview once more with `EN_POOL_SIZE=64` separates the two for the
+  owner's G0 decision without changing the default measurement.
+  Date: 2026-11-13
 
 - Decision: The benchmark spawns the `en-server` executable as a child process and talks to it
   over HTTP, rather than linking the server's modules into the benchmark.
@@ -82,7 +187,82 @@ Nothing in this plan changes the `en-server` executable or any library.
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+All three milestones are done. Every record below comes from the commit this plan lands in,
+with `en-server` itself unchanged from the baseline commit.
+
+**Baseline.** Commit `5361988d5a783f7b90216f140189ed15c3483836`, built by
+`en-server/loadbench/build-baseline.sh 5361988`. Machine: Apple M5 Ultra, 36 cores (12
+performance, 24 efficiency), 256 GiB, macOS 27.2; PostgreSQL 18.6 (ephemeral-pg 0.3.1.0); GHC
+9.12.4. The machine was a working developer desktop (a virtual machine, a browser and editors
+were running), not an idle one. Defaults: 32 client threads, 5 s warm-up, 30 s measurement, one
+discarded warm-up round. `en-server/loadbench/results/baseline.json`:
+
+```text
+workload              req/s    p50_ms    p95_ms    p99_ms  errors
+check-direct          11183     2.783     4.051     5.249       0
+check-nested           4526     7.056     8.170     9.676       0
+check-cached          17303     1.565     3.027     4.012       0
+lookup                 3095     9.695    17.447    21.997       0
+check-last-key        10192     3.019     4.253     5.638       0
+write                  8840     3.025     7.833    11.231       0
+```
+
+At 32 threads the server is saturated (check-direct peaks at about 13,700 req/s with 16
+threads), so these latencies include queueing. `check-last-key` is within noise of
+`check-direct`: scanning 65 keys costs nothing this benchmark can see.
+
+**Self-comparison** (baseline against itself, 5 rounds,
+`en-server/loadbench/results/self-comparison.json`): `RESULT: PASS`; throughput and p50 medians within
+±5.6% of their twins, p99 medians within ±11.3%. Noise per workload, throughput / p50 / p99:
+
+```text
+check-direct     10.5%  9.3%  25.2%
+check-nested      9.4%  4.9%  55.7%
+check-cached     11.5%  9.0%  18.5%
+lookup           12.5% 10.1%  37.3%
+check-last-key   10.9% 12.1%  23.8%
+write            16.5% 12.7%  32.9%
+```
+
+This is above the 10% throughput target on four workloads. Lengthening the window from 20 to
+30 seconds and discarding the first round took it from 11–61% to these figures; the remaining
+spread moves whole rounds at once (one round slower on every workload), which is background
+load on the machine rather than sampling error. On this machine the gates therefore resolve a
+regression of roughly 10–17% in throughput and more in p99; a quieter machine is needed to
+resolve less. 30 seconds is now the default.
+
+**The rule can fail.** `ab --candidate-env EN_POOL_SIZE=1 --rounds 3 --measure-seconds 10`
+(`en-server/loadbench/results/pool-size-1.json`): `REGRESSION` on all six workloads,
+`check-direct` throughput 8,982 → 1,238 req/s (−86.2%).
+
+**Interference preview** (3 rounds plus a warm-up round per topology, 30 s windows; victim
+`check-direct` with 8 threads; aggressor `check-nested` and `lookup` with 32 threads each;
+`en-server/loadbench/results/interference.json` and `interference-pool64.json`):
+
+```text
+pool       topology              alone_req/s  alone_p99  loaded_req/s  loaded_p99  tput_ratio  p99_ratio
+10 (dflt)  shared-process              10747      2.108           311      67.529       0.029     32.035
+10 (dflt)  separate-processes          10366      2.547          6339       4.959       0.612      1.947
+64         shared-process              12467      1.740           699      16.001       0.056      9.196
+64         separate-processes          11742      1.881          7871       3.795       0.670      2.018
+```
+
+Sharing a process today costs an idle caller twenty to thirty times more than sharing a machine
+does. A per-tenant pool alone (the 64-connection row is the closest available stand-in) leaves
+most of that gap. What this means for the tenant design is in Surprises & Discoveries and in the
+MasterPlan's G0 report.
+
+**Other findings.** `lookup` does not follow self-recursive usersets past one level, while
+`check` does (Surprises & Discoveries); it needs its own bug report or improvement request, and
+the fixture is built so the benchmark does not depend on it. Planner statistics dominate
+`lookup` unless every round starts with `VACUUM ANALYZE`.
+
+**Friction.** No friction entries were recorded under this plan; the small costs met (an
+ambiguous `cabal list-bin` target, a GNU `sed` on a BSD-style command line) were below the
+threshold in `agents/skills/exec-plan/FRICTION.md`.
+
+**ADRs.** None written. The decisions here (process-level A/B against a preserved baseline,
+not in CI) are task-local until EP-5's distillation decides whether they are durable.
 
 
 ## Context and Orientation
@@ -280,7 +460,7 @@ workload       metric      baseline   candidate   delta    noise   tolerance   v
 check-direct   req/s       5210       5188        -0.4%    2.1%    3.0%        PASS
 check-direct   p99_ms      2.10       2.14        +1.9%    6.0%    10.0%       PASS
 …
-RESULT: PASS (6 workloads)
+RESULT: PASS (6 workloads, 5 rounds)
 ```
 
 Run the preview and the full baseline:
@@ -380,6 +560,19 @@ withServer :: ServerSpec -> (RunningServer -> IO a) -> IO a
 -- Run `en-server <args>` to completion: exit code, stdout, stderr.
 runServerCommand :: ServerSpec -> [String] -> IO (ExitCode, Text, Text)
 ```
+
+As implemented (2026-11-13), the module also exports: `withPostgres` (bracketed start and
+stop), `postgresDatabase` (the underlying ephemeral-pg handle), `runDatabaseScript url sql`
+(one script on its own connection, outside a transaction, so `VACUUM` works),
+`baseEnvironment` (the parent's `PATH`, `HOME`, `LANG`, `LC_ALL` and `TMPDIR`, which a child
+needs to behave like a shell-launched process), `serverSpec binary env` (a spec that waits for
+readiness and captures output), and `baseUrl`, `serverPort` and `capturedLines` on a
+`RunningServer`. `ServerSpec` has a fourth field, `captureStdout :: Bool`; the benchmark sets it
+to `False` because the request log writes one line per request, and stderr is always captured.
+`capturedLines` returns stdout and stderr interleaved in arrival order, stderr lines prefixed
+with `stderr: `, keeping the most recent 20,000. `stopPostgres` removes the data directory;
+`restartPostgres` keeps it. A fault test that needs PostgreSQL *down for a while* (rather than
+restarted at once) will need a new primitive, because ephemeral-pg's `stop` also cleans up.
 
 `en-server-loadbench` must provide the subcommands `run`, `ab` and `interference`, the options
 `--server`, `--baseline`, `--candidate`, `--candidate-env`, `--rounds`, `--measure-seconds`,
