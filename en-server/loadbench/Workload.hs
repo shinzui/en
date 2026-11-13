@@ -78,9 +78,10 @@ data Target = Target
     secret :: !ByteString
   }
 
--- | One request: a path under the base URL and a JSON body, always POSTed.
+-- | One request: a method, a path under the base URL and a JSON body (empty for GET).
 data RequestSpec = RequestSpec
-  { path :: !Text,
+  { method :: !ByteString,
+    path :: !Text,
     body :: !LazyByteString.ByteString
   }
 
@@ -96,7 +97,7 @@ data Workload = Workload
     expectation :: Value -> Either Text ()
   }
 
--- | The six workloads of a @run@, in the order they are reported.
+-- | The seven workloads of a @run@, in the order they are reported.
 --
 -- @write@ is last because it grows the database. The salt makes its tuples new on every
 -- round of an A/B run, which reuses one database per binary.
@@ -107,8 +108,23 @@ benchWorkloads writeSalt =
     checkDirect {name = "check-cached", profile = CachedProfile},
     lookupWorkload,
     checkDirect {name = "check-last-key", credential = LastReadOnlyKey},
+    schemaRead,
     writeWorkload writeSalt
   ]
+
+-- | @GET \/v1\/schema@: answered from memory with no database work, so its cost is the
+-- HTTP server, the middleware chain (authentication, rate limiting, request id, request
+-- log, metrics) and servant routing. It is the workload most sensitive to overhead added
+-- on the request path, which the database-bound workloads cannot resolve.
+schemaRead :: Workload
+schemaRead =
+  Workload
+    { name = "schema-read",
+      profile = PlainProfile,
+      credential = PrimaryKey,
+      makeRequest = \_ _ -> RequestSpec {method = "GET", path = "/v1/schema", body = ""},
+      expectation = expectField "hash"
+    }
 
 -- | A user and a space whose direct viewer the user is. Users rotate so the decision
 -- cache, when enabled, holds one entry per user rather than one entry in total.
@@ -146,7 +162,8 @@ lookupWorkload =
       credential = PrimaryKey,
       makeRequest = \thread n ->
         RequestSpec
-          { path = "/v1/lookup",
+          { method = "POST",
+            path = "/v1/lookup",
             body =
               render $
                 "{\"consistency\":{\"mode\":\"minimizeLatency\"},\"subject\":"
@@ -166,7 +183,8 @@ writeWorkload salt =
       credential = PrimaryKey,
       makeRequest = \thread n ->
         RequestSpec
-          { path = "/v1/relationships",
+          { method = "POST",
+            path = "/v1/relationships",
             body =
               render $
                 "{\"tuples\":[{\"object\":{\"objectType\":\"space\",\"objectId\":\"w-"
@@ -188,7 +206,8 @@ rotate thread n = (thread * 7919 + n) `mod` userCount
 checkRequest :: Builder.Builder -> Builder.Builder -> Int -> Int -> RequestSpec
 checkRequest objectType prefix user objectNumber =
   RequestSpec
-    { path = "/v1/check",
+    { method = "POST",
+      path = "/v1/check",
       body =
         render $
           "{\"consistency\":{\"mode\":\"minimizeLatency\"},\"context\":{\"values\":{}},\"subject\":"
@@ -300,7 +319,7 @@ runGroups settings groups = do
   let measureFrom = started + seconds' (warmupSeconds settings)
       measureUntil = measureFrom + seconds' (measureSeconds settings)
   forConcurrently (zip managers groups) \(manager, group) -> do
-    request0 <- buildRequest (target group) (RequestSpec "/" "")
+    request0 <- buildRequest (target group) (RequestSpec "POST" "/" "")
     perThread <-
       mapConcurrently
         (clientThread manager request0 (groupWorkload group) measureFrom measureUntil)
@@ -321,7 +340,7 @@ buildRequest target' spec = do
   request <- Http.parseRequest (Text.unpack (targetUrl target' <> path spec))
   pure
     request
-      { Http.method = "POST",
+      { Http.method = method spec,
         Http.requestHeaders =
           [ (hAuthorization, "Bearer " <> secret target'),
             (hContentType, "application/json")
@@ -349,7 +368,8 @@ clientThread manager request0 workload' measureFrom measureUntil thread = do
             let spec = makeRequest workload' thread n
                 request =
                   request0
-                    { Http.path = encodeText (path spec),
+                    { Http.method = method spec,
+                      Http.path = encodeText (path spec),
                       Http.requestBody = Http.RequestBodyLBS (body spec)
                     }
             outcome <- try (Http.withResponse request manager consume) :: IO (Either SomeException (Either Text ()))

@@ -129,7 +129,7 @@ usage =
   unlines
     [ "usage:",
       "  en-server-loadbench run [--server PATH] [--smoke] [--json PATH]",
-      "  en-server-loadbench ab --baseline PATH --candidate PATH [--rounds N] [--candidate-env KEY=VALUE]... [--smoke] [--json PATH]",
+      "  en-server-loadbench ab --baseline PATH --candidate PATH [--rounds N] [--server-env KEY=VALUE]... [--candidate-env KEY=VALUE]... [--smoke] [--json PATH]",
       "  en-server-loadbench interference [--server PATH] [--rounds N] [--server-env KEY=VALUE]... [--smoke] [--json PATH]",
       "",
       "common options: --threads N --warmup-seconds S --measure-seconds S --warmup-rounds N",
@@ -299,10 +299,18 @@ abCommand o = do
   candidatePath <- maybe (die' "ab needs --candidate PATH") pure (candidate o)
   let roundCount = fromMaybe 5 (rounds o)
   runs <- withBench \bench -> do
-    baselineUrl <- prepareDatabase bench baselinePath "bench_baseline"
-    candidateUrl <- prepareDatabase bench candidatePath "bench_candidate"
+    -- Two identically seeded databases. Each round swaps which binary uses which, so a
+    -- fixed difference between the two databases (physical layout, cache state) lands on
+    -- both binaries equally instead of on one of them for the whole run.
+    databaseA <- prepareDatabase bench baselinePath "bench_a"
+    databaseB <- prepareDatabase bench candidatePath "bench_b"
+    let databaseFor which r
+          | even r == (which == "baseline") = databaseA
+          | otherwise = databaseB
+        baselineUrl = databaseFor "baseline" (0 :: Int)
+        candidateUrl = databaseFor "candidate" (0 :: Int)
     forM_ [1 .. warmupRoundCount o] \r ->
-      forM_ [(baselinePath, [], baselineUrl), (candidatePath, candidateEnv o, candidateUrl)] \(binary, overrides, url) -> do
+      forM_ [(baselinePath, serverEnv o, baselineUrl), (candidatePath, serverEnv o <> candidateEnv o, candidateUrl)] \(binary, overrides, url) -> do
         hPutStrLn stderr ("warm-up round " <> show r <> " (discarded): " <> binary)
         _ <- measureRound bench o binary overrides url
         pure ()
@@ -312,10 +320,11 @@ abCommand o = do
     forM_ [0 .. roundCount - 1] \r -> do
       let order = if even r then ["baseline", "candidate"] else ["candidate", "baseline"]
       forM_ order \which -> do
-        let (binary, overrides, url) =
+        let url = databaseFor which r
+            (binary, overrides) =
               if which == "baseline"
-                then (baselinePath, [], baselineUrl)
-                else (candidatePath, candidateEnv o, candidateUrl)
+                then (baselinePath, serverEnv o)
+                else (candidatePath, serverEnv o <> candidateEnv o)
         hPutStrLn stderr ("round " <> show (r + 1) <> "/" <> show roundCount <> ": " <> Text.unpack which)
         measured <- measureRound bench o binary overrides url
         modifyIORef' collected (<> [AbRun {binaryLabel = which, roundIndex = r, results = measured}])
@@ -345,6 +354,7 @@ abCommand o = do
           "baseline" .= baselinePath,
           "candidate" .= candidatePath,
           "candidateEnv" .= map (\(k, v) -> k <> "=" <> v) (candidateEnv o),
+          "serverEnv" .= map (\(k, v) -> k <> "=" <> v) (serverEnv o),
           "settings" .= settingsJson (loadSettings o),
           "rounds" .= roundCount,
           "warmupRounds" .= warmupRoundCount o,
@@ -377,7 +387,13 @@ printVerdicts verdicts = do
         (100 * c.delta)
         (100 * c.noise)
         (100 * c.tolerance)
-        (if c.regression then "REGRESSION" else "PASS" :: String)
+        (verdictLabel c)
+
+verdictLabel :: MetricComparison -> String
+verdictLabel c
+  | not c.gating = if c.regression then "info (worse)" else "info"
+  | c.regression = "REGRESSION"
+  | otherwise = "PASS"
 
 -- * interference
 

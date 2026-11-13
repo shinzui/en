@@ -22,6 +22,11 @@ provenance:
       at: 2026-11-13T03:42:23Z
       mode: "update"
       note: "Link the lookup-recursion fix plan 77"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T19:21:11Z
+      mode: "update"
+      note: "Reference rebased to 09a7d6b; verdict rule gates throughput only, databases swap per round, schema-read workload added"
 ---
 
 # Build an en-server load benchmark and record the single-tenant baseline
@@ -123,6 +128,24 @@ Nothing in this plan changes the `en-server` executable or any library.
 
 ## Decision Log
 
+- Decision (revision, 2026-11-13): the verdict rule gates throughput only; p50 and p99 are
+  compared and printed as `info`. `ab` swaps the two databases between rounds, and a seventh
+  workload, `schema-read` (`GET /v1/schema`, answered from memory), measures the request path
+  alone. `ab` also applies `--server-env` to both binaries.
+  Rationale: the load is closed-loop at saturation, so by Little's law median latency is
+  client threads divided by throughput (check-direct: 32 / 10898 req/s = 2.94 ms against a
+  measured p50 of 2.82 ms). Gating p50 counted throughput twice, and a lookup throughput drop
+  inside its noise (-6.2% against 11.3%) failed as a p50 REGRESSION (+7.4% against 7.0%)
+  because p50's three-round noise came out tighter by chance. Each binary always used its own
+  database, so a fixed difference between the two databases fell on one binary for the whole
+  run. And every database-bound workload is dominated by PostgreSQL, so none could resolve
+  overhead added to the HTTP and middleware path, which is the only place a request-path
+  change shows. Validated before use: the reference against itself passes all seven
+  workloads; a candidate with `EN_POOL_SIZE=1` is a throughput REGRESSION on all six
+  database-bound workloads (-33% to -64%) and `schema-read` is unaffected.
+  Decided with the owner.
+  Date: 2026-11-13
+
 - Decision: The second Milestone 2 acceptance check (`build-baseline.sh`, then `ab` of the
   baseline against a freshly built `en-server` from the same commit) is dropped; it was started
   and stopped after 15 minutes. Default measurement windows are 30 seconds, and every `ab`,
@@ -195,6 +218,15 @@ Nothing in this plan changes the `en-server` executable or any library.
 
 
 ## Outcomes & Retrospective
+
+**Reference rebased (2026-11-13).** The reference binary for every later gate is now commit
+`09a7d6b831478e805fd2c8b26f825c0b0e0a161c` (`build-baseline.sh 09a7d6b`), not `5361988`.
+Between the two, `docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md`
+made lookup follow recursive usersets to a fixpoint, which costs this fixture's `lookup`
+workload about a third of its throughput (A/B `5361988` against `09a7d6b`: req/s -35.4%, p50
++53.5%; `.dev/loadbench/attribution-baseline-vs-prerefactor.json`). `09a7d6b` has that fix and
+no tenant code, so gates measured against it measure tenancy alone. Decided with the owner;
+see the parent MasterPlan's Decision Log. The tables below remain the record for `5361988`.
 
 All three milestones are done. Every record below comes from the commit this plan lands in,
 with `en-server` itself unchanged from the baseline commit.

@@ -10,8 +10,13 @@
 -- @(max - min) / median@ across that binary's rounds. The tolerance is the larger of the
 -- noise and a floor: 3% for throughput and p50, 10% for p99. The workload is a REGRESSION
 -- if the candidate's median throughput is below the baseline's by more than the
--- tolerance, or its median p50 or p99 is above the baseline's by more than the tolerance;
--- otherwise it is a PASS.
+-- tolerance; otherwise it is a PASS.
+--
+-- Only throughput gates. The load is closed-loop at saturation, so by Little's law the
+-- median latency is the client thread count divided by throughput: p50 restates
+-- throughput, and gating it separately turned a throughput drop inside the noise into a
+-- REGRESSION whenever p50's three-round noise estimate happened to come out tighter. p50 and
+-- p99 are still compared and printed, marked @info@.
 module Verdict
   ( Metric (..),
     metricName,
@@ -64,6 +69,9 @@ data MetricComparison = MetricComparison
     delta :: !Double,
     noise :: !Double,
     tolerance :: !Double,
+    -- | Whether this metric decides the verdict; only throughput does.
+    gating :: !Bool,
+    -- | The candidate is worse than the baseline by more than the tolerance.
     regression :: !Bool
   }
   deriving stock (Generic, Show)
@@ -78,6 +86,7 @@ compareMetric which baselineRounds candidateRounds =
       delta,
       noise,
       tolerance,
+      gating = which == Throughput,
       regression
     }
   where
@@ -104,7 +113,7 @@ verdictFor name baselineRounds candidateRounds =
   WorkloadVerdict
     { workload = name,
       comparisons,
-      passed = not (any (\c -> c.regression) comparisons)
+      passed = not (any (\c -> c.gating && c.regression) comparisons)
     }
   where
     comparisons =
