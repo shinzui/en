@@ -43,6 +43,7 @@ executable en-server
     Middleware
     Observability
     Telemetry
+    Tenant
 
   ghc-options:
     -threaded
@@ -153,3 +154,42 @@ test-suite en-server-middleware-test
     tasty-hunit,
     text,
     wai,
+
+-- Black-box tenancy proofs: starts the built en-server (and, for the upgrade case, the
+-- baseline binary named by EN_BASELINE_BIN) against ephemeral PostgreSQL. See
+-- docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md.
+test-suite en-server-tenant-tests
+  import: warnings, shared
+  type: exitcode-stdio-1.0
+  hs-source-dirs:
+    test
+    test-support
+
+  main-is: TenantSpec.hs
+  other-modules: ServerHarness
+  ghc-options:
+    -threaded
+    -rtsopts
+    -with-rtsopts=-N
+
+  build-tool-depends: en-server:en-server
+  build-depends:
+    aeson,
+    base,
+    bytestring,
+    containers,
+    directory,
+    en-migrations,
+    ephemeral-pg >=0.3.1 && <0.4,
+    filepath,
+    hasql,
+    http-client >=0.7 && <0.8,
+    http-types,
+    network >=3.1 && <3.3,
+    pg-migrate ^>=1.2.0.0,
+    process,
+    tasty,
+    tasty-hunit,
+    temporary,
+    text,
+    unix,

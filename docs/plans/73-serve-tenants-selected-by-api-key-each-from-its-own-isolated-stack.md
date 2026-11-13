@@ -363,7 +363,7 @@ After Milestone 1:
 cabal build all
 cabal test en-core en-servant en-server
 just start-and-test && just process-down
-EN_BASELINE_BIN=.dev/loadbench/en-server-baseline cabal test en-server-tenant-tests --test-options='-p upgrade'
+EN_BASELINE_BIN="$PWD/.dev/loadbench/en-server-baseline" cabal test en-server-tenant-tests --test-options='-p upgrade'
 cabal run -v0 en-server-loadbench -- ab \
   --baseline .dev/loadbench/en-server-baseline \
   --candidate "$(cabal list-bin en-server:exe:en-server)" \

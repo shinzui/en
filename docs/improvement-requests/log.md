@@ -1,5 +1,8 @@
 # Bundle Update Log
 
+## 2026-11-13
+* **Update**: IR-2 accepted at gate G0 (single-tenant use must pay no performance tax) and in progress under docs/masterplans/12-serve-several-isolated-tenants-from-one-en-server.md
+
 ## 2026-11-12
 * **Addition**: Propose IR-2 from mori://shinzui/mori: serve several isolated tenants (schema, datastore, keys, tokens, grant generation, changes feed) from one en-server, selected by the caller's key, so the Nagare platform En can host an application's model such as Mori's registry model beside its own.
 

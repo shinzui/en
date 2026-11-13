@@ -16,6 +16,10 @@
 -- setting that will never take effect.
 module Config
   ( ServerConfig (..),
+    SharedConfig (..),
+    Tenancy (..),
+    TenantName (..),
+    TenantConfig (..),
     StoreConfig (..),
     PoolConfig (..),
     TlsConfig (..),
@@ -103,9 +107,45 @@ data StoreConfig = StoreConfig
   }
   deriving stock (Generic)
 
-data ServerConfig = ServerConfig
+-- | A tenant's name, as declared in @EN_TENANTS@.
+newtype TenantName = TenantName Text
+  deriving stock (Eq, Ord, Show)
+
+-- | Everything that belongs to one datastore: where it lives, which schema it serves, who
+-- may call it, and whether it mints grants. Legacy mode has exactly one, read from the
+-- unprefixed variables.
+data TenantConfig = TenantConfig
   { store :: !StoreConfig,
-    port :: !Int,
+    auth :: !AuthConfig,
+    -- | Issuer configuration for @POST \/v1\/grants@. 'Nothing' when
+    --     @EN_BISCUIT_ISSUER_SECRET_KEY@ is unset, which disables the endpoint. When it
+    --     is set, caller authentication must be active or startup is refused — a
+    --     minting endpoint on an unauthenticated server would hand bearer tokens to
+    --     anyone.
+    biscuit :: !(Maybe BiscuitConfig)
+  }
+  deriving stock (Generic)
+
+-- | How many datastores this process serves.
+--
+-- Legacy mode is not a one-entry tenant table: it is its own constructor, so the server it
+-- selects can dispatch to its single stack directly, with no tenant lookup on the request
+-- path.
+data Tenancy
+  = SingleStore !TenantConfig
+  deriving stock (Generic)
+
+data ServerConfig = ServerConfig
+  { shared :: !SharedConfig,
+    tenancy :: !Tenancy
+  }
+  deriving stock (Generic)
+
+-- | The settings that belong to the process rather than to a datastore. Where one names
+-- a per-datastore resource (a cache, a rate-limit bucket map, a maintenance loop), every
+-- datastore gets its own resource of that size.
+data SharedConfig = SharedConfig
+  { port :: !Int,
     optimizedRevisionTtlMs :: !Int,
     tupleReadMaxEntries :: !Int,
     decisionMaxEntries :: !Int,
@@ -116,13 +156,6 @@ data ServerConfig = ServerConfig
     --     deadline above, which is a clock rather than a bound: raising the depth budget
     --     buys a slow lookup no more time.
     budget :: !EvaluationBudget,
-    auth :: !AuthConfig,
-    -- | Issuer configuration for @POST \/v1\/grants@. 'Nothing' when
-    --     @EN_BISCUIT_ISSUER_SECRET_KEY@ is unset, which disables the endpoint. When it
-    --     is set, caller authentication must be active or startup is refused — a
-    --     minting endpoint on an unauthenticated server would hand bearer tokens to
-    --     anyone.
-    biscuit :: !(Maybe BiscuitConfig),
     rateLimit :: !RateLimitConfig,
     maintenance :: !MaintenanceConfig,
     -- | Whether this process initializes the OpenTelemetry SDK. Exporter and sampler
@@ -255,22 +288,23 @@ parseServerConfig environment = do
   checkMintingAuthGate auth biscuit
   pure
     ( ServerConfig
-        { store,
-          port,
-          optimizedRevisionTtlMs,
-          tupleReadMaxEntries,
-          decisionMaxEntries,
-          maxBatchSize,
-          deadlineDefaultMillis,
-          deadlineMaxMillis,
-          budget,
-          auth,
-          biscuit,
-          rateLimit,
-          maintenance,
-          telemetry = if telemetryEnabled then TelemetryEnabled else TelemetryDisabled,
-          tls,
-          schemaReloadForce
+        { shared =
+            SharedConfig
+              { port,
+                optimizedRevisionTtlMs,
+                tupleReadMaxEntries,
+                decisionMaxEntries,
+                maxBatchSize,
+                deadlineDefaultMillis,
+                deadlineMaxMillis,
+                budget,
+                rateLimit,
+                maintenance,
+                telemetry = if telemetryEnabled then TelemetryEnabled else TelemetryDisabled,
+                tls,
+                schemaReloadForce
+              },
+          tenancy = SingleStore TenantConfig {store, auth, biscuit}
         },
       authWarnings <> storeWarnings
     )

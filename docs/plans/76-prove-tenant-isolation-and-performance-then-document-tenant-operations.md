@@ -326,7 +326,7 @@ Milestone 1:
 
 ```bash
 cabal build all
-EN_BASELINE_BIN=.dev/loadbench/en-server-baseline cabal test en-server-tenant-tests
+EN_BASELINE_BIN="$PWD/.dev/loadbench/en-server-baseline" cabal test en-server-tenant-tests
 cabal test en-server-config-tests en-server-middleware-test
 cabal run -v0 en-server-loadbench -- ab \
   --baseline .dev/loadbench/en-server-baseline \

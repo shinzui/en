@@ -2,6 +2,9 @@
 
 ## 2026-11-13
 
+* **Addition**: FRIC-2 records detour tooling friction with mori://shinzui/en: just start-and-test cannot run when port 8080 is taken
+
+
 * **Update**: FRIC-1 accepted: Accepted under ADR 7's measured-exception policy; the same cost recurred from ExecPlan 70, which is why the ADR section was extended rather than a new rule written
 
 

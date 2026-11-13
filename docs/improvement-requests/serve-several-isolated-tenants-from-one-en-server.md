@@ -6,9 +6,10 @@ description: >-
 timestamp: "2026-11-12T22:51:59Z"
 generated:
   by: process:claude-code
-  at: "2026-11-12T22:51:59Z"
+  at: "2026-11-13T14:40:00Z"
 requestId: IR-2
-status: proposed
+status: in-progress
+targetPlan: docs/masterplans/12-serve-several-isolated-tenants-from-one-en-server.md
 origin: mori://shinzui/mori
 originPlan: mori://shinzui/mori/plans/302-migrate-the-shared-registry-from-legacy-tokens-to-shomei-and-en-with-a-team-pilot
 acceptanceCriteria:
