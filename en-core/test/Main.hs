@@ -155,6 +155,7 @@ import En.Tuple
     TupleCaveat (..),
   )
 import PreludeProbe qualified
+import RecursiveLookup (testRecursiveLookup)
 
 validatedKikanTH :: ValidSchema
 validatedKikanTH =
@@ -760,6 +761,7 @@ main = do
   branchExpansion <- expandEngine consistencyStore (runTupleStoreInMemory branchTuples) branchGraph MinimizeLatency (expandRequest reviewDoc (RelationName "reviewer") requestContext (ExpandLimit 20) Nothing)
   assertEqual "expand renders one child per conjunct, not one per row" (Just 2) (fmap length (treeConjuncts branchExpansion))
   assertEqual "expand keeps a multi-row conjunct whole, as a union of its rows" (Just [2, 1]) (fmap (fmap branchWidth) (treeConjuncts branchExpansion))
+  testRecursiveLookup
   pure ()
 
 sampleTuple :: Tuple

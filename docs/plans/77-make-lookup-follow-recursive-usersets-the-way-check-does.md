@@ -16,6 +16,11 @@ provenance:
       at: 2026-11-13T03:59:02Z
       mode: "update"
       note: "Validated against the engine; widened to indirect arrows and the skipRecursive guard, fixed the emit-window step, tightened convergence and fixtures"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T04:28:33Z
+      mode: "implement"
+      note: "Milestones 1 and 2 implemented: cycle-head fixpoint in En.Lookup, agreement tests, nested-group bench"
 ---
 
 # Make lookup follow recursive usersets the way check does
@@ -79,12 +84,26 @@ The defect was found while building the load benchmark of
 
 ## Progress
 
-- [ ] Milestone 1: failing agreement tests in `en-core` reproduce the defect for self-recursive
-      and mutually recursive usersets; `cabal test en-core-interface-tests` fails on exactly
-      those cases and passes everything else.
-- [ ] Milestone 2: lookup evaluates recursive usersets to a fixpoint; the agreement tests and
-      every existing `en-core`, `en-postgres` and `en-servant` suite pass; lookup benchmarks for
-      non-recursive schemas show no regression.
+- [x] Milestone 1 (2026-11-13): failing agreement tests in `en-core` reproduce the defect for
+      self-recursive and mutually recursive usersets; `cabal test en-core-interface-tests` fails
+      on exactly those cases and passes everything else. The cases live in
+      `en-core/test/RecursiveLookup.hs`, called from `main`. Against the unchanged engine every
+      case listed under Milestone 1's acceptance failed (alice `s2, s3`; bob `s5`; groups `g2, g3`
+      and `g5`; team `t2`; cyclic data; `f2, f3` of fixture 2; fixture 3 `Left
+      ResolutionLimitExceeded`; `g2..g4` of fixture 4, and `g2` with the ban; caveated cycle `b, c`;
+      both depth-budget cases), plus two cases this implementation added: the arrow over two
+      tupleset types (`f2, f3` omitted) and the caveated nested group (`space:s1` missing the
+      `min_rank` obligation). The `lookupSubjects` case and every pre-existing case passed.
+      Committed together with Milestone 2 (see Decision Log).
+- [x] Milestone 2 (2026-11-13): lookup evaluates recursive usersets to a fixpoint. `cabal test
+      en-core` (interface and conformance) and `cabal test en-servant-tests` pass; `cabal build
+      all` succeeds with no new warnings in the changed files. Benchmarks, `cabal bench
+      en-core-bench` (`.dev/lookup-bench-before.txt`, `.dev/lookup-bench-after.txt`):
+      `lookup/reachable-spaces` 2.87 µs ± 166 ns before (2.81 µs on a re-run), 2.43 µs ± 110 ns
+      after; `lookup/wide-fanout` 349 µs ± 33 µs before (301 µs on a re-run), 357 µs ± 30 µs
+      after; new `lookup/nested-groups` (300 spaces through two levels of nesting under ten
+      groups) 149 µs ± 8.9 µs, against 34 µs for the wrong pre-change answer. Check, expand and
+      cache benchmarks unchanged within noise. `en-postgres` is exercised in Milestone 3.
 - [ ] Milestone 3: the fix is proved through PostgreSQL and the HTTP server, the user guide
       states what lookup guarantees about recursion, and the ADR or plan records are updated.
 
@@ -145,6 +164,42 @@ unchanged engine. No source file was changed.
 - Observation: `en-core/test/Main.hs` does not import `En.LookupSubjects` and has no helper
   for it; only `en-core/conformance/Main.hs` uses it.
 
+The following were found while implementing, on 2026-11-13.
+
+- Observation: a directly recursive arrow whose tupleset also accepts another type is
+  truncated too. With `folder.parent: folder, org` and `view = viewer | parent->view`, alice an
+  org viewer, `f1` a child of the org and `f2`, `f3` a chain below `f1`, lookup returned `[f1]`
+  and check allowed all three. The old skip guard dropped the whole arrow while computing the
+  seeds, including its `org` entry, so the frontier walk never started from `f1`. Fixed by
+  skipping only the recursive tupleset entry (see the Decision Log); covered by
+  `multiTypeArrowCases`.
+
+- Observation: lookup dropped the decision of the userset a row was reached through.
+  `evalThis` gated every row's caveat against `Allowed`, so for `space.member: org#member` with
+  a caveated org membership (`min_rank`) and a caveated space grant (`min_level`), lookup
+  reported `space:s1` as `Conditional [min_level]` while check reported
+  `Conditional [min_level, min_rank]`. A caller supplying only `clearance` would have been told
+  `Allowed` by lookup. This is not recursive, but it is a lookup/check disagreement on the
+  conditional answer, and a fixpoint over decisions is meaningless while a step discards them,
+  so it was fixed here (the row now starts from the subject object's decision, as arrows
+  already did); covered by `caveatedNestedGroupCases`.
+
+- Observation: on a caveated cycle whose root grant is itself conditional, lookup can list more
+  obligations than check. With `group:a#member@user:alice` caveated `min_level`, and
+  `a#member@b#member`, `b#member@a#member` caveated `min_rank`, check reports `a` as
+  `Conditional [min_level]` and lookup as `Conditional [min_level, min_rank]`: lookup carries
+  `a`'s own decision around the cycle `a -> b -> a`, a walk that check prunes because it
+  revisits `a`. The plan's caveated fixture (uncaveated root) agrees exactly. See the Decision
+  Log for why this was accepted.
+
+- Observation: two representation choices for the internal result measurably slowed lookups
+  that never recurse. Strict fields on the new `Evaluated` record made `lookup/wide-fanout`
+  about three times slower (1.08 ms against 349 µs), and reading the record through the
+  `#objects`/`#assumed` label lenses made `lookup/reachable-spaces` about 30% slower (3.7 µs
+  against 2.8 µs). Neither changed the work done (traced: three `evalRelation` calls, no cycle
+  head, against four before). A lazy `objects` field and INLINE pattern-match accessors removed
+  both. Recorded as friction FRIC-1.
+
 
 ## Decision Log
 
@@ -200,6 +255,49 @@ unchanged engine. No source file was changed.
   round count over everything the subject reaches, so near the budget one can fail where the
   other answers. Both fail loudly; neither returns a short answer.
   Date: 2026-11-12
+
+
+- Decision: The new cases live in their own test module, `en-core/test/RecursiveLookup.hs`,
+  called from the end of `main` in `en-core/test/Main.hs`, and Milestone 1 is committed together
+  with Milestone 2.
+  Rationale: the cases collect their mismatches and report them together, which needs its own
+  small runner and helpers (agreement, paging, a tuple parser); the module is self-contained
+  over the in-memory store and keeps `Main.hs` from growing further. Committing the milestones
+  together keeps `master` green.
+  Date: 2026-11-13
+
+- Decision: The directly recursive arrow keeps its frontier walk (`evalRecursiveUserset`,
+  `expandRecursive`), and its skip now drops only the recursive tupleset entry, not the whole
+  arrow. Its seeds are computed by evaluating the current relation's rewrite directly, and
+  `evalRelation` clears `skipRecursive` for every subproblem below.
+  Rationale: skipping the whole arrow lost seeds reached through the tupleset's other subject
+  types (Surprises & Discoveries). Keeping the frontier walk keeps today's cost for the shape the
+  benchmark and the demo schema use; `lookup/reachable-spaces` is faster after the change than
+  before. Removing the special case was not tried.
+  Date: 2026-11-13
+
+- Decision: A userset row's decision starts from the decision of the userset object it names,
+  then is gated by the row's caveat, in `evalThis` as already in arrows.
+  Rationale: lookup reported `Allowed`/fewer obligations where check reported `Conditional`
+  (Surprises & Discoveries); agreement includes the conditional answer, and the fixpoint's
+  equality compares decisions.
+  Date: 2026-11-13
+
+- Decision: For an object on a caveated cycle, lookup's obligations are allowed to contain
+  check's rather than equal them; the test for that fixture asserts containment
+  (`LookupObligationsContainCheck`), every other fixture asserts equality.
+  Rationale: lookup's subproblem is a whole type, so it cannot tell a walk that revisits an
+  object from a simple path without tracking provenance per object, which is out of scope. The
+  difference is safe: the object sets agree (every walk contains a simple path with a subset of
+  its caveats), `Allowed` and `Denied` agree, and extra obligations only ask the caller for more
+  context; re-evaluating with that context gives the right answer. This narrows "with the same
+  obligations" in Purpose for that one shape.
+  Date: 2026-11-13
+
+- Decision: `Evaluated.objects` is a lazy field and `Evaluated` is read through INLINE
+  pattern-match accessors, not label lenses.
+  Rationale: measured (Surprises & Discoveries, FRIC-1).
+  Date: 2026-11-13
 
 
 ## Outcomes & Retrospective

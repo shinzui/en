@@ -91,7 +91,10 @@ test-suite en-core-interface-tests
   type: exitcode-stdio-1.0
   hs-source-dirs: test
   main-is: Main.hs
-  other-modules: PreludeProbe
+  other-modules:
+    PreludeProbe
+    RecursiveLookup
+
   build-depends:
     base,
     containers,

@@ -193,5 +193,13 @@ in  Schema.Project::{
         , description = Some
             "Commit-pinned reviews of en's correctness, security, performance, design, test coverage, documentation, and operability"
         }
+      , Schema.OkfBundle::{
+        , name = "friction-log"
+        , path = "docs/friction-log"
+        , profile = Some "docs/friction-log/profile.dhall"
+        , okfVersion = "0.2"
+        , description = Some
+            "Friction met while implementing plans, before triage into bug reports and requests"
+        }
       ]
     }

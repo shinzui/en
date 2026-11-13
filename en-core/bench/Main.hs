@@ -39,7 +39,8 @@ main :: IO ()
 main = do
   graph <- either (fail . show) pure (compileSchema benchSchema)
   wideGraph <- either (fail . show) pure (compileSchema wideSchema)
-  assertFixtures graph wideGraph
+  nestedGraph <- either (fail . show) pure (compileSchema nestedGroupSchema)
+  assertFixtures graph wideGraph nestedGraph
   defaultMain
     [ bgroup
         "check"
@@ -62,7 +63,9 @@ main = do
         [ bench "reachable-spaces" $
             whnfAppIO (\request -> runEngine (Lookup.lookup graph MinimizeLatency request)) viewSpacesRequest,
           bench "wide-fanout" $
-            whnfAppIO (\request -> runFanoutEngine (Lookup.lookup wideGraph MinimizeLatency request)) fanoutRequest
+            whnfAppIO (\request -> runFanoutEngine (Lookup.lookup wideGraph MinimizeLatency request)) fanoutRequest,
+          bench "nested-groups" $
+            whnfAppIO (\request -> runNestedEngine (Lookup.lookup nestedGraph MinimizeLatency request)) nestedSpacesRequest
         ],
       bgroup
         "expand"
@@ -93,8 +96,8 @@ main = do
 -- expensive one. These assertions are the fixtures' meaning: @non-member@ is
 -- expensive /because it denies after draining the relation/, and a future edit that
 -- turns it into an early error would otherwise look like an optimization.
-assertFixtures :: ReachabilityGraph -> ReachabilityGraph -> IO ()
-assertFixtures graph wideGraph = do
+assertFixtures :: ReachabilityGraph -> ReachabilityGraph -> ReachabilityGraph -> IO ()
+assertFixtures graph wideGraph nestedGraph = do
   expectEq "check/shallow-owner" (Right Allowed) . fmap (view (#decision)) =<< runEngine (check graph MinimizeLatency emptyContext (SubjectId user) (RelationName "view") space)
   expectEq "check/nested-parent" (Right Allowed) . fmap (view (#decision)) =<< runEngine (check graph MinimizeLatency emptyContext (SubjectId user) (RelationName "view") childSpace)
   expectEq "check/deep-nested" (Right Allowed) . fmap (view (#decision)) =<< runDeepEngine (check graph MinimizeLatency emptyContext (SubjectId user) (RelationName "view") deepLeaf)
@@ -104,6 +107,7 @@ assertFixtures graph wideGraph = do
   expectEq "check-wide/non-member" (Right Denied) . fmap (view (#decision)) =<< runWideEngine (check wideGraph MinimizeLatency emptyContext (SubjectId outsider) (RelationName "viewer") wideFolder)
   expectEq "lookup/reachable-spaces" (Right 2) . fmap (length . (view (#objects))) =<< runEngine (Lookup.lookup graph MinimizeLatency viewSpacesRequest)
   expectEq "lookup/wide-fanout" (Right 50) . fmap (length . (view (#objects))) =<< runFanoutEngine (Lookup.lookup wideGraph MinimizeLatency fanoutRequest)
+  expectEq "lookup/nested-groups" (Right nestedSpaceCount) . fmap (length . (view (#objects))) =<< runNestedEngine (Lookup.lookup nestedGraph MinimizeLatency nestedSpacesRequest)
   expectEq "expand/deep-nested" (Right deepLeaf) . fmap (view (#root)) =<< runDeepEngine (expand graph MinimizeLatency deepExpandRequest)
 
 expectEq :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -122,6 +126,10 @@ runWideEngine action =
 runFanoutEngine :: Eff '[ConsistencyStore, TupleStore, Error EnError] a -> IO (Either EnError a)
 runFanoutEngine action =
   pure (runPureEff (runErrorNoCallStack (runTupleStoreInMemory fanoutTuples (runConsistencyStoreInMemory action))))
+
+runNestedEngine :: Eff '[ConsistencyStore, TupleStore, Error EnError] a -> IO (Either EnError a)
+runNestedEngine action =
+  pure (runPureEff (runErrorNoCallStack (runTupleStoreInMemory nestedGroupTuples (runConsistencyStoreInMemory action))))
 
 runDeepEngine :: Eff '[ConsistencyStore, TupleStore, Error EnError] a -> IO (Either EnError a)
 runDeepEngine action =
@@ -322,6 +330,70 @@ fanoutRequest =
       objectType = ObjectType "folder",
       context = emptyContext,
       limit = LookupLimit 50,
+      cursor = Nothing
+    }
+
+-- | Nested groups: @group.member@ accepts @group#member@, so lookup reaches the spaces
+-- through a fixpoint over the groups rather than one pass.
+--
+-- Added with docs/plans/77, when lookup learned to follow nested groups at all. Before
+-- that it returned only the spaces granted to groups the user is a direct member of, so
+-- there is no earlier number to compare with: this is the baseline for any later
+-- optimisation of the fixpoint (reading only what the last round added).
+nestedGroupSchema :: Schema
+nestedGroupSchema =
+  either (error . ("invalid benchmark schema fixture: " <>) . show) id $ do
+    userObject <- Schema.object "user" []
+    groupObject <-
+      Schema.object
+        "group"
+        [Schema.relation "member" [Schema.subject "user", Schema.userset "group" "member"] Schema.this]
+    spaceObject <-
+      Schema.object
+        "space"
+        [ Schema.relation "viewer" [Schema.subject "user", Schema.userset "group" "member"] Schema.this,
+          Schema.permission "view" (Schema.computed "viewer")
+        ]
+    Schema.build [userObject, groupObject, spaceObject]
+
+nestedGroupCount :: Int
+nestedGroupCount = 10
+
+nestedSpaceCount :: Int
+nestedSpaceCount = 300
+
+nestedGroup :: Text -> Int -> ObjectRef
+nestedGroup level n =
+  ObjectRef (ObjectType "group") (level <> "-" <> Text.pack (show n))
+
+-- | Two levels of nesting: the user is in ten inner groups, each inside a middle group,
+-- each inside an outer group, and 300 spaces are granted to the outer groups only.
+nestedGroupTuples :: [Tuple]
+nestedGroupTuples =
+  concat
+    [ [Tuple (nestedGroup "inner" n) member (SubjectId user) Nothing | n <- groups],
+      [Tuple (nestedGroup "middle" n) member (SubjectSet (nestedGroup "inner" n) member) Nothing | n <- groups],
+      [Tuple (nestedGroup "outer" n) member (SubjectSet (nestedGroup "middle" n) member) Nothing | n <- groups],
+      [ Tuple
+          (ObjectRef (ObjectType "space") ("nested-" <> Text.pack (show n)))
+          (RelationName "viewer")
+          (SubjectSet (nestedGroup "outer" (n `mod` nestedGroupCount + 1)) member)
+          Nothing
+      | n <- [1 .. nestedSpaceCount]
+      ]
+    ]
+  where
+    groups = [1 .. nestedGroupCount]
+    member = RelationName "member"
+
+nestedSpacesRequest :: LookupRequest
+nestedSpacesRequest =
+  LookupRequest
+    { subject = SubjectId user,
+      permission = RelationName "view",
+      objectType = ObjectType "space",
+      context = emptyContext,
+      limit = LookupLimit 1000,
       cursor = Nothing
     }
 

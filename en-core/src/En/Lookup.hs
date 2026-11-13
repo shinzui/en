@@ -184,8 +184,9 @@ data LookupPage = LookupPage
 -- candidates have been allowed to fill it.
 --
 -- The deadline interrupts the walk rather than labelling its result. It is polled
--- between store pages, before each branch, and before each round of recursive arrow
--- expansion. A lookup that runs out of budget returns 'LookupTruncated' with /no
+-- between store pages, before each branch, and before each round of a recursive
+-- fixpoint (recursive arrow expansion, and the rounds 'evalRelation' runs for nested
+-- usersets). A lookup that runs out of budget returns 'LookupTruncated' with /no
 -- objects/ and an unmoved watermark, because the objects found before the interruption
 -- are an arbitrary subset of the answer rather than its smallest members -- emitting
 -- them would advance the watermark past results not yet discovered. Retry with a
@@ -339,8 +340,10 @@ runLookup budget candidateCheck deadline graph revision token cursorState reques
       pure (Right (interruptedPage cursorState token))
     Right candidates ->
       -- The one place the working set becomes a list. 'Map.elems' is already
-      -- ascending by object key, which is the order pages and watermarks assume.
-      traverse (pageLookup budget deadline (request ^. #limit) cursorState token . Map.elems) candidates
+      -- ascending by object key, which is the order pages and watermarks assume. The
+      -- request's subproblem is the only one on the path here, and 'evalRelation'
+      -- removes it from 'assumed' when its fixpoint converges, so this answer is final.
+      traverse (pageLookup budget deadline (request ^. #limit) cursorState token . Map.elems . evaluatedObjects) candidates
   where
     emitWindow =
       EmitWindow
@@ -421,13 +424,37 @@ data EmitWindow = EmitWindow
   }
   deriving stock (Generic)
 
+-- | What an evaluator knows on the way down. It is an argument and is never returned,
+-- so anything a callee must tell its caller travels in 'Evaluated'.
+--
+-- 'visited' is the path from the request's subproblem to the current one. 'assumptions'
+-- holds, for each subproblem on that path, the approximation of its answer that the
+-- current round of its fixpoint assumes (see 'evalRelation').
 data EvalState = EvalState
   { depth :: !Int,
     visited :: !(Set Subproblem),
+    assumptions :: !(Map.Map Subproblem LookupObjects),
     skipRecursive :: !(Maybe RecursiveStep),
     budget :: !EvaluationBudget
   }
   deriving stock (Generic)
+
+-- | An evaluator's answer, and the in-progress subproblems whose assumed answer it was
+-- built from.
+--
+-- An empty 'assumed' set means the answer is final. A non-empty one means it is
+-- provisional: it is only as complete as the assumptions it read, and it becomes final
+-- when the fixpoint of every subproblem it names has converged. Every evaluator that
+-- combines or transforms results must carry 'assumed' along; dropping it anywhere makes
+-- a provisional answer look final, which is exactly the silent truncation the fixpoint
+-- exists to prevent.
+data Evaluated = Evaluated
+  { -- Both fields are lazy on purpose. Strict fields force each subproblem's map as
+    -- soon as its result is inspected, and that measured about three times slower on
+    -- the wide-fanout lookup benchmark than the lazy 'Either' this record replaced.
+    objects :: LookupObjects,
+    assumed :: !(Set Subproblem)
+  }
 
 data Subproblem = Subproblem
   { subject :: !Subject,
@@ -444,8 +471,40 @@ data RecursiveStep = RecursiveStep
 
 initialState :: EvaluationBudget -> EvalState
 initialState budget =
-  EvalState {depth = 0, visited = Set.empty, skipRecursive = Nothing, budget}
+  EvalState {depth = 0, visited = Set.empty, assumptions = Map.empty, skipRecursive = Nothing, budget}
 
+-- | Evaluate one subproblem: the objects of @objectType@ on which @subject@ has
+-- @relation@.
+--
+-- Unlike check's subproblem, which names one object, this one is a question about a
+-- whole type, so recursion through the same type -- nested groups
+-- (@group.member: group#member@), mutually nested groups and teams, an arrow through a
+-- computed permission -- comes back to the /same/ subproblem. Treating that revisit as
+-- empty, which is right for check, truncates lookup to the objects reachable without
+-- recursion.
+--
+-- So a revisit contributes the current approximation of the subproblem's answer (its
+-- assumption, empty at first) and marks the result as depending on it. The subproblem
+-- that sees its own name in its result's 'assumed' set is a /cycle head/: it evaluates
+-- its rewrite again with the previous round's answer as the assumption, and repeats
+-- until a round returns what the round before it did. Each round is computed afresh
+-- from the store and the previous assumption. Candidate generation only grows as the
+-- assumption grows, and intersections and exclusions confirm their candidates with a
+-- forward check, which handles recursion exactly, so the rounds converge. Two rounds are
+-- equal when they hold the same objects with the same decisions, obligations compared
+-- as sets (see 'sameObjects').
+--
+-- A head that has not converged after @maxDepth@ rounds fails with
+-- 'ResolutionLimitExceeded' rather than returning a partial set, and the deadline is
+-- polled before every round. A chain of @n@ nested groups needs @n + 1@ rounds.
+--
+-- Rounds never run under an 'EmitWindow': a window truncates confirmation, and a
+-- truncated round fed back as an assumption loses objects. When the request's own
+-- subproblem turns out to be a cycle head, its windowed first round is discarded and the
+-- iteration starts again without a window; 'pageLookup' cuts the page afterwards.
+--
+-- A schema without such recursion never revisits a subproblem, so its results carry no
+-- assumptions and it takes exactly one pass.
 evalRelation ::
   (TupleStore :> es, Error Interrupt :> es) =>
   Maybe EmitWindow ->
@@ -458,32 +517,102 @@ evalRelation ::
   ObjectType ->
   RelationName ->
   EvalState ->
-  Eff es (Either EnError LookupObjects)
+  Eff es (Either EnError Evaluated)
 evalRelation window candidateCheck deadline graph context revision subject objectType relation state
   | (state ^. #depth) >= (state ^. #budget . #maxDepth) =
       pure (Left ResolutionLimitExceeded)
-  | Set.member subproblem (state ^. #visited) && (state ^. #skipRecursive) == Nothing =
-      pure (Right Map.empty)
+  | Set.member subproblem (state ^. #visited) =
+      pure
+        ( Right
+            Evaluated
+              { objects = Map.findWithDefault Map.empty subproblem (state ^. #assumptions),
+                assumed = Set.singleton subproblem
+              }
+        )
   | otherwise =
       case Map.lookup ref (graph ^. #relations) of
         Nothing ->
           pure (Left (UnknownRelation (renderRef ref)))
-        Just schemaRelation ->
-          evalRewrite
-            window
-            candidateCheck
-            deadline
-            graph
-            context
-            revision
-            subject
-            objectType
-            relation
-            (schemaRelation ^. #rewrite)
-            (state & #depth %~ (+ 1) & #visited %~ Set.insert subproblem)
+        Just schemaRelation -> do
+          let relationRewrite = schemaRelation ^. #rewrite
+              -- An arrow's skip applies only inside the rewrite that set it, so every
+              -- subproblem below starts without one.
+              descended =
+                state & #depth %~ (+ 1) & #visited %~ Set.insert subproblem & #skipRecursive .~ Nothing
+          -- The first round needs no assumption entry: a subproblem that is not on the
+          -- path has none, and a revisit reads an absent one as empty.
+          firstRound <- evalRewrite window candidateCheck deadline graph context revision subject objectType relation relationRewrite descended
+          case firstRound of
+            Right result@(Evaluated _ assumed)
+              | Set.member subproblem assumed ->
+                  convergeHead window candidateCheck deadline graph context revision subject objectType relation relationRewrite descended result
+            _ -> pure firstRound
   where
     ref = RelationRef {objectType, relation}
     subproblem = Subproblem {subject, objectType, relation}
+
+-- | Run a cycle head to its fixpoint, given its first round. See 'evalRelation'.
+--
+-- Kept out of 'evalRelation' so the path every non-recursive subproblem takes stays a
+-- direct call to 'evalRewrite'.
+convergeHead ::
+  (TupleStore :> es, Error Interrupt :> es) =>
+  Maybe EmitWindow ->
+  CheckForCandidate es ->
+  Deadline (Eff es) ->
+  ReachabilityGraph ->
+  CaveatContext ->
+  Revision ->
+  Subject ->
+  ObjectType ->
+  RelationName ->
+  Rewrite ->
+  EvalState ->
+  Evaluated ->
+  Eff es (Either EnError Evaluated)
+convergeHead window candidateCheck deadline graph context revision subject objectType relation relationRewrite descended firstResult =
+  case window of
+    Nothing -> converge 1 firstResult
+    Just _ -> do
+      -- The windowed first round may have truncated a confirmation; start again.
+      requireBudget deadline
+      either (pure . Left) (converge 1) =<< evalRound Map.empty
+  where
+    subproblem = Subproblem {subject, objectType, relation}
+    evalRound assumption =
+      evalRewrite Nothing candidateCheck deadline graph context revision subject objectType relation relationRewrite (descended & #assumptions %~ Map.insert subproblem assumption)
+    converge rounds previous
+      | rounds >= (descended ^. #budget . #maxDepth) = pure (Left ResolutionLimitExceeded)
+      | otherwise = do
+          -- Each round of the fixpoint is a unit of skippable work, like a branch.
+          requireBudget deadline
+          next <- evalRound (evaluatedObjects previous)
+          case next of
+            Left err -> pure (Left err)
+            Right current
+              | sameObjects (evaluatedObjects previous) (evaluatedObjects current) ->
+                  pure (Right (Evaluated (evaluatedObjects current) (Set.delete subproblem (evaluatedAssumed current))))
+              | otherwise -> converge (rounds + 1) current
+
+-- | Whether two rounds of a fixpoint hold the same answer: the same objects, and per
+-- object the same decision with 'Conditional' obligations compared as sets. Obligation
+-- lists keep first-occurrence order, which can depend on the previous round, so a
+-- reordering is not a change.
+sameObjects :: LookupObjects -> LookupObjects -> Bool
+sameObjects left right =
+  fmap settled left == fmap settled right
+  where
+    settled LookupObject {decision} =
+      case decision of
+        Allowed -> SettledAllowed
+        Denied -> SettledDenied
+        Conditional obligations -> SettledConditional (Set.fromList obligations)
+
+data SettledDecision
+  = SettledAllowed
+  | SettledDenied
+  | SettledConditional !(Set Decision.CaveatObligation)
+  deriving stock (Eq)
 
 -- | The emit window rides along a rewrite only where the rewrite's output /is/ the
 -- page's output.
@@ -509,7 +638,7 @@ evalRewrite ::
   RelationName ->
   Rewrite ->
   EvalState ->
-  Eff es (Either EnError LookupObjects)
+  Eff es (Either EnError Evaluated)
 evalRewrite window candidateCheck deadline graph context revision subject objectType currentRelation rewrite state =
   case rewrite of
     This ->
@@ -540,8 +669,16 @@ evalRewrite window candidateCheck deadline graph context revision subject object
               evalRewrite branchWindow candidateCheck deadline graph context revision subject objectType currentRelation current state
           )
           rewrites
-      pure (mergeAllObjects <$> sequence results)
+      pure (mergeAllEvaluated <$> sequence results)
 
+-- | Direct tuples: rows whose subject is the requested subject (or its wildcard), then,
+-- for each userset subject @T#r@ the relation allows, rows whose subject is one of the
+-- @T:x#r@ the subject has @r@ on.
+--
+-- A userset row's decision starts from the subject object's own decision and is then
+-- gated by the row's caveat, so a conditional membership of @T:x@ keeps its
+-- obligations rather than becoming 'Allowed'. This is the composition check performs
+-- along the same path.
 evalThis ::
   (TupleStore :> es, Error Interrupt :> es) =>
   CheckForCandidate es ->
@@ -553,15 +690,15 @@ evalThis ::
   ObjectType ->
   RelationName ->
   EvalState ->
-  Eff es (Either EnError LookupObjects)
+  Eff es (Either EnError Evaluated)
 evalThis candidateCheck deadline graph context revision subject objectType relation state = do
   direct <- readRowsForSubjects (state ^. #budget . #pageLimit) deadline revision objectType relation (subjectsWithWildcard subject)
   case direct of
     Left err -> pure (Left err)
     Right directRows -> do
       usersetObjects <- rowsForAllowedUsersets
-      let directObjects = objectsFromList . catMaybes <$> traverse rowLookupObject directRows
-      pure (mergeObjects <$> directObjects <*> usersetObjects)
+      let directObjects = finalObjects . objectsFromList . catMaybes <$> traverse (rowLookupObject Map.empty) directRows
+      pure (mergeEvaluated <$> directObjects <*> usersetObjects)
   where
     rowsForAllowedUsersets = do
       case lookupRelation graph objectType relation of
@@ -571,20 +708,35 @@ evalThis candidateCheck deadline graph context revision subject objectType relat
             traverse
               ( \allowed ->
                   case (allowed ^. #relation) of
-                    Nothing -> pure (Right Map.empty)
+                    Nothing -> pure (Right emptyEvaluated)
                     Just subjectRelation -> do
                       subjectObjects <- evalRelation Nothing candidateCheck deadline graph context revision subject (allowed ^. #objectType) subjectRelation state
                       case subjectObjects of
                         Left err -> pure (Left err)
-                        Right objects -> do
-                          let subjectSets = [SubjectSet object subjectRelation | LookupObject {object} <- Map.elems objects]
+                        Right evaluated -> do
+                          let objects = evaluatedObjects evaluated
+                              subjectSets = [SubjectSet object subjectRelation | object <- Map.keys objects]
                           rows <- readRowsForSubjects (state ^. #budget . #pageLimit) deadline revision objectType relation subjectSets
-                          pure (objectsFromList . catMaybes <$> (rows >>= traverse rowLookupObject))
+                          pure (derivedFrom evaluated . objectsFromList . catMaybes <$> (rows >>= traverse (rowLookupObject objects)))
               )
               (Set.toAscList (relationDefinition ^. #allowedSubjects))
-          pure (mergeAllObjects <$> sequence collected)
-    rowLookupObject TupleRow {tuple} =
-      fmap (LookupObject (tuple ^. #object)) <$> includeDecision graph context (tuple ^. #caveat) Allowed
+          pure (mergeAllEvaluated <$> sequence collected)
+    rowLookupObject subjectObjects TupleRow {tuple} =
+      fmap (LookupObject (tuple ^. #object))
+        <$> includeDecision graph context (tuple ^. #caveat) (subjectDecision subjectObjects (tuple ^. #subject))
+
+-- | The decision a row's subject carries into the row: the decision of the userset
+-- object it names, 'Allowed' for a direct subject (and for a userset object the map does
+-- not hold, which the reads above never return).
+subjectDecision :: LookupObjects -> Subject -> CheckDecision
+subjectDecision subjectObjects =
+  \case
+    SubjectId subjectObject -> decisionOf subjectObject
+    SubjectSet subjectObject _ -> decisionOf subjectObject
+    SubjectWildcard _ -> Allowed
+  where
+    decisionOf subjectObject =
+      maybe Allowed (view #decision) (Map.lookup subjectObject subjectObjects)
 
 evalTupleToUserset ::
   (TupleStore :> es, Error Interrupt :> es) =>
@@ -599,49 +751,70 @@ evalTupleToUserset ::
   RelationName ->
   RelationName ->
   EvalState ->
-  Eff es (Either EnError LookupObjects)
-evalTupleToUserset candidateCheck deadline graph context revision subject objectType currentRelation tuplesetRelation computedRelation state
-  | (state ^. #skipRecursive) == Just RecursiveStep {tuplesetRelation, computedRelation} =
-      pure (Right Map.empty)
-  | otherwise = do
-      case lookupRelation graph objectType tuplesetRelation of
-        Left err -> pure (Left err)
-        Right tuplesetDefinition -> do
-          collected <-
-            traverse
-              ( \allowed -> do
-                  if (allowed ^. #objectType) == objectType && computedRelation == currentRelation
-                    then evalRecursiveUserset allowed
-                    else do
-                      usersetObjects <- evalRelation Nothing candidateCheck deadline graph context revision subject (allowed ^. #objectType) computedRelation state
-                      case usersetObjects of
-                        Left err -> pure (Left err)
-                        Right objects -> do
-                          let subjects = concatMap (subjectsForAllowed allowed) (Map.elems objects)
-                          rows <- readRowsForSubjects (state ^. #budget . #pageLimit) deadline revision objectType tuplesetRelation subjects
-                          pure (objectsFromList <$> (rows >>= applyRows objects))
-              )
-              (Set.toAscList (tuplesetDefinition ^. #allowedSubjects))
-          pure (mergeAllObjects <$> sequence collected)
+  Eff es (Either EnError Evaluated)
+evalTupleToUserset candidateCheck deadline graph context revision subject objectType currentRelation tuplesetRelation computedRelation state =
+  case lookupRelation graph objectType tuplesetRelation of
+    Left err -> pure (Left err)
+    Right tuplesetDefinition -> do
+      collected <-
+        traverse
+          ( \allowed -> do
+              if isRecursive allowed
+                then
+                  if (state ^. #skipRecursive) == Just recursiveStep
+                    then pure (Right emptyEvaluated)
+                    else evalRecursiveUserset allowed
+                else do
+                  usersetObjects <- evalRelation Nothing candidateCheck deadline graph context revision subject (allowed ^. #objectType) computedRelation state
+                  case usersetObjects of
+                    Left err -> pure (Left err)
+                    Right evaluated -> do
+                      let objects = evaluatedObjects evaluated
+                          subjects = concatMap (subjectsForAllowed allowed) (Map.elems objects)
+                      rows <- readRowsForSubjects (state ^. #budget . #pageLimit) deadline revision objectType tuplesetRelation subjects
+                      pure (derivedFrom evaluated . objectsFromList <$> (rows >>= applyRows objects))
+          )
+          (Set.toAscList (tuplesetDefinition ^. #allowedSubjects))
+      pure (mergeAllEvaluated <$> sequence collected)
   where
+    -- A directly recursive arrow (@view = viewer | parent->view@ with @parent: folder@
+    -- on a folder) is answered by its own frontier fixpoint rather than by the general
+    -- one in 'evalRelation': the seeds are the relation's rewrite evaluated with this
+    -- tupleset entry skipped, and 'expandRecursive' follows the arrow from them one
+    -- frontier at a time, reading only the objects the last round added. Only this
+    -- entry is skipped, so the seeds include what the tupleset's other subject types
+    -- lead to (a folder whose parent is an org), and the frontier walk continues from
+    -- those too. An arrow that recurses indirectly (@inherited = parent->view@,
+    -- @view = viewer | inherited@) is not special-cased: its revisit goes through the
+    -- general fixpoint.
+    isRecursive allowed =
+      (allowed ^. #objectType) == objectType && computedRelation == currentRelation
     recursiveStep = RecursiveStep {tuplesetRelation, computedRelation}
-    evalRecursiveUserset allowed = do
-      seeds <-
-        evalRelation
-          Nothing
-          candidateCheck
-          deadline
-          graph
-          context
-          revision
-          subject
-          (allowed ^. #objectType)
-          computedRelation
-          (state & #skipRecursive ?~ recursiveStep)
-      case seeds of
+    evalRecursiveUserset allowed =
+      -- The seeds come from evaluating the current relation's rewrite directly, not
+      -- through 'evalRelation': its subproblem is already on the path, so it would be
+      -- answered as a revisit. 'evalRelation' clears the skip for every subproblem
+      -- below, so the cycle guard stays on for them.
+      case lookupRelation graph objectType currentRelation of
         Left err -> pure (Left err)
-        Right seedObjects ->
-          expandRecursive allowed seedObjects Map.empty 0
+        Right currentDefinition -> do
+          seeds <-
+            evalRewrite
+              Nothing
+              candidateCheck
+              deadline
+              graph
+              context
+              revision
+              subject
+              objectType
+              currentRelation
+              (currentDefinition ^. #rewrite)
+              (state & #skipRecursive ?~ recursiveStep)
+          case seeds of
+            Left err -> pure (Left err)
+            Right seeded ->
+              fmap (derivedFrom seeded) <$> expandRecursive allowed (evaluatedObjects seeded) Map.empty 0
     subjectsForAllowed allowed LookupObject {object} =
       SubjectId object
         : case (allowed ^. #relation) of
@@ -715,9 +888,48 @@ mergeObjects :: LookupObjects -> LookupObjects -> LookupObjects
 mergeObjects =
   Map.unionWith (\left right -> left & #decision .~ combineDecisions (left ^. #decision) (right ^. #decision))
 
-mergeAllObjects :: [LookupObjects] -> LookupObjects
-mergeAllObjects =
-  foldl' mergeObjects Map.empty
+-- 'Evaluated' is read through these INLINE accessors rather than the @#objects@ and
+-- @#assumed@ label lenses. Measured on @lookup/reachable-spaces@, reading it through
+-- the lenses cost about a third of the benchmark; these accessors cost nothing
+-- measurable.
+evaluatedObjects :: Evaluated -> LookupObjects
+{-# INLINE evaluatedObjects #-}
+evaluatedObjects (Evaluated objects _) =
+  objects
+
+evaluatedAssumed :: Evaluated -> Set Subproblem
+{-# INLINE evaluatedAssumed #-}
+evaluatedAssumed (Evaluated _ assumed) =
+  assumed
+
+-- | A result that depends on no assumption.
+finalObjects :: LookupObjects -> Evaluated
+{-# INLINE finalObjects #-}
+finalObjects objects =
+  Evaluated {objects, assumed = Set.empty}
+
+emptyEvaluated :: Evaluated
+emptyEvaluated =
+  finalObjects Map.empty
+
+-- | 'mergeObjects', depending on whatever either side depended on.
+mergeEvaluated :: Evaluated -> Evaluated -> Evaluated
+{-# INLINE mergeEvaluated #-}
+mergeEvaluated (Evaluated leftObjects leftAssumed) (Evaluated rightObjects rightAssumed) =
+  Evaluated
+    { objects = mergeObjects leftObjects rightObjects,
+      assumed = Set.union leftAssumed rightAssumed
+    }
+
+mergeAllEvaluated :: [Evaluated] -> Evaluated
+mergeAllEvaluated =
+  foldl' mergeEvaluated emptyEvaluated
+
+-- | Objects computed from @source@'s objects depend on what @source@ depended on.
+derivedFrom :: Evaluated -> LookupObjects -> Evaluated
+{-# INLINE derivedFrom #-}
+derivedFrom (Evaluated _ assumed) objects =
+  Evaluated {objects, assumed}
 
 objectsFromList :: [LookupObject] -> LookupObjects
 objectsFromList =
@@ -762,17 +974,19 @@ confirmCandidates ::
   Revision ->
   Subject ->
   RelationName ->
-  Either EnError LookupObjects ->
-  Eff es (Either EnError LookupObjects)
+  Either EnError Evaluated ->
+  Eff es (Either EnError Evaluated)
 confirmCandidates _ _ _ _ _ _ _ (Left err) =
   pure (Left err)
 confirmCandidates window candidateCheck graph context revision subject relation (Right candidates) =
-  confirmUntilPageFull emptyCheckMemo 0 [] wanted
+  -- What is confirmed depends on which candidates were offered, so the output depends
+  -- on whatever the candidates did.
+  fmap (derivedFrom candidates) <$> confirmUntilPageFull emptyCheckMemo 0 [] wanted
   where
     -- 'Map.elems' is ascending by object key, which is the order the page wants and
     -- the order the confirm budget assumes: the candidates confirmed first are the
     -- ones the page will emit.
-    ordered = Map.elems candidates
+    ordered = Map.elems (evaluatedObjects candidates)
 
     wanted =
       case window of
@@ -874,10 +1088,10 @@ combineDecisions :: CheckDecision -> CheckDecision -> CheckDecision
 combineDecisions left right =
   Decision.union [left, right]
 
-applyRewriteCaveat :: ReachabilityGraph -> CaveatContext -> CaveatName -> LookupObjects -> Either EnError LookupObjects
-applyRewriteCaveat graph context caveat objects = do
+applyRewriteCaveat :: ReachabilityGraph -> CaveatContext -> CaveatName -> Evaluated -> Either EnError Evaluated
+applyRewriteCaveat graph context caveat evaluated = do
   gate <- evaluateNamedCaveat graph context caveat (CaveatPayload Map.empty)
-  pure (applyGateToObjects gate objects)
+  pure (Evaluated (applyGateToObjects gate (evaluatedObjects evaluated)) (evaluatedAssumed evaluated))
 
 evaluateTupleCaveat :: ReachabilityGraph -> CaveatContext -> Maybe TupleCaveat -> Either EnError CheckDecision
 evaluateTupleCaveat _ _ Nothing =
