@@ -21,6 +21,11 @@ provenance:
       at: 2026-11-13T04:28:33Z
       mode: "implement"
       note: "Milestones 1 and 2 implemented: cycle-head fixpoint in En.Lookup, agreement tests, nested-group bench"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T19:27:55Z
+      mode: "update"
+      note: "Recorded the server-level lookup cost measured by MasterPlan 12"
 ---
 
 # Make lookup follow recursive usersets the way check does
@@ -337,6 +342,16 @@ two-level nested-group benchmark is 149 µs and is the baseline for an increment
 (re-reading only what the last round added), which was out of scope. Getting there took
 measurement. Strict fields on the new result record cost about 3× on `wide-fanout`, and label
 lenses on it cost about 30% on `reachable-spaces`.
+
+Server-level cost, measured afterwards (2026-11-13, by
+`docs/masterplans/12-serve-several-isolated-tenants-from-one-en-server.md`): an A/B of the HTTP
+load benchmark between `5361988` (before this plan) and `09a7d6b` (after it, no other engine
+change) shows the `lookup` workload at -35.4% throughput, against flat checks
+(`en-server/loadbench/results/attribution-lookup-fix.json`). That workload's spaces are granted
+to inner groups, and `group.member` accepts `group#member`, so the fixpoint runs a confirming
+round over the outer groups even though they grant nothing and the answer is unchanged (105
+spaces). This is the cost the incremental fixpoint, left out of scope above, would remove, and
+the measurement to repeat if it is taken up.
 
 Friction: FRIC-1 (generic-lens labels on the new result record were not optimised away on the
 lookup hot path) is `accepted`. ADR 7's measured-exception section now covers it, and it is

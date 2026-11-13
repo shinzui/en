@@ -307,11 +307,13 @@ implementation changed their decisions, and write new ADRs for any durable decis
 recorded; one is expected: the performance gates and the verdict rule as the standing method for
 judging changes to the `en-server` request path.
 
-Before marking IR-2, ask the owner the question deferred from plan 73 (Surprises &
-Discoveries): En accepts a written tuple of a type its schema does not define, in every mode,
-so AC-2's "refused as unknown" verification does not hold as worded. Either write-time
-validation becomes its own plan outside this initiative, or AC-2's resolution records the
-narrower guarantee the isolation suite proves.
+Before marking IR-2, check the state of
+`docs/plans/78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md`, which the owner
+chose (2026-11-13) over narrowing AC-2: En accepted written tuples of undeclared types in every
+mode, so AC-2's "refused as unknown" verification did not hold. If plan 78 is complete, AC-2
+holds as written and the tenant suite asserts `schema_violation`; cite plan 78 in AC-2's
+evidence. If it is not, IR-2's resolution records the narrower guarantee the isolation suite
+proves and names plan 78 as the open follow-up.
 
 Mark IR-2 `completed` in
 `docs/improvement-requests/serve-several-isolated-tenants-from-one-en-server.md`: set
