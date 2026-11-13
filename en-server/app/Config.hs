@@ -140,7 +140,8 @@ tenantVariableSuffixes =
     "DATABASE_URL",
     "GC_WINDOW",
     "POOL_SIZE",
-    "SCHEMA_PATH"
+    "SCHEMA_PATH",
+    "SCHEMA_RELOAD_FORCE"
   ]
 
 -- | Everything that belongs to one datastore: where it lives, which schema it serves, who
@@ -154,7 +155,11 @@ data TenantConfig = TenantConfig
     --     is set, caller authentication must be active or startup is refused — a
     --     minting endpoint on an unauthenticated server would hand bearer tokens to
     --     anyone.
-    biscuit :: !(Maybe BiscuitConfig)
+    biscuit :: !(Maybe BiscuitConfig),
+    -- | Activate this store's schema on @SIGHUP@ even when it strands live grants. In
+    --     tenant mode @EN_TENANT_\<NAME\>_SCHEMA_RELOAD_FORCE@, defaulting to
+    --     @EN_SCHEMA_RELOAD_FORCE@.
+    schemaReloadForce :: !Bool
   }
   deriving stock (Generic)
 
@@ -319,7 +324,10 @@ parseServerConfig environment
       biscuit <- parseBiscuit "EN_BISCUIT_ISSUER_SECRET_KEY" environment
       checkMintingAuthGate auth biscuit
       pure
-        ( ServerConfig {shared, tenancy = SingleStore TenantConfig {store, auth, biscuit}},
+        ( ServerConfig
+            { shared,
+              tenancy = SingleStore TenantConfig {store, auth, biscuit, schemaReloadForce = shared ^. #schemaReloadForce}
+            },
           authWarnings <> storeWarnings
         )
 
@@ -382,7 +390,7 @@ parseTenantServerConfig environment = do
   shared <- parseSharedConfig environment
   defaultPool <- parsePool environment
   defaultGcWindow <- Text.pack <$> withDefaultIn environment "EN_GC_WINDOW" "24 hours" nonEmptyString
-  tenants <- traverse (\name -> (name,) <$> parseTenant environment defaultPool defaultGcWindow name) names
+  tenants <- traverse (\name -> (name,) <$> parseTenant environment shared defaultPool defaultGcWindow name) names
   rejectSharedSecrets tenants
   rejectSharedDatabases tenants
   pure (ServerConfig {shared, tenancy = Tenants tenants}, [])
@@ -448,8 +456,8 @@ rejectTenantVariablesWithoutTenants environment =
         Text.pack variable
           <> " is set but EN_TENANTS is not. Declare the tenants with EN_TENANTS=name,... or remove the per-tenant variables."
 
-parseTenant :: Map String String -> PoolConfig -> Text -> TenantName -> Either Text TenantConfig
-parseTenant environment defaultPool defaultGcWindow name = do
+parseTenant :: Map String String -> SharedConfig -> PoolConfig -> Text -> TenantName -> Either Text TenantConfig
+parseTenant environment shared defaultPool defaultGcWindow name = do
   databaseUrl <- requiredIn environment (variable "DATABASE_URL") ("a PostgreSQL connection string for tenant " <> tenant <> ".")
   schemaPath <- requiredIn environment (variable "SCHEMA_PATH") ("the schema file tenant " <> tenant <> " serves.")
   poolSize <- withDefaultIn environment (variable "POOL_SIZE") (defaultPool ^. #size) positive
@@ -471,6 +479,7 @@ parseTenant environment defaultPool defaultGcWindow name = do
     (Text.pack (variable "API_KEYS_READ_WRITE") <> " and " <> Text.pack (variable "API_KEYS_READ_ONLY"))
     keys
   biscuit <- parseBiscuit (variable "BISCUIT_ISSUER_SECRET_KEY") environment
+  schemaReloadForce <- withDefaultIn environment (variable "SCHEMA_RELOAD_FORCE") (shared ^. #schemaReloadForce) boolean
   pure
     TenantConfig
       { store =
@@ -481,7 +490,8 @@ parseTenant environment defaultPool defaultGcWindow name = do
               pool = defaultPool & #size .~ poolSize
             },
         auth = AuthKeys keys,
-        biscuit
+        biscuit,
+        schemaReloadForce
       }
   where
     variable = tenantVariable name

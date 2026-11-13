@@ -38,7 +38,7 @@ module Tenant
   )
 where
 
-import Config (BiscuitConfig (..), SharedConfig (..), StoreConfig (..), TenantConfig (..), TenantName (..), validateGcWindow)
+import Config (BiscuitConfig (..), SharedConfig (..), StoreConfig (..), TenantConfig (..), TenantName (..), tenantVariable, validateGcWindow)
 import Control.Exception (IOException, try)
 import Data.Foldable (traverse_)
 import Data.Generics.Labels ()
@@ -102,6 +102,8 @@ data TenantStack = TenantStack
     --     unchanged, and @[tenant NAME] @ otherwise.
     logPrefix :: !Text,
     store :: !StoreConfig,
+    -- | Activate a reload that strands live grants; see 'reloadStack'.
+    schemaReloadForce :: !Bool,
     pool :: !Pool.Pool,
     consistency :: !ConsistencyConfig,
     activeSchema :: !(IORef ActiveSchema),
@@ -375,6 +377,7 @@ buildStack shared requestLogger name tenantConfig = do
       { name,
         logPrefix,
         store = storeConfig,
+        schemaReloadForce = tenantConfig ^. #schemaReloadForce,
         pool,
         consistency = config,
         activeSchema = activeSchemaRef,
@@ -416,13 +419,14 @@ mintEnvFromConfig cfg =
 -- An unchanged file is not a reload. The swap is skipped when the candidate's hash equals the
 -- active one's, which also skips the token-invalidation warning — an operator who signals twice
 -- should not be told, falsely, that they have just invalidated every token in flight.
-reloadStack :: SharedConfig -> TenantStack -> IO ()
-reloadStack shared stack =
+reloadStack :: TenantStack -> IO ()
+reloadStack stack =
   case (stack ^. #store . #schemaPath) of
     Nothing -> say "SIGHUP received but no EN_SCHEMA_PATH is set; nothing to reload."
     Just path -> reloadFrom path
   where
     say = stackSay stack
+    forceVariable = maybe "EN_SCHEMA_RELOAD_FORCE" (\name -> Text.pack (tenantVariable name "SCHEMA_RELOAD_FORCE")) (stack ^. #name)
     activeSchemaRef = stack ^. #activeSchema
     Runner runAppNow = stack ^. #runNow
 
@@ -449,10 +453,10 @@ reloadStack shared stack =
       validateTuplesAgainstSchema candidate revision
 
     activate candidate graph oldHash newHash report
-      | not (null (report ^. #orphans)) && not (shared ^. #schemaReloadForce) = do
+      | not (null (report ^. #orphans)) && not (stack ^. #schemaReloadForce) = do
           say ("Schema reload refused: " <> orphanSummary newHash report)
           traverse_ (say . renderTupleOrphan) (report ^. #orphans)
-          say "reload refused; set EN_SCHEMA_RELOAD_FORCE=true to activate anyway."
+          say ("reload refused; set " <> forceVariable <> "=true to activate anyway.")
       | otherwise = do
           loadedAt <- getCurrentTime
           atomicWriteIORef

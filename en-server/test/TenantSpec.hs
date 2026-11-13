@@ -9,6 +9,7 @@
 -- client would refuse to send.
 module Main (main) where
 
+import Control.Concurrent (threadDelay)
 import Control.Monad (forM_, replicateM, unless)
 import Data.Aeson (Value, (.:), (.=))
 import Data.Aeson qualified as Aeson
@@ -25,6 +26,7 @@ import System.Directory (doesFileExist)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Posix.Signals (sigHUP)
 import Test.Tasty (TestTree, defaultMain, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCaseSteps)
 
@@ -36,7 +38,14 @@ main =
       [ upgradeTest,
         isolationTest,
         rateLimitTest,
-        storageSeparationTest
+        storageSeparationTest,
+        testGroup
+          "independent lifecycles"
+          [ reloadTest,
+            reloadContainmentTest,
+            grantGenerationTest,
+            garbageCollectionTest
+          ]
       ]
 
 -- * AC-1: a server without tenant configuration upgrades in place
@@ -146,6 +155,10 @@ data Fixture = Fixture
   { alphaPostgres :: PostgresInstance,
     betaPostgres :: PostgresInstance,
     server :: RunningServer,
+    alphaSchemaPath :: FilePath,
+    betaSchemaPath :: FilePath,
+    alphaUrl :: Text,
+    betaUrl :: Text,
     alpha :: Client,
     alphaReadOnly :: Client,
     beta :: Client
@@ -188,6 +201,10 @@ withTwoTenants extra action =
               { alphaPostgres,
                 betaPostgres,
                 server,
+                alphaSchemaPath = alphaPath,
+                betaSchemaPath = betaPath,
+                alphaUrl,
+                betaUrl,
                 alpha = Client manager server alphaWriter,
                 alphaReadOnly = Client manager server alphaReader,
                 beta = Client manager server betaWriter
@@ -341,6 +358,125 @@ storageSeparationTest = testCaseSteps "a tenant keeps serving while the other's 
     writeTuple b ("repo", "r1", "reader", "bob") >>= expectProblem 503 "store_error"
     check b fullyConsistent ("repo", "r1", "read", "bob") >>= expectProblem 503 "store_error"
     lookupObjects b fullyConsistent "repo" "bob" Nothing >>= expectProblem 503 "store_error"
+
+-- * AC-4: independent lifecycles
+
+-- | A compatible edit to one tenant's schema, then @SIGHUP@: only that tenant's schema and
+-- tokens change.
+reloadTest :: TestTree
+reloadTest = testCaseSteps "a schema reload swaps one tenant and invalidates only its tokens" \step ->
+  withTwoTenants [] \fixture -> do
+    let a = alpha fixture
+        b = beta fixture
+    tokenA <- writeTuple a ("team", "t1", "member", "ann") >>= expectStatus 200 >>= field "token"
+    tokenB <- writeTuple b ("team", "t1", "member", "bob") >>= expectStatus 200 >>= field "token"
+    beforeA <- schemaInfo a
+    beforeB <- schemaInfo b
+
+    step "append a relation to alpha's schema and send SIGHUP"
+    appendFile (alphaSchemaPath fixture) "object folder {\n  relation viewer: user\n  permission view = viewer\n}\n"
+    signalServer (server fixture) sigHUP
+    afterA <- awaitSchemaChange a beforeA
+
+    step "beta's schema, load time and tokens are untouched"
+    afterB <- schemaInfo b
+    assertEqual "beta's schema" beforeB afterB
+    assertBool "alpha's hash changed" (fst afterA /= fst beforeA)
+    decisionB <- check b (atLeastAsFresh tokenB) ("team", "t1", "membership", "bob") >>= expectStatus 200 >>= decisionOf
+    assertEqual "beta's pre-reload token still validates" "allowed" decisionB
+    check a (atLeastAsFresh tokenA) ("team", "t1", "membership", "ann") >>= expectProblem 400 "invalid_consistency_token"
+
+-- | One @SIGHUP@ with a broken file for alpha and a good edit for beta: alpha keeps serving
+-- its previous schema, beta is reloaded.
+reloadContainmentTest :: TestTree
+reloadContainmentTest = testCaseSteps "a failed reload of one tenant does not stop the other's" \step ->
+  withTwoTenants [] \fixture -> do
+    let a = alpha fixture
+        b = beta fixture
+    beforeA <- schemaInfo a
+    beforeB <- schemaInfo b
+    step "break alpha's file, edit beta's, send one SIGHUP"
+    writeFile (alphaSchemaPath fixture) "object user {\n  this is not a schema\n"
+    appendFile (betaSchemaPath fixture) "object folder {\n  relation viewer: user\n  permission view = viewer\n}\n"
+    signalServer (server fixture) sigHUP
+    _ <- awaitSchemaChange b beforeB
+    step "alpha still serves its previous schema and its refusal is logged under its name"
+    afterA <- schemaInfo a
+    assertEqual "alpha's schema" beforeA afterA
+    output <- capturedLines (server fixture)
+    assertBool
+      ("no prefixed refusal for alpha in:\n" <> Text.unpack (Text.unlines output))
+      (any (\line -> "[tenant alpha] schema reload failed" `Text.isInfixOf` line) output)
+
+-- | Writes under alpha advance alpha's grant generation and never beta's.
+grantGenerationTest :: TestTree
+grantGenerationTest = testCaseSteps "one tenant's writes never move another tenant's grant generation" \_step ->
+  withTwoTenants [] \fixture -> do
+    let generation url = queryDatabaseText url "SELECT generation::text FROM en_grant_generation_head"
+    _ <- writeTuple (beta fixture) ("team", "b1", "member", "bob") >>= expectStatus 200
+    alphaBefore <- generation (alphaUrl fixture)
+    betaBefore <- generation (betaUrl fixture)
+    forM_ ["a1", "a2", "a3"] \team ->
+      writeTuple (alpha fixture) ("team", team, "member", "ann") >>= expectStatus 200
+    alphaAfter <- generation (alphaUrl fixture)
+    betaAfter <- generation (betaUrl fixture)
+    assertEqual "beta's generation" betaBefore betaAfter
+    assertBool ("alpha's generation advanced: " <> show (alphaBefore, alphaAfter)) (readInt alphaAfter > readInt alphaBefore)
+
+-- | Each tenant's maintenance loop reaps only its own database, under its own GC window:
+-- alpha (1 second) reaps its deleted row; beta (1 hour) keeps its own.
+garbageCollectionTest :: TestTree
+garbageCollectionTest = testCaseSteps "garbage collection runs per tenant, under each tenant's window" \step ->
+  withTwoTenants
+    [ ("EN_MAINTENANCE_INTERVAL_SECONDS", "1"),
+      ("EN_TENANT_ALPHA_GC_WINDOW", "1 second"),
+      ("EN_TENANT_BETA_GC_WINDOW", "1 hour")
+    ]
+    \fixture -> do
+      let rows url = readInt <$> queryDatabaseText url "SELECT count(*)::text FROM relation_tuple"
+      step "each tenant writes, then deletes, one relationship"
+      forM_ [(alpha fixture, "ann"), (beta fixture, "bob")] \(client, user) -> do
+        _ <- writeTuple client ("team", "gc", "member", user) >>= expectStatus 200
+        deleteTuple client ("team", "gc", "member", user) >>= expectStatus 200
+      betaRows <- rows (betaUrl fixture)
+      assertEqual "beta keeps its soft-deleted row" 1 betaRows
+      step "alpha's maintenance reaps alpha's row"
+      awaitCondition 30 "alpha's deleted row to be reaped" ((== 0) <$> rows (alphaUrl fixture))
+      step "beta's row is still there, and each tenant logged its own passes"
+      betaRowsAfter <- rows (betaUrl fixture)
+      assertEqual "beta's rows after alpha's reaping" 1 betaRowsAfter
+      output <- capturedLines (server fixture)
+      let passes tenant = filter (("[tenant " <> tenant <> "] maintenance: horizon=") `Text.isPrefixOf`) output
+      assertBool "alpha logged a pass that reaped" (any (" reaped=1 " `Text.isInfixOf`) (passes "alpha"))
+      assertBool "beta logged its own passes" (not (null (passes "beta")))
+      assertBool "beta reaped nothing" (all (" reaped=0 " `Text.isInfixOf`) (passes "beta"))
+
+-- | The served schema's hash and load time.
+schemaInfo :: Client -> IO (Text, Text)
+schemaInfo client = do
+  info <- getSchemaReply client >>= expectStatus 200
+  (,) <$> field "hash" info <*> field "loadedAt" info
+
+-- | Wait for the client's tenant to serve a different schema than @before@.
+awaitSchemaChange :: Client -> (Text, Text) -> IO (Text, Text)
+awaitSchemaChange client before = do
+  awaitCondition 10 "the schema to be reloaded" ((/= before) <$> schemaInfo client)
+  schemaInfo client
+
+-- | Poll every 100 ms for up to @seconds@.
+awaitCondition :: Int -> String -> IO Bool -> IO ()
+awaitCondition seconds description condition = go (seconds * 10)
+  where
+    go :: Int -> IO ()
+    go remaining = do
+      done <- condition
+      unless done $
+        if remaining <= 0
+          then assertFailure ("timed out waiting for " <> description)
+          else threadDelay 100_000 >> go (remaining - 1)
+
+readInt :: Text -> Int
+readInt = read . Text.unpack
 
 -- * Identity
 

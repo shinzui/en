@@ -3,7 +3,7 @@ module Main (main) where
 import Config (BiscuitConfig (..), ServerConfig (..), SharedConfig (..), Tenancy (..), TenantConfig (..), TenantName (..), TlsConfig (..), loadServerConfig, loadStoreConfig, renderTenantName)
 import Control.Concurrent.Async (withAsync)
 import Control.Concurrent.MVar (newMVar, withMVar)
-import Control.Exception (bracket)
+import Control.Exception (SomeException, bracket, try)
 import Control.Monad (foldM)
 import Data.Aeson qualified as Aeson
 import Data.ByteString.Lazy qualified as LazyByteString
@@ -181,7 +181,7 @@ runServe serverConfig = do
       bracket (buildStack shared requestLogger Nothing tenantConfig) releaseStack \stack ->
         withTelemetry (shared ^. #telemetry) \(tracerProvider, otelMiddleware) -> do
           printServingLines shared stack (tenantConfig ^. #biscuit)
-          installReloadHandler shared [stack]
+          installReloadHandler [stack]
           let servantTelemetryMiddleware =
                 maybe id (\provider -> openTelemetryServantMiddleware provider servedProxy) tracerProvider
               -- Outermost first. The WAI telemetry layer creates and attaches the server
@@ -203,7 +203,7 @@ runServe serverConfig = do
         let stackList = map fst stacks
         withTelemetry (shared ^. #telemetry) \(tracerProvider, otelMiddleware) -> do
           printTenantServingLines shared stacks
-          installReloadHandler shared stackList
+          installReloadHandler stackList
           (livenessProbe, readinessProbe) <- tenantProbes stackList
           let servantTelemetryMiddleware =
                 maybe id (\provider -> openTelemetryServantMiddleware provider servedProxy) tracerProvider
@@ -298,7 +298,7 @@ withMaintenance shared stacks action =
   foldr
     ( \stack inner ->
         let Runner runAppNow = stack ^. #runNow
-         in withAsync (runMaintenanceLoop (shared ^. #maintenance) runAppNow) \_maintenance -> inner
+         in withAsync (runMaintenanceLoop (stack ^. #logPrefix) (shared ^. #maintenance) runAppNow) \_maintenance -> inner
     )
     action
     stacks
@@ -308,13 +308,17 @@ withMaintenance shared stacks action =
 -- One writer, serialized. Two SIGHUPs in flight would otherwise race to
 -- `atomicWriteIORef`, and the loser's orphan report would describe a schema that is
 -- not the one now serving.
-installReloadHandler :: SharedConfig -> [TenantStack] -> IO ()
-installReloadHandler shared stacks = do
+--
+-- Each stack is reloaded on its own: a stack whose reload throws is logged, and the next
+-- stack is still reloaded. ('reloadStack' already turns every expected failure into a
+-- refusal; this catches the unexpected.)
+installReloadHandler :: [TenantStack] -> IO ()
+installReloadHandler stacks = do
   reloadGuard <- newMVar ()
   _ <-
     installHandler
       sigHUP
-      (Catch (withMVar reloadGuard \() -> traverse_ (reloadStack shared) stacks))
+      (Catch (withMVar reloadGuard \() -> traverse_ reloadContained stacks))
       Nothing
   pure ()
 
@@ -351,7 +355,7 @@ printTenantServingLines shared stacks = do
       )
     say ("API keys: " <> describeKeys (config ^. #auth))
     say ("Biscuit grant minting: " <> describeMinting (config ^. #biscuit))
-    say ("Schema reload: SIGHUP" <> describeReloadSource (stack ^. #store . #schemaPath) (shared ^. #schemaReloadForce))
+    say ("Schema reload: SIGHUP" <> describeReloadSource (stack ^. #store . #schemaPath) (stack ^. #schemaReloadForce))
   where
     describeKeys = \case
       AuthDisabled -> "none"
@@ -564,6 +568,13 @@ chunksOf :: Int -> [a] -> [[a]]
 chunksOf size = \case
   [] -> []
   items -> let (chunk, rest) = splitAt size items in chunk : chunksOf size rest
+
+-- | 'reloadStack', with any unexpected exception logged instead of escaping the handler.
+reloadContained :: TenantStack -> IO ()
+reloadContained stack =
+  try @SomeException (reloadStack stack) >>= \case
+    Right () -> pure ()
+    Left err -> toStderr ("en-server: " <> (stack ^. #logPrefix) <> "schema reload failed unexpectedly: " <> showText err)
 
 -- | Run Warp until SIGTERM or SIGINT, then drain.
 --

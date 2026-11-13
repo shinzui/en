@@ -74,18 +74,22 @@ describeMaintenance config
 -- A pass that fails -- most plausibly because PostgreSQL is restarting -- is logged and
 -- the schedule continues. Asynchronous exceptions are re-thrown rather than logged, or
 -- cancellation would be swallowed and the thread would outlive the server.
-runMaintenanceLoop :: MaintenanceConfig -> RunApp -> IO ()
-runMaintenanceLoop config runApp
+--
+-- Every line is prefixed with @prefix@: empty in legacy mode, @[tenant NAME] @ for a tenant.
+runMaintenanceLoop :: Text -> MaintenanceConfig -> RunApp -> IO ()
+runMaintenanceLoop prefix config runApp
   | (config ^. #intervalSeconds) <= 0 = pure ()
   | otherwise = forever do
       threadDelay ((config ^. #intervalSeconds) * 1_000_000)
-      outcome <- try @SomeException (runPass config runApp)
+      outcome <- try @SomeException (runPass logLine config runApp)
       case outcome of
         Right () -> pure ()
         Left err
           | isAsync err -> throwIO err
           | otherwise -> logLine ("pass failed: " <> Text.pack (show err))
   where
+    logLine message = Text.putStrLn (prefix <> "maintenance: " <> message)
+
     isAsync err =
       case fromException err :: Maybe SomeAsyncException of
         Just _ -> True
@@ -103,8 +107,8 @@ runMaintenanceLoop config runApp
 -- below it and bless a snapshot needing a row this pass reaps. Publishing before
 -- reaping is what makes reaping and validation agree across time; see @docs/plans/60@
 -- Milestone 4.
-runPass :: MaintenanceConfig -> RunApp -> IO ()
-runPass config runApp =
+runPass :: (Text -> IO ()) -> MaintenanceConfig -> RunApp -> IO ()
+runPass logLine config runApp =
   runApp TupleStore.advanceGcHorizon >>= \case
     Left err -> logLine ("could not advance the garbage-collection horizon: " <> renderEnError err)
     Right horizon ->
@@ -157,7 +161,3 @@ runBatch runApp session =
 
 renderEnError :: EnError -> Text
 renderEnError = Text.pack . show
-
-logLine :: Text -> IO ()
-logLine message =
-  Text.putStrLn ("maintenance: " <> message)

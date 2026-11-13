@@ -26,6 +26,7 @@ module ServerHarness
     createEmptyDatabase,
     migrateDatabaseUrl,
     runDatabaseScript,
+    queryDatabaseText,
 
     -- * Server processes
     ServerSpec (..),
@@ -34,6 +35,7 @@ module ServerHarness
     baseUrl,
     serverPort,
     capturedLines,
+    signalServer,
     withServer,
     runServerCommand,
     baseEnvironment,
@@ -58,7 +60,10 @@ import EphemeralPg qualified as Pg
 import GHC.Clock (getMonotonicTimeNSec)
 import Hasql.Connection qualified as Connection
 import Hasql.Connection.Settings qualified as Settings
+import Hasql.Decoders qualified as Decoders
+import Hasql.Encoders qualified as Encoders
 import Hasql.Session qualified as Session
+import Hasql.Statement qualified as Statement
 import Network.HTTP.Client qualified as Http
 import Network.HTTP.Types (statusCode)
 import Network.Socket qualified as Socket
@@ -66,7 +71,7 @@ import System.Directory (createDirectoryIfMissing)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.IO (Handle, IOMode (WriteMode), hClose, hIsEOF, hSetBinaryMode, openFile)
-import System.Posix.Signals (sigKILL, signalProcess)
+import System.Posix.Signals (Signal, sigKILL, signalProcess)
 import System.Posix.User (getEffectiveUserID)
 import System.Process qualified as Process
 import System.Timeout (timeout)
@@ -172,6 +177,21 @@ runDatabaseScript url sql =
       Right () -> pure ()
       Left err -> fail ("could not run script against " <> Text.unpack url <> ": " <> show err)
 
+-- | Run a query returning one row of one column, cast to text in SQL
+-- (@SELECT generation::text FROM …@), against the database at this URL.
+queryDatabaseText :: Text -> Text -> IO Text
+queryDatabaseText url sql =
+  bracket (acquire (Settings.connectionString url)) Connection.release \connection ->
+    Connection.use connection (Session.statement () statement) >>= \case
+      Right value -> pure value
+      Left err -> fail ("could not query " <> Text.unpack url <> ": " <> show err)
+  where
+    statement =
+      Statement.unpreparable
+        sql
+        Encoders.noParams
+        (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.text)))
+
 -- | A libpq keyword/value connection string, the form @EN_DATABASE_URL@ accepts.
 databaseUrl :: Pg.Database -> Text -> Text
 databaseUrl database name =
@@ -209,8 +229,16 @@ serverSpec binary environment =
 
 data RunningServer = RunningServer
   { port :: !Int,
-    outputLines :: !(IORef (Seq Text))
+    outputLines :: !(IORef (Seq Text)),
+    processHandle :: !(IORef (Maybe Process.ProcessHandle))
   }
+
+-- | Send a signal to the running server, e.g. @sigHUP@ to reload its schemas.
+signalServer :: RunningServer -> Signal -> IO ()
+signalServer server signal =
+  readIORef (processHandle server) >>= \case
+    Nothing -> fail "the server has not been started"
+    Just handle -> Process.getPid handle >>= mapM_ (signalProcess signal)
 
 baseUrl :: RunningServer -> Text
 baseUrl server = "http://127.0.0.1:" <> Text.pack (show (port server))
@@ -240,10 +268,12 @@ withServer :: ServerSpec -> (RunningServer -> IO a) -> IO a
 withServer spec action = do
   freePort <- findFreePort
   outputLines <- newIORef Seq.empty
-  let server = RunningServer {port = freePort, outputLines}
+  processHandle <- newIORef Nothing
+  let server = RunningServer {port = freePort, outputLines, processHandle}
       env = ("EN_PORT", show freePort) : filter ((/= "EN_PORT") . fst) (environment spec)
   mask \restore -> do
     (handle, stdoutDone, stderrDone) <- spawn spec env outputLines
+    atomicModifyIORef' processHandle (const (Just handle, ()))
     let stop = stopProcess handle >> readMVar stdoutDone >> readMVar stderrDone
     result <-
       restore

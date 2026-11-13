@@ -22,6 +22,11 @@ provenance:
       at: 2026-11-13T14:29:04Z
       mode: "update"
       note: "Owner passed G0 with option 2: added G5 guidance for the tenant-mode request path"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T19:30:56Z
+      mode: "implement"
+      note: "Milestone 1: independent reload, GC and generations proven; per-tenant reload force"
 ---
 
 # Give each tenant an independent lifecycle and contain its storage faults
@@ -55,9 +60,13 @@ their documentation, which the last child plan of the parent MasterPlan writes.
 
 ## Progress
 
-- [ ] Milestone 1: independent reload, maintenance, garbage collection and grant generations
-      are proven by new cases in `en-server-tenant-tests`; a per-tenant reload-force override
-      exists.
+- [x] Milestone 1 (2026-11-13): independent reload, maintenance, garbage collection and grant
+      generations are proven by new cases in `en-server-tenant-tests` (group "independent
+      lifecycles": reload swaps one tenant and invalidates only its tokens; a failed reload of
+      one tenant does not stop the other's; one tenant's writes never move another's grant
+      generation; garbage collection runs per tenant under each tenant's window);
+      `EN_TENANT_<NAME>_SCHEMA_RELOAD_FORCE` exists (config tests: 38 pass). Maintenance and
+      reload lines carry the `[tenant NAME] ` prefix; legacy lines are unchanged.
 - [ ] Milestone 2: `import`, `export` and `check-schema` accept `--tenant NAME` and operate on
       that tenant's database only.
 - [ ] Milestone 3: a tenant whose storage is faulty at startup or later is unavailable alone and
@@ -67,7 +76,13 @@ their documentation, which the last child plan of the parent MasterPlan writes.
 
 ## Surprises & Discoveries
 
-(None yet.)
+- Observation: the garbage-collection case proves more than the plan asked by giving the two
+  tenants different windows (alpha `1 second`, beta `1 hour`): alpha's deleted row is reaped
+  while beta's stays, so the case shows both that alpha's maintenance never touches beta's
+  database and that the per-tenant GC window is honoured. Grant generations are read straight
+  from `en_grant_generation_head` rather than from a check's `grantGeneration` field, which is
+  optional in the response. The harness gained `signalServer` and `queryDatabaseText` for these
+  cases (`en-server/test-support/ServerHarness.hs`).
 
 
 ## Decision Log

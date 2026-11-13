@@ -118,6 +118,16 @@ acceptCases =
     testCase "names and keys are trimmed like the legacy lists" do
       tenants <- expectTenants (parse (("EN_TENANTS", " alpha , beta ") : alpha <> beta))
       assertEqual "names" [TenantName "alpha", TenantName "beta"] (map fst tenants),
+    testCase "schema reload force is per tenant, defaulting to the process-wide value" do
+      tenants <- expectTenants (parse (twoTenants <> [("EN_SCHEMA_RELOAD_FORCE", "true"), ("EN_TENANT_BETA_SCHEMA_RELOAD_FORCE", "false")]))
+      (a, b) <- twoOf tenants
+      assertBool "alpha inherits true" (a ^. #schemaReloadForce)
+      assertBool "beta overrides to false" (not (b ^. #schemaReloadForce)),
+    testCase "legacy mode keeps EN_SCHEMA_RELOAD_FORCE" do
+      (config, _) <- expectRight (parse (legacyEnvironment <> [("EN_SCHEMA_RELOAD_FORCE", "true")]))
+      case config ^. #tenancy of
+        SingleStore tenant -> assertBool "force" (tenant ^. #schemaReloadForce)
+        Tenants _ -> assertFailure "parsed as tenant mode",
     testCase "process-wide settings still apply" do
       (config, _) <- expectRight (parse (twoTenants <> [("EN_PORT", "9000"), ("EN_RATE_LIMIT_RPS", "5")]))
       assertEqual "port" 9000 (config ^. #shared . #port)
@@ -185,6 +195,8 @@ rejectCases =
     testCase "a per-tenant variable for an undeclared tenant" do
       expectFailure ["Unknown variable EN_TENANT_GAMMA_DATABASE_URL", "alpha, beta"] $
         parse (twoTenants <> [("EN_TENANT_GAMMA_DATABASE_URL", "postgresql://localhost/en_gamma")]),
+    testCase "an invalid per-tenant reload force" do
+      expectFailure ["EN_TENANT_ALPHA_SCHEMA_RELOAD_FORCE=yes", "true or false"] (parse (twoTenants <> [("EN_TENANT_ALPHA_SCHEMA_RELOAD_FORCE", "yes")])),
     testCase "an invalid per-tenant pool size" do
       expectFailure ["EN_TENANT_ALPHA_POOL_SIZE=0", "positive"] (parse (twoTenants <> [("EN_TENANT_ALPHA_POOL_SIZE", "0")])),
     testCase "a malformed per-tenant issuer key" do
