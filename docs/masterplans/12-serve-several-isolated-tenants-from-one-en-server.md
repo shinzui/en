@@ -207,7 +207,7 @@ per-tenant availability is reported, not gated" (plan 75). Plan 76 performs the 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | EP-1 | Build an en-server load benchmark and record the single-tenant baseline | docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md | None | None | Complete |
-| EP-2 | Serve tenants selected by API key, each from its own isolated stack | docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md | EP-1, gate G0 | None | In Progress |
+| EP-2 | Serve tenants selected by API key, each from its own isolated stack | docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md | EP-1, gate G0 | None | Complete |
 | EP-3 | Give each tenant an independent lifecycle and contain its storage faults | docs/plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md | EP-2 | None | Not Started |
 | EP-4 | Carry the tenant through logs, metrics, traces and readiness | docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md | EP-2, EP-3 | None | Not Started |
 | EP-5 | Prove tenant isolation and performance, then document tenant operations | docs/plans/76-prove-tenant-isolation-and-performance-then-document-tenant-operations.md | EP-2, EP-3, EP-4 | None | Not Started |
@@ -252,7 +252,7 @@ for gate G1; EP-3 and EP-4 run only its smoke mode (`just loadbench-smoke`). EP-
 for the last time and adds the three tenant scenarios (gates G2, G3 and G5).
 
 **The baseline binary** (`.dev/loadbench/en-server-baseline`, built from the commit recorded in
-EP-1). Owner: EP-1. It is the fixed reference for every A/B run and for EP-2's upgrade test of
+EP-1; since 2026-11-13 that is `09a7d6b`, see Decision Log). Owner: EP-1. It is the fixed reference for every A/B run and for EP-2's upgrade test of
 IR-2 AC-1. It is a build product, not a checked-in file; EP-1 provides the script that rebuilds it
 from the recorded commit.
 
@@ -291,7 +291,8 @@ EP-1 is complete (2026-11-13): the benchmark, the baseline binary (commit `53619
 single-tenant baseline and the interference preview are recorded in
 `docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md` and
 `en-server/loadbench/results/`, and were reported to the owner. Gate G0 passed on 2026-11-13
-(option 2 of the brief below), and EP-2 is in progress. EP-2 moves IR-2 to `in-progress`; EP-5
+(option 2 of the brief below). EP-2 is complete (2026-11-13): tenants are served by key from
+isolated stacks, the isolation suite passes, and G1's first run passes. EP-3 is next. EP-2 moves IR-2 to `in-progress`; EP-5
 marks it `completed`. The initiative has six gates that are not owned by a single child plan.
 Each is checked off only with benchmark or test evidence recorded in the named child plan.
 
@@ -307,6 +308,9 @@ Each is checked off only with benchmark or test evidence recorded in the named c
       every workload, at two points: the end of EP-2 Milestone 1, where the legacy request path
       changes, and EP-5, against the finished behaviour. EP-2 Milestone 3, EP-3 and EP-4 run
       `just loadbench-smoke` instead, as a functional check rather than a gate.
+      First point passed 2026-11-13 (EP-2, run on its Milestone 3 binary, so it covers every
+      legacy-path change EP-2 made): `RESULT: PASS (7 workloads, 3 rounds)` against `09a7d6b`,
+      `en-server/loadbench/results/g1-ep2.json`. The EP-5 point remains, so the box stays open.
 - [ ] **G2, no regression with idle neighbours.** One tenant of a two-tenant server, with the
       other tenant idle, shows no regression against the baseline binary serving the same
       workload alone (EP-5).
@@ -490,6 +494,27 @@ tenant (G5, added) and a tenant with idle neighbours (G2) must show no regressio
   an unavailable tenant, because `servant-health` cannot name a check in a passing response;
   EP-4 resolves it and the owner is asked to confirm.
   Date: 2026-11-12
+
+- Decision: The A/B verdict rule gates throughput only (latency is reported, not gated), `ab`
+  swaps the two databases between rounds, and the workload `schema-read` (`GET /v1/schema`)
+  is added to measure the request path alone. Applies to G1, G2 and G5.
+  Rationale: at saturation p50 is threads divided by throughput (Little's law), so gating it
+  double-counted throughput and failed a lookup drop that was inside its own noise; and the
+  database-bound workloads cannot resolve overhead on the HTTP and middleware path, which is
+  the only place tenancy touches a single-tenant server. Validated by a self-comparison
+  (PASS) and a crippled candidate (REGRESSION) before the gate run. Details in
+  `docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md`.
+  Decided with the owner.
+  Date: 2026-11-13
+
+- Decision: The reference binary for every gate is rebased from `5361988` to `09a7d6b` (the
+  commit before any tenant code, after
+  `docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md`).
+  Rationale: The first G1 run failed on `lookup` alone (req/s -31.5%). An A/B of `5361988`
+  against `09a7d6b` shows the plan-77 fixpoint lookup accounts for it (req/s -35.4%, p50
+  +53.5%), so against the old reference every later gate would flag a cost unrelated to
+  tenancy. Decided with the owner.
+  Date: 2026-11-13
 
 - Decision: Gate G0 passes with option 2. G3 is measured and reported, not go/no-go; no
   per-tenant admission bound is designed. This supersedes the 2026-11-12 entry defining G3 as a

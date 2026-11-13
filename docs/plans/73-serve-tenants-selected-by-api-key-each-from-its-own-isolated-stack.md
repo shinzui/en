@@ -17,6 +17,11 @@ provenance:
       at: 2026-11-13T02:19:34Z
       mode: "update"
       note: "Gate G1 reduced to EP-2 M1 and EP-5 with 3 rounds; smoke benchmark elsewhere; list-bin target fixed"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T15:10:10Z
+      mode: "implement"
+      note: "Milestones 1-3 implemented; G1 lookup regression traced to plan 77's lookup fix, re-run pending"
 ---
 
 # Serve tenants selected by API key, each from its own isolated stack
@@ -50,21 +55,68 @@ part of AC-6 that says a read-only key stays read-only within its tenant.
 
 ## Progress
 
-- [ ] Milestone 1: the per-datastore runtime is extracted into a `TenantStack`; a server without
+- [x] Milestone 1: the per-datastore runtime is extracted into a `TenantStack`; a server without
       `EN_TENANTS` builds exactly one and behaves as before. Existing suites pass, the upgrade
       test passes against the baseline binary, and the A/B benchmark reports `RESULT: PASS`
       (gate G1).
-- [ ] Milestone 2: `EN_TENANTS` and the per-tenant variables are parsed and validated;
-      `cabal test en-server-config-tests` covers every acceptance and rejection rule.
-- [ ] Milestone 3: requests are routed by key to per-tenant stacks;
-      `cabal test en-server-tenant-tests` passes its isolation cases, including the case that
-      exercises every alpha route while beta's PostgreSQL is stopped; `just loadbench-smoke`
-      passes; the ADR is written.
+      2026-11-13: refactor committed (`43076df`). `cabal test en-core en-servant en-server`
+      passes; the Hurl suite passes 6/6 files (run by hand, see friction entry FRIC-2); the
+      upgrade case passes against the baseline binary. G1 against the recorded baseline
+      (`5361988`) failed on `lookup` only (throughput -31.5%, p50 +49%); see Surprises &
+      Discoveries. With the reference rebased to `09a7d6b` and the verdict rule revised
+      (both decided with the owner; see the parent MasterPlan's Decision Log), gate G1 passed
+      on the Milestone 3 binary in legacy mode, which covers every change this plan made to
+      the legacy path (`en-server/loadbench/results/g1-ep2.json`):
+
+      ```text
+      workload         req/s base  req/s cand   delta   noise  verdict
+      check-direct      11070.133   10587.967   -4.4%   11.2%  PASS
+      check-nested       4455.700    4433.267   -0.5%    7.7%  PASS
+      check-cached      17173.067   16291.600   -5.1%    6.7%  PASS
+      lookup             2109.567    2140.000   +1.4%    9.0%  PASS
+      check-last-key    10084.100   10622.267   +5.3%   21.0%  PASS
+      schema-read       25839.967   28293.733   +9.5%   23.0%  PASS
+      write              8870.367    8952.900   +0.9%    8.3%  PASS
+      RESULT: PASS (7 workloads, 3 rounds)
+      ```
+- [x] Milestone 2 (2026-11-13): `EN_TENANTS` and the per-tenant variables are parsed and
+      validated; `cabal test en-server-config-tests` passes 35 cases, one per acceptance and
+      rejection rule plus legacy-mode equivalence.
+- [x] Milestone 3 (2026-11-13, `c38b735`): requests are routed by key to per-tenant stacks;
+      `cabal test en-server-tenant-tests` passes all four cases (upgrade, two-tenant
+      isolation, per-tenant rate limits, every alpha route while beta's PostgreSQL is
+      stopped); `just openapi` reports no drift; `just loadbench-smoke` passes; ADR 9 is
+      written.
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- Observation: En does not validate written tuples against the schema in any mode. A write
+  of `repo:r9#reader@user:ann` under alpha's key, whose schema has no `repo`, is accepted with
+  200 and stored in alpha's database, exactly as a single-tenant server accepts a tuple of an
+  undeclared type; `check-schema` and reload's orphan report exist to find such tuples. IR-2
+  AC-2's verification ("refused as unknown under A's schema") and this plan's isolation case
+  assumed write-time validation. The isolation case was changed to assert what isolation
+  requires: the stray tuple stays in the writer's store, never appears to the other tenant,
+  and a check of it under the writer's key is refused by the writer's schema. Adding
+  write-time validation would change `en-servant` and `en-core` for every deployment, which
+  the parent MasterPlan excludes. The owner (2026-11-13) treats it as unrelated to tenancy
+  and will decide whether to add write-time validation, or relax AC-2's wording, once the
+  initiative is done; plan 76 carries the question into IR-2's resolution.
+  Evidence: `writeTuplesHandler` in `en-servant/src/En/Tuple/Api.hs` calls
+  `applyTupleWrites` with no schema check.
+
+- Observation (resolved; see Outcomes): the first G1 run, recorded baseline `5361988` against the Milestone 1 binary,
+  reported `RESULT: REGRESSION` on `lookup` alone (req/s 2956 -> 2024, -31.5%; p50 10.1 -> 15.1
+  ms). The only engine change between the baseline commit and this plan's first commit is
+  `docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md` (`138017d`,
+  `0af9e77`), which makes lookup follow recursive usersets to a fixpoint, and the benchmark
+  fixture nests groups. The baseline binary therefore no longer represents "today's server"
+  for lookup. Evidence: `.dev/loadbench/g1-m1.json`.
+
+- Observation: the `just start-and-test` recipe assumes port 8080; on this machine another
+  process holds it. Friction entry FRIC-2
+  (`docs/friction-log/2-just-start-and-test-cannot-run-when-port-8080-is-taken.md`).
 
 
 ## Decision Log
@@ -100,6 +152,26 @@ part of AC-6 that says a read-only key stays read-only within its tenant.
   accident under a tenant's name would be a silent misconfiguration.
   Date: 2026-11-12
 
+- Decision: The configuration types `TenantName` and `TenantConfig` are defined in
+  `en-server/app/Config.hs` and re-exported by `en-server/app/Tenant.hs`, and `buildStack`
+  takes the process's request logger as an argument:
+  `buildStack :: SharedConfig -> Middleware -> Maybe TenantName -> TenantConfig -> IO TenantStack`.
+  Rationale: `Config` parses them and `Tenant` imports `Config`, so defining them in `Tenant`
+  would be a module cycle; the logger is created once because its lock serializes the one
+  stdout.
+  Date: 2026-11-13
+
+- Decision: The isolation suite speaks raw JSON over HTTP rather than through `en-client`.
+  Rationale: it needs to send stray headers and body fields a typed client cannot, and the
+  upgrade case already shows an unchanged wire; a typed client adds nothing a raw request does
+  not prove.
+  Date: 2026-11-13
+
+- Decision: Subcommands (`import`, `export`, `check-schema`) exit 2 when `EN_TENANTS` is set,
+  naming the workaround (run without `EN_TENANTS` with the tenant's database and schema).
+  Rationale: Milestone 2's rule; plan 74 adds `--tenant`.
+  Date: 2026-11-13
+
 - Decision: Biscuit grant minting (`POST /v1/grants`) is configured per tenant; there is no
   shared issuer key in tenant mode.
   Rationale: A shared signing key would let one tenant's grant verify against a verifier that
@@ -109,7 +181,32 @@ part of AC-6 that says a read-only key stays read-only within its tenant.
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Complete (2026-11-13). One `en-server` process serves several tenants, each from its own
+stack, selected only by the key that authenticated the request (`43076df`, `c38b735`).
+Delivered against IR-2: AC-1 (legacy mode unchanged; the upgrade case passes against the
+baseline binary; the Hurl suite passes), AC-2 (with the narrower guarantee below), AC-3, and
+the key-role half of AC-6, all in `cabal test en-server-tenant-tests`;
+`cabal test en-server-config-tests` covers every configuration rule (35 cases). Gate G1
+passes against the pre-tenancy reference. ADR 9 records the architecture.
+
+What differed from the plan:
+
+- En never validates written tuples against the schema, so AC-2's "refused as unknown" does
+  not hold as worded in any mode. The suite proves the stray tuple stays in the writer's
+  store and under the writer's schema. The owner will decide at the end of the initiative
+  whether to add write-time validation separately or narrow AC-2.
+- The first G1 failure came from the reference, not this plan: the recorded baseline predated
+  the plan-77 lookup fix, which alone costs this fixture's lookup about 35% throughput
+  (`en-server/loadbench/results/attribution-lookup-fix.json`). The reference is now
+  `09a7d6b`. A second run then failed on lookup p50 by 0.4 points while lookup throughput
+  passed, which exposed that gating p50 at saturation double-counts throughput. The verdict
+  rule was revised (throughput gates, databases swap per round, a `schema-read` request-path
+  workload) and validated both ways before the gate run. Lesson: a gate instrument needs a
+  "fails when it should, passes when it should" check after every change to the reference or
+  the rule, before a long run is trusted.
+
+Friction: FRIC-2 (`just start-and-test` assumes port 8080), accepted with a recorded
+workaround.
 
 
 ## Context and Orientation
@@ -374,7 +471,7 @@ cabal run -v0 en-server-loadbench -- ab \
 The last command must end with:
 
 ```text
-RESULT: PASS (6 workloads, 3 rounds)
+RESULT: PASS (7 workloads, 3 rounds)
 ```
 
 If `.dev/loadbench/en-server-baseline` is missing, rebuild it with the commit recorded in

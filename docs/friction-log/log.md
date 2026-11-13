@@ -2,6 +2,9 @@
 
 ## 2026-11-13
 
+* **Update**: FRIC-2 accepted: Status set to accepted.
+
+
 * **Addition**: FRIC-2 records detour tooling friction with mori://shinzui/en: just start-and-test cannot run when port 8080 is taken
 
 

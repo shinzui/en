@@ -127,15 +127,18 @@ All four earlier children must be Complete. In order, and what each left behind:
 `docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md`
 created the executable `en-server-loadbench` (sources in `en-server/loadbench/`, workloads in
 `Workload.hs`) and the harness `en-server/test-support/ServerHarness.hs`. Its `run` subcommand
-measures six workloads (`check-direct`, `check-nested`, `check-cached`, `lookup`,
-`check-last-key`, `write`) against one server; `ab --baseline B --candidate C` alternates two
-binaries over several rounds and applies the **verdict rule**: per workload, compare medians of
-throughput, p50 and p99; the tolerance is the larger of the measured round-to-round noise and a
-floor of 3% (throughput, p50) or 10% (p99); a candidate worse than the baseline by more than the
-tolerance is a `REGRESSION`; the command ends with `RESULT: PASS` only if every workload passes.
+measures seven workloads (`check-direct`, `check-nested`, `check-cached`, `lookup`,
+`check-last-key`, `schema-read`, `write`) against one server; `schema-read` is
+`GET /v1/schema`, answered from memory, and isolates the request path. `ab --baseline B
+--candidate C` alternates two binaries over several rounds, swapping their two databases each
+round, and applies the **verdict rule**: per workload, compare medians of throughput; the
+tolerance is the larger of the measured round-to-round noise and a floor of 3%; a candidate
+whose throughput is worse than the baseline's by more than the tolerance is a `REGRESSION`; the
+command ends with `RESULT: PASS` only if every workload passes. p50 and p99 are printed as
+`info`: at saturation p50 restates throughput (Little's law), so it does not gate.
 `interference` measures a "victim" caller alone and beside a saturating "aggressor" caller, in
 one process and in two processes. The **baseline binary**, `.dev/loadbench/en-server-baseline`,
-is `en-server` built before any tenant code existed; rebuild it with
+is `en-server` built before any tenant code existed (commit `09a7d6b`); rebuild it with
 `en-server/loadbench/build-baseline.sh <commit>` using the commit recorded in that plan. Its
 recorded baseline results are in `en-server/loadbench/results/`.
 
@@ -210,7 +213,7 @@ Add a `tenants` subcommand to `en-server-loadbench`, reusing the workloads and t
 mode serving one database, and the candidate side is the current binary started with
 `EN_TENANTS` naming exactly one tenant whose database URL, schema, keys and settings are those of
 the baseline side (the legacy variables translated to their `EN_TENANT_<NAME>_…` forms, nothing
-else changed). All six workloads run through that tenant's keys. A `PASS` means an operator who
+else changed). All seven workloads run through that tenant's keys. A `PASS` means an operator who
 adopts tenant configuration for one tenant pays nothing for it. If it regresses where G1 does
 not, the cause is in the tenant-mode request path: key-to-stack routing, the availability check
 added by `docs/plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md`,
@@ -221,7 +224,7 @@ or the tenant log and metric identity added by
 serving one database alone, and the candidate side is the current binary in tenant mode serving
 two tenants on two identically seeded databases, with all load sent through the first tenant's
 key and the second tenant idle. Per-tenant settings equal the baseline's (same pool size, same
-cache sizes). All six workloads run. A `PASS` means a tenant with idle neighbours is
+cache sizes). All seven workloads run. A `PASS` means a tenant with idle neighbours is
 indistinguishable from a dedicated server.
 
 `tenants busy-neighbour` (G3, reported, not gating) measures a victim running `check-direct` with 8 client
@@ -304,6 +307,12 @@ implementation changed their decisions, and write new ADRs for any durable decis
 recorded; one is expected: the performance gates and the verdict rule as the standing method for
 judging changes to the `en-server` request path.
 
+Before marking IR-2, ask the owner the question deferred from plan 73 (Surprises &
+Discoveries): En accepts a written tuple of a type its schema does not define, in every mode,
+so AC-2's "refused as unknown" verification does not hold as worded. Either write-time
+validation becomes its own plan outside this initiative, or AC-2's resolution records the
+narrower guarantee the isolation suite proves.
+
 Mark IR-2 `completed` in
 `docs/improvement-requests/serve-several-isolated-tenants-from-one-en-server.md`: set
 `completedAt`, `targetPlan` (the parent MasterPlan) and a `resolution` that lists the evidence
@@ -357,7 +366,7 @@ cabal run -v0 en-server-loadbench -- tenants busy-neighbour \
 `tenants busy-neighbour` prints its table and verdict for the record only:
 
 ```text
-RESULT: PASS (6 workloads)
+RESULT: PASS (7 workloads)
 ```
 
 Milestone 3:
