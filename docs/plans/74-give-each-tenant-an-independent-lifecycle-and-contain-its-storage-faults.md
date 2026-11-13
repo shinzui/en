@@ -67,8 +67,12 @@ their documentation, which the last child plan of the parent MasterPlan writes.
       generation; garbage collection runs per tenant under each tenant's window);
       `EN_TENANT_<NAME>_SCHEMA_RELOAD_FORCE` exists (config tests: 38 pass). Maintenance and
       reload lines carry the `[tenant NAME] ` prefix; legacy lines are unchanged.
-- [ ] Milestone 2: `import`, `export` and `check-schema` accept `--tenant NAME` and operate on
-      that tenant's database only.
+- [x] Milestone 2 (2026-11-13): `import`, `export` and `check-schema` accept `--tenant NAME`
+      and operate on that tenant's database only (tenant suite group "tenant-aware
+      subcommands": alpha's `check-schema` reports `3 orphan(s) across 3 live tuple(s)` with
+      none of beta's; `export --tenant beta` prints beta's two relationships; an import under
+      alpha is invisible to beta; missing, unknown and unexpected `--tenant` each exit 2).
+      Config tests: 41 pass. Diagnostics carry the `[tenant NAME] ` prefix on stderr.
 - [ ] Milestone 3: a tenant whose storage is faulty at startup or later is unavailable alone and
       recovers alone; an expected datastore id can be pinned per tenant; readiness fails only
       when no tenant can serve. The fault cases pass and `just loadbench-smoke` exits 0.
@@ -107,6 +111,16 @@ their documentation, which the last child plan of the parent MasterPlan writes.
   Rationale: Readiness removes the whole pod from traffic. Failing it for one tenant's outage
   would take every healthy tenant down with it, which is the opposite of containment.
   Date: 2026-11-12
+
+- Decision: `--tenant` may appear anywhere after the subcommand, and an unusable tenant
+  selection (missing in tenant mode, undeclared, or given without `EN_TENANTS`) exits 2 with
+  the reason, the code `usage` and an unreadable `check-schema` candidate already use. A
+  configuration error in the selected tenant's store variables (for example a missing
+  `EN_TENANT_<NAME>_DATABASE_URL`) also exits 2, since the subcommand reports it before
+  touching any store.
+  Rationale: exit 1 is reserved by `check-schema` for "the candidate strands grants"; a
+  pipeline must be able to tell a wrong command line from a dangerous schema.
+  Date: 2026-11-13
 
 - Decision: `EN_TENANT_<NAME>_EXPECTED_DATASTORE_ID` verifies the database's identity and never
   assigns it.

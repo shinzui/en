@@ -23,8 +23,26 @@ main =
       "en-server configuration"
       [ testGroup "legacy mode" legacyCases,
         testGroup "tenant mode accepts" acceptCases,
-        testGroup "tenant mode rejects" rejectCases
+        testGroup "tenant mode rejects" rejectCases,
+        testGroup "subcommand store for --tenant" subcommandCases
       ]
+
+subcommandCases :: [TestTree]
+subcommandCases =
+  [ testCase "reads only the named tenant's store, needing no keys" do
+      store <-
+        expectRight . parseTenantStoreConfig (TenantName "beta") . Map.fromList $
+          unsetVar "EN_TENANT_BETA_API_KEYS_READ_WRITE" twoTenants <> [("EN_TENANT_BETA_POOL_SIZE", "2")]
+      assertEqual "database" "postgresql://localhost/en_beta" (store ^. #databaseUrl)
+      assertEqual "schema" (Just "/etc/en/beta.en") (store ^. #schemaPath)
+      assertEqual "pool" 2 (store ^. #pool . #size),
+    testCase "an undeclared tenant names the declared ones" do
+      expectFailure ["Unknown tenant gamma", "alpha, beta"] $
+        parseTenantStoreConfig (TenantName "gamma") (Map.fromList twoTenants),
+    testCase "--tenant without EN_TENANTS" do
+      expectFailure ["--tenant needs EN_TENANTS"] $
+        parseTenantStoreConfig (TenantName "alpha") (Map.fromList legacyEnvironment)
+  ]
 
 -- * Legacy mode
 

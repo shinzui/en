@@ -24,6 +24,7 @@ import Network.HTTP.Types (Header, statusCode)
 import ServerHarness
 import System.Directory (doesFileExist)
 import System.Environment (lookupEnv)
+import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Signals (sigHUP)
@@ -45,6 +46,11 @@ main =
             reloadContainmentTest,
             grantGenerationTest,
             garbageCollectionTest
+          ],
+        testGroup
+          "tenant-aware subcommands"
+          [ subcommandTest,
+            subcommandSelectionTest
           ]
       ]
 
@@ -159,6 +165,9 @@ data Fixture = Fixture
     betaSchemaPath :: FilePath,
     alphaUrl :: Text,
     betaUrl :: Text,
+    -- | The server's binary and complete environment, for running subcommands.
+    serverBinary :: FilePath,
+    serverEnvironment :: [(String, String)],
     alpha :: Client,
     alphaReadOnly :: Client,
     beta :: Client
@@ -205,6 +214,8 @@ withTwoTenants extra action =
                 betaSchemaPath = betaPath,
                 alphaUrl,
                 betaUrl,
+                serverBinary = binary,
+                serverEnvironment = environment,
                 alpha = Client manager server alphaWriter,
                 alphaReadOnly = Client manager server alphaReader,
                 beta = Client manager server betaWriter
@@ -450,6 +461,66 @@ garbageCollectionTest = testCaseSteps "garbage collection runs per tenant, under
       assertBool "alpha logged a pass that reaped" (any (" reaped=1 " `Text.isInfixOf`) (passes "alpha"))
       assertBool "beta logged its own passes" (not (null (passes "beta")))
       assertBool "beta reaped nothing" (all (" reaped=0 " `Text.isInfixOf`) (passes "beta"))
+
+-- * AC-4: tenant-aware subcommands
+
+-- | @check-schema@, @export@ and @import@ with @--tenant@ see one tenant's store only.
+subcommandTest :: TestTree
+subcommandTest = testCaseSteps "check-schema, export and import act on one tenant's store" \step ->
+  withSystemTempDirectory "en-tenant-subcommands" \directory ->
+    withTwoTenants [] \fixture -> do
+      let run arguments = runServerCommand (serverSpec (serverBinary fixture) (serverEnvironment fixture)) arguments
+      forM_ ["a1", "a2", "a3"] \team -> writeTuple (alpha fixture) ("team", team, "member", "ann") >>= expectStatus 200
+      forM_ ["b1", "b2"] \team -> writeTuple (beta fixture) ("team", team, "member", "bob") >>= expectStatus 200
+
+      step "check-schema --tenant alpha counts only alpha's relationships"
+      let candidate = directory </> "no-team.en"
+      writeFile candidate "object user {}\nobject document {\n  relation viewer: user\n  permission view = viewer\n}\n"
+      (checked, checkOut, _) <- run ["check-schema", "--tenant", "alpha", candidate]
+      assertEqual "check-schema exit (strands grants)" (ExitFailure 1) checked
+      assertBool ("alpha's three orphans in:\n" <> Text.unpack checkOut) ("3 orphan(s) across 3 live tuple(s)" `Text.isInfixOf` checkOut)
+      assertBool "no beta relationship in the report" (not (any (`Text.isInfixOf` checkOut) ["b1", "b2", "bob"]))
+
+      step "export --tenant beta prints only beta's relationships"
+      (exported, exportOut, _) <- run ["export", "--tenant", "beta"]
+      assertEqual "export exit" ExitSuccess exported
+      assertEqual "beta's relationships" 2 (length (Text.lines exportOut))
+      assertBool "no alpha relationship exported" (not (any (`Text.isInfixOf` exportOut) ["a1", "a2", "a3", "ann"]))
+
+      step "import --tenant alpha writes only to alpha"
+      let file = directory </> "import.ndjson"
+      LazyByteString.writeFile file (Aeson.encode (tupleJson ("document", "imported", "viewer", "zed")) <> "\n")
+      (imported, importOut, importErr) <- run ["import", "--tenant", "alpha", "--file", file]
+      assertEqual ("import exit: " <> Text.unpack importErr) ExitSuccess imported
+      token <- maybe (assertFailure ("no token line in " <> show importOut)) pure (Text.stripPrefix "token: " =<< lastLine importOut)
+      decision <- check (alpha fixture) (atLeastAsFresh token) ("document", "imported", "view", "zed") >>= expectStatus 200 >>= decisionOf
+      assertEqual "alpha sees the import" "allowed" decision
+      queryBySubject (beta fixture) "zed" >>= expectStatus 200 >>= expectNoMention ["zed", "imported"]
+  where
+    lastLine text = case reverse (filter (not . Text.null) (Text.lines text)) of
+      line : _ -> Just line
+      [] -> Nothing
+
+-- | The rules for choosing a tenant: required in tenant mode, must be declared, and
+-- meaningless without @EN_TENANTS@. Each is exit 2, like any unusable command line.
+subcommandSelectionTest :: TestTree
+subcommandSelectionTest = testCaseSteps "subcommands refuse a missing, unknown or unexpected --tenant" \step ->
+  withTwoTenants [] \fixture -> do
+    let run environment arguments = runServerCommand (serverSpec (serverBinary fixture) environment) arguments
+    step "no --tenant in tenant mode lists the tenants"
+    (missing, _, missingErr) <- run (serverEnvironment fixture) ["export"]
+    assertEqual "exit" (ExitFailure 2) missing
+    assertBool ("names the tenants: " <> Text.unpack missingErr) ("--tenant (alpha, beta)" `Text.isInfixOf` missingErr)
+    step "an undeclared tenant"
+    (unknown, _, unknownErr) <- run (serverEnvironment fixture) ["export", "--tenant", "gamma"]
+    assertEqual "exit" (ExitFailure 2) unknown
+    assertBool ("names gamma: " <> Text.unpack unknownErr) ("Unknown tenant gamma" `Text.isInfixOf` unknownErr)
+    step "--tenant without EN_TENANTS"
+    base <- baseEnvironment
+    let legacy = base <> [("EN_DATABASE_URL", Text.unpack (alphaUrl fixture))]
+    (unexpected, _, unexpectedErr) <- run legacy ["export", "--tenant", "alpha"]
+    assertEqual "exit" (ExitFailure 2) unexpected
+    assertBool ("explains: " <> Text.unpack unexpectedErr) ("--tenant needs EN_TENANTS" `Text.isInfixOf` unexpectedErr)
 
 -- | The served schema's hash and load time.
 schemaInfo :: Client -> IO (Text, Text)

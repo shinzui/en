@@ -1,6 +1,6 @@
 module Main (main) where
 
-import Config (BiscuitConfig (..), ServerConfig (..), SharedConfig (..), Tenancy (..), TenantConfig (..), TenantName (..), TlsConfig (..), loadServerConfig, loadStoreConfig, renderTenantName)
+import Config (BiscuitConfig (..), ServerConfig (..), SharedConfig (..), Tenancy (..), TenantConfig (..), TenantName (..), TlsConfig (..), loadServerConfig, loadStoreConfig, loadTenantStoreConfig, parseTenantNames, renderTenantName)
 import Control.Concurrent.Async (withAsync)
 import Control.Concurrent.MVar (newMVar, withMVar)
 import Control.Exception (SomeException, bracket, try)
@@ -83,9 +83,9 @@ instance (HasEndpoint sub) => HasEndpoint (RelayPage defaultSize maxSize Servant
 -- any process is touched, from CI or a deploy pipeline, against production data.
 data Command
   = Serve
-  | Import FilePath Int
-  | Export
-  | CheckSchema FilePath
+  | Import (Maybe TenantName) FilePath Int
+  | Export (Maybe TenantName)
+  | CheckSchema (Maybe TenantName) FilePath
 
 -- | Tuples per import transaction when @--batch-size@ is not given.
 defaultBatchSize :: Int
@@ -106,43 +106,66 @@ main = do
       runServe serverConfig
     -- A subcommand's stdout carries data -- the export stream, the import's
     -- token line -- so every diagnostic the shared prologue emits goes to stderr.
-    Just (Import path batchSize) -> withSubcommandStore (runImport path batchSize)
-    Just Export -> withSubcommandStore runExport
+    Just (Import tenant path batchSize) -> withSubcommandStore tenant (runImport path batchSize)
+    Just (Export tenant) -> withSubcommandStore tenant runExport
     -- The candidate is read and validated before the store config is even loaded, so a
     -- typo in a schema file costs no database round trip and no misleading "serving the
     -- built-in demo schema" warning from a command that serves nothing.
-    Just (CheckSchema path) -> do
+    Just (CheckSchema tenant path) -> do
       candidate <- loadCandidateSchema path >>= either candidateFailure pure
-      withSubcommandStore (runCheckSchema candidate)
+      withSubcommandStore tenant (runCheckSchema candidate)
 
 -- | The shared prologue of the bulk subcommands.
 --
 -- Reads 'loadStoreConfig' rather than 'loadServerConfig': a command that binds no
 -- port has no API keys, rate limit, or TLS material to configure, and
 -- 'loadServerConfig' fails closed without them -- correctly, for a server.
-withSubcommandStore :: (LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()) -> IO ()
-withSubcommandStore action = do
-  -- A subcommand acts on one datastore, and nothing selects one of several yet.
-  lookupEnv "EN_TENANTS" >>= \case
-    Nothing -> pure ()
-    Just _ ->
+--
+-- A subcommand acts on one datastore. In tenant mode @--tenant NAME@ chooses it, and the
+-- command reads only that tenant's store variables. A missing, unknown or unexpected
+-- @--tenant@ exits 2, like any other unusable command line.
+withSubcommandStore :: Maybe TenantName -> (LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()) -> IO ()
+withSubcommandStore tenant action = do
+  tenants <- lookupEnv "EN_TENANTS"
+  (storeConfig, say) <- case (tenants, tenant) of
+    (Nothing, Nothing) -> do
+      (storeConfig, warnings) <- loadStoreConfig >>= either configFailure pure
+      traverse_ toStderr warnings
+      pure (storeConfig, toStderr)
+    (Just declared, Nothing) ->
       candidateFailure
-        "EN_TENANTS is set, so this command cannot tell which tenant to act on. Run it without EN_TENANTS, with that tenant's database and schema in EN_DATABASE_URL and EN_SCHEMA_PATH."
-  (storeConfig, warnings) <- loadStoreConfig >>= either configFailure pure
-  traverse_ toStderr warnings
-  bracket (openStore toStderr storeConfig) (Pool.release . (^. #pool)) \opened ->
+        ( "EN_TENANTS is set; choose a tenant with --tenant ("
+            <> either (const (Text.pack declared)) (Text.intercalate ", " . map renderTenantName . NonEmpty.toList) (parseTenantNames declared)
+            <> ")"
+        )
+    (_, Just name) -> do
+      storeConfig <- loadTenantStoreConfig name >>= either candidateFailure pure
+      pure (storeConfig, toStderr . (("[tenant " <> renderTenantName name <> "] ") <>))
+  bracket (openStore say storeConfig) (Pool.release . (^. #pool)) \opened ->
     action (opened ^. #loadedSchema) (opened ^. #pool) (opened ^. #consistency)
 
 parseCommand :: [String] -> Maybe Command
-parseCommand = \case
-  [] -> Just Serve
-  ["export"] -> Just Export
-  ["check-schema", path] -> Just (CheckSchema path)
-  ("import" : rest) -> parseImport Nothing defaultBatchSize rest
-  _ -> Nothing
+parseCommand arguments = do
+  (tenant, rest) <- extractTenant arguments
+  case rest of
+    [] | isNothing tenant -> Just Serve
+    ["export"] -> Just (Export tenant)
+    ["check-schema", path] -> Just (CheckSchema tenant path)
+    ("import" : options) -> (\build -> build tenant) <$> parseImport Nothing defaultBatchSize options
+    _ -> Nothing
   where
+    -- @--tenant NAME@ may appear anywhere after the subcommand, at most once.
+    extractTenant = \case
+      [] -> Just (Nothing, [])
+      ("--tenant" : name : rest) -> do
+        (again, remaining) <- extractTenant rest
+        guard (isNothing again)
+        Just (Just (TenantName (Text.pack name)), remaining)
+      ["--tenant"] -> Nothing
+      (other : rest) -> fmap (other :) <$> extractTenant rest
+
     parseImport path batchSize = \case
-      [] -> Import <$> path <*> Just batchSize
+      [] -> (\file tenant -> Import tenant file batchSize) <$> path
       ("--file" : value : rest) -> parseImport (Just value) batchSize rest
       ("--batch-size" : value : rest) -> do
         parsed <- readMaybe value
@@ -156,11 +179,12 @@ usage = do
     (Text.hPutStrLn stderr)
     [ "usage:",
       "  en-server                                     serve the HTTP API",
-      "  en-server import --file PATH [--batch-size N] import newline-delimited-JSON tuples",
-      "  en-server export                              write every live tuple as newline-delimited JSON",
-      "  en-server check-schema PATH                   report which live tuples PATH would strand",
+      "  en-server import --file PATH [--batch-size N] [--tenant NAME]  import newline-delimited-JSON tuples",
+      "  en-server export [--tenant NAME]                               write every live tuple as newline-delimited JSON",
+      "  en-server check-schema [--tenant NAME] PATH                    report which live tuples PATH would strand",
       "",
-      "All four read EN_DATABASE_URL and the optional EN_SCHEMA_PATH.",
+      "All four read EN_DATABASE_URL and the optional EN_SCHEMA_PATH. With EN_TENANTS set,",
+      "the subcommands require --tenant NAME and read that tenant's EN_TENANT_<NAME>_* store.",
       "check-schema exits 0 when the candidate strands nothing, 1 when it strands grants,",
       "and 2 when the candidate itself cannot be read, parsed, or validated."
     ]

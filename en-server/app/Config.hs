@@ -29,7 +29,10 @@ module Config
     BiscuitConfig (..),
     loadServerConfig,
     loadStoreConfig,
+    loadTenantStoreConfig,
     parseServerConfig,
+    parseTenantStoreConfig,
+    parseTenantNames,
     validateGcWindow,
     knownVariables,
     storeVariables,
@@ -285,6 +288,44 @@ loadStoreConfig = do
   pure (parseStoreConfig (Map.fromList present))
   where
     readVariable name = fmap ((,) name) <$> lookupEnv name
+
+-- | One tenant's store, for the subcommands run with @--tenant NAME@.
+--
+-- Reads @EN_TENANTS@, that tenant's @EN_TENANT_\<NAME\>_*@ store variables and the
+-- process-wide pool and GC defaults, and nothing a serving process adds: no keys, no rate
+-- limit, no TLS, exactly as 'loadStoreConfig' for legacy mode.
+loadTenantStoreConfig :: TenantName -> IO (Either Text StoreConfig)
+loadTenantStoreConfig name = do
+  environment <- getEnvironment
+  let wanted variable = variable `elem` storeVariables || variable == "EN_TENANTS" || "EN_TENANT_" `isPrefixOf` variable
+  pure (parseTenantStoreConfig name (Map.fromList (filter (wanted . fst) environment)))
+
+-- | Pure part of 'loadTenantStoreConfig'. The name must be one @EN_TENANTS@ declares.
+parseTenantStoreConfig :: TenantName -> Map String String -> Either Text StoreConfig
+parseTenantStoreConfig name environment = do
+  declared <- case Map.lookup "EN_TENANTS" environment of
+    Nothing -> Left "--tenant needs EN_TENANTS: without it there is one store, read from EN_DATABASE_URL."
+    Just raw -> parseTenantNames raw
+  unless (name `elem` declared) $
+    Left $
+      "Unknown tenant "
+        <> renderTenantName name
+        <> "; EN_TENANTS declares "
+        <> Text.intercalate ", " (renderTenantName <$> NonEmpty.toList declared)
+        <> "."
+  defaultPool <- parsePool environment
+  defaultGcWindow <- Text.pack <$> withDefaultIn environment "EN_GC_WINDOW" "24 hours" nonEmptyString
+  databaseUrl <- requiredIn environment (tenantVariable name "DATABASE_URL") ("a PostgreSQL connection string for tenant " <> renderTenantName name <> ".")
+  schemaPath <- requiredIn environment (tenantVariable name "SCHEMA_PATH") ("the schema file tenant " <> renderTenantName name <> " serves.")
+  poolSize <- withDefaultIn environment (tenantVariable name "POOL_SIZE") (defaultPool ^. #size) positive
+  gcWindow <- Text.pack <$> withDefaultIn environment (tenantVariable name "GC_WINDOW") (Text.unpack defaultGcWindow) nonEmptyString
+  pure
+    StoreConfig
+      { databaseUrl = Text.pack databaseUrl,
+        gcWindow,
+        schemaPath = Just schemaPath,
+        pool = defaultPool & #size .~ poolSize
+      }
 
 parseStoreConfig :: Map String String -> Either Text (StoreConfig, [Text])
 parseStoreConfig environment = do
