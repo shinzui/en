@@ -67,7 +67,7 @@ executable en-server
     hasql-pool ^>=1.4,
     hs-opentelemetry-api >=1.0 && <1.1,
     hs-opentelemetry-exporter-otlp >=1.0 && <1.1,
-    hs-opentelemetry-instrumentation-servant >=0.3 && <0.4,
+    hs-opentelemetry-instrumentation-servant >=1.0 && <1.1,
     hs-opentelemetry-instrumentation-wai >=1.0 && <1.1,
     hs-opentelemetry-sdk >=1.0 && <1.1,
     http-types,

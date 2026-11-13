@@ -58,15 +58,16 @@ source-repository-package
 -- ------------------------------------------------------------
 -- Servant route naming for OpenTelemetry.
 --
--- Upstream has no released 0.3.0.0 package. Its HasEndpoint instances do not
--- cover MultiVerb or AuthProtect, so en's NamedRoutes API fails to type-check
--- at the middleware call site, and its hs-opentelemetry-api ==0.3.* bound
--- excludes the 1.0 cohort. mori://shinzui/hs-opentelemetry-instrumentation-servant
--- supplies those instances, admits the 1.0 API, and keeps the example's
--- shutdown call compatible with that API. Keep this commit pin load-bearing
--- and deliberate until upstream releases the route and API changes.
+-- Upstream (mori://cachix/hs-opentelemetry-instrumentation-servant) now
+-- admits the hs-opentelemetry 1.0 cohort on main (c830d53, version 1.0.0.0),
+-- but it is not on Hackage and its HasEndpoint instances still do not cover
+-- MultiVerb or AuthProtect, so en's NamedRoutes API fails to type-check at the
+-- middleware call site. mori://shinzui/hs-opentelemetry-instrumentation-servant
+-- branch feat/multiverb-authprotect is upstream main plus exactly one commit
+-- adding those two instances. Drop this pin once upstream merges the instances
+-- and releases to Hackage.
 -- ------------------------------------------------------------
 source-repository-package
   type: git
   location: https://github.com/shinzui/hs-opentelemetry-instrumentation-servant.git
-  tag: 7a6f692e85295f965cd1827f9354c28af9e62742
+  tag: d79a26337faedc37fd9301e58a207cb5834fc909
