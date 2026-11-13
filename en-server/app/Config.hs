@@ -141,6 +141,7 @@ tenantVariableSuffixes =
     "API_KEYS_READ_WRITE",
     "BISCUIT_ISSUER_SECRET_KEY",
     "DATABASE_URL",
+    "EXPECTED_DATASTORE_ID",
     "GC_WINDOW",
     "POOL_SIZE",
     "SCHEMA_PATH",
@@ -162,7 +163,11 @@ data TenantConfig = TenantConfig
     -- | Activate this store's schema on @SIGHUP@ even when it strands live grants. In
     --     tenant mode @EN_TENANT_\<NAME\>_SCHEMA_RELOAD_FORCE@, defaulting to
     --     @EN_SCHEMA_RELOAD_FORCE@.
-    schemaReloadForce :: !Bool
+    schemaReloadForce :: !Bool,
+    -- | Tenant mode's @EN_TENANT_\<NAME\>_EXPECTED_DATASTORE_ID@: the datastore id this
+    --     tenant's database must already report. It is compared, never assigned; legacy
+    --     mode has none.
+    expectedDatastoreId :: !(Maybe Text)
   }
   deriving stock (Generic)
 
@@ -367,7 +372,7 @@ parseServerConfig environment
       pure
         ( ServerConfig
             { shared,
-              tenancy = SingleStore TenantConfig {store, auth, biscuit, schemaReloadForce = shared ^. #schemaReloadForce}
+              tenancy = SingleStore TenantConfig {store, auth, biscuit, schemaReloadForce = shared ^. #schemaReloadForce, expectedDatastoreId = Nothing}
             },
           authWarnings <> storeWarnings
         )
@@ -521,6 +526,7 @@ parseTenant environment shared defaultPool defaultGcWindow name = do
     keys
   biscuit <- parseBiscuit (variable "BISCUIT_ISSUER_SECRET_KEY") environment
   schemaReloadForce <- withDefaultIn environment (variable "SCHEMA_RELOAD_FORCE") (shared ^. #schemaReloadForce) boolean
+  expectedDatastoreId <- fmap Text.pack <$> optionalIn environment (variable "EXPECTED_DATASTORE_ID") nonEmptyString
   pure
     TenantConfig
       { store =
@@ -532,7 +538,8 @@ parseTenant environment shared defaultPool defaultGcWindow name = do
             },
         auth = AuthKeys keys,
         biscuit,
-        schemaReloadForce
+        schemaReloadForce,
+        expectedDatastoreId
       }
   where
     variable = tenantVariable name

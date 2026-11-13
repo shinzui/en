@@ -19,14 +19,28 @@ module Tenant
     TenantStack (..),
     Runner (..),
     buildStack,
+    buildRuntime,
     releaseStack,
     reloadStack,
     stackSay,
 
+    -- * Tenant slots: a stack, or the reason there is none
+    SlotState (..),
+    TenantSlot (..),
+    openSlot,
+    runSlot,
+    slotApplication,
+    slotProbes,
+    tenantAvailability,
+    releaseSlot,
+
     -- * Opening a store without serving it
     LoadedSchema (..),
     OpenedStore (..),
+    StoreFault (..),
     openStore,
+    loadStoreSchema,
+    connectStore,
     loadCandidateSchema,
 
     -- * Shared helpers
@@ -39,10 +53,13 @@ module Tenant
 where
 
 import Config (BiscuitConfig (..), SharedConfig (..), StoreConfig (..), TenantConfig (..), TenantName (..), tenantVariable, validateGcWindow)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (mapConcurrently)
 import Control.Exception (IOException, try)
 import Data.Foldable (traverse_)
 import Data.Generics.Labels ()
-import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
+import Data.Maybe (listToMaybe)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Data.Time (DiffTime)
@@ -73,18 +90,24 @@ import En.Schema.Parse (parseSchema)
 import En.SchemaCheck (renderTupleOrphan, validateTuplesAgainstSchema)
 import En.Servant.OpenApi (appWithOpenApiProbes)
 import En.Servant.Probes (mkProbes)
+import En.Servant.Problem (problemResponse, specStoreError)
 import En.Servant.Seam (ActiveSchema (..), AppEffects, Env (..), MintEnv (..))
 import Hasql.Connection.Settings qualified as Settings
+import Hasql.Decoders qualified as Decoders
+import Hasql.Encoders qualified as Encoders
 import Hasql.Errors qualified as Hasql
 import Hasql.Pool qualified as Pool
 import Hasql.Pool.Config qualified as Pool.Config
 import Hasql.Session (Session)
 import Hasql.Session qualified as Session
+import Hasql.Statement qualified as Statement
+import Maintenance (runMaintenanceLoop)
 import Metrics (metricsMiddleware, metricsRoute, newMetrics)
 import Middleware (rateLimitMiddleware)
 import Network.Wai qualified as Wai
 import Observability (requestIdMiddleware)
-import Servant.Health (ProbeCheck)
+import Servant.Health (ProbeCheck, ProbeVerdict (..))
+import Servant.Health.Check (boolCheck, newFailureTracker, safeCheck, withProbeTimeout)
 import System.Exit (exitFailure)
 import System.IO (stderr)
 
@@ -145,6 +168,19 @@ data OpenedStore = OpenedStore
   }
   deriving stock (Generic)
 
+-- | Why a store could not be opened.
+data StoreFault
+  = -- | The database's state: unreachable, unmigrated, or not the database the operator
+    --     pinned. It can change without a restart, so a tenant waits and retries.
+    StoreUnavailable !Text.Text
+  | -- | The operator's input, such as an invalid GC window. It never fixes itself.
+    StoreMisconfigured !Text.Text
+
+renderStoreFault :: StoreFault -> Text.Text
+renderStoreFault = \case
+  StoreUnavailable message -> message
+  StoreMisconfigured message -> message
+
 -- | Validate the schema, open the pool, and resolve this database's identity --
 -- everything the server and the subcommands need and none of them should do differently.
 --
@@ -153,14 +189,37 @@ data OpenedStore = OpenedStore
 -- anything is served. The caller releases the pool.
 openStore :: (Text.Text -> IO ()) -> StoreConfig -> IO OpenedStore
 openStore say storeConfig = do
+  loadedSchema <- loadStoreSchema say storeConfig
+  connectStore say storeConfig Nothing loadedSchema >>= \case
+    Left fault -> configFailure (renderStoreFault fault)
+    Right (pool, consistency) -> pure OpenedStore {loadedSchema, pool, consistency}
+
+-- | Read and validate the store's schema file. A failure exits 1: the schema is
+-- deployment input, and failing the start is what stops a rollout before it replaces a
+-- healthy process.
+loadStoreSchema :: (Text.Text -> IO ()) -> StoreConfig -> IO LoadedSchema
+loadStoreSchema say storeConfig = do
   (schemaSource, sourceText, rawSchema) <- loadSchema (storeConfig ^. #schemaPath)
   validSchema <-
     either (configFailure . ("Invalid schema: " <>) . Text.pack . show) pure (validateSchema rawSchema)
-  let loadedSchema =
-        LoadedSchema {source = sourceText, origin = schemaOrigin schemaSource, validSchema}
   say (describeSchemaSource schemaSource)
   say ("Schema hash: " <> renderSchemaHash (schemaHash validSchema))
-  let poolConfig = (storeConfig ^. #pool)
+  pure LoadedSchema {source = sourceText, origin = schemaOrigin schemaSource, validSchema}
+
+-- | Open the pool and establish the database's identity, or say why not. On a fault
+-- the pool is released.
+--
+-- With a pin (the variable that set it, and the expected id) the id is only read, never
+-- minted: a URL pointed at the wrong database must not stamp an identity into it.
+connectStore ::
+  (Text.Text -> IO ()) ->
+  StoreConfig ->
+  Maybe (Text.Text, Text.Text) ->
+  LoadedSchema ->
+  IO (Either StoreFault (Pool.Pool, ConsistencyConfig))
+connectStore say storeConfig pin loadedSchema = do
+  let validSchema = loadedSchema ^. #validSchema
+      poolConfig = (storeConfig ^. #pool)
   pool <-
     Pool.acquire $
       Pool.Config.settings
@@ -174,28 +233,68 @@ openStore say storeConfig = do
   let runDbSession :: Session a -> IO (Either Text.Text a)
       runDbSession session =
         either (Left . renderUsageError) Right <$> Pool.use pool session
+      fault outcome = Pool.release pool >> pure (Left outcome)
   -- Pool connections are established lazily, so a bad EN_DATABASE_URL would
   -- otherwise surface only on the first request rather than at startup.
   runDbSession (Session.script "SELECT 1") >>= \case
-    Right () -> pure ()
     Left err ->
-      configFailure $
+      fault . StoreUnavailable $
         "Could not reach PostgreSQL through EN_DATABASE_URL. "
           <> err
           <> "\n"
           <> migrationHint
-  -- Only PostgreSQL can adjudicate its own interval grammar, so this waits for a
-  -- reachable database -- but it still runs before the port binds.
-  validateGcWindow runDbSession (storeConfig ^. #gcWindow) >>= either configFailure pure
-  datastoreIdText <- resolveDatastoreId runDbSession
-  say ("Datastore id: " <> datastoreIdText)
-  let consistency =
-        ConsistencyConfig
-          { datastoreId = DatastoreId datastoreIdText,
-            schemaHash = schemaHash validSchema,
-            gcWindow = (storeConfig ^. #gcWindow)
-          }
-  pure OpenedStore {loadedSchema, pool, consistency}
+    Right () ->
+      -- Only PostgreSQL can adjudicate its own interval grammar, so this waits for a
+      -- reachable database -- but it still runs before the port binds.
+      validateGcWindow runDbSession (storeConfig ^. #gcWindow) >>= \case
+        Left err -> fault (StoreMisconfigured err)
+        Right () ->
+          identify runDbSession >>= \case
+            Left outcome -> fault outcome
+            Right datastoreIdText -> do
+              say ("Datastore id: " <> datastoreIdText)
+              let consistency =
+                    ConsistencyConfig
+                      { datastoreId = DatastoreId datastoreIdText,
+                        schemaHash = schemaHash validSchema,
+                        gcWindow = (storeConfig ^. #gcWindow)
+                      }
+              pure (Right (pool, consistency))
+  where
+    identify :: (forall a. Session a -> IO (Either Text.Text a)) -> IO (Either StoreFault Text.Text)
+    identify runDbSession = case pin of
+      Nothing -> resolveDatastoreId runDbSession
+      Just (variable, expected) ->
+        runDbSession (Session.statement () readDatastoreIdStatement) >>= \case
+          Left err -> pure (Left (missingIdentity err))
+          Right Nothing ->
+            pure . Left . StoreUnavailable $
+              "This database has no datastore id yet, and "
+                <> variable
+                <> " is set, so none is minted. Start the tenant once without the pin, or point it at the database that holds "
+                <> expected
+                <> "."
+          Right (Just actual)
+            | actual == expected -> pure (Right actual)
+            | otherwise ->
+                pure . Left . StoreUnavailable $
+                  "This database's datastore id is " <> actual <> ", but " <> variable <> " is " <> expected <> "."
+
+-- | Read the database's identity without minting one.
+readDatastoreIdStatement :: Statement.Statement () (Maybe Text.Text)
+readDatastoreIdStatement =
+  Statement.preparable
+    "SELECT datastore_id FROM en_datastore_metadata"
+    Encoders.noParams
+    (Decoders.rowMaybe (Decoders.column (Decoders.nonNullable Decoders.text)))
+
+missingIdentity :: Text.Text -> StoreFault
+missingIdentity err =
+  StoreUnavailable $
+    "Could not resolve this database's datastore identity: "
+      <> err
+      <> "\nThis database's migrations are missing or out of date. "
+      <> migrationHint
 
 -- | Open one datastore and build everything a request against it needs.
 --
@@ -204,10 +303,27 @@ openStore say storeConfig = do
 -- here, so every stack has its own buckets and its own counters.
 buildStack :: SharedConfig -> Wai.Middleware -> Maybe TenantName -> TenantConfig -> IO TenantStack
 buildStack shared requestLogger name tenantConfig = do
-  let logPrefix = maybe "" (\(TenantName tenant) -> "[tenant " <> tenant <> "] ") name
+  OpenedStore {loadedSchema, pool, consistency} <-
+    openStore (toStdout . (prefixFor name <>)) (tenantConfig ^. #store)
+  buildRuntime shared requestLogger name tenantConfig loadedSchema pool consistency
+
+-- | @[tenant NAME] @, or nothing for legacy mode's one stack.
+prefixFor :: Maybe TenantName -> Text.Text
+prefixFor = maybe "" (\(TenantName tenant) -> "[tenant " <> tenant <> "] ")
+
+-- | Everything a request needs, over a store that is already open and identified.
+buildRuntime ::
+  SharedConfig ->
+  Wai.Middleware ->
+  Maybe TenantName ->
+  TenantConfig ->
+  LoadedSchema ->
+  Pool.Pool ->
+  ConsistencyConfig ->
+  IO TenantStack
+buildRuntime shared requestLogger name tenantConfig loadedSchema pool config = do
+  let logPrefix = prefixFor name
       storeConfig = tenantConfig ^. #store
-  OpenedStore {loadedSchema, pool, consistency = config} <-
-    openStore (toStdout . (logPrefix <>)) storeConfig
   loadedAt <- getCurrentTime
   activeSchemaRef <-
     newIORef
@@ -388,6 +504,180 @@ buildStack shared requestLogger name tenantConfig = do
         application
       }
 
+-- * Tenant slots
+
+-- | A tenant has a stack, or the reason it has none and since when.
+data SlotState
+  = Available !TenantStack
+  | Unavailable !Text.Text !UTCTime
+
+-- | One tenant in tenant mode: its configuration, the schema it was started with, and
+-- whether its store is open.
+data TenantSlot = TenantSlot
+  { name :: !TenantName,
+    config :: !TenantConfig,
+    -- | Read at startup. A tenant that recovers later is served under it; @SIGHUP@ reloads
+    --     available tenants only.
+    loadedSchema :: !LoadedSchema,
+    state :: !(IORef SlotState)
+  }
+  deriving stock (Generic)
+
+slotPrefix :: TenantSlot -> Text.Text
+slotPrefix slot = prefixFor (Just (slot ^. #name))
+
+slotSay :: TenantSlot -> Text.Text -> IO ()
+slotSay slot message = toStdout (slotPrefix slot <> message)
+
+-- | Load the tenant's schema (a failure exits 1) and try to open its store. A store that is
+-- unreachable, unmigrated or not the pinned database leaves the tenant unavailable instead
+-- of stopping the process; a misconfiguration such as an invalid GC window exits 1.
+openSlot :: SharedConfig -> Wai.Middleware -> TenantName -> TenantConfig -> IO TenantSlot
+openSlot shared requestLogger name tenantConfig = do
+  let prefix = prefixFor (Just name)
+      say = toStdout . (prefix <>)
+  schema <- loadStoreSchema say (tenantConfig ^. #store)
+  initial <-
+    connectStore say (tenantConfig ^. #store) (pinFor name tenantConfig) schema >>= \case
+      Right (pool, consistency) -> Available <$> buildRuntime shared requestLogger (Just name) tenantConfig schema pool consistency
+      Left (StoreMisconfigured message) -> configFailure (prefix <> message)
+      Left (StoreUnavailable reason) -> do
+        say ("UNAVAILABLE: " <> oneLine reason)
+        Unavailable reason <$> getCurrentTime
+  state <- newIORef initial
+  pure TenantSlot {name, config = tenantConfig, loadedSchema = schema, state}
+
+pinFor :: TenantName -> TenantConfig -> Maybe (Text.Text, Text.Text)
+pinFor name tenantConfig =
+  (Text.pack (tenantVariable name "EXPECTED_DATASTORE_ID"),) <$> (tenantConfig ^. #expectedDatastoreId)
+
+oneLine :: Text.Text -> Text.Text
+oneLine = Text.unwords . Text.lines
+
+-- | The tenant's background work, for the life of the server: its maintenance loop when it
+-- is available, otherwise retry opening its store (after 5 seconds, then doubling to 60)
+-- until it is, then its maintenance loop.
+--
+-- A recovered store whose datastore id another available tenant already reports stays
+-- unavailable: it is the same database reached through a different URL.
+runSlot :: SharedConfig -> Wai.Middleware -> [TenantSlot] -> TenantSlot -> IO ()
+runSlot shared requestLogger slots slot =
+  readIORef (slot ^. #state) >>= \case
+    Available stack -> maintain stack
+    Unavailable {} -> recover 5 >>= maintain
+  where
+    maintain stack =
+      let Runner runAppNow = stack ^. #runNow
+       in runMaintenanceLoop (stack ^. #logPrefix) (shared ^. #maintenance) runAppNow
+
+    recover :: Int -> IO TenantStack
+    recover delaySeconds = do
+      threadDelay (delaySeconds * 1_000_000)
+      let next = recover (min 60 (delaySeconds * 2))
+          tenantConfig = slot ^. #config
+      connectStore (slotSay slot) (tenantConfig ^. #store) (pinFor (slot ^. #name) tenantConfig) (slot ^. #loadedSchema) >>= \case
+        Left fault -> do
+          stillUnavailable (renderStoreFault fault)
+          next
+        Right (pool, consistency) -> do
+          clash <- datastoreClash (consistency ^. #datastoreId)
+          case clash of
+            Just other -> do
+              Pool.release pool
+              stillUnavailable
+                ( "Tenant "
+                    <> renderName other
+                    <> " already serves this database (datastore id "
+                    <> renderDatastoreId (consistency ^. #datastoreId)
+                    <> "). Each tenant needs its own database."
+                )
+              next
+            Nothing -> do
+              stack <- buildRuntime shared requestLogger (Just (slot ^. #name)) tenantConfig (slot ^. #loadedSchema) pool consistency
+              atomicWriteIORef (slot ^. #state) (Available stack)
+              slotSay slot "AVAILABLE"
+              pure stack
+
+    -- Log a reason only when it changes, so a long outage is one line, not one a minute.
+    stillUnavailable reason = do
+      changed <- atomicModifyIORef' (slot ^. #state) \case
+        Unavailable previous since
+          | previous == reason -> (Unavailable previous since, False)
+          | otherwise -> (Unavailable reason since, True)
+        other -> (other, False)
+      when changed (slotSay slot ("UNAVAILABLE: " <> oneLine reason))
+
+    datastoreClash datastoreId = do
+      others <- traverse (\other -> (other ^. #name,) <$> readIORef (other ^. #state)) (filter ((/= slot ^. #name) . (^. #name)) slots)
+      pure (listToMaybe [name | (name, Available stack) <- others, stack ^. #consistency . #datastoreId == datastoreId])
+
+    renderName (TenantName tenant) = tenant
+    renderDatastoreId (DatastoreId value) = value
+
+-- | The application paired with a tenant's keys: its stack's, or the store-unavailable
+-- problem a store failure produces. One read of the slot per request.
+slotApplication :: TenantSlot -> Wai.Application
+slotApplication slot request respond =
+  readIORef (slot ^. #state) >>= \case
+    Available stack -> (stack ^. #application) request respond
+    Unavailable {} -> respond tenantUnavailable
+
+tenantUnavailable :: Wai.Response
+tenantUnavailable = problemResponse specStoreError "this tenant's store is unavailable; retry later"
+
+-- | Every tenant's name and whether its store is open, in declaration order.
+tenantAvailability :: [TenantSlot] -> IO [(TenantName, Bool)]
+tenantAvailability =
+  traverse \slot ->
+    readIORef (slot ^. #state) <&> \case
+      Available _ -> (slot ^. #name, True)
+      Unavailable {} -> (slot ^. #name, False)
+
+-- | The process's probes in tenant mode.
+--
+-- Liveness reads every tenant's in-memory state. Readiness pings every tenant's pool (an
+-- unavailable tenant fails), tracking each tenant's failure onset separately, and passes
+-- while at least one tenant can serve: readiness removes the whole process from traffic,
+-- and failing it for one tenant would take every healthy tenant down too. When none can
+-- serve it reports the first tenant's failure, named @postgres:\<tenant\>@.
+slotProbes :: [TenantSlot] -> IO (ProbeCheck, ProbeCheck)
+slotProbes slots = do
+  trackLiveness <- newFailureTracker
+  trackers <- traverse (const newFailureTracker) slots
+  let responsive = traverse_ (readIORef . (^. #state)) slots >> pure True
+      liveness =
+        trackLiveness
+          ( withProbeTimeout
+              2_000_000
+              "liveness"
+              (safeCheck "liveness" (boolCheck "liveness" responsive))
+          )
+      tenantCheck track slot =
+        let checkName = "postgres:" <> renderTenant (slot ^. #name)
+         in track (safeCheck checkName (boolCheck checkName (slotReady slot)))
+      checks = zipWith tenantCheck trackers slots
+      readiness = do
+        verdicts <- mapConcurrently id checks
+        pure case filter (/= Healthy) verdicts of
+          failed
+            | length failed < length verdicts -> Healthy
+            | first : _ <- failed -> first
+            | otherwise -> Healthy
+  pure (liveness, readiness)
+  where
+    renderTenant (TenantName tenant) = tenant
+    slotReady slot =
+      readIORef (slot ^. #state) >>= \case
+        Available stack -> stack ^. #checkReady
+        Unavailable {} -> pure False
+
+-- | Release the slot's pool, if it has one.
+releaseSlot :: TenantSlot -> IO ()
+releaseSlot slot =
+  readIORef (slot ^. #state) >>= \case
+    Available stack -> releaseStack stack
+    Unavailable {} -> pure ()
+
 -- | Release the stack's pool. Maintenance threads must already be stopped.
 releaseStack :: TenantStack -> IO ()
 releaseStack stack = Pool.release (stack ^. #pool)
@@ -517,17 +807,12 @@ loadCandidateSchema path = do
 -- always means the metadata migration has not been applied -- serving with a fallback
 -- identity would silently re-open the cross-datastore hole this table exists to close, so
 -- it is a startup failure instead.
-resolveDatastoreId :: (forall a. Session a -> IO (Either Text.Text a)) -> IO Text.Text
+resolveDatastoreId :: (forall a. Session a -> IO (Either Text.Text a)) -> IO (Either StoreFault Text.Text)
 resolveDatastoreId runDbSession = do
   candidate <- UUID.toText <$> UUID.V4.nextRandom
   runDbSession (resolveDatastoreIdSession candidate) >>= \case
-    Right value -> pure value
-    Left err ->
-      configFailure $
-        "Could not resolve this database's datastore identity: "
-          <> err
-          <> "\nThis database's migrations are missing or out of date. "
-          <> migrationHint
+    Right value -> pure (Right value)
+    Left err -> pure (Left (missingIdentity err))
 
 -- | A startup-time database failure, in prose rather than as hasql's constructors.
 --

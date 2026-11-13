@@ -27,6 +27,7 @@ module ServerHarness
     migrateDatabaseUrl,
     runDatabaseScript,
     queryDatabaseText,
+    setDatabaseAccepting,
 
     -- * Server processes
     ServerSpec (..),
@@ -176,6 +177,36 @@ runDatabaseScript url sql =
     Connection.use connection (Session.script sql) >>= \case
       Right () -> pure ()
       Left err -> fail ("could not run script against " <> Text.unpack url <> ": " <> show err)
+
+-- | Take one database of the instance out of service, or put it back, while PostgreSQL
+-- keeps running: @ALLOW_CONNECTIONS false@ refuses every new connection (superusers
+-- included), and the database's open sessions are terminated, so a pool holding them sees
+-- broken connections exactly as in an outage. 'True' allows connections again.
+--
+-- ephemeral-pg cannot stop a server and keep its data for a later start, and this is the
+-- closer model of a tenant's outage anyway: one database goes away, its neighbours do not.
+setDatabaseAccepting :: PostgresInstance -> Text -> Bool -> IO ()
+setDatabaseAccepting instance' name accepting = do
+  unless (Text.all (\c -> c == '_' || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) name) $
+    fail ("invalid database name: " <> Text.unpack name)
+  database <- postgresDatabase instance'
+  let sql =
+        "ALTER DATABASE \""
+          <> name
+          <> "\" WITH ALLOW_CONNECTIONS "
+          <> (if accepting then "true" else "false")
+          <> ";"
+          <> ( if accepting
+                 then ""
+                 else
+                   " SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '"
+                     <> name
+                     <> "' AND pid <> pg_backend_pid();"
+             )
+  bracket (acquire (Pg.connectionSettings database)) Connection.release \connection ->
+    Connection.use connection (Session.script sql) >>= \case
+      Right () -> pure ()
+      Left err -> fail ("could not change access to " <> Text.unpack name <> ": " <> show err)
 
 -- | Run a query returning one row of one column, cast to text in SQL
 -- (@SELECT generation::text FROM …@), against the database at this URL.

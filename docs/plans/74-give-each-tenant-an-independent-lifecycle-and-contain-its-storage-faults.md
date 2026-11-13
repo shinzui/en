@@ -73,12 +73,39 @@ their documentation, which the last child plan of the parent MasterPlan writes.
       none of beta's; `export --tenant beta` prints beta's two relationships; an import under
       alpha is invisible to beta; missing, unknown and unexpected `--tenant` each exit 2).
       Config tests: 41 pass. Diagnostics carry the `[tenant NAME] ` prefix on stderr.
-- [ ] Milestone 3: a tenant whose storage is faulty at startup or later is unavailable alone and
-      recovers alone; an expected datastore id can be pinned per tenant; readiness fails only
-      when no tenant can serve. The fault cases pass and `just loadbench-smoke` exits 0.
+- [x] Milestone 3 (2026-11-13): a tenant whose storage is faulty at startup or later is
+      unavailable alone and recovers alone; an expected datastore id can be pinned per tenant;
+      readiness fails only when no tenant can serve. Tenant suite group "storage faults are
+      contained" passes all seven cases (outage while running, unreachable at startup,
+      unmigrated, mismatched pin, matching pin, total outage, legacy unchanged); the whole
+      suite passes 17 of 17; config tests 41 of 41; the Hurl suite passes 6/6 in legacy mode;
+      the upgrade case passes; `just loadbench-smoke` exits 0.
 
 
 ## Surprises & Discoveries
+
+- Observation: the first request on a pooled connection that PostgreSQL has terminated is
+  answered `500 internal_error`, not `503 store_error`. The server logs `en: internal error:
+  Unexpected number of rows`: hasql reports a row-count decoding failure on that session,
+  and `sessionErrorToEnError` in `en-postgres/src/En/Postgres/TupleStore.hs` classifies
+  statement errors other than server errors as `InternalError`. The request still fails
+  closed, and the following requests open fresh connections, are refused, and answer 503.
+  This is independent of tenancy (a single-tenant server sees it after any session
+  termination: a failover, an administrator's `pg_terminate_backend`, an idle-session kill),
+  and fixing it is a change to `en-postgres`, which the parent MasterPlan excludes. The
+  outage case asserts that alpha fails closed throughout and settles on `503 store_error`.
+  Reported to the owner as a follow-up.
+
+- Observation: `ephemeral-pg` cannot stop a server and keep its data for a later start
+  (`stop` removes the data directory; `restart` has no gap). Outages are simulated per
+  database instead: `ALTER DATABASE … WITH ALLOW_CONNECTIONS false` plus terminating the
+  database's sessions (`setDatabaseAccepting` in `en-server/test-support/ServerHarness.hs`).
+  That is the closer model of a tenant's outage anyway, since only one database goes away.
+
+- Observation: with 17 cases the suite exhausted macOS's 32 System V shared-memory segments
+  (two PostgreSQL instances per case, a case per core); `initdb` failed with "could not
+  create shared memory segment". `TenantSpec`'s main now sets `TASTY_NUM_THREADS=3` unless
+  the caller sets it. Friction entry FRIC-3.
 
 - Observation: the garbage-collection case proves more than the plan asked by giving the two
   tenants different windows (alpha `1 second`, beta `1 hour`): alpha's deleted row is reaped
@@ -122,6 +149,25 @@ their documentation, which the last child plan of the parent MasterPlan writes.
   pipeline must be able to tell a wrong command line from a dangerous schema.
   Date: 2026-11-13
 
+- Decision: Tenant mode wraps each tenant in a slot (`TenantSlot` in `en-server/app/Tenant.hs`)
+  whose state is `Available stack` or `Unavailable reason since`; the slot's application reads
+  that state once per request. One worker per slot runs maintenance while available, or
+  retries opening the store (5 s, doubling to 60 s) and then runs maintenance. Store opening
+  is split into `loadStoreSchema` (exits on a bad schema) and `connectStore` (returns a
+  `StoreFault`: `StoreUnavailable` retries, `StoreMisconfigured` exits at startup).
+  Rationale: legacy mode keeps calling `openStore`, which still exits on any fault with
+  today's messages, and never touches a slot, so its request path is unchanged.
+  Date: 2026-11-13
+
+- Decision: A tenant that recovers is served under the schema read at startup; `SIGHUP`
+  skips unavailable tenants, so an edit made during the outage is applied by the next
+  `SIGHUP` after recovery. An unavailable tenant's 503 is answered before its stack, so it
+  does not reach that tenant's request log or metrics.
+  Rationale: re-reading the file in the worker would make recovery fail on a schema edit
+  that `SIGHUP` would have refused, and the stack's middleware does not exist yet while the
+  store is unavailable. Plan 75 decides how an unavailable tenant is observed.
+  Date: 2026-11-13
+
 - Decision: `EN_TENANT_<NAME>_EXPECTED_DATASTORE_ID` verifies the database's identity and never
   assigns it.
   Rationale: `docs/user/service-and-operations.md` explains why there is deliberately no
@@ -133,7 +179,23 @@ their documentation, which the last child plan of the parent MasterPlan writes.
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Complete (2026-11-13; `a1e713e`, `d2d620c` and the Milestone 3 commit). Each tenant now has an
+independent lifecycle, proven in `en-server-tenant-tests`: a `SIGHUP` swaps only the tenants
+whose files changed and invalidates only their tokens, a broken file for one tenant does not
+stop another's reload, writes, grant generations and garbage collection stay within a
+tenant's database, and `import`, `export` and `check-schema` act on the tenant named by
+`--tenant`. Storage faults are contained: a tenant that is unreachable, unmigrated or not the
+pinned database is unavailable alone, answers 503, keeps authentication, and recovers without
+a restart; readiness fails only when no tenant can serve. Legacy mode's behaviour, request
+path and messages are unchanged (Hurl 6/6, upgrade case, legacy startup-failure case).
+This delivers IR-2 AC-4 and AC-5, except their documentation (plan 76).
+
+Gaps: a terminated pooled connection answers 500 once before 503 (`en-server` cannot fix it;
+see Surprises & Discoveries). Partial outages are visible in the log and to
+`tenantAvailability`, which plan 75 turns into metrics and readiness detail.
+
+Friction: FRIC-3 (macOS shared-memory limit with parallel ephemeral PostgreSQL), accepted with
+the `TASTY_NUM_THREADS` default as its workaround.
 
 
 ## Context and Orientation

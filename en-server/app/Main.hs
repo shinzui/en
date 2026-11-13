@@ -16,6 +16,7 @@ import Data.List (sortOn)
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
+import Data.Traversable (for)
 import Effectful (Eff, IOE, runEff, (:>))
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import En.Biscuit.Keys (IssuerKeyId (..))
@@ -43,8 +44,6 @@ import OpenTelemetry.Instrumentation.Servant (openTelemetryServantMiddleware)
 import OpenTelemetry.Instrumentation.Servant.Internal (HasEndpoint (..))
 import Relay.Pagination.Servant (RelayPage)
 import Servant.API qualified as Servant
-import Servant.Health (ProbeCheck)
-import Servant.Health.Check (boolCheck, newFailureTracker, safeCheck, sequenceChecks, withProbeTimeout)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (ExitCode (ExitFailure), exitSuccess, exitWith)
 import System.IO (BufferMode (BlockBuffering, LineBuffering), hSetBuffering, stderr, stdout)
@@ -53,15 +52,22 @@ import Telemetry (withTelemetry)
 import Tenant
   ( LoadedSchema (..),
     Runner (..),
+    SlotState (..),
+    TenantSlot (..),
     TenantStack (..),
     buildStack,
     configFailure,
     loadCandidateSchema,
+    openSlot,
     openStore,
+    releaseSlot,
     releaseStack,
     reloadStack,
     renderSchemaHash,
+    runSlot,
     showText,
+    slotApplication,
+    slotProbes,
     toStderr,
     toStdout,
   )
@@ -222,62 +228,67 @@ runServe serverConfig = do
           withMaintenance shared [stack] $
             serve (shared ^. #tls) (shared ^. #port) wrappedApp
     Tenants tenants ->
-      withStacks shared requestLogger (NonEmpty.toList tenants) \stacks -> do
-        rejectSharedDatastores stacks
-        let stackList = map fst stacks
+      withSlots shared requestLogger (NonEmpty.toList tenants) \slots -> do
+        rejectSharedDatastores slots
         withTelemetry (shared ^. #telemetry) \(tracerProvider, otelMiddleware) -> do
-          printTenantServingLines shared stacks
-          installReloadHandler stackList
-          (livenessProbe, readinessProbe) <- tenantProbes stackList
+          printTenantServingLines shared slots
+          installSlotReloadHandler slots
+          (livenessProbe, readinessProbe) <- slotProbes slots
           let servantTelemetryMiddleware =
                 maybe id (\provider -> openTelemetryServantMiddleware provider servedProxy) tracerProvider
-              -- Every configured key, paired with the application of its tenant. The
+              -- Every configured key, paired with the application of its tenant's slot. The
               -- key that authenticates a request is the only thing that selects a tenant.
               routes =
-                [ TenantRoute {routeKey = key, routeApplication = stack ^. #application}
-                | (stack, config) <- stacks,
-                  AuthKeys keys <- [config ^. #auth],
+                [ TenantRoute {routeKey = key, routeApplication = slotApplication slot}
+                | slot <- slots,
+                  AuthKeys keys <- [slot ^. #config . #auth],
                   key <- keys
                 ]
               wrappedApp =
                 otelMiddleware
                   . servantTelemetryMiddleware
                   $ tenantAuthMiddleware (probesApplication livenessProbe readinessProbe) routes
-          withMaintenance shared stackList $
+          withSlotWorkers shared requestLogger slots $
             serve (shared ^. #tls) (shared ^. #port) wrappedApp
 
--- | Build one stack per tenant, in declaration order, and release them all afterwards.
+-- | Open one slot per tenant, in declaration order, and release every pool afterwards.
 --
--- Any tenant that cannot start (unreadable schema, unreachable database, missing
--- migrations) exits 1 naming the tenant, as a single-store server does today.
-withStacks ::
+-- A tenant whose schema file is unusable, or whose store is misconfigured, exits 1 naming
+-- the tenant. A tenant whose store is unreachable, unmigrated or not the pinned database
+-- starts unavailable; its worker ('runSlot') keeps trying.
+withSlots ::
   SharedConfig ->
   Wai.Middleware ->
   [(TenantName, TenantConfig)] ->
-  ([(TenantStack, TenantConfig)] -> IO a) ->
+  ([TenantSlot] -> IO a) ->
   IO a
-withStacks shared requestLogger tenants action =
+withSlots shared requestLogger tenants action =
   foldr
-    ( \(name, config) inner built ->
-        bracket (buildStack shared requestLogger (Just name) config) releaseStack \stack ->
-          inner (built <> [(stack, config)])
+    ( \(name, config) inner opened ->
+        bracket (openSlot shared requestLogger name config) releaseSlot \slot ->
+          inner (opened <> [slot])
     )
     action
     tenants
     []
 
 -- | Two tenants whose URLs differ but reach one database would share tuples, tokens and
--- garbage collection; the datastore id is what tells.
-rejectSharedDatastores :: [(TenantStack, TenantConfig)] -> IO ()
-rejectSharedDatastores stacks =
-  case adjacentClashes (sortOn fst [(stack ^. #consistency . #datastoreId, stack ^. #name) | (stack, _) <- stacks]) of
+-- garbage collection; the datastore id is what tells. Checked among the tenants available
+-- at startup; a tenant that recovers later is checked by its worker.
+rejectSharedDatastores :: [TenantSlot] -> IO ()
+rejectSharedDatastores slots = do
+  available <- fmap concat . for slots $ \slot ->
+    readIORef (slot ^. #state) <&> \case
+      Available stack -> [(stack ^. #consistency . #datastoreId, slot ^. #name)]
+      Unavailable {} -> []
+  case adjacentClashes (sortOn fst available) of
     [] -> pure ()
     (a, b) : _ ->
       configFailure $
         "Tenants "
-          <> tenantLabel a
+          <> renderTenantName a
           <> " and "
-          <> tenantLabel b
+          <> renderTenantName b
           <> " reach the same database (one datastore id through different URLs). Each tenant needs its own database."
   where
     adjacentClashes = \case
@@ -285,31 +296,30 @@ rejectSharedDatastores stacks =
         | idA == idB -> (a, b) : adjacentClashes rest
         | otherwise -> adjacentClashes rest
       _ -> []
-    tenantLabel = maybe "(none)" renderTenantName
 
--- | The process's probes in tenant mode: liveness reads every tenant's in-memory schema,
--- readiness asks every tenant's pool, one check named @postgres:\<tenant\>@ each.
-tenantProbes :: [TenantStack] -> IO (ProbeCheck, ProbeCheck)
-tenantProbes stacks = do
-  trackLiveness <- newFailureTracker
-  trackReadiness <- newFailureTracker
-  let responsive = traverse_ (readIORef . (^. #activeSchema)) stacks >> pure True
-      liveness =
-        trackLiveness
-          ( withProbeTimeout
-              2_000_000
-              "liveness"
-              (safeCheck "liveness" (boolCheck "liveness" responsive))
-          )
-      readiness =
-        trackReadiness
-          ( sequenceChecks
-              [ safeCheck checkName (boolCheck checkName (stack ^. #checkReady))
-              | stack <- stacks,
-                let checkName = "postgres:" <> maybe "" renderTenantName (stack ^. #name)
-              ]
-          )
-  pure (liveness, readiness)
+-- | Run each slot's worker beside the action: maintenance for an available tenant, recovery
+-- then maintenance for an unavailable one. Cancelled when `serve` returns.
+withSlotWorkers :: SharedConfig -> Wai.Middleware -> [TenantSlot] -> IO () -> IO ()
+withSlotWorkers shared requestLogger slots action =
+  foldr
+    (\slot inner -> withAsync (runSlot shared requestLogger slots slot) \_worker -> inner)
+    action
+    slots
+
+-- | 'installReloadHandler' for tenant mode: an unavailable tenant is skipped with a line.
+installSlotReloadHandler :: [TenantSlot] -> IO ()
+installSlotReloadHandler slots = do
+  reloadGuard <- newMVar ()
+  let reloadSlot slot =
+        readIORef (slot ^. #state) >>= \case
+          Available stack -> reloadContained stack
+          Unavailable {} -> toStdout ("[tenant " <> renderTenantName (slot ^. #name) <> "] SIGHUP: unavailable, not reloading.")
+  _ <-
+    installHandler
+      sigHUP
+      (Catch (withMVar reloadGuard \() -> traverse_ reloadSlot slots))
+      Nothing
+  pure ()
 
 -- | Run each stack's maintenance loop beside the action.
 --
@@ -347,10 +357,10 @@ installReloadHandler stacks = do
   pure ()
 
 -- | Tenant mode's startup lines: the process-wide settings once, then each tenant's.
-printTenantServingLines :: SharedConfig -> [(TenantStack, TenantConfig)] -> IO ()
-printTenantServingLines shared stacks = do
+printTenantServingLines :: SharedConfig -> [TenantSlot] -> IO ()
+printTenantServingLines shared slots = do
   Text.putStrLn ("en-server listening on :" <> Text.pack (show (shared ^. #port)))
-  Text.putStrLn ("Tenants: " <> Text.intercalate ", " [maybe "" renderTenantName (stack ^. #name) | (stack, _) <- stacks])
+  Text.putStrLn ("Tenants: " <> Text.intercalate ", " [renderTenantName (slot ^. #name) | slot <- slots])
   Text.putStrLn ("Optimized revision cache (per tenant): " <> describeMillisCache (shared ^. #optimizedRevisionTtlMs))
   Text.putStrLn ("Tuple-read cache (per tenant): " <> describeEntryCache (shared ^. #tupleReadMaxEntries))
   Text.putStrLn ("Decision cache (per tenant): " <> describeEntryCache (shared ^. #decisionMaxEntries))
@@ -364,9 +374,10 @@ printTenantServingLines shared stacks = do
         <> "; max batch size: "
         <> Text.pack (show (shared ^. #maxBatchSize))
     )
-  for_ stacks \(stack, config) -> do
-    let say = Text.putStrLn . ((stack ^. #logPrefix) <>)
-        poolConfig = stack ^. #store . #pool
+  for_ slots \slot -> do
+    let config = slot ^. #config
+        say = Text.putStrLn . (("[tenant " <> renderTenantName (slot ^. #name) <> "] ") <>)
+        poolConfig = config ^. #store . #pool
     say
       ( "Connection pool: size="
           <> Text.pack (show (poolConfig ^. #size))
@@ -379,7 +390,8 @@ printTenantServingLines shared stacks = do
       )
     say ("API keys: " <> describeKeys (config ^. #auth))
     say ("Biscuit grant minting: " <> describeMinting (config ^. #biscuit))
-    say ("Schema reload: SIGHUP" <> describeReloadSource (stack ^. #store . #schemaPath) (stack ^. #schemaReloadForce))
+    say ("Schema reload: SIGHUP" <> describeReloadSource (config ^. #store . #schemaPath) (config ^. #schemaReloadForce))
+    traverse_ (\expected -> say ("Expected datastore id: " <> expected)) (config ^. #expectedDatastoreId)
   where
     describeKeys = \case
       AuthDisabled -> "none"

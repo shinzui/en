@@ -205,6 +205,7 @@ test-suite en-server-tenant-tests
 
   main-is: TenantSpec.hs
   other-modules: ServerHarness
+  -- How many cases run at once is set in TenantSpec's main (TASTY_NUM_THREADS).
   ghc-options:
     -threaded
     -rtsopts

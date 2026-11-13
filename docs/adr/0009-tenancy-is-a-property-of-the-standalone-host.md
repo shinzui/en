@@ -64,6 +64,12 @@ Tenancy lives only in `en-server`, the standalone host.
   needs performance isolation runs a dedicated `en-server` per tenant.
 - Database connections and memory grow with the number of tenants, since each has its own
   pool and caches.
+- A tenant's store faults are contained (docs/plans/74): a tenant whose database is
+  unreachable, unmigrated or not the one pinned by `EN_TENANT_<NAME>_EXPECTED_DATASTORE_ID`
+  starts unavailable, answers 503 `store_error` with authentication intact, and is retried
+  until it recovers, while the others serve. A bad schema file or an invalid GC window still
+  stops the process: those are deployment input. Legacy mode still exits on any startup
+  fault.
 - Embedded hosts of `en-core` are unaffected; an embedding application that wants several
   tenants composes several `Env`s itself.
 - Adding, removing or re-keying a tenant requires a restart. Per-tenant HTTP

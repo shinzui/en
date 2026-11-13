@@ -2,6 +2,12 @@
 
 ## 2026-11-13
 
+* **Update**: FRIC-3 accepted: Status set to accepted.
+
+
+* **Addition**: FRIC-3 records detour environment friction with mori://shinzui/ephemeral-pg: macOS SysV shared memory limit fails parallel ephemeral PostgreSQL
+
+
 * **Update**: FRIC-2 accepted: Status set to accepted.
 
 

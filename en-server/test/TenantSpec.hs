@@ -23,16 +23,24 @@ import Network.HTTP.Client qualified as Http
 import Network.HTTP.Types (Header, statusCode)
 import ServerHarness
 import System.Directory (doesFileExist)
-import System.Environment (lookupEnv)
+import System.Environment (lookupEnv, setEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Signals (sigHUP)
+import System.Timeout (timeout)
 import Test.Tasty (TestTree, defaultMain, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCaseSteps)
 
 main :: IO ()
-main =
+main = do
+  -- Each case starts two PostgreSQL instances, and each instance holds a System V shared
+  -- memory segment. macOS allows 32 system-wide (kern.sysv.shmmni), so running a case per
+  -- core exhausts them and initdb fails with "could not create shared memory segment: No
+  -- space left on device". Three cases at a time, unless the caller says otherwise.
+  lookupEnv "TASTY_NUM_THREADS" >>= \case
+    Just _ -> pure ()
+    Nothing -> setEnv "TASTY_NUM_THREADS" "3"
   defaultMain $
     testGroup
       "en-server tenancy"
@@ -46,6 +54,16 @@ main =
             reloadContainmentTest,
             grantGenerationTest,
             garbageCollectionTest
+          ],
+        testGroup
+          "storage faults are contained"
+          [ outageWhileRunningTest,
+            unreachableAtStartupTest,
+            unmigratedTest,
+            wrongDatastoreIdTest,
+            pinnedDatastoreIdTest,
+            totalOutageTest,
+            legacyStartupFailureTest
           ],
         testGroup
           "tenant-aware subcommands"
@@ -179,12 +197,31 @@ data Fixture = Fixture
 -- Both tenants name their read-write key @writer@: a caller is the pair of tenant and key
 -- name, so the names may repeat.
 withTwoTenants :: [(String, String)] -> (Fixture -> IO a) -> IO a
-withTwoTenants extra action =
+withTwoTenants = withTwoTenantsUsing defaultSetup
+
+-- | How alpha's database is prepared before the server starts.
+data Setup = Setup
+  { -- | Apply En's migrations to alpha's database (otherwise it is left empty).
+    alphaMigrated :: Bool,
+    -- | Runs after both databases exist and before the server starts: alpha's instance and
+    --     database URL.
+    beforeStart :: PostgresInstance -> Text -> IO ()
+  }
+
+defaultSetup :: Setup
+defaultSetup = Setup {alphaMigrated = True, beforeStart = \_ _ -> pure ()}
+
+withTwoTenantsUsing :: Setup -> [(String, String)] -> (Fixture -> IO a) -> IO a
+withTwoTenantsUsing setup extra action =
   withSystemTempDirectory "en-tenant-tests" \directory ->
     withPostgres \alphaPostgres ->
       withPostgres \betaPostgres -> do
-        alphaUrl <- createMigratedDatabase alphaPostgres "en_alpha"
+        alphaUrl <-
+          if alphaMigrated setup
+            then createMigratedDatabase alphaPostgres "en_alpha"
+            else createEmptyDatabase alphaPostgres "en_alpha"
         betaUrl <- createMigratedDatabase betaPostgres "en_beta"
+        beforeStart setup alphaPostgres alphaUrl
         let alphaPath = directory </> "alpha.en"
             betaPath = directory </> "beta.en"
         writeFile alphaPath (Text.unpack alphaSchema)
@@ -461,6 +498,149 @@ garbageCollectionTest = testCaseSteps "garbage collection runs per tenant, under
       assertBool "alpha logged a pass that reaped" (any (" reaped=1 " `Text.isInfixOf`) (passes "alpha"))
       assertBool "beta logged its own passes" (not (null (passes "beta")))
       assertBool "beta reaped nothing" (all (" reaped=0 " `Text.isInfixOf`) (passes "beta"))
+
+-- * AC-5: storage faults are contained
+
+-- | Alpha's database goes away while the server runs: alpha answers 503, beta and readiness
+-- are unaffected, and alpha recovers by itself when its database returns.
+outageWhileRunningTest :: TestTree
+outageWhileRunningTest = testCaseSteps "an outage while running affects only that tenant, which recovers" \step ->
+  withTwoTenants [] \fixture -> do
+    let a = alpha fixture
+        b = beta fixture
+    _ <- writeTuple a ("team", "t1", "member", "ann") >>= expectStatus 200
+    step "take alpha's database out of service"
+    setDatabaseAccepting (alphaPostgres fixture) "en_alpha" False
+    -- The first request on a pooled connection the outage closed is classified by
+    -- en-postgres as an internal error (500) rather than a store error (503); see plan 74's
+    -- Surprises & Discoveries. Containment requires that alpha fails closed throughout and
+    -- settles on the retryable store error once its stale connections are gone.
+    awaitCondition 30 "alpha to answer 503 store_error" do
+      reply@(status, _) <- check a fullyConsistent ("team", "t1", "membership", "ann")
+      assertBool ("alpha must fail closed during its outage, got " <> show reply) (status >= 500)
+      pure (status == 503)
+    output <- capturedLines (server fixture)
+    forM_ (take 1 (filter ("en: internal error:" `Text.isInfixOf`) output)) \line ->
+      step ("server logged, before settling: " <> Text.unpack (Text.take 300 line))
+    check a fullyConsistent ("team", "t1", "membership", "ann") >>= expectProblem 503 "store_error"
+    writeTuple a ("team", "t2", "member", "ann") >>= expectProblem 503 "store_error"
+    _ <- writeTuple b ("team", "t1", "member", "bob") >>= expectStatus 200
+    _ <- check b fullyConsistent ("team", "t1", "membership", "bob") >>= expectStatus 200
+    expectReady a 200
+    step "bring it back: alpha serves again with no restart"
+    setDatabaseAccepting (alphaPostgres fixture) "en_alpha" True
+    awaitCondition 30 "alpha to serve again" ((== 200) . fst <$> check a fullyConsistent ("team", "t1", "membership", "ann"))
+
+-- | Alpha's database refuses connections when the server starts: the server starts anyway,
+-- alpha is unavailable (with authentication intact), and recovers when the database returns.
+unreachableAtStartupTest :: TestTree
+unreachableAtStartupTest = testCaseSteps "a tenant unreachable at startup starts unavailable and recovers" \step ->
+  withTwoTenantsUsing
+    defaultSetup {beforeStart = \postgres _ -> setDatabaseAccepting postgres "en_alpha" False}
+    []
+    \fixture -> do
+      let a = alpha fixture
+      step "the server started; alpha is unavailable, beta serves"
+      expectLogLine fixture "[tenant alpha] UNAVAILABLE: Could not reach PostgreSQL"
+      check a fullyConsistent ("team", "t1", "membership", "ann") >>= expectProblem 503 "store_error"
+      writeTuple (alphaReadOnly fixture) ("team", "t1", "member", "ann") >>= expectProblem 403 "permission_denied"
+      requestWith (a {secret = "unknown-secret-0123456789"}) [] "GET" "/v1/schema" Nothing >>= expectProblem 401 "unauthenticated"
+      _ <- writeTuple (beta fixture) ("team", "t1", "member", "bob") >>= expectStatus 200
+      step "alpha's database returns; alpha becomes available without a restart"
+      setDatabaseAccepting (alphaPostgres fixture) "en_alpha" True
+      awaitCondition 30 "alpha to become available" (hasLogLine fixture "[tenant alpha] AVAILABLE")
+      _ <- writeTuple a ("team", "t1", "member", "ann") >>= expectStatus 200
+      pure ()
+
+-- | Alpha points at a database without En's tables: unavailable, naming the migrations;
+-- migrating it brings alpha up without a restart.
+unmigratedTest :: TestTree
+unmigratedTest = testCaseSteps "an unmigrated tenant database is unavailable until migrated" \step ->
+  withTwoTenantsUsing defaultSetup {alphaMigrated = False} [] \fixture -> do
+    expectLogLine fixture "[tenant alpha] UNAVAILABLE: Could not resolve this database's datastore identity"
+    expectLogLine fixture "migrations are missing or out of date"
+    check (alpha fixture) fullyConsistent ("team", "t1", "membership", "ann") >>= expectProblem 503 "store_error"
+    _ <- writeTuple (beta fixture) ("team", "t1", "member", "bob") >>= expectStatus 200
+    step "apply En's migrations to alpha's database"
+    migrateDatabaseUrl (alphaUrl fixture)
+    awaitCondition 30 "alpha to become available" (hasLogLine fixture "[tenant alpha] AVAILABLE")
+    _ <- writeTuple (alpha fixture) ("team", "t1", "member", "ann") >>= expectStatus 200
+    pure ()
+
+-- | A pin that does not match keeps alpha unavailable, names both ids, and never writes to
+-- alpha's database.
+wrongDatastoreIdTest :: TestTree
+wrongDatastoreIdTest = testCaseSteps "a mismatched datastore id pin keeps the tenant unavailable and its database untouched" \_step ->
+  withTwoTenantsUsing
+    defaultSetup {beforeStart = \_ url -> runDatabaseScript url "INSERT INTO en_datastore_metadata (datastore_id) VALUES ('alpha-actual-id')"}
+    [("EN_TENANT_ALPHA_EXPECTED_DATASTORE_ID", "alpha-expected-id")]
+    \fixture -> do
+      expectLogLine fixture "[tenant alpha] UNAVAILABLE: This database's datastore id is alpha-actual-id, but EN_TENANT_ALPHA_EXPECTED_DATASTORE_ID is alpha-expected-id."
+      check (alpha fixture) fullyConsistent ("team", "t1", "membership", "ann") >>= expectProblem 503 "store_error"
+      _ <- writeTuple (beta fixture) ("team", "t1", "member", "bob") >>= expectStatus 200
+      metadata <- queryDatabaseText (alphaUrl fixture) "SELECT string_agg(datastore_id, ',')::text FROM en_datastore_metadata"
+      assertEqual "alpha's metadata is untouched" "alpha-actual-id" metadata
+
+-- | The matching pin serves, and an empty database is never stamped when a pin is set.
+pinnedDatastoreIdTest :: TestTree
+pinnedDatastoreIdTest = testCaseSteps "a matching datastore id pin serves" \_step ->
+  withTwoTenantsUsing
+    defaultSetup {beforeStart = \_ url -> runDatabaseScript url "INSERT INTO en_datastore_metadata (datastore_id) VALUES ('alpha-actual-id')"}
+    [("EN_TENANT_ALPHA_EXPECTED_DATASTORE_ID", "alpha-actual-id")]
+    \fixture -> do
+      expectLogLine fixture "[tenant alpha] Datastore id: alpha-actual-id"
+      _ <- writeTuple (alpha fixture) ("team", "t1", "member", "ann") >>= expectStatus 200
+      pure ()
+
+-- | Every tenant down: readiness fails naming a tenant check; liveness passes.
+totalOutageTest :: TestTree
+totalOutageTest = testCaseSteps "readiness fails only when no tenant can serve" \step ->
+  withTwoTenants [] \fixture -> do
+    step "alpha down, beta up: ready"
+    setDatabaseAccepting (alphaPostgres fixture) "en_alpha" False
+    expectReady (alpha fixture) 200
+    step "both down: not ready, naming a tenant; still live"
+    setDatabaseAccepting (betaPostgres fixture) "en_beta" False
+    (status, body) <- requestWith ((alpha fixture) {secret = ""}) [] "GET" "/health/ready" Nothing
+    assertEqual "readiness" 503 status
+    assertBool ("names postgres:alpha: " <> show body) ("postgres:alpha" `Text.isInfixOf` Text.decodeUtf8 (LazyByteString.toStrict body))
+    (liveStatus, _) <- requestWith ((alpha fixture) {secret = ""}) [] "GET" "/health/live" Nothing
+    assertEqual "liveness" 200 liveStatus
+
+-- | Without @EN_TENANTS@ an unreachable database still stops the server, as it always has.
+legacyStartupFailureTest :: TestTree
+legacyStartupFailureTest = testCaseSteps "legacy mode still exits when its database is unreachable" \_step ->
+  withPostgres \postgres -> do
+    url <- createMigratedDatabase postgres "en_legacy"
+    setDatabaseAccepting postgres "en_legacy" False
+    base <- baseEnvironment
+    binary <- locateServerBinary
+    let environment =
+          base
+            <> [ ("EN_DATABASE_URL", Text.unpack url),
+                 ("EN_API_KEYS_READ_WRITE", "writer:" <> Text.unpack alphaWriter),
+                 ("EN_PORT", "18999")
+               ]
+    outcome <- timeout 60_000_000 (runServerCommand (serverSpec binary environment) [])
+    case outcome of
+      Nothing -> assertFailure "the legacy server did not exit"
+      Just (code, _, err) -> do
+        assertEqual "exit" (ExitFailure 1) code
+        assertBool ("today's message: " <> Text.unpack err) ("Could not reach PostgreSQL through EN_DATABASE_URL" `Text.isInfixOf` err)
+
+expectReady :: Client -> Int -> IO ()
+expectReady client expected = do
+  (status, body) <- requestWith (client {secret = ""}) [] "GET" "/health/ready" Nothing
+  assertEqual ("GET /health/ready: " <> show body) expected status
+
+hasLogLine :: Fixture -> Text -> IO Bool
+hasLogLine fixture fragment = any (fragment `Text.isInfixOf`) <$> capturedLines (server fixture)
+
+expectLogLine :: Fixture -> Text -> IO ()
+expectLogLine fixture fragment = do
+  found <- hasLogLine fixture fragment
+  output <- capturedLines (server fixture)
+  assertBool ("no log line containing " <> show fragment <> " in:\n" <> Text.unpack (Text.unlines output)) found
 
 -- * AC-4: tenant-aware subcommands
 

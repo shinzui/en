@@ -26,6 +26,11 @@ provenance:
       at: 2026-11-13T14:29:04Z
       mode: "update"
       note: "G0 passed with option 2; G3 reported not gating; G5 single-declared-tenant gate added; EP-2 started"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T19:46:05Z
+      mode: "implement"
+      note: "EP-2 and EP-3 complete; baseline rebased; verdict rule revised; G1 first point passed"
 ---
 
 # Serve several isolated tenants from one En server
@@ -208,7 +213,7 @@ per-tenant availability is reported, not gated" (plan 75). Plan 76 performs the 
 |---|-------|------|-----------|-----------|--------|
 | EP-1 | Build an en-server load benchmark and record the single-tenant baseline | docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md | None | None | Complete |
 | EP-2 | Serve tenants selected by API key, each from its own isolated stack | docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md | EP-1, gate G0 | None | Complete |
-| EP-3 | Give each tenant an independent lifecycle and contain its storage faults | docs/plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md | EP-2 | None | In Progress |
+| EP-3 | Give each tenant an independent lifecycle and contain its storage faults | docs/plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md | EP-2 | None | Complete |
 | EP-4 | Carry the tenant through logs, metrics, traces and readiness | docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md | EP-2, EP-3 | None | Not Started |
 | EP-5 | Prove tenant isolation and performance, then document tenant operations | docs/plans/76-prove-tenant-isolation-and-performance-then-document-tenant-operations.md | EP-2, EP-3, EP-4 | None | Not Started |
 
@@ -292,7 +297,10 @@ single-tenant baseline and the interference preview are recorded in
 `docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md` and
 `en-server/loadbench/results/`, and were reported to the owner. Gate G0 passed on 2026-11-13
 (option 2 of the brief below). EP-2 is complete (2026-11-13): tenants are served by key from
-isolated stacks, the isolation suite passes, and G1's first run passes. EP-3 is next. EP-2 moves IR-2 to `in-progress`; EP-5
+isolated stacks, the isolation suite passes, and G1's first run passes. EP-3 is complete
+(2026-11-13): reload, maintenance, GC and grant generations are independent per tenant, the
+subcommands take `--tenant`, and a tenant's storage faults are contained and recover without
+a restart. EP-4 is next. EP-2 moves IR-2 to `in-progress`; EP-5
 marks it `completed`. The initiative has six gates that are not owned by a single child plan.
 Each is checked off only with benchmark or test evidence recorded in the named child plan.
 
@@ -400,6 +408,18 @@ tenant (G5, added) and a tenant with idle neighbours (G2) must show no regressio
 
 
 ## Surprises & Discoveries
+
+- Observation (EP-3, outside this initiative): the first request on a pooled connection that
+  PostgreSQL terminated answers `500 internal_error` (`Unexpected number of rows`) instead of
+  `503 store_error`, in every mode; `sessionErrorToEnError` in `en-postgres` classifies it as
+  internal. It fails closed, and later requests answer 503. A fix belongs to `en-postgres`.
+  Evidence: plan 74, Surprises & Discoveries; the outage case of `en-server-tenant-tests`.
+
+- Observation (EP-2 and EP-3, recurring surface): the tenant test suite and the benchmark both
+  run many ephemeral PostgreSQL instances on a busy development desktop; EP-2 met the port
+  assumption of `just start-and-test` (FRIC-2) and EP-3 the macOS shared-memory limit
+  (FRIC-3). Both have recorded workarounds; EP-5's long runs should start from a machine with
+  few other PostgreSQL instances.
 
 - Observation (EP-1, decisive for G0): a busy caller inside the same `en-server` process
   costs an idle caller twenty to thirty times more than a busy second process on the same
