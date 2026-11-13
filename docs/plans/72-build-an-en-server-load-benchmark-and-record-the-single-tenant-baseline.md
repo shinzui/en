@@ -17,6 +17,11 @@ provenance:
       at: 2026-11-13T00:54:04Z
       mode: "implement"
       note: "Benchmark, harness, A/B verdict, baseline script and interference preview implemented; baseline recorded for gate G0"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T03:42:23Z
+      mode: "update"
+      note: "Link the lookup-recursion fix plan 77"
 ---
 
 # Build an en-server load benchmark and record the single-tenant baseline
@@ -79,8 +84,8 @@ Nothing in this plan changes the `en-server` executable or any library.
   subject, which is that subproblem. This is an engine correctness defect outside this
   initiative's scope (the MasterPlan excludes changes to `en-core`). The fixture keeps lookups to
   one level of groups and puts the two-level grants on a separate `folder` type, so the
-  benchmark's expected answers do not change when the defect is fixed. It should be raised as
-  its own bug report or improvement request.
+  benchmark's expected answers do not change when the defect is fixed. The fix is planned in
+  `docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md`.
 
 - Observation: planner statistics dominate `lookup`. Right after seeding, `lookup` ran at about
   500 req/s with 4 threads; after `VACUUM ANALYZE` it ran at about 2,500 req/s with 8 threads.
@@ -253,8 +258,9 @@ most of that gap. What this means for the tenant design is in Surprises & Discov
 MasterPlan's G0 report.
 
 **Other findings.** `lookup` does not follow self-recursive usersets past one level, while
-`check` does (Surprises & Discoveries); it needs its own bug report or improvement request, and
-the fixture is built so the benchmark does not depend on it. Planner statistics dominate
+`check` does (Surprises & Discoveries); the fix is planned in
+`docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md`, and the fixture is
+built so the benchmark does not depend on it. Planner statistics dominate
 `lookup` unless every round starts with `VACUUM ANALYZE`.
 
 **Friction.** No friction entries were recorded under this plan; the small costs met (an

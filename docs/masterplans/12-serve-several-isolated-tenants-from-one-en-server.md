@@ -293,6 +293,8 @@ in the named child plan.
 - [ ] **G0, owner go/no-go (after EP-1).** EP-1 reports the single-tenant baseline and the
       in-process interference preview. The owner confirms that the preview and the stated
       shared-process limit are acceptable. If not, EP-2 to EP-5 are cancelled.
+      Status 2026-11-13: evidence reported, **decision deferred by the owner**. The brief below
+      is what the decision rests on.
 - [ ] **G1, no single-tenant regression.** A server started without `EN_TENANTS` shows no
       regression against the baseline binary under EP-1's A/B verdict rule (`--rounds 3`), on
       every workload, at two points: the end of EP-2 Milestone 1, where the legacy request path
@@ -313,6 +315,62 @@ in Surprises & Discoveries, and report to the owner. Work is committed to `maste
 repository does not use feature branches by default), so every child plan keeps legacy mode
 passing the smoke benchmark and the existing suites at its tip; if the initiative is abandoned, the commits carrying this MasterPlan's
 trailer are reverted.
+
+
+### Gate G0 decision brief (2026-11-13)
+
+Recorded so the owner can decide later without the session that produced it. Full evidence:
+`docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md`
+(Outcomes & Retrospective) and `en-server/loadbench/results/`.
+
+**Single-tenant baseline** (commit `5361988`; Apple M5 Ultra, 36 cores, macOS 27.2, PostgreSQL
+18.6, GHC 9.12.4; 32 client threads, 30 s windows, server saturated):
+
+```text
+workload              req/s    p50_ms    p95_ms    p99_ms
+check-direct          11183     2.783     4.051     5.249
+check-nested           4526     7.056     8.170     9.676
+check-cached          17303     1.565     3.027     4.012
+lookup                 3095     9.695    17.447    21.997
+check-last-key        10192     3.019     4.253     5.638
+write                  8840     3.025     7.833    11.231
+```
+
+**Instrument resolution.** The baseline compared with itself passes, with medians within
+±5.6% (p99 within ±11.3%), but round-to-round throughput noise is 9.4–16.5% on this working
+desktop. Gates run here detect regressions of roughly 10–17% or more; a quiet machine is needed
+for a tighter "no degradation" claim. A one-connection-pool candidate is flagged on every
+workload, so the rule does fail when it should.
+
+**Interference preview** (victim: 8 threads of `check-direct`; aggressor: 32 threads each of
+`check-nested` and `lookup`). Share of the victim's throughput kept while the aggressor runs:
+
+```text
+pool          shared process          two separate processes
+10 (default)  2.9%   (p99 x32)        61%  (p99 x1.9)
+64            5.6%   (p99 x9.2)       67%  (p99 x2.0)
+```
+
+**What it means for the design.** Per-tenant pools, caches and rate-limit buckets (the design
+above) remove little of the gap: one process divides its capacity per in-flight request, so
+the tenant with more concurrent requests takes most of it, while the operating system divides
+CPU between two processes roughly per process. Shared stop-the-world garbage collection and the
+single request-log lock add to it. As designed, **G3 is very likely to fail.**
+
+**Options.**
+
+1. *Go, with a design change*: add a per-tenant admission bound (a cap on each tenant's
+   in-flight requests, possibly with a queue) to EP-2, keep G3 as written, and measure the
+   bound with `interference`-style runs early in EP-2, stopping again if it does not approach
+   the separate-process figure. Unproven; it would need its own Decision Log entry and changes
+   to `docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md`.
+2. *Go, with a weaker G3*: accept that a busy neighbour degrades a tenant, bounded only by the
+   existing per-caller rate limiter. This relaxes the owner's second condition.
+3. *No-go*: serve each tenant from its own `en-server` process; mark IR-2 `rejected` with this
+   brief as its resolution and cancel EP-2 to EP-5.
+
+Recommendation recorded at the time: option 1 only if the owner accepts a second stop after an
+early measurement of the bound; otherwise option 3.
 
 
 ## Surprises & Discoveries
@@ -342,7 +400,9 @@ trailer are reverted.
   self-recursive userset (`group#member` inside `group.member`) past its first level, while
   `POST /v1/check` does, so lookup omits objects check allows. The cause is the `visited` guard in
   `evalRelation` (`en-core/src/En/Lookup.hs`). This initiative does not change `en-core`; it
-  should be raised as its own bug report or improvement request. The benchmark fixture avoids it.
+  is planned as its own fix in
+  `docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md`, independent of
+  this initiative. The benchmark fixture avoids it.
 
 
 ## Decision Log
