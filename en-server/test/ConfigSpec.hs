@@ -61,7 +61,7 @@ legacyCases =
       (config, warnings) <- expectRight (parse legacyEnvironment)
       assertEqual "warnings" [] warnings
       case config ^. #tenancy of
-        Tenants _ -> assertFailure "parsed as tenant mode"
+        Tenants _ _ -> assertFailure "parsed as tenant mode"
         SingleStore tenant -> do
           assertEqual "database" "postgresql://localhost/en" (tenant ^. #store . #databaseUrl)
           assertEqual "schema" (Just "/etc/en/app.en") (tenant ^. #store . #schemaPath)
@@ -73,7 +73,10 @@ legacyCases =
       expectFailure ["Missing EN_DATABASE_URL"] (parse (drop 1 legacyEnvironment)),
     testCase "a per-tenant variable without EN_TENANTS is refused" do
       expectFailure ["EN_TENANT_ALPHA_POOL_SIZE", "EN_TENANTS is not"] $
-        parse (legacyEnvironment <> [("EN_TENANT_ALPHA_POOL_SIZE", "4")])
+        parse (legacyEnvironment <> [("EN_TENANT_ALPHA_POOL_SIZE", "4")]),
+    testCase "EN_METRICS_KEYS without EN_TENANTS is refused" do
+      expectFailure ["EN_METRICS_KEYS", "EN_TENANTS is not"] $
+        parse (legacyEnvironment <> [("EN_METRICS_KEYS", "ops:ops-scrape-secret-0123456789")])
   ]
 
 -- * Tenant mode
@@ -145,7 +148,13 @@ acceptCases =
       (config, _) <- expectRight (parse (legacyEnvironment <> [("EN_SCHEMA_RELOAD_FORCE", "true")]))
       case config ^. #tenancy of
         SingleStore tenant -> assertBool "force" (tenant ^. #schemaReloadForce)
-        Tenants _ -> assertFailure "parsed as tenant mode",
+        Tenants _ _ -> assertFailure "parsed as tenant mode",
+    testCase "no EN_METRICS_KEYS means no scrape key" do
+      (config, _) <- expectRight (parse twoTenants)
+      assertEqual "scrape keys" [] (scrapeKeys config),
+    testCase "EN_METRICS_KEYS gives read-only scrape keys" do
+      (config, _) <- expectRight (parse (twoTenants <> [("EN_METRICS_KEYS", "ops:ops-scrape-secret-0123456789, backup:backup-scrape-secret-0123")]))
+      assertEqual "scrape keys" [("ops", ReadOnly), ("backup", ReadOnly)] (scrapeKeys config),
     testCase "process-wide settings still apply" do
       (config, _) <- expectRight (parse (twoTenants <> [("EN_PORT", "9000"), ("EN_RATE_LIMIT_RPS", "5")]))
       assertEqual "port" 9000 (config ^. #shared . #port)
@@ -219,7 +228,23 @@ rejectCases =
       expectFailure ["EN_TENANT_ALPHA_POOL_SIZE=0", "positive"] (parse (twoTenants <> [("EN_TENANT_ALPHA_POOL_SIZE", "0")])),
     testCase "a malformed per-tenant issuer key" do
       expectFailure ["Invalid EN_TENANT_ALPHA_BISCUIT_ISSUER_SECRET_KEY"] $
-        parse (twoTenants <> [("EN_TENANT_ALPHA_BISCUIT_ISSUER_SECRET_KEY", "not-a-key")])
+        parse (twoTenants <> [("EN_TENANT_ALPHA_BISCUIT_ISSUER_SECRET_KEY", "not-a-key")]),
+    testCase "a scrape key secret shorter than 16 bytes" do
+      expectFailure ["Invalid EN_METRICS_KEYS", "shorter than 16 bytes"] $
+        parse (twoTenants <> [("EN_METRICS_KEYS", "ops:short")]),
+    testCase "a scrape key secret that is also a tenant key's" do
+      expectFailure ["same API key secret", "key ops of EN_METRICS_KEYS", "tenant alpha"] $
+        parse (twoTenants <> [("EN_METRICS_KEYS", "ops:alpha-writer-0123456789")]),
+    testCase "a scrape key secret colliding is never printed" do
+      case parse (twoTenants <> [("EN_METRICS_KEYS", "ops:alpha-writer-0123456789")]) of
+        Right _ -> assertFailure "expected a failure"
+        Left message -> assertBool "secret in message" (not ("alpha-writer-0123456789" `Text.isInfixOf` message)),
+    testCase "a duplicate scrape key name" do
+      expectFailure ["Duplicate API key name", "EN_METRICS_KEYS", "ops"] $
+        parse (twoTenants <> [("EN_METRICS_KEYS", "ops:ops-scrape-secret-0123456789,ops:ops-other-secret-0123456789")]),
+    testCase "a malformed scrape key entry" do
+      expectFailure ["Invalid EN_METRICS_KEYS", "no ':' separator"] $
+        parse (twoTenants <> [("EN_METRICS_KEYS", "no-separator")])
   ]
 
 -- * Helpers
@@ -243,6 +268,11 @@ keySummary = \case
   AuthDisabled -> []
   AuthKeys keys -> [(key ^. #keyName, key ^. #keyRole) | key <- keys]
 
+scrapeKeys :: ServerConfig -> [(Text, KeyRole)]
+scrapeKeys config = case config ^. #tenancy of
+  Tenants _ keys -> [(key ^. #keyName, key ^. #keyRole) | key <- keys]
+  SingleStore _ -> []
+
 expectRight :: Either Text a -> IO a
 expectRight = either (assertFailure . ("unexpected failure: " <>) . Text.unpack) pure
 
@@ -250,7 +280,7 @@ expectTenants :: Either Text (ServerConfig, [Text]) -> IO [(TenantName, TenantCo
 expectTenants result = do
   (config, _) <- expectRight result
   case config ^. #tenancy of
-    Tenants tenants -> pure (NonEmpty.toList tenants)
+    Tenants tenants _ -> pure (NonEmpty.toList tenants)
     SingleStore _ -> assertFailure "parsed as legacy mode"
 
 -- | The parse fails, and its message mentions every fragment.

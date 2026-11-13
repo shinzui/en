@@ -35,7 +35,8 @@ import En.Servant.OpenApi (probesApplication, servedProxy)
 import En.Tuple (Tuple)
 import Hasql.Pool qualified as Pool
 import Maintenance (describeMaintenance, runMaintenanceLoop)
-import Middleware (AuthConfig (..), TenantRoute (..), authMiddleware, describeRateLimit, tenantAuthMiddleware)
+import Metrics (scrapeResponse)
+import Middleware (ApiKey (..), AuthConfig (..), TenantRoute (..), authMiddleware, describeRateLimit, scrapeOnly, tenantAuthMiddleware)
 import Network.Wai qualified as Wai
 import Network.Wai.Handler.Warp qualified as Warp
 import Network.Wai.Handler.WarpTLS qualified as WarpTLS
@@ -57,6 +58,7 @@ import Tenant
     TenantStack (..),
     buildStack,
     configFailure,
+    legacyApplication,
     loadCandidateSchema,
     openSlot,
     openStore,
@@ -68,6 +70,7 @@ import Tenant
     showText,
     slotApplication,
     slotProbes,
+    slotSource,
     toStderr,
     toStdout,
   )
@@ -208,8 +211,9 @@ runServe serverConfig = do
   requestLogger <- newRequestLogger
   case serverConfig ^. #tenancy of
     SingleStore tenantConfig ->
-      bracket (buildStack shared requestLogger Nothing tenantConfig) releaseStack \stack ->
+      bracket (buildStack shared Nothing tenantConfig) releaseStack \stack ->
         withTelemetry (shared ^. #telemetry) \(tracerProvider, otelMiddleware) -> do
+          application <- legacyApplication shared (requestLogger Nothing) stack
           printServingLines shared stack (tenantConfig ^. #biscuit)
           installReloadHandler [stack]
           let servantTelemetryMiddleware =
@@ -224,31 +228,36 @@ runServe serverConfig = do
                 otelMiddleware
                   . servantTelemetryMiddleware
                   . authMiddleware (tenantConfig ^. #auth)
-                  $ (stack ^. #application)
+                  $ application
           withMaintenance shared [stack] $
             serve (shared ^. #tls) (shared ^. #port) wrappedApp
-    Tenants tenants ->
+    Tenants tenants metricsKeys ->
       withSlots shared requestLogger (NonEmpty.toList tenants) \slots -> do
         rejectSharedDatastores slots
         withTelemetry (shared ^. #telemetry) \(tracerProvider, otelMiddleware) -> do
-          printTenantServingLines shared slots
+          printTenantServingLines shared slots metricsKeys
           installSlotReloadHandler slots
           (livenessProbe, readinessProbe) <- slotProbes slots
           let servantTelemetryMiddleware =
                 maybe id (\provider -> openTelemetryServantMiddleware provider servedProxy) tracerProvider
               -- Every configured key, paired with the application of its tenant's slot. The
               -- key that authenticates a request is the only thing that selects a tenant.
+              --
+              -- An operator's scrape key is paired with every tenant's metrics, rendered
+              -- together, and may call nothing else.
+              operatorScrape _ respond = scrapeResponse (map slotSource slots) >>= respond
               routes =
                 [ TenantRoute {routeKey = key, routeApplication = slotApplication slot}
                 | slot <- slots,
                   AuthKeys keys <- [slot ^. #config . #auth],
                   key <- keys
                 ]
+                  <> [TenantRoute {routeKey = key, routeApplication = scrapeOnly operatorScrape} | key <- metricsKeys]
               wrappedApp =
                 otelMiddleware
                   . servantTelemetryMiddleware
                   $ tenantAuthMiddleware (probesApplication livenessProbe readinessProbe) routes
-          withSlotWorkers shared requestLogger slots $
+          withSlotWorkers shared slots $
             serve (shared ^. #tls) (shared ^. #port) wrappedApp
 
 -- | Open one slot per tenant, in declaration order, and release every pool afterwards.
@@ -258,7 +267,7 @@ runServe serverConfig = do
 -- starts unavailable; its worker ('runSlot') keeps trying.
 withSlots ::
   SharedConfig ->
-  Wai.Middleware ->
+  (Maybe Text.Text -> Wai.Middleware) ->
   [(TenantName, TenantConfig)] ->
   ([TenantSlot] -> IO a) ->
   IO a
@@ -299,10 +308,10 @@ rejectSharedDatastores slots = do
 
 -- | Run each slot's worker beside the action: maintenance for an available tenant, recovery
 -- then maintenance for an unavailable one. Cancelled when `serve` returns.
-withSlotWorkers :: SharedConfig -> Wai.Middleware -> [TenantSlot] -> IO () -> IO ()
-withSlotWorkers shared requestLogger slots action =
+withSlotWorkers :: SharedConfig -> [TenantSlot] -> IO () -> IO ()
+withSlotWorkers shared slots action =
   foldr
-    (\slot inner -> withAsync (runSlot shared requestLogger slots slot) \_worker -> inner)
+    (\slot inner -> withAsync (runSlot shared slots slot) \_worker -> inner)
     action
     slots
 
@@ -357,10 +366,14 @@ installReloadHandler stacks = do
   pure ()
 
 -- | Tenant mode's startup lines: the process-wide settings once, then each tenant's.
-printTenantServingLines :: SharedConfig -> [TenantSlot] -> IO ()
-printTenantServingLines shared slots = do
+printTenantServingLines :: SharedConfig -> [TenantSlot] -> [ApiKey] -> IO ()
+printTenantServingLines shared slots metricsKeys = do
   Text.putStrLn ("en-server listening on :" <> Text.pack (show (shared ^. #port)))
   Text.putStrLn ("Tenants: " <> Text.intercalate ", " [renderTenantName (slot ^. #name) | slot <- slots])
+  Text.putStrLn
+    ( "Metrics scrape keys (every tenant, GET /metrics only): "
+        <> if null metricsKeys then "none" else Text.intercalate ", " [key ^. #keyName | key <- metricsKeys]
+    )
   Text.putStrLn ("Optimized revision cache (per tenant): " <> describeMillisCache (shared ^. #optimizedRevisionTtlMs))
   Text.putStrLn ("Tuple-read cache (per tenant): " <> describeEntryCache (shared ^. #tupleReadMaxEntries))
   Text.putStrLn ("Decision cache (per tenant): " <> describeEntryCache (shared ^. #decisionMaxEntries))

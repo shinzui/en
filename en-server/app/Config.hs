@@ -178,8 +178,9 @@ data TenantConfig = TenantConfig
 -- path.
 data Tenancy
   = SingleStore !TenantConfig
-  | -- | @EN_TENANTS@ is set: each tenant in declaration order, each with its own keys.
-    Tenants !(NonEmpty (TenantName, TenantConfig))
+  | -- | @EN_TENANTS@ is set: each tenant in declaration order, each with its own keys, and
+    --     the operator's scrape keys from @EN_METRICS_KEYS@ (possibly none).
+    Tenants !(NonEmpty (TenantName, TenantConfig)) ![ApiKey]
   deriving stock (Generic)
 
 data ServerConfig = ServerConfig
@@ -237,6 +238,7 @@ knownVariables =
     "EN_MAINTENANCE_INTERVAL_SECONDS",
     "EN_MAX_BATCH_SIZE",
     "EN_MAX_DEPTH",
+    "EN_METRICS_KEYS",
     "EN_OPTIMIZED_REVISION_CACHE_TTL_MS",
     "EN_PAGE_LIMIT",
     "EN_POOL_ACQUISITION_TIMEOUT_MS",
@@ -364,6 +366,8 @@ parseServerConfig environment
   | Map.member "EN_TENANTS" environment = parseTenantServerConfig environment
   | otherwise = do
       rejectTenantVariablesWithoutTenants environment
+      when (Map.member "EN_METRICS_KEYS" environment) $
+        Left "EN_METRICS_KEYS is set but EN_TENANTS is not. A scrape key reads every tenant's metrics; without tenants, scrape GET /metrics with a key from EN_API_KEYS_READ_ONLY."
       (store, storeWarnings) <- parseStoreConfig environment
       shared <- parseSharedConfig environment
       (auth, authWarnings) <- parseAuth environment
@@ -437,9 +441,11 @@ parseTenantServerConfig environment = do
   defaultPool <- parsePool environment
   defaultGcWindow <- Text.pack <$> withDefaultIn environment "EN_GC_WINDOW" "24 hours" nonEmptyString
   tenants <- traverse (\name -> (name,) <$> parseTenant environment shared defaultPool defaultGcWindow name) names
-  rejectSharedSecrets tenants
+  metricsKeys <- parseKeyListIn environment "EN_METRICS_KEYS" ReadOnly
+  rejectDuplicateNames "EN_METRICS_KEYS" metricsKeys
+  rejectSharedSecrets tenants metricsKeys
   rejectSharedDatabases tenants
-  pure (ServerConfig {shared, tenancy = Tenants tenants}, [])
+  pure (ServerConfig {shared, tenancy = Tenants tenants metricsKeys}, [])
   where
     rejectLegacyVariable name
       | Map.member name environment =
@@ -545,30 +551,28 @@ parseTenant environment shared defaultPool defaultGcWindow name = do
     variable = tenantVariable name
     tenant = renderTenantName name
 
--- | A secret selects a tenant, so it must belong to exactly one tenant and one key. The
--- message names tenants and keys, never the secret.
-rejectSharedSecrets :: NonEmpty (TenantName, TenantConfig) -> Either Text ()
-rejectSharedSecrets tenants =
+-- | A secret selects a tenant (or the operator's scrape view), so it must belong to
+-- exactly one key of one tenant, or to one scrape key. The message names tenants and keys,
+-- never the secret.
+rejectSharedSecrets :: NonEmpty (TenantName, TenantConfig) -> [ApiKey] -> Either Text ()
+rejectSharedSecrets tenants metricsKeys =
   case clashes of
     [] -> Right ()
-    ((tenantA, keyA), (tenantB, keyB)) : _ ->
+    (ownerA, ownerB) : _ ->
       Left $
-        "The same API key secret is configured for key "
-          <> keyA
-          <> " of tenant "
-          <> renderTenantName tenantA
-          <> " and key "
-          <> keyB
-          <> " of tenant "
-          <> renderTenantName tenantB
-          <> ". A secret must belong to exactly one key of one tenant."
+        "The same API key secret is configured for "
+          <> ownerA
+          <> " and "
+          <> ownerB
+          <> ". A secret must belong to exactly one key of one tenant, or to one EN_METRICS_KEYS key."
   where
     owned =
-      [ (key ^. #keySecret, (name, key ^. #keyName))
+      [ (key ^. #keySecret, "key " <> key ^. #keyName <> " of tenant " <> renderTenantName name)
       | (name, config) <- NonEmpty.toList tenants,
         AuthKeys keys <- [config ^. #auth],
         key <- keys
       ]
+        <> [(key ^. #keySecret, "key " <> key ^. #keyName <> " of EN_METRICS_KEYS") | key <- metricsKeys]
     clashes = adjacentClashes (sortOn fst owned)
     adjacentClashes = \case
       (secretA, ownerA) : rest@((secretB, ownerB) : _)

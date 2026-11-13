@@ -12,11 +12,20 @@
 --
 -- @\/metrics@ is not exempt from authentication: a scraper presents a read-only bearer
 -- key like any other caller.
+--
+-- In tenant mode every sample carries a @tenant@ label and the gauge
+-- @en_tenant_available@ is added. A tenant's key scrapes one 'Source', its own; an
+-- operator's @EN_METRICS_KEYS@ key scrapes every tenant's, merged per family. Legacy mode
+-- renders one unlabelled 'Source' and its output is what it has always been
+-- (docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md).
 module Metrics
   ( Metrics,
     newMetrics,
     metricsMiddleware,
     metricsRoute,
+    Source (..),
+    scrapeRoute,
+    scrapeResponse,
   )
 where
 
@@ -32,7 +41,7 @@ import En.Cache (CacheStats (..))
 import En.Prelude
 import GHC.Clock (getMonotonicTimeNSec)
 import Network.HTTP.Types (Status (..), hContentType, methodGet, status200)
-import Network.Wai (Middleware, Request (..), responseLBS, responseStatus)
+import Network.Wai (Middleware, Request (..), Response, responseLBS, responseStatus)
 import Numeric (showFFloat)
 import Servant.Health.Paths qualified as Health
 
@@ -68,22 +77,70 @@ metricsMiddleware (Metrics ref) inner request respond = do
           totalDurationNs = (old ^. #totalDurationNs) + (new ^. #totalDurationNs)
         }
 
--- | Serve @GET \/metrics@ in the Prometheus text exposition format.
+-- | Serve @GET \/metrics@ in the Prometheus text exposition format: legacy mode's one
+-- unlabelled registry.
 --
 -- Cache statistics are read at scrape time rather than mirrored into 'Metrics', so
 -- there is exactly one copy of each counter.
 metricsRoute :: Metrics -> [(Text, IO CacheStats)] -> Middleware
-metricsRoute (Metrics ref) caches inner request respond
+metricsRoute metrics caches =
+  scrapeRoute
+    [ Source
+        { tenant = Nothing,
+          metrics,
+          caches = traverse (\(name, readStats) -> (,) name <$> readStats) caches,
+          available = Nothing
+        }
+    ]
+
+-- | One registry as a scrape sees it.
+data Source = Source
+  { -- | Added to every sample as @tenant="NAME"@; 'Nothing' in legacy mode.
+    tenant :: !(Maybe Text),
+    metrics :: !Metrics,
+    -- | The cache counters, read at scrape time. A tenant whose store is not open has no
+    --     caches and reports none.
+    caches :: !(IO [(Text, CacheStats)]),
+    -- | Whether the tenant can serve, rendered as @en_tenant_available@; 'Nothing' in
+    --     legacy mode, which has no such family.
+    available :: !(Maybe (IO Bool))
+  }
+  deriving stock (Generic)
+
+-- | Serve @GET \/metrics@ from these sources; pass every other request on.
+scrapeRoute :: [Source] -> Middleware
+scrapeRoute sources inner request respond
   | requestMethod request == methodGet,
-    pathInfo request == ["metrics"] = do
-      requests <- readIORef ref
-      cacheStats <- traverse (\(name, readStats) -> (,) name <$> readStats) caches
-      respond $
-        responseLBS
-          status200
-          [(hContentType, "text/plain; version=0.0.4; charset=utf-8")]
-          (toLazyByteString (render requests cacheStats))
+    pathInfo request == ["metrics"] =
+      scrapeResponse sources >>= respond
   | otherwise = inner request respond
+
+-- | Render the sources as one exposition: each family declared once, followed by every
+-- source's samples.
+scrapeResponse :: [Source] -> IO Response
+scrapeResponse sources = do
+  snapshots <- traverse snapshot sources
+  pure $
+    responseLBS
+      status200
+      [(hContentType, "text/plain; version=0.0.4; charset=utf-8")]
+      (toLazyByteString (render snapshots))
+  where
+    snapshot source = do
+      let Metrics ref = source ^. #metrics
+      requests <- readIORef ref
+      cacheStats <- source ^. #caches
+      available <- sequence (source ^. #available)
+      pure Snapshot {tenant = source ^. #tenant, requests, cacheStats, available}
+
+-- | A source read at one scrape.
+data Snapshot = Snapshot
+  { tenant :: !(Maybe Text),
+    requests :: !(Map (Text, Text) RequestStats),
+    cacheStats :: ![(Text, CacheStats)],
+    available :: !(Maybe Bool)
+  }
+  deriving stock (Generic)
 
 -- | The first path segment below any version prefix, restricted to the routes en
 -- actually serves. An unrecognized path becomes @other@ — without this, a caller could
@@ -122,55 +179,79 @@ statusClass status =
     5 -> "5xx"
     _ -> "other"
 
-render :: Map (Text, Text) RequestStats -> [(Text, CacheStats)] -> Builder
-render requests caches =
-  mconcat
-    [ family
+-- | Every family once, each followed by the samples of every snapshot in order. A
+-- snapshot's tenant, if any, is the last label of each of its samples.
+render :: [Snapshot] -> Builder
+render snapshots =
+  mconcat $
+    [ counter
         "en_http_requests_total"
         "Total HTTP requests handled, by path group and status class."
-        [(requestLabels labels, intDec (stats ^. #count)) | (labels, stats) <- observations],
-      family
+        (requestSamples \stats -> intDec (stats ^. #count)),
+      counter
         "en_http_request_duration_seconds_sum"
         "Total time spent handling HTTP requests, in seconds."
-        [(requestLabels labels, seconds (stats ^. #totalDurationNs)) | (labels, stats) <- observations],
-      family
+        (requestSamples \stats -> seconds (stats ^. #totalDurationNs)),
+      counter
         "en_http_request_duration_seconds_count"
         "Number of HTTP request durations observed."
-        [(requestLabels labels, intDec (stats ^. #count)) | (labels, stats) <- observations],
+        (requestSamples \stats -> intDec (stats ^. #count)),
       cacheFamily "en_cache_hits_total" "Cache lookups served from the cache." (^. #hits),
       cacheFamily "en_cache_misses_total" "Cache lookups that fell through to the store." (^. #misses),
       cacheFamily "en_cache_inserts_total" "Entries written into the cache." (^. #inserts),
       cacheFamily "en_cache_evictions_total" "Entries evicted from the cache." (^. #evictions)
     ]
+      <> [ family
+             "gauge"
+             "en_tenant_available"
+             "Whether the tenant's storage is serving (1) or not (0)."
+             availability
+         | not (null availability)
+         ]
   where
-    observations = Map.toList requests
-    requestLabels (path, status) = [("path", path), ("status", status)]
+    counter = family "counter"
+    labelled snapshot labels = labels <> maybe [] (\name -> [("tenant", name)]) (snapshot ^. #tenant)
+    requestSamples value =
+      [ (labelled snapshot [("path", path), ("status", status)], value stats)
+      | snapshot <- snapshots,
+        ((path, status), stats) <- Map.toList (snapshot ^. #requests)
+      ]
     cacheFamily name description field =
-      family
+      counter
         name
         description
-        [([("cache", cache)], intDec (field stats)) | (cache, stats) <- caches]
+        [ (labelled snapshot [("cache", cache)], intDec (field stats))
+        | snapshot <- snapshots,
+          (cache, stats) <- snapshot ^. #cacheStats
+        ]
+    availability =
+      [ (labelled snapshot [], if up then "1" else "0")
+      | snapshot <- snapshots,
+        Just up <- [snapshot ^. #available]
+      ]
 
 -- | A @# HELP@\/@# TYPE@ header followed by its samples. Prometheus requires every
 -- sample of a family to be contiguous and the family to be declared once, so the header
 -- is emitted even when there are no samples yet.
-family :: Builder -> Builder -> [([(Text, Text)], Builder)] -> Builder
-family name description samples =
+family :: Builder -> Builder -> Builder -> [([(Text, Text)], Builder)] -> Builder
+family kind name description samples =
   "# HELP "
     <> name
     <> " "
     <> description
     <> "\n# TYPE "
     <> name
-    <> " counter\n"
+    <> " "
+    <> kind
+    <> "\n"
     <> foldMap sample samples
   where
     sample (labels, value) =
       name <> renderLabels labels <> " " <> value <> "\n"
 
 -- | Label values here are drawn from fixed sets ('knownPaths', 'statusClass', and the
--- cache names @Main@ passes), so none can contain a quote, backslash, or newline and no
--- escaping is required.
+-- cache names @Main@ passes) or are tenant names, which match @[a-z][a-z0-9-]{0,30}@, so
+-- none can contain a quote, backslash, or newline and no escaping is required.
 renderLabels :: [(Text, Text)] -> Builder
 renderLabels [] = mempty
 renderLabels labels =

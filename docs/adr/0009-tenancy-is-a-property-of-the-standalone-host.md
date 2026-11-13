@@ -6,6 +6,8 @@ authors: [shinzui]
 related:
   - docs/masterplans/12-serve-several-isolated-tenants-from-one-en-server.md
   - docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md
+  - docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md
+  - docs/adr/0010-a-partially-available-en-server-stays-ready.md
   - docs/improvement-requests/serve-several-isolated-tenants-from-one-en-server.md
   - mori://shinzui/mori/plans/302-migrate-the-shared-registry-from-legacy-tokens-to-shomei-and-en-with-a-team-pilot
 ---
@@ -31,9 +33,12 @@ Tenancy lives only in `en-server`, the standalone host.
 
 - **One single-datastore stack per tenant.** `en-server/app/Tenant.hs` builds, for each
   tenant, everything that exists once per datastore: connection pool, datastore id, active
-  schema, the three caches, rate-limit buckets, metrics registry, maintenance loop, `Env`
-  and the WAI application inside authentication. The same function builds the one stack
-  of a server without tenants.
+  schema, the three caches, maintenance loop, `Env` and servant application. The same
+  function builds the one stack of a server without tenants. The middleware between
+  authentication and that application (rate-limit buckets, request id, request logger,
+  metrics registry and route) is also one per tenant; in tenant mode it belongs to the
+  tenant's slot rather than its stack, so it outlives a stack rebuilt after a storage
+  fault (docs/plans/75).
 - **One PostgreSQL database per tenant**, each migrated by `en-migrate` and carrying the
   unchanged tables. A tenant column was rejected: it would put a tenant filter on every
   hot-path statement, require re-proving garbage collection, grant-generation ordering and

@@ -31,6 +31,11 @@ provenance:
       at: 2026-11-13T19:46:05Z
       mode: "implement"
       note: "EP-2 and EP-3 complete; baseline rebased; verdict rule revised; G1 first point passed"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T20:03:59Z
+      mode: "implement"
+      note: "EP-4 complete; slot-owned serving chain recorded for EP-5's gates"
 ---
 
 # Serve several isolated tenants from one En server
@@ -214,7 +219,7 @@ per-tenant availability is reported, not gated" (plan 75). Plan 76 performs the 
 | EP-1 | Build an en-server load benchmark and record the single-tenant baseline | docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md | None | None | Complete |
 | EP-2 | Serve tenants selected by API key, each from its own isolated stack | docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md | EP-1, gate G0 | None | Complete |
 | EP-3 | Give each tenant an independent lifecycle and contain its storage faults | docs/plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md | EP-2 | None | Complete |
-| EP-4 | Carry the tenant through logs, metrics, traces and readiness | docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md | EP-2, EP-3 | None | Not Started |
+| EP-4 | Carry the tenant through logs, metrics, traces and readiness | docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md | EP-2, EP-3 | None | Complete |
 | EP-5 | Prove tenant isolation and performance, then document tenant operations | docs/plans/76-prove-tenant-isolation-and-performance-then-document-tenant-operations.md | EP-2, EP-3, EP-4 | None | Not Started |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
@@ -300,7 +305,12 @@ single-tenant baseline and the interference preview are recorded in
 isolated stacks, the isolation suite passes, and G1's first run passes. EP-3 is complete
 (2026-11-13): reload, maintenance, GC and grant generations are independent per tenant, the
 subcommands take `--tenant`, and a tenant's storage faults are contained and recover without
-a restart. EP-4 is next. EP-2 moves IR-2 to `in-progress`; EP-5
+a restart. EP-4 is complete (2026-11-13): log lines, metric samples and server spans carry
+the tenant, `EN_METRICS_KEYS` gives operators an all-tenant scrape, and
+`en_tenant_available` and the log name an unavailable tenant while readiness stays 200
+([ADR 10](../adr/0010-a-partially-available-en-server-stays-ready.md); the owner is asked to
+confirm the readiness wording, see Decision Log 2026-11-12). EP-5 is next and waits for the
+owner's go-ahead. EP-2 moves IR-2 to `in-progress`; EP-5
 marks it `completed`. The initiative has six gates that are not owned by a single child plan.
 Each is checked off only with benchmark or test evidence recorded in the named child plan.
 
@@ -408,6 +418,17 @@ tenant (G5, added) and a tenant with idle neighbours (G2) must show no regressio
 
 
 ## Surprises & Discoveries
+
+- Observation (EP-4, affects EP-5): in tenant mode the serving chain (rate limiter, request id,
+  request logger, metrics) now belongs to the tenant slot and wraps the availability switch;
+  a stack holds only its servant application. Legacy mode builds the same chain in the same
+  order around its one stack (`legacyApplication` in `en-server/app/Tenant.hs`). So G5 measures
+  the slot chain plus the tenant span attribute and log fields, and G1 re-measures the rebuilt
+  legacy chain. Also, an open store that stops answering stays `Available`, so
+  `en_tenant_available` follows the readiness ping, not slot state alone, and lags an outage by
+  up to one probe period. The operations guide must say so.
+  Evidence: `docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md`
+  (Decision Log, Surprises & Discoveries).
 
 - Observation (EP-3, outside this initiative): the first request on a pooled connection that
   PostgreSQL terminated answers `500 internal_error` (`Unexpected number of rows`) instead of

@@ -22,6 +22,11 @@ provenance:
       at: 2026-11-13T14:29:04Z
       mode: "update"
       note: "Owner passed G0 with option 2: added G5 guidance for the tenant-mode request path"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T20:03:59Z
+      mode: "implement"
+      note: "EP-4 implemented: tenant in logs, spans, metrics and availability; ADR 10 written"
 ---
 
 # Carry the tenant through logs, metrics, traces and readiness
@@ -54,19 +59,58 @@ each tenant's state".
 
 ## Progress
 
-- [ ] Milestone 1: in tenant mode the request log line has `tenant` and `caller` fields and the
+- [x] Milestone 1: in tenant mode the request log line has `tenant` and `caller` fields and the
       server span has an `en.tenant` attribute; legacy-mode log lines are unchanged.
-- [ ] Milestone 2: metric series carry a `tenant` label; a tenant key scrapes only its own
+      Done 2026-11-13. Evidence: `en-server-tenant-tests` cases "each request log line names its
+      tenant and caller" and "legacy mode logs and exposes exactly what it always has" (exact
+      field set); `en-server-middleware-test` case "the tenant is an attribute of the request's
+      server span" runs the real WAI telemetry middleware with a recording tracer provider.
+- [x] Milestone 2: metric series carry a `tenant` label; a tenant key scrapes only its own
       tenant; an `EN_METRICS_KEYS` key scrapes all tenants and nothing else; legacy-mode
       `/metrics` output is unchanged.
-- [ ] Milestone 3: per-tenant availability is reported by an `en_tenant_available` metric and by
+      Done 2026-11-13. Evidence: tenant case "a tenant's key scrapes its tenant, the operator's
+      key every tenant and nothing else", the legacy case above (exact family list, no
+      `tenant=`), `en-server-config-tests` (49 pass, 7 new `EN_METRICS_KEYS` cases), and the
+      rendering cases of `en-server-middleware-test`.
+- [x] Milestone 3: per-tenant availability is reported by an `en_tenant_available` metric and by
       log lines on every change; the readiness behaviour is covered by tests and recorded in an
       ADR; `just loadbench-smoke` exits 0.
+      Done 2026-11-13. Evidence: tenant cases "a tenant's outage is named by the log and the
+      gauge while readiness stays 200" and "a tenant unavailable from startup is still logged,
+      counted and scraped", plus the existing "readiness fails only when no tenant can serve"
+      (503 naming `postgres:alpha`); [ADR 10](../adr/0010-a-partially-available-en-server-stays-ready.md).
+      Full suite: `EN_BASELINE_BIN="$PWD/.dev/loadbench/en-server-baseline" cabal test
+      en-server-tenant-tests` passes all 22 cases, the upgrade case included. Smoke run, exit 0:
+
+      ```text
+      workload              req/s    p50_ms    p95_ms    p99_ms  errors
+      check-direct           9858     0.357     0.956     1.268       0
+      check-nested           4487     0.756     1.579     1.840       0
+      check-cached          12449     0.298     0.395     1.099       0
+      lookup                 1497     2.596     3.660     5.019       0
+      check-last-key         9433     0.370     0.987     1.335       0
+      schema-read           21967     0.165     0.232     0.938       0
+      write                  3288     1.199     1.902     2.400       0
+      ```
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- Observation: an open store whose database stops answering stays `Available` in its slot (plan
+  74): its requests answer 503 and it recovers by itself, so slot state alone cannot drive
+  `en_tenant_available`. The plan's "computed at scrape time from the health function" needed a
+  second input.
+  Evidence: `en-server/app/Tenant.hs`, `SlotState`; the outage case passed before this plan
+  with alpha `Available` throughout. Resolved by the `serving` flag (Decision Log).
+
+- Observation: the span attribute could be tested in-process after all. The WAI
+  instrumentation's context key is private, but running `newOpenTelemetryWaiMiddleware'` with a
+  tracer provider that has one no-op span processor yields a recording span the inner
+  application can read with `spanGetAttributes`. A provider with no processor yields only
+  dropped spans, which would have made the test vacuous.
+  Evidence: `en-server/test/MiddlewareSpec.hs`; `createSpan` in
+  `mori://iand675/hs-opentelemetry` (`api/src/OpenTelemetry/Trace/Core.hs`, the
+  `tracerProviderHasProcessor` fast path).
 
 
 ## Decision Log
@@ -98,10 +142,66 @@ each tenant's state".
   and is noted as a possible follow-up, not a requirement of this plan.
   Date: 2026-11-12
 
+- Decision: In tenant mode the whole serving chain (rate limiter, request id, `en.tenant` span
+  attribute, request logger, metrics recorder and metrics route) belongs to the tenant slot and
+  wraps the availability switch; the stack holds only the servant application and its cache
+  readers. Legacy mode builds the identical chain around its one stack, in today's order.
+  Rationale: the plan asked only to move the metrics recorder and route outside the switch.
+  Moving the rest with them keeps the order every request sees the same in both modes (rate
+  limiter outermost, metrics innermost), lets an unavailable tenant's 503 reach the request log
+  under its name (plan 74 left that open), and keeps a tenant's buckets and counters across a
+  recovery, which builds a new stack.
+  Date: 2026-11-13
+
+- Decision: A tenant can serve when its store is open and its last readiness ping passed; a
+  per-slot `serving` flag records the ping, readiness logs each change once, and the gauge
+  reads the flag. A scrape never pings a database.
+  Rationale: see Surprises & Discoveries. Pinging at scrape time would make a scrape wait on an
+  unreachable database's connection timeout. A background ping loop was rejected as a second
+  source of truth beside readiness. The cost: the gauge lags an outage by up to one probe
+  period, and without readiness probes only open-store transitions move it (recorded in ADR 10).
+  Date: 2026-11-13
+
+- Decision: An `EN_METRICS_KEYS` key is a read-only key placed in the same key list as the
+  tenants' keys, paired with an application that answers `GET /metrics` with every tenant's
+  sources and 403 `permission_denied` for anything else. Its requests are not rate-limited,
+  logged or counted.
+  Rationale: `tenantAuthMiddleware` needs no new branch, so a tenant request pays nothing for
+  the operator key. A write with it is refused by the read-only check first (same code, message
+  "this API key is read-only"). Its scrape belongs to no tenant, so it has no tenant's request
+  log, counters or buckets to land in.
+  Date: 2026-11-13
+
+- Decision: The A/B mentioned under Validation was not run; this plan ran `just
+  loadbench-smoke`, as the MasterPlan's gate schedule says (G1 runs at EP-2 Milestone 1 and in
+  EP-5, G5 in EP-5).
+  Rationale: the MasterPlan's 2026-11-13 decision on G1 supersedes this plan's older Validation
+  line.
+  Date: 2026-11-13
+
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Completed 2026-11-13. In tenant mode every request log line names its tenant and caller (the
+key's name, never a client-supplied header), each server span carries `en.tenant`, every metric
+sample carries `tenant`, a tenant's key scrapes only its own tenant, an `EN_METRICS_KEYS` key
+scrapes every tenant and nothing else, and `en_tenant_available` plus one log line per change
+name an unavailable tenant while `/health/ready` stays 200. Legacy mode's log line and
+`/metrics` output are unchanged, asserted by exact field set and family list. This completes
+IR-2 AC-6, with the readiness wording difference recorded in
+[ADR 10](../adr/0010-a-partially-available-en-server-stays-ready.md) for the owner to confirm.
+[ADR 9](../adr/0009-tenancy-is-a-property-of-the-standalone-host.md) now says the serving chain
+belongs to the slot in tenant mode.
+
+What remains for plan 76: gate G5 measures the tenant-mode request path this plan finished
+(tenant span attribute, tenant log fields, slot-owned chain), and G1 re-measures legacy mode,
+whose chain is rebuilt by `legacyApplication` in the same order as before. The operations guide
+should document the log fields, the `tenant` label, `EN_METRICS_KEYS`, the gauge's probe-period
+lag, and the readiness rule.
+
+Friction: none recorded under this plan. Running the formatter took one detour: the `treefmt`
+on PATH finds no config file because the configuration is a flake module (`nix fmt`); fourmolu
+was run directly. Under a minute, below the recording threshold.
 
 
 ## Context and Orientation

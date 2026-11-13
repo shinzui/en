@@ -13,6 +13,8 @@ import Control.Concurrent (threadDelay)
 import Control.Monad (forM_, replicateM, unless)
 import Data.Aeson (Value, (.:), (.=))
 import Data.Aeson qualified as Aeson
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Aeson.Types qualified as Aeson
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.List (find, sort)
@@ -69,6 +71,14 @@ main = do
           "tenant-aware subcommands"
           [ subcommandTest,
             subcommandSelectionTest
+          ],
+        testGroup
+          "the tenant in logs, metrics and readiness"
+          [ requestLogTest,
+            metricsScopeTest,
+            availabilityTest,
+            unavailableAtStartupObservedTest,
+            legacyObservabilityTest
           ]
       ]
 
@@ -642,6 +652,184 @@ expectLogLine fixture fragment = do
   output <- capturedLines (server fixture)
   assertBool ("no log line containing " <> show fragment <> " in:\n" <> Text.unpack (Text.unlines output)) found
 
+-- * AC-6: the tenant in logs, metrics and readiness
+
+-- | The secret of the operator's scrape key, @ops@.
+operatorSecret :: Text
+operatorSecret = "ops-scrape-secret-0123456789"
+
+withOperatorKey :: [(String, String)]
+withOperatorKey = [("EN_METRICS_KEYS", "ops:" <> Text.unpack operatorSecret)]
+
+-- | Each request's line names its tenant and the key's name, never a client-supplied caller.
+requestLogTest :: TestTree
+requestLogTest = testCaseSteps "each request log line names its tenant and caller" \step ->
+  withTwoTenants [] \fixture ->
+    forM_ [(alpha fixture, "alpha", "writer"), (alphaReadOnly fixture, "alpha", "reader"), (beta fixture, "beta", "writer")] \(client, tenant, caller) -> do
+      step ("a check with " <> Text.unpack tenant <> "'s " <> Text.unpack caller <> " key, claiming to be someone else")
+      let marker = "observe-" <> tenant <> "-" <> caller
+      _ <- checkWith client [("User-Agent", Text.encodeUtf8 marker), ("X-En-Caller", "forged")] ("team", "t1", "membership", "ann") >>= expectStatus 200
+      line <- onlyRequestLine fixture marker
+      assertEqual "tenant" (Just tenant) (textField "tenant" line)
+      assertEqual "caller" (Just caller) (textField "caller" line)
+      assertEqual "path" (Just "/v1/check") (textField "path" line)
+
+-- | A tenant's key sees its own series; the operator's key sees every tenant's and may call
+-- nothing but @GET /metrics@.
+metricsScopeTest :: TestTree
+metricsScopeTest = testCaseSteps "a tenant's key scrapes its tenant, the operator's key every tenant and nothing else" \step ->
+  withTwoTenants withOperatorKey \fixture -> do
+    let a = alpha fixture
+        b = beta fixture
+        ops = a {secret = operatorSecret}
+    _ <- check a fullyConsistent ("team", "t1", "membership", "ann") >>= expectStatus 200
+    _ <- check b fullyConsistent ("team", "t1", "membership", "bob") >>= expectStatus 200
+
+    step "alpha's scrape has alpha's series and nothing of beta's"
+    alphaScrape <- scrapeLines a
+    assertBool "alpha's check is counted" (any ("en_http_requests_total{path=\"check\",status=\"2xx\",tenant=\"alpha\"}" `Text.isPrefixOf`) alphaScrape)
+    assertBool "alpha's gauge" ("en_tenant_available{tenant=\"alpha\"} 1" `elem` alphaScrape)
+    assertEqual "lines naming beta" [] (filter ("tenant=\"beta\"" `Text.isInfixOf`) alphaScrape)
+    assertBool "every sample is alpha's" (all (\line -> "#" `Text.isPrefixOf` line || "tenant=\"alpha\"" `Text.isInfixOf` line) alphaScrape)
+
+    step "calling only beta leaves alpha's counters unchanged"
+    before <- requestCounts a
+    _ <- replicateM 3 (check b fullyConsistent ("team", "t1", "membership", "bob") >>= expectStatus 200)
+    after <- requestCounts a
+    assertEqual "alpha's request counters" before after
+
+    step "the operator's scrape has both tenants, each family declared once"
+    opsScrape <- scrapeLines ops
+    let typeLines = filter ("# TYPE " `Text.isPrefixOf`) opsScrape
+    assertEqual "family headers" (length typeLines) (length (dedupe typeLines))
+    assertBool "a gauge family" ("# TYPE en_tenant_available gauge" `elem` typeLines)
+    forM_ ["alpha", "beta"] \tenant -> do
+      assertBool (Text.unpack tenant <> "'s check") (any (("en_http_requests_total{path=\"check\",status=\"2xx\",tenant=\"" <> tenant <> "\"}") `Text.isPrefixOf`) opsScrape)
+      assertBool (Text.unpack tenant <> "'s gauge") (("en_tenant_available{tenant=\"" <> tenant <> "\"} 1") `elem` opsScrape)
+
+    step "the operator's key may call nothing else"
+    check ops fullyConsistent ("team", "t1", "membership", "ann") >>= expectProblem 403 "permission_denied"
+    writeTuple ops ("team", "t1", "member", "ann") >>= expectProblem 403 "permission_denied"
+    getSchemaReply ops >>= expectProblem 403 "permission_denied"
+
+-- | An outage that begins while the server runs: readiness stays 200, the log names the
+-- tenant when its database stops answering and again when it answers, and the gauge
+-- follows, for the operator and for the tenant's own key.
+availabilityTest :: TestTree
+availabilityTest = testCaseSteps "a tenant's outage is named by the log and the gauge while readiness stays 200" \step ->
+  withTwoTenants withOperatorKey \fixture -> do
+    let a = alpha fixture
+        ops = a {secret = operatorSecret}
+    step "take alpha's database out of service"
+    setDatabaseAccepting (alphaPostgres fixture) "en_alpha" False
+    awaitCondition 30 "the readiness check to log alpha's outage" do
+      expectReady a 200
+      hasLogLine fixture "[tenant alpha] UNAVAILABLE: its database did not answer the readiness check"
+    opsScrape <- scrapeLines ops
+    assertBool "operator sees alpha at 0" ("en_tenant_available{tenant=\"alpha\"} 0" `elem` opsScrape)
+    assertBool "operator sees beta at 1" ("en_tenant_available{tenant=\"beta\"} 1" `elem` opsScrape)
+    alphaScrape <- scrapeLines a
+    assertBool "alpha's own scrape shows its gauge at 0" ("en_tenant_available{tenant=\"alpha\"} 0" `elem` alphaScrape)
+    expectReady a 200
+
+    step "bring it back: the log and the gauge say so"
+    setDatabaseAccepting (alphaPostgres fixture) "en_alpha" True
+    awaitCondition 30 "the readiness check to log alpha's recovery" do
+      expectReady a 200
+      output <- capturedLines (server fixture)
+      pure (any ("[tenant alpha] AVAILABLE" ==) output)
+    recovered <- scrapeLines ops
+    assertBool "operator sees alpha at 1" ("en_tenant_available{tenant=\"alpha\"} 1" `elem` recovered)
+
+-- | A tenant unavailable from startup still answers its own scrape, and its 503s are logged
+-- and counted under its name.
+unavailableAtStartupObservedTest :: TestTree
+unavailableAtStartupObservedTest = testCaseSteps "a tenant unavailable from startup is still logged, counted and scraped" \_step ->
+  withTwoTenantsUsing
+    defaultSetup {beforeStart = \postgres _ -> setDatabaseAccepting postgres "en_alpha" False}
+    []
+    \fixture -> do
+      let a = alpha fixture
+      expectLogLine fixture "[tenant alpha] UNAVAILABLE: Could not reach PostgreSQL"
+      checkWith a [("User-Agent", "observe-unavailable")] ("team", "t1", "membership", "ann") >>= expectProblem 503 "store_error"
+      line <- onlyRequestLine fixture "observe-unavailable"
+      assertEqual "tenant" (Just "alpha") (textField "tenant" line)
+      assertEqual "status" (Just (Aeson.Number 503)) (KeyMap.lookup "status" line)
+      alphaScrape <- scrapeLines a
+      assertBool "the 503 is counted" ("en_http_requests_total{path=\"check\",status=\"5xx\",tenant=\"alpha\"} 1" `elem` alphaScrape)
+      assertBool "the gauge is 0" ("en_tenant_available{tenant=\"alpha\"} 0" `elem` alphaScrape)
+
+-- | Without @EN_TENANTS@ the request log line has exactly today's fields and @/metrics@
+-- exactly today's families, with no tenant label.
+legacyObservabilityTest :: TestTree
+legacyObservabilityTest = testCaseSteps "legacy mode logs and exposes exactly what it always has" \_step ->
+  withPostgres \postgres -> do
+    url <- createMigratedDatabase postgres "en_legacy"
+    base <- baseEnvironment
+    binary <- locateServerBinary
+    let environment =
+          base
+            <> [ ("EN_DATABASE_URL", Text.unpack url),
+                 ("EN_API_KEYS_READ_WRITE", "writer:" <> Text.unpack alphaWriter)
+               ]
+    manager <- Http.newManager Http.defaultManagerSettings
+    withServer (serverSpec binary environment) \running -> do
+      let client = Client manager running alphaWriter
+      _ <- checkWith client [("User-Agent", "observe-legacy"), ("X-En-Caller", "forged")] ("space", "s1", "view", "ann") >>= expectStatus 200
+      line <- onlyRequestLineIn running "observe-legacy"
+      assertEqual
+        "log line fields"
+        (sort ["duration_ms", "method", "path", "status", "time", "user_agent"])
+        (sort (map Key.toText (KeyMap.keys line)))
+      scrape <- scrapeLines client
+      assertEqual
+        "metric families"
+        [ "# TYPE en_http_requests_total counter",
+          "# TYPE en_http_request_duration_seconds_sum counter",
+          "# TYPE en_http_request_duration_seconds_count counter",
+          "# TYPE en_cache_hits_total counter",
+          "# TYPE en_cache_misses_total counter",
+          "# TYPE en_cache_inserts_total counter",
+          "# TYPE en_cache_evictions_total counter"
+        ]
+        (filter ("# TYPE " `Text.isPrefixOf`) scrape)
+      assertEqual "lines with a tenant label" [] (filter ("tenant=" `Text.isInfixOf`) scrape)
+
+-- | The one request log line whose user agent is the marker, waiting for it: the line is
+-- written after the response is sent.
+onlyRequestLine :: Fixture -> Text -> IO Aeson.Object
+onlyRequestLine fixture = onlyRequestLineIn (server fixture)
+
+onlyRequestLineIn :: RunningServer -> Text -> IO Aeson.Object
+onlyRequestLineIn running marker = do
+  awaitCondition 10 ("a request log line from " <> Text.unpack marker) (not . null <$> matching)
+  matching >>= \case
+    [line] -> pure line
+    other -> assertFailure ("expected exactly one request log line from " <> Text.unpack marker <> ", got " <> show other)
+  where
+    matching = do
+      output <- capturedLines running
+      pure
+        [ line
+        | raw <- output,
+          Just line <- [Aeson.decodeStrict (Text.encodeUtf8 raw) :: Maybe Aeson.Object],
+          KeyMap.lookup "user_agent" line == Just (Aeson.String marker)
+        ]
+
+textField :: Aeson.Key -> Aeson.Object -> Maybe Text
+textField key line = case KeyMap.lookup key line of
+  Just (Aeson.String value) -> Just value
+  _ -> Nothing
+
+scrapeLines :: Client -> IO [Text]
+scrapeLines client = do
+  (status, body) <- requestWith client [] "GET" "/metrics" Nothing
+  assertEqual ("GET /metrics: " <> show body) 200 status
+  pure (Text.lines (Text.decodeUtf8 (LazyByteString.toStrict body)))
+
+dedupe :: (Eq a) => [a] -> [a]
+dedupe = foldr (\x seen -> if x `elem` seen then seen else x : seen) []
+
 -- * AC-4: tenant-aware subcommands
 
 -- | @check-schema@, @export@ and @import@ with @--tenant@ see one tenant's store only.
@@ -808,14 +996,22 @@ deleteByFilter client objectType objectId =
 
 check :: Client -> Value -> (Text, Text, Text, Text) -> IO Reply
 check client consistency (objectType, objectId, permission, user) =
-  post client "/v1/check" $
-    Aeson.object
-      [ "consistency" .= consistency,
-        "context" .= emptyContext,
-        "subject" .= subjectRef "user" user,
-        "permission" .= permission,
-        "object" .= objectRef objectType objectId
-      ]
+  post client "/v1/check" (checkBody consistency (objectType, objectId, permission, user))
+
+-- | A fully consistent check with extra request headers.
+checkWith :: Client -> [Header] -> (Text, Text, Text, Text) -> IO Reply
+checkWith client headers relationship =
+  requestWith client headers "POST" "/v1/check" (Just (checkBody fullyConsistent relationship))
+
+checkBody :: Value -> (Text, Text, Text, Text) -> Value
+checkBody consistency (objectType, objectId, permission, user) =
+  Aeson.object
+    [ "consistency" .= consistency,
+      "context" .= emptyContext,
+      "subject" .= subjectRef "user" user,
+      "permission" .= permission,
+      "object" .= objectRef objectType objectId
+    ]
 
 batchCheck :: Client -> (Text, Text, Text, Text) -> IO Reply
 batchCheck client (objectType, objectId, permission, user) =

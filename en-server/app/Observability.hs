@@ -13,10 +13,16 @@
 -- acceptable on an authorization hot path, and neither is configurable away. What is
 -- actually wanted here — time, method, path, status, duration, user agent, and trace
 -- correlation — is the function below.
+--
+-- In tenant mode the line also names the tenant and the caller, and 'tenantSpanMiddleware'
+-- puts the tenant on the server span. Legacy mode's line is unchanged
+-- (docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md).
 module Observability
   ( requestIdHeaderName,
     requestIdMiddleware,
     newRequestLogger,
+    tenantSpanMiddleware,
+    tenantSpanAttribute,
   )
 where
 
@@ -88,36 +94,53 @@ sanitizeRequestId value
 
 -- | One JSON line per handled request, on stdout.
 --
+-- The lock is created once, for the process; the result specializes the middleware per
+-- stack. With no tenant (legacy mode) the line is exactly what it has always been. With a
+-- tenant, the line gains @tenant@ and @caller@, the caller read from the @X-En-Caller@
+-- header authentication set (a client-supplied value never survives authentication). The
+-- tenant's fields are built once here, not per request.
+--
 -- The 'MVar' serializes writes: two concurrent requests completing together would
 -- otherwise interleave inside a single 'ByteString' write. Duration is measured on the
 -- monotonic clock, so an NTP step cannot produce a negative latency.
-newRequestLogger :: IO Middleware
+newRequestLogger :: IO (Maybe Text.Text -> Middleware)
 newRequestLogger = do
   lock <- newMVar ()
-  pure \inner request respond ->
-    if defaultRequestLogPredicate request
-      then do
-        start <- getMonotonicTimeNSec
-        inner request \response -> do
-          received <- respond response
-          end <- getMonotonicTimeNSec
-          now <- getCurrentTime
-          correlation <- correlationFields request
-          let line =
-                logLine
-                  (Text.pack (iso8601Show now))
-                  request
-                  (responseStatus response)
-                  (end - start)
-                  correlation
-          withMVar lock \() ->
-            LazyChar8.hPutStrLn stdout (encode line)
-          pure received
-      else inner request respond
+  pure \tenant ->
+    let identity = case tenant of
+          Nothing -> const []
+          Just name -> \request ->
+            [ "tenant" .= name,
+              "caller" .= (Text.decodeUtf8Lenient <$> lookup callerHeaderName (requestHeaders request))
+            ]
+     in \inner request respond ->
+          if defaultRequestLogPredicate request
+            then do
+              start <- getMonotonicTimeNSec
+              inner request \response -> do
+                received <- respond response
+                end <- getMonotonicTimeNSec
+                now <- getCurrentTime
+                correlation <- correlationFields request
+                let line =
+                      logLine
+                        (Text.pack (iso8601Show now))
+                        request
+                        (responseStatus response)
+                        (end - start)
+                        (identity request <> correlation)
+                withMVar lock \() ->
+                  LazyChar8.hPutStrLn stdout (encode line)
+                pure received
+            else inner request respond
+
+-- | Set by authentication to the verified key's name; see "Middleware".
+callerHeaderName :: HeaderName
+callerHeaderName = "X-En-Caller"
 
 -- | The shape every en-server request log line takes.
 logLine :: Text.Text -> Request -> Status -> Word64 -> [Pair] -> Value
-logLine timestamp request status elapsedNs correlation =
+logLine timestamp request status elapsedNs extra =
   object $
     [ "time" .= timestamp,
       "method" .= decode (requestMethod request),
@@ -126,9 +149,22 @@ logLine timestamp request status elapsedNs correlation =
       "duration_ms" .= (fromIntegral elapsedNs / 1e6 :: Double),
       "user_agent" .= (decode <$> lookup hUserAgent (requestHeaders request))
     ]
-      <> correlation
+      <> extra
   where
     decode = Text.decodeUtf8Lenient
+
+-- | The span attribute that names the tenant a request was served for.
+tenantSpanAttribute :: Text.Text
+tenantSpanAttribute = "en.tenant"
+
+-- | Put the tenant on the request's server span, when telemetry created one. With
+-- telemetry disabled there is no span and this only passes the request on.
+tenantSpanMiddleware :: Text.Text -> Middleware
+tenantSpanMiddleware tenant inner request respond = do
+  case requestContext request >>= OTel.Context.lookupSpan of
+    Nothing -> pure ()
+    Just span' -> OTel.addAttribute span' tenantSpanAttribute tenant
+  inner request respond
 
 -- | Correlate a log line only with a valid server span. Invalid contexts have all-zero
 -- identifiers and would look joinable while pointing to no exported trace.

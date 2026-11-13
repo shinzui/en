@@ -20,6 +20,7 @@ module Tenant
     Runner (..),
     buildStack,
     buildRuntime,
+    legacyApplication,
     releaseStack,
     reloadStack,
     stackSay,
@@ -30,6 +31,7 @@ module Tenant
     openSlot,
     runSlot,
     slotApplication,
+    slotSource,
     slotProbes,
     tenantAvailability,
     releaseSlot,
@@ -67,7 +69,7 @@ import Data.UUID qualified as UUID
 import Data.UUID.V4 qualified as UUID.V4
 import Effectful (Eff, IOE, runEff)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
-import En.Cache (Cache, CacheConfig (..), SubproblemKey, TupleReadKey, cacheStats, newCache)
+import En.Cache (Cache, CacheConfig (..), CacheStats, SubproblemKey, TupleReadKey, cacheStats, newCache)
 import En.Check (CheckCacheEnv (..), checkCachedWithBudget, checkWithBudget)
 import En.Decision (ResidualDecision)
 import En.Effect.CachedTupleStore (cachedTupleStore)
@@ -102,10 +104,10 @@ import Hasql.Session (Session)
 import Hasql.Session qualified as Session
 import Hasql.Statement qualified as Statement
 import Maintenance (runMaintenanceLoop)
-import Metrics (metricsMiddleware, metricsRoute, newMetrics)
+import Metrics (Metrics, Source (..), metricsMiddleware, metricsRoute, newMetrics, scrapeRoute)
 import Middleware (rateLimitMiddleware)
 import Network.Wai qualified as Wai
-import Observability (requestIdMiddleware)
+import Observability (requestIdMiddleware, tenantSpanMiddleware)
 import Servant.Health (ProbeCheck, ProbeVerdict (..))
 import Servant.Health.Check (boolCheck, newFailureTracker, safeCheck, withProbeTimeout)
 import System.Exit (exitFailure)
@@ -137,10 +139,12 @@ data TenantStack = TenantStack
     checkReady :: !(IO Bool),
     livenessProbe :: !ProbeCheck,
     readinessProbe :: !ProbeCheck,
-    -- | The servant application wrapped in every middleware that sits inside
-    --     authentication: rate limiter, request id, request logger, metrics recorder and
-    --     metrics route. It expects the verified caller in @X-En-Caller@.
-    application :: !Wai.Application
+    -- | The servant application alone. The middleware between it and authentication is
+    --     added by 'legacyApplication' in legacy mode and by the tenant's slot in tenant
+    --     mode, where it must outlive the stack (see 'openSlot').
+    servantApplication :: !Wai.Application,
+    -- | The stack's cache counters, read at scrape time.
+    caches :: ![(Text, IO CacheStats)]
   }
   deriving stock (Generic)
 
@@ -297,15 +301,36 @@ missingIdentity err =
       <> migrationHint
 
 -- | Open one datastore and build everything a request against it needs.
---
--- The request logger is passed in rather than built here: its lock serializes writes to
--- the one stdout every stack shares. The rate limiter and the metrics registry are built
--- here, so every stack has its own buckets and its own counters.
-buildStack :: SharedConfig -> Wai.Middleware -> Maybe TenantName -> TenantConfig -> IO TenantStack
-buildStack shared requestLogger name tenantConfig = do
+buildStack :: SharedConfig -> Maybe TenantName -> TenantConfig -> IO TenantStack
+buildStack shared name tenantConfig = do
   OpenedStore {loadedSchema, pool, consistency} <-
     openStore (toStdout . (prefixFor name <>)) (tenantConfig ^. #store)
-  buildRuntime shared requestLogger name tenantConfig loadedSchema pool consistency
+  buildRuntime shared name tenantConfig loadedSchema pool consistency
+
+-- | Every middleware between authentication and a servant application, outermost first:
+-- rate limiter, request id, the request logger (with whatever identity the caller adds),
+-- the metrics recorder, and the metrics route.
+--
+-- Authentication remains outside rate limiting so buckets are per verified caller.
+-- Request ids sit inside the limiter, so a throttled request costs no UUID. The metrics
+-- layer is innermost, so it cannot see the 401/403/429 the outer middlewares
+-- short-circuit, which stay countable at the proxy.
+--
+-- The rate limiter is built here, so every caller of this function (one per datastore)
+-- has its own buckets.
+newServingChain :: SharedConfig -> Wai.Middleware -> Metrics -> Wai.Middleware -> IO Wai.Middleware
+newServingChain shared logger metrics route = do
+  rateLimit <- rateLimitMiddleware (shared ^. #rateLimit)
+  pure (rateLimit . requestIdMiddleware . logger . metricsMiddleware metrics . route)
+
+-- | Legacy mode's application: the one stack's servant application inside the serving
+-- chain, with its own metrics registry and a request logger that adds no identity. This
+-- is the request path en-server has always had.
+legacyApplication :: SharedConfig -> Wai.Middleware -> TenantStack -> IO Wai.Application
+legacyApplication shared requestLogger stack = do
+  metrics <- newMetrics
+  chain <- newServingChain shared requestLogger metrics (metricsRoute metrics (stack ^. #caches))
+  pure (chain (stack ^. #servantApplication))
 
 -- | @[tenant NAME] @, or nothing for legacy mode's one stack.
 prefixFor :: Maybe TenantName -> Text.Text
@@ -314,14 +339,13 @@ prefixFor = maybe "" (\(TenantName tenant) -> "[tenant " <> tenant <> "] ")
 -- | Everything a request needs, over a store that is already open and identified.
 buildRuntime ::
   SharedConfig ->
-  Wai.Middleware ->
   Maybe TenantName ->
   TenantConfig ->
   LoadedSchema ->
   Pool.Pool ->
   ConsistencyConfig ->
   IO TenantStack
-buildRuntime shared requestLogger name tenantConfig loadedSchema pool config = do
+buildRuntime shared name tenantConfig loadedSchema pool config = do
   let logPrefix = prefixFor name
       storeConfig = tenantConfig ^. #store
   loadedAt <- getCurrentTime
@@ -466,28 +490,6 @@ buildRuntime shared requestLogger name tenantConfig loadedSchema pool config = d
     mkProbes
       (readIORef activeSchemaRef >> pure True)
       checkReady
-  rateLimit <- rateLimitMiddleware (shared ^. #rateLimit)
-  metrics <- newMetrics
-  -- Outermost first, continuing the chain `Main` starts with telemetry and
-  -- authentication. Authentication remains outside rate limiting so buckets are per
-  -- verified caller. Request ids sit inside the limiter, so a throttled request costs no
-  -- UUID. The metrics layer wraps the servant application, so probes are counted; it
-  -- cannot see the 401/403/429 the outer middlewares short-circuit, which stay
-  -- countable at the proxy.
-  --
-  -- Serves `appWithOpenApi`, not `app`: the former adds GET /v1/openapi.json and the
-  -- ErrorFormatters that make body-parse and 404 errors speak the error envelope.
-  let application =
-        rateLimit
-          . requestIdMiddleware
-          . requestLogger
-          . metricsMiddleware metrics
-          . metricsRoute
-            metrics
-            [ ("tuple_read", cacheStats tupleReadCache),
-              ("decision", cacheStats decisionCache)
-            ]
-          $ appWithOpenApiProbes serverEnv livenessProbe readinessProbe
   pure
     TenantStack
       { name,
@@ -501,7 +503,13 @@ buildRuntime shared requestLogger name tenantConfig loadedSchema pool config = d
         checkReady,
         livenessProbe,
         readinessProbe,
-        application
+        -- Serves `appWithOpenApi`, not `app`: the former adds GET /v1/openapi.json and the
+        -- ErrorFormatters that make body-parse and 404 errors speak the error envelope.
+        servantApplication = appWithOpenApiProbes serverEnv livenessProbe readinessProbe,
+        caches =
+          [ ("tuple_read", cacheStats tupleReadCache),
+            ("decision", cacheStats decisionCache)
+          ]
       }
 
 -- * Tenant slots
@@ -511,15 +519,23 @@ data SlotState
   = Available !TenantStack
   | Unavailable !Text.Text !UTCTime
 
--- | One tenant in tenant mode: its configuration, the schema it was started with, and
--- whether its store is open.
+-- | One tenant in tenant mode: its configuration, the schema it was started with, whether
+-- its store is open, and what must outlive any one stack -- its rate-limit buckets and
+-- metrics registry, held by its serving chain.
 data TenantSlot = TenantSlot
   { name :: !TenantName,
     config :: !TenantConfig,
     -- | Read at startup. A tenant that recovers later is served under it; @SIGHUP@ reloads
     --     available tenants only.
     loadedSchema :: !LoadedSchema,
-    state :: !(IORef SlotState)
+    state :: !(IORef SlotState),
+    -- | Whether the tenant's last readiness ping passed. An open store whose database
+    --     stopped answering is still 'Available' -- its requests fail with store errors and
+    --     it recovers by itself -- so this, not 'state' alone, says whether it can serve.
+    serving :: !(IORef Bool),
+    metrics :: !Metrics,
+    -- | The serving chain around the availability switch; see 'openSlot'.
+    application :: !Wai.Application
   }
   deriving stock (Generic)
 
@@ -532,20 +548,48 @@ slotSay slot message = toStdout (slotPrefix slot <> message)
 -- | Load the tenant's schema (a failure exits 1) and try to open its store. A store that is
 -- unreachable, unmigrated or not the pinned database leaves the tenant unavailable instead
 -- of stopping the process; a misconfiguration such as an invalid GC window exits 1.
-openSlot :: SharedConfig -> Wai.Middleware -> TenantName -> TenantConfig -> IO TenantSlot
+--
+-- The serving chain (rate limiter, request id, tenant span attribute, request logger with
+-- the tenant and caller, metrics recorder and route) wraps the availability switch rather
+-- than a stack. So an unavailable tenant's 503 is logged and counted under its name, its
+-- @GET \/metrics@ still answers, and its buckets and counters survive a recovery, which
+-- builds a new stack. The tenant's identity is bound here, once, never looked up per
+-- request.
+openSlot :: SharedConfig -> (Maybe Text.Text -> Wai.Middleware) -> TenantName -> TenantConfig -> IO TenantSlot
 openSlot shared requestLogger name tenantConfig = do
   let prefix = prefixFor (Just name)
       say = toStdout . (prefix <>)
+      TenantName tenant = name
   schema <- loadStoreSchema say (tenantConfig ^. #store)
   initial <-
     connectStore say (tenantConfig ^. #store) (pinFor name tenantConfig) schema >>= \case
-      Right (pool, consistency) -> Available <$> buildRuntime shared requestLogger (Just name) tenantConfig schema pool consistency
+      Right (pool, consistency) -> Available <$> buildRuntime shared (Just name) tenantConfig schema pool consistency
       Left (StoreMisconfigured message) -> configFailure (prefix <> message)
       Left (StoreUnavailable reason) -> do
         say ("UNAVAILABLE: " <> oneLine reason)
         Unavailable reason <$> getCurrentTime
   state <- newIORef initial
-  pure TenantSlot {name, config = tenantConfig, loadedSchema = schema, state}
+  serving <- newIORef case initial of
+    Available _ -> True
+    Unavailable {} -> False
+  metrics <- newMetrics
+  let unserved =
+        TenantSlot
+          { name,
+            config = tenantConfig,
+            loadedSchema = schema,
+            state,
+            serving,
+            metrics,
+            application = availabilitySwitch state
+          }
+  chain <-
+    newServingChain
+      shared
+      (tenantSpanMiddleware tenant . requestLogger (Just tenant))
+      metrics
+      (scrapeRoute [slotSource unserved])
+  pure unserved {application = chain (availabilitySwitch state)}
 
 pinFor :: TenantName -> TenantConfig -> Maybe (Text.Text, Text.Text)
 pinFor name tenantConfig =
@@ -560,8 +604,8 @@ oneLine = Text.unwords . Text.lines
 --
 -- A recovered store whose datastore id another available tenant already reports stays
 -- unavailable: it is the same database reached through a different URL.
-runSlot :: SharedConfig -> Wai.Middleware -> [TenantSlot] -> TenantSlot -> IO ()
-runSlot shared requestLogger slots slot =
+runSlot :: SharedConfig -> [TenantSlot] -> TenantSlot -> IO ()
+runSlot shared slots slot =
   readIORef (slot ^. #state) >>= \case
     Available stack -> maintain stack
     Unavailable {} -> recover 5 >>= maintain
@@ -593,7 +637,8 @@ runSlot shared requestLogger slots slot =
                 )
               next
             Nothing -> do
-              stack <- buildRuntime shared requestLogger (Just (slot ^. #name)) tenantConfig (slot ^. #loadedSchema) pool consistency
+              stack <- buildRuntime shared (Just (slot ^. #name)) tenantConfig (slot ^. #loadedSchema) pool consistency
+              atomicWriteIORef (slot ^. #serving) True
               atomicWriteIORef (slot ^. #state) (Available stack)
               slotSay slot "AVAILABLE"
               pure stack
@@ -614,24 +659,49 @@ runSlot shared requestLogger slots slot =
     renderName (TenantName tenant) = tenant
     renderDatastoreId (DatastoreId value) = value
 
--- | The application paired with a tenant's keys: its stack's, or the store-unavailable
--- problem a store failure produces. One read of the slot per request.
+-- | The application paired with a tenant's keys: its serving chain around its stack's
+-- servant application, or around the store-unavailable problem a store failure produces.
 slotApplication :: TenantSlot -> Wai.Application
-slotApplication slot request respond =
-  readIORef (slot ^. #state) >>= \case
-    Available stack -> (stack ^. #application) request respond
+slotApplication slot = slot ^. #application
+
+-- | The stack's servant application, or the store-unavailable problem. One read of the
+-- slot per request.
+availabilitySwitch :: IORef SlotState -> Wai.Application
+availabilitySwitch state request respond =
+  readIORef state >>= \case
+    Available stack -> (stack ^. #servantApplication) request respond
     Unavailable {} -> respond tenantUnavailable
 
 tenantUnavailable :: Wai.Response
 tenantUnavailable = problemResponse specStoreError "this tenant's store is unavailable; retry later"
 
--- | Every tenant's name and whether its store is open, in declaration order.
+-- | The tenant as a metrics scrape sees it: its registry and caches under its name, and
+-- whether it can serve. A tenant whose store is not open has no caches to report.
+slotSource :: TenantSlot -> Source
+slotSource slot =
+  Source
+    { tenant = Just tenant,
+      metrics = slot ^. #metrics,
+      caches =
+        readIORef (slot ^. #state) >>= \case
+          Available stack -> traverse (\(cache, readStats) -> (cache,) <$> readStats) (stack ^. #caches)
+          Unavailable {} -> pure [],
+      available = Just (slotServing slot)
+    }
+  where
+    TenantName tenant = slot ^. #name
+
+-- | The store is open and its last readiness ping passed.
+slotServing :: TenantSlot -> IO Bool
+slotServing slot =
+  readIORef (slot ^. #state) >>= \case
+    Available _ -> readIORef (slot ^. #serving)
+    Unavailable {} -> pure False
+
+-- | Every tenant's name and whether it can serve, in declaration order: its store is open
+-- and, as of the last readiness check, its database answers.
 tenantAvailability :: [TenantSlot] -> IO [(TenantName, Bool)]
-tenantAvailability =
-  traverse \slot ->
-    readIORef (slot ^. #state) <&> \case
-      Available _ -> (slot ^. #name, True)
-      Unavailable {} -> (slot ^. #name, False)
+tenantAvailability = traverse \slot -> (slot ^. #name,) <$> slotServing slot
 
 -- | The process's probes in tenant mode.
 --
@@ -640,6 +710,12 @@ tenantAvailability =
 -- while at least one tenant can serve: readiness removes the whole process from traffic,
 -- and failing it for one tenant would take every healthy tenant down too. When none can
 -- serve it reports the first tenant's failure, named @postgres:\<tenant\>@.
+--
+-- Each check of an open store also records whether it passed. A change is logged, once:
+-- @UNAVAILABLE@ when a serving tenant's database stops answering, @AVAILABLE@ when it
+-- answers again. So an outage that begins after startup leaves a named line in the log,
+-- and @en_tenant_available@ follows it. (A store that is not open is the worker's to
+-- report; see 'runSlot'.)
 slotProbes :: [TenantSlot] -> IO (ProbeCheck, ProbeCheck)
 slotProbes slots = do
   trackLiveness <- newFailureTracker
@@ -668,8 +744,21 @@ slotProbes slots = do
     renderTenant (TenantName tenant) = tenant
     slotReady slot =
       readIORef (slot ^. #state) >>= \case
-        Available stack -> stack ^. #checkReady
+        Available stack -> do
+          ready <- stack ^. #checkReady
+          recordServing slot ready
+          pure ready
         Unavailable {} -> pure False
+
+-- | Record a readiness result for an open store, logging a change.
+recordServing :: TenantSlot -> Bool -> IO ()
+recordServing slot ready = do
+  changed <- atomicModifyIORef' (slot ^. #serving) \previous -> (ready, previous /= ready)
+  when changed $
+    slotSay slot $
+      if ready
+        then "AVAILABLE"
+        else "UNAVAILABLE: its database did not answer the readiness check; requests answer 503 store_error until it does."
 
 -- | Release the slot's pool, if it has one.
 releaseSlot :: TenantSlot -> IO ()

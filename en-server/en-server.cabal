@@ -139,20 +139,29 @@ test-suite en-server-middleware-test
     app
 
   main-is: MiddlewareSpec.hs
-  other-modules: Middleware
+  other-modules:
+    Metrics
+    Middleware
+    Observability
+
   build-depends:
+    aeson,
     base,
     bytestring,
     containers,
     en-core,
     en-servant,
     generic-lens,
+    hs-opentelemetry-api >=1.0 && <1.1,
+    hs-opentelemetry-instrumentation-wai >=1.0 && <1.1,
     http-types,
     ram,
     servant-health,
     tasty,
     tasty-hunit,
     text,
+    time,
+    uuid,
     wai,
 
 -- The configuration rules, through the pure parser in app/Config.hs.

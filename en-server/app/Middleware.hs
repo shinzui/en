@@ -15,6 +15,7 @@ module Middleware
     TenantRoute (..),
     authMiddleware,
     tenantAuthMiddleware,
+    scrapeOnly,
     rateLimitMiddleware,
     describeRateLimit,
   )
@@ -40,7 +41,7 @@ import En.Servant.Problem
     specUnauthenticated,
   )
 import GHC.Clock (getMonotonicTimeNSec)
-import Network.HTTP.Types (HeaderName, hAuthorization, methodPost)
+import Network.HTTP.Types (HeaderName, hAuthorization, methodGet, methodPost)
 import Network.Wai (Application, Middleware, Request (..), Response)
 import Servant.Health.Paths qualified as Health
 
@@ -137,6 +138,24 @@ tenantAuthMiddleware probes routes request respond
             respond readOnlyKey
         | otherwise ->
             (route ^. #routeApplication) (withCaller (route ^. #routeKey . #keyName) request) respond
+
+-- | The application of an operator's @EN_METRICS_KEYS@ key: @GET \/metrics@ and nothing
+-- else.
+--
+-- Such a key reads every tenant's metrics and no tenant's data, so every other route --
+-- reads included -- is refused with the problem a read-only key's write gets. The key is
+-- paired with this application in the same key list as the tenants' keys, so selecting it
+-- costs a tenant request nothing.
+scrapeOnly :: Application -> Application
+scrapeOnly scrape request respond
+  | requestMethod request == methodGet,
+    pathInfo request == ["metrics"] =
+      scrape request respond
+  | otherwise = respond scrapeKey
+
+scrapeKey :: Response
+scrapeKey =
+  problemResponse specPermissionDenied "this API key may only scrape GET /metrics"
 
 -- | As 'authenticate', over keys paired with their tenant's application.
 authenticateRoute :: [TenantRoute] -> Request -> Maybe TenantRoute
