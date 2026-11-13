@@ -19,7 +19,7 @@ globally distributed authorization product.
 
 ## Deployment Shapes
 
-`en` has two production shapes.
+`en` has two production shapes, and the dedicated service can be shared by several tenants.
 
 ### Embedded Library
 
@@ -86,6 +86,18 @@ Treat the dedicated service as a read-path dependency. It should be deployed
 like a database-adjacent infrastructure service: low network latency to
 PostgreSQL, bounded request concurrency, explicit health checks, and alerting
 on latency and error rate.
+
+### Shared Service with Tenants
+
+One `en-server` can serve several applications that each need their own model: start it
+with `EN_TENANTS`, and give each tenant its own schema file, PostgreSQL database and API
+keys. A caller's key selects its tenant, so clients are unchanged. Tenants are isolated in
+data, tokens, caches, rate limits, schema reloads and storage faults, but share the
+process's CPU and memory: a busy tenant slows its neighbours. Use it where several
+applications want authorization without one `en-server` each and none needs performance
+isolation; give a performance-sensitive workload its own `en-server`. A server serving one
+tenant pays nothing for the feature. See "Serving several tenants" in
+[Service and Operations](service-and-operations.md).
 
 ## Enforcement Boundaries
 

@@ -1,0 +1,11 @@
+object user {}
+
+object team {
+  relation member: user
+  permission membership = member
+}
+
+object document {
+  relation viewer: user
+  permission view = viewer
+}

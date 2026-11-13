@@ -1,10 +1,10 @@
 ---
 title: "Standalone authorization server"
 type: Capability
-description: "A deployable HTTP service over the libraries with startup-validated configuration, API-key auth, rate limiting, optional TLS, health and readiness probes, Prometheus metrics, JSON request logging, graceful shutdown, and background GC."
+description: "A deployable HTTP service over the libraries with startup-validated configuration, API-key auth, rate limiting, optional TLS, health and readiness probes, Prometheus metrics, JSON request logging, graceful shutdown, background GC, and optional serving of several isolated tenants from one process."
 generated:
-  by: anthropic/claude-opus-5
-  at: "2026-08-24T14:35:00Z"
+  by: anthropic/claude-opus-5-5
+  at: "2026-11-13T21:00:00Z"
 capabilityId: CAP-20
 provider: mori://shinzui/en
 status: shipped
@@ -27,6 +27,12 @@ evidence:
   - kind: module
     resource: en-server/app/Metrics.hs
     proves: A Prometheus endpoint publishing per-path/per-status request counts and latency totals plus cache statistics.
+  - kind: test
+    resource: en-server/test/TenantSpec.hs
+    proves: "Two tenants in one process, each selected by its API key, cannot read, write, validate against or invalidate each other's state, and one tenant's storage fault leaves the other serving; the guide's two-tenant example starts and is isolated."
+  - kind: module
+    resource: en-server/app/Tenant.hs
+    proves: "One complete single-datastore stack per tenant, a slot that keeps a tenant unavailable and retries its store, and per-tenant probes and metrics sources."
   - kind: guide
     resource: docs/user/service-and-operations.md
     proves: "Running the server: configuration, pooling, probes, shutdown, logging, metrics, background maintenance, auth, rate limiting, and TLS."
@@ -51,6 +57,9 @@ What it adds beyond the API:
   active trace and span identifiers. Probe paths are excluded.
 - **Graceful shutdown** on signal, and a **background maintenance loop** that reclaims
   tombstoned rows in bounded batches and advances the GC horizon.
+- **Tenants.** With `EN_TENANTS`, one process serves several tenants, each with its own
+  schema, database and keys, selected by the caller's key; logs, metrics and spans carry the
+  tenant. Tenants share the process's CPU and memory (docs/adr/0009, docs/adr/0010).
 
 ## Limits
 

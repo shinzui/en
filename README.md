@@ -38,7 +38,7 @@ single-app service.
 | `en-migrations` | pg-migrate-managed PostgreSQL schema (relation tuples, xid8 soft-delete, the revisions table, datastore identity, the gc-horizon mark), embedded at compile time from an ordered manifest; applied by `cabal run en-migrate -- up`, or `just run-migrations` in dev |
 | `en-postgres` | PostgreSQL implementations of the store effects + `pg_snapshot` revision machinery |
 | `en-servant` | Servant API + `requirePermission`, a fail-closed handler helper |
-| `en-server` | Standalone authorization service (thin app over the libraries) |
+| `en-server` | Standalone authorization service (thin app over the libraries); one process can serve several isolated tenants, each with its own schema, database and keys |
 | `en-client` | Haskell client for the standalone service |
 | `en-biscuit` | Optional Biscuit decision-token layer: mint short-lived signed proofs of `en` decisions and verify/attenuate them locally downstream |
 

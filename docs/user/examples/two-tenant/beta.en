@@ -1,0 +1,11 @@
+object user {}
+
+object team {
+  relation member: user
+  permission membership = member
+}
+
+object repo {
+  relation reader: user
+  permission read = reader
+}

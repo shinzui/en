@@ -1,6 +1,9 @@
 # Bundle Update Log
 
 ## 2026-11-13
+
+* **Update**: IR-2 completed under docs/masterplans/12-serve-several-isolated-tenants-from-one-en-server.md: tenants selected by key, one database per tenant, per-tenant lifecycle, fault containment and observability, with no single-tenant regression. AC-2 holds in a narrower form until docs/plans/78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md lands; AC-6's readiness wording differs per ADR 10.
+
 * **Update**: IR-2 accepted at gate G0 (single-tenant use must pay no performance tax) and in progress under docs/masterplans/12-serve-several-isolated-tenants-from-one-en-server.md
 
 ## 2026-11-12

@@ -1,5 +1,8 @@
 # Capability Catalog Log
 
+## 2026-11-13
+* **Update**: CAP-20 now covers serving several isolated tenants from one en-server (EN_TENANTS), with the tenant suite and Tenant.hs as evidence (docs/masterplans/12-serve-several-isolated-tenants-from-one-en-server.md).
+
 ## 2026-08-24
 
 * **Adoption**: Authored the initial profile-governed capability catalog for `en` under the

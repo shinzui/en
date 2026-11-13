@@ -546,6 +546,8 @@ the query string, reads only `User-Agent` from the request headers, and never re
 response bodies. In particular, `Authorization`, `Cookie`, private headers, and authorization
 subjects and objects do not enter the line.
 
+In tenant mode each line also has `tenant` and `caller`; see "Serving several tenants".
+
 Probe requests to `/health/live` and `/health/ready` are not logged — they fire every few
 seconds and have nothing to correlate. The `401`, `403`, and `429` responses that
 authentication and rate limiting short-circuit are also not logged, because those
@@ -608,6 +610,9 @@ cache is disabled.
 Divide `..._duration_seconds_sum` by `..._duration_seconds_count` for mean latency.
 There are no histograms, so there are no quantiles; if you need them, the counters
 are cheap to replace with `prometheus-client`.
+
+In tenant mode every sample carries a `tenant` label, a tenant's key sees only its own
+tenant, and `en_tenant_available` reports each tenant; see "Serving several tenants".
 
 All counters are in-process and reset when the process restarts, which is what
 Prometheus expects. They are per-replica: aggregate across replicas at query time.
@@ -768,6 +773,332 @@ The static key list is the baseline mechanism, not the ceiling. Authentication
 is a WAI middleware wrapping the whole application, so a stronger verifier —
 mTLS client certificates, or a verified shomei identity — replaces the
 credential check inside that middleware without touching any handler or route.
+
+## Serving several tenants
+
+One `en-server` process can serve several **tenants**. A tenant is an independent
+authorization owner: a name, a schema file, a PostgreSQL database of its own, and its own
+read-write and read-only API keys. The tenant of a request is the tenant of the key that
+authenticated it. No header, path, body field or wire type names a tenant, so a client
+written against a dedicated server works unchanged against its tenant on a shared one.
+
+Use tenants when several applications each need their own model and none of them needs
+performance isolation from the others: tenants share the process's CPU, memory and listener
+(see "Isolation guarantees and their limits" below). When a workload needs its own CPU, run
+a dedicated `en-server` for it instead. A server started without `EN_TENANTS` is in
+**legacy mode** and is exactly the single-store server the rest of this guide describes.
+
+### Configuration
+
+`EN_TENANTS` names the tenants, comma-separated. A name is a lower-case letter followed by
+at most 30 lower-case letters, digits or `-`. Each tenant's settings are variables named
+`EN_TENANT_<NAME>_<SETTING>`, where `<NAME>` is the tenant name upper-cased with `-`
+replaced by `_` (tenant `team-a` reads `EN_TENANT_TEAM_A_DATABASE_URL`).
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `EN_TENANTS` | yes | The tenants, in the order they start, e.g. `alpha,beta` |
+| `EN_TENANT_<NAME>_DATABASE_URL` | yes | The tenant's PostgreSQL database. Each tenant needs its own database; two tenants reaching one database are refused at startup |
+| `EN_TENANT_<NAME>_SCHEMA_PATH` | yes | The tenant's schema file. There is no built-in demo schema in tenant mode |
+| `EN_TENANT_<NAME>_API_KEYS_READ_WRITE` | see below | `name:secret` entries, as `EN_API_KEYS_READ_WRITE` |
+| `EN_TENANT_<NAME>_API_KEYS_READ_ONLY` | see below | `name:secret` entries, as `EN_API_KEYS_READ_ONLY` |
+| `EN_TENANT_<NAME>_POOL_SIZE` | no | The tenant's connection pool size; defaults to `EN_POOL_SIZE` |
+| `EN_TENANT_<NAME>_GC_WINDOW` | no | The tenant's garbage-collection window; defaults to `EN_GC_WINDOW` |
+| `EN_TENANT_<NAME>_SCHEMA_RELOAD_FORCE` | no | As `EN_SCHEMA_RELOAD_FORCE`, for this tenant; defaults to it |
+| `EN_TENANT_<NAME>_BISCUIT_ISSUER_SECRET_KEY` | no | The tenant's grant issuer key; minting is off without it |
+| `EN_TENANT_<NAME>_EXPECTED_DATASTORE_ID` | no | Pin the tenant to the database holding this datastore id (see "Backup and restore") |
+| `EN_METRICS_KEYS` | no | `name:secret` entries for operators: `GET /metrics` for every tenant, nothing else |
+
+Every tenant needs at least one key; authentication cannot be disabled in tenant mode. The
+legacy store, key and issuer variables (`EN_DATABASE_URL`, `EN_SCHEMA_PATH`,
+`EN_API_KEYS_READ_WRITE`, `EN_API_KEYS_READ_ONLY`, `EN_AUTH_DISABLED`,
+`EN_BISCUIT_ISSUER_SECRET_KEY`) are refused beside `EN_TENANTS`, and `EN_METRICS_KEYS` is
+refused without it. Every other `EN_*` setting is process-wide and applies to each tenant
+alike: each tenant gets its own caches of the configured sizes, its own rate-limit buckets
+at the configured rate, its own pool with the configured timeouts, and its own maintenance
+loop on the configured schedule. An `EN_TENANT_` variable that is not one of the settings
+above for a declared tenant (a typo, or a tenant missing from `EN_TENANTS`) fails startup.
+
+**Keys.** A secret belongs to exactly one key of one tenant, or to one `EN_METRICS_KEYS`
+entry; a secret configured twice fails startup, and the message names the keys, never the
+secret. Key names are unique within a tenant and may repeat across tenants: a caller is the
+pair of tenant and key name, in the request log and in the rate limiter. Adding, rotating or
+removing a key or a tenant means changing the environment and restarting the process.
+
+### From two empty databases to a running server
+
+The example below is checked in under `docs/user/examples/two-tenant/`, and the test suite
+starts a server from these exact files (`documented-example` in `en-server-tenant-tests`).
+`tenants.env`:
+
+```shell
+# Two tenants served by one en-server. Load from the repository root with:
+#   set -a; . docs/user/examples/two-tenant/tenants.env; set +a
+# Replace every secret before using this anywhere but a laptop: a secret selects its tenant.
+EN_TENANTS=alpha,beta
+
+EN_TENANT_ALPHA_DATABASE_URL=postgresql://localhost/en_alpha
+EN_TENANT_ALPHA_SCHEMA_PATH=docs/user/examples/two-tenant/alpha.en
+EN_TENANT_ALPHA_API_KEYS_READ_WRITE=alpha-app:alpha-app-secret-change-me-01
+EN_TENANT_ALPHA_API_KEYS_READ_ONLY=alpha-reader:alpha-reader-secret-change-me-01
+
+EN_TENANT_BETA_DATABASE_URL=postgresql://localhost/en_beta
+EN_TENANT_BETA_SCHEMA_PATH=docs/user/examples/two-tenant/beta.en
+EN_TENANT_BETA_API_KEYS_READ_WRITE=beta-app:beta-app-secret-change-me-0001
+
+# Optional: a key that scrapes GET /metrics for every tenant and can do nothing else.
+EN_METRICS_KEYS=prometheus:ops-scrape-secret-change-me-0001
+```
+
+`alpha.en`:
+
+```text
+object user {}
+
+object team {
+  relation member: user
+  permission membership = member
+}
+
+object document {
+  relation viewer: user
+  permission view = viewer
+}
+```
+
+`beta.en`:
+
+```text
+object user {}
+
+object team {
+  relation member: user
+  permission membership = member
+}
+
+object repo {
+  relation reader: user
+  permission read = reader
+}
+```
+
+Create and migrate each database. Migrations run once per tenant database, with the same
+`en-migrate` as a single-store deployment (see "Migrations"):
+
+```shell
+createdb en_alpha
+createdb en_beta
+DATABASE_URL=postgresql://localhost/en_alpha en-migrate up
+DATABASE_URL=postgresql://localhost/en_beta en-migrate up
+```
+
+Start the server from the repository root, so the schema paths resolve:
+
+```shell
+set -a; . docs/user/examples/two-tenant/tenants.env; set +a
+en-server
+```
+
+```text
+en-server listening on :8080
+Tenants: alpha, beta
+Metrics scrape keys (every tenant, GET /metrics only): prometheus
+…
+[tenant alpha] Datastore id: 5b0c…
+[tenant beta] Datastore id: 91e2…
+```
+
+Each tenant's lines carry its `[tenant NAME]` prefix. Alpha's key writes and checks
+`document`s; beta's writes and checks `repo`s. A check of a type the key's tenant does not
+define is a `400`, and neither tenant can read the other's relationships, changes, schema,
+tokens or cursors:
+
+```shell
+curl -sS localhost:8080/v1/relationships \
+  -H 'Authorization: Bearer alpha-app-secret-change-me-01' -H 'Content-Type: application/json' \
+  -d '{"tuples":[{"object":{"objectType":"document","objectId":"d1"},"relation":"viewer","subject":{"kind":"id","objectType":"user","objectId":"ann"}}]}'
+curl -sS localhost:8080/v1/schema -H 'Authorization: Bearer beta-app-secret-change-me-0001'
+```
+
+The second command returns beta's schema text, `beta.en`, and nothing of alpha's.
+
+Writes are not yet validated against the schema in any mode, so alpha's key can store a
+`repo` relationship. It stays in alpha's database and is evaluated under alpha's schema,
+which does not define it; it never reaches beta. Refusing such writes is planned in
+`docs/plans/78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md`.
+
+### Schema changes, import and export per tenant
+
+`SIGHUP` reloads every tenant whose schema file changed, each exactly as "Reloading the
+schema without a restart" describes. A tenant whose file is unchanged is not reloaded, so
+only the edited tenant's tokens are invalidated; a refused or failed reload of one tenant
+leaves the others reloaded. A tenant that is unavailable when the signal arrives is skipped
+with a line.
+
+The subcommands act on one tenant, chosen with `--tenant NAME`, and read only that tenant's
+`EN_TENANT_<NAME>_*` store variables from the same environment. With `EN_TENANTS` set,
+`--tenant` is required; without it, it is refused.
+
+```shell
+en-server check-schema --tenant alpha ./alpha-v2.en
+en-server export --tenant beta > beta.ndjson
+en-server import --tenant beta --file beta.ndjson
+```
+
+### Backup and restore
+
+Each tenant's database is an ordinary En database: back it up and restore it on its own,
+with `pg_dump` and `pg_restore`, and nothing about one tenant's backup touches another.
+The runbook in "Operational warning: backup, restore, and datastore identity" applies to each
+tenant database separately: after restoring a tenant's dump into a fresh cluster, delete its
+`en_datastore_metadata` row before the tenant next starts.
+
+`EN_TENANT_<NAME>_EXPECTED_DATASTORE_ID` pins a tenant to the database it was meant to
+serve. With a pin, the tenant only reads the database's id, never mints one: a database
+holding a different id, or none, leaves the tenant unavailable with a line naming both ids,
+and its database is not written. A wrong URL therefore cannot stamp an identity into
+another database. After the restore runbook deletes the identity row, unset the pin, start
+the server once so the tenant mints a new id, then set the pin to the new id from the
+`[tenant NAME] Datastore id:` line.
+
+### When one tenant's storage fails
+
+A tenant whose database is unreachable, not migrated, or not the pinned one when the server
+starts does not stop the server: the tenant starts **unavailable**, the others serve, and the
+log says why:
+
+```text
+[tenant alpha] UNAVAILABLE: Could not reach PostgreSQL …
+```
+
+The tenant's keys still authenticate (a wrong key is still `401`, a read-only key's write
+still `403`), and its requests answer `503 store_error`. The server retries the tenant's
+database after 5 seconds, then at doubling intervals up to a minute, and logs
+`[tenant alpha] AVAILABLE` once it serves, with no restart. A database that fails while the
+server runs behaves the same way from the tenants' point of view: that tenant's requests
+answer `503` until its database returns, and the others are unaffected. An invalid schema
+file or GC window is deployment input, not a storage fault, and still stops the server. In
+legacy mode any startup fault stops the server, as it always has.
+
+### Logs, metrics, traces and readiness
+
+In tenant mode each request log line also names the tenant and the caller, the name of the
+key that authenticated the request:
+
+```json
+{"time":"2026-11-13T10:00:00Z","method":"POST","path":"/v1/check","status":200,"duration_ms":0.82,"user_agent":"curl/8.7.1","tenant":"alpha","caller":"alpha-app"}
+```
+
+A client cannot choose the logged caller: authentication replaces any `X-En-Caller` header.
+An unavailable tenant's `503` responses are logged and counted under its name. With
+telemetry enabled, each server span carries the attribute `en.tenant`. Legacy-mode lines
+have exactly the fields described under "Request logging".
+
+Every metric sample gains a `tenant` label, and a gauge is added:
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `en_tenant_available` | gauge | `tenant` |
+
+`GET /metrics` with a tenant's key shows only that tenant's samples. An `EN_METRICS_KEYS` key
+shows every tenant's, each family once, and is answered `403` on every other route:
+
+```shell
+curl -sS localhost:8080/metrics -H 'Authorization: Bearer ops-scrape-secret-change-me-0001'
+```
+
+```text
+# TYPE en_http_requests_total counter
+en_http_requests_total{path="check",status="5xx",tenant="alpha"} 3
+en_http_requests_total{path="check",status="2xx",tenant="beta"} 12
+…
+# HELP en_tenant_available Whether the tenant's storage is serving (1) or not (0).
+# TYPE en_tenant_available gauge
+en_tenant_available{tenant="alpha"} 0
+en_tenant_available{tenant="beta"} 1
+```
+
+`en_tenant_available` is 1 while the tenant's store is open and its last readiness ping
+passed. An outage that begins while the server runs is noticed at the next readiness probe:
+the gauge drops to 0 and the log gets one line,
+`[tenant alpha] UNAVAILABLE: its database did not answer the readiness check; …`, and
+`[tenant alpha] AVAILABLE` when it answers again. A scrape never pings a database, so the
+gauge lags an outage by up to one probe period, and a deployment that never probes
+readiness sees only startup and recovery transitions.
+
+**Readiness stays `200` while any tenant can serve.** Readiness withdraws the whole pod,
+and failing it for one tenant would take every healthy tenant down too. `/health/ready`
+answers `503` only when no tenant can serve, naming the first tenant's check,
+`postgres:<tenant>`. Alert on `en_tenant_available == 0`, per tenant, not on readiness; and
+note that a rollout cannot be gated on one tenant's storage. See
+[ADR 10](../adr/0010-a-partially-available-en-server-stays-ready.md).
+
+### Isolation guarantees and their limits
+
+Guaranteed, and proven by `en-server-tenant-tests` against real PostgreSQL:
+
+- **Data.** Each tenant reads and writes only its own database; every route of one tenant
+  answers while the other tenant's PostgreSQL is stopped.
+- **Tokens and cursors.** Consistency tokens, lookup cursors and watch cursors carry the
+  minting tenant's datastore id and are refused by every other tenant.
+- **Schema.** Each request is evaluated under its own tenant's schema; a reload changes one
+  tenant's schema and invalidates only that tenant's tokens.
+- **Caches, rate limits, metrics.** Each tenant has its own caches, rate-limit buckets and
+  counters; two callers with the same key name in two tenants never share a bucket.
+- **Garbage collection and grant generations** run per tenant database, under each tenant's
+  window; one tenant's writes never move another's grant generation.
+- **Faults.** One tenant's storage fault never makes another tenant unavailable.
+
+Not isolated:
+
+- **CPU, memory and the listener.** Tenants share the process's cores, its
+  garbage-collected heap, its port and TLS configuration. A busy tenant slows its
+  neighbours, much more than a busy second process on the same machine would. Measured
+  before tenant code existed, with one caller saturating `check-nested` and `lookup` beside
+  an 8-thread `check-direct` caller, the light caller kept 2.9% of its throughput in a shared
+  process (p99 ×32) against 61% across two processes (p99 ×1.9); with `EN_POOL_SIZE=64`,
+  5.6% against 67%. Per-tenant pools and caches were not separately measured; they are not
+  expected to change this much, because a process divides its CPU per in-flight request
+  rather than per tenant. The per-caller rate limiter is the only in-process control. A
+  workload that needs performance isolation needs its own `en-server`.
+- **Settings.** The evaluation budget, lookup deadlines, batch size, cache sizes, rate
+  limit and maintenance schedule are process-wide, the same for every tenant.
+- **Resources grow per tenant.** Each tenant holds its own pool, so the process opens up to
+  the sum of the tenants' pool sizes in PostgreSQL connections (10 per tenant by default),
+  and its own caches, so cache memory is the configured size times the number of tenants.
+- **The process boundary.** Anyone who can set the process's environment or read its memory
+  reaches every tenant.
+
+A server that serves one tenant pays nothing for tenancy, whether it is started without
+`EN_TENANTS` or declares exactly one tenant, and a tenant whose neighbours are idle is as
+fast as a dedicated server. These are measured against En built before tenancy existed, by
+the A/B rule of `en-server-loadbench` (throughput may not fall by more than the measured
+noise, at least 3%):
+
+Candidate throughput relative to the pre-tenancy baseline, median of three paired rounds
+(both servers measured at once, four cores each):
+
+| Workload | Without `EN_TENANTS` (G1) | Tenant `bench` beside an idle tenant (G2, G5) |
+| --- | --- | --- |
+| `check-direct` | -0.6% | +0.4% |
+| `check-nested` | -0.2% | -0.3% |
+| `check-cached` | +0.0% | -0.3% |
+| `lookup` | +0.1% | +0.2% |
+| `check-last-key` | -0.1% | -0.6% |
+| `schema-read` | see below | see below |
+| `write` | +0.1% | -0.3% |
+
+Every workload passed, with round-to-round noise of at most 2.4%, on an Apple M5 Ultra
+(36 cores, macOS 27.2) running PostgreSQL 18.6 and GHC 9.12.4, at a load average of about
+20 from unrelated work. The same instrument fails a candidate given half the cores (-35% to
+-45%) and one with a single pooled connection (-58% to -82% on every database workload).
+
+`schema-read` (`GET /v1/schema`, served from memory) is the exception: in the paired design
+both servers settle at the same rate whatever their core count, so it cannot show a
+difference there. Measured one server at a time, it passed for a server without
+`EN_TENANTS`, and the same binary served it no slower in tenant mode than in legacy mode.
+The raw results are under `en-server/loadbench/results/` (`g1-paired.json`,
+`g2-g5-paired.json`, `g1-final.json`).
 
 ## Servant API
 

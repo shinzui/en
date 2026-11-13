@@ -26,6 +26,7 @@ module Verdict
     compareMetric,
     WorkloadVerdict (..),
     verdictFor,
+    pairedVerdictFor,
     median,
     spread,
   )
@@ -120,6 +121,44 @@ verdictFor name baselineRounds candidateRounds =
       [ compareMetric which (map (metricOf which) baselineRounds) (map (metricOf which) candidateRounds)
       | which <- allMetrics
       ]
+
+-- | Compare one workload measured in pairs: each element is one round's baseline and
+-- candidate result, taken over the same wall-clock window.
+--
+-- The quantity judged is the per-round ratio candidate / baseline. Load from outside the
+-- benchmark falls on both servers of a pair at once and cancels in the ratio, which is why
+-- a paired run does not need an idle machine. The rule is the unpaired one applied to the
+-- ratios: the median ratio is compared with 1, the noise is the ratios' own
+-- @(max - min) / median@, and the tolerance is the larger of that noise and the same floors
+-- (3% for throughput and p50, 10% for p99). Only throughput gates.
+pairedVerdictFor :: Text -> [(WorkloadResult, WorkloadResult)] -> WorkloadVerdict
+pairedVerdictFor name pairs =
+  WorkloadVerdict
+    { workload = name,
+      comparisons,
+      passed = not (any (\c -> c.gating && c.regression) comparisons)
+    }
+  where
+    comparisons = map compareRatios allMetrics
+    compareRatios which =
+      let base = median (map (metricOf which . fst) pairs)
+          cand = median (map (metricOf which . snd) pairs)
+          ratios = [if b == 0 then 1 else c / b | (bRound, cRound) <- pairs, let b = metricOf which bRound, let c = metricOf which cRound]
+          ratio = median ratios
+          noise = spread ratios
+          tolerance = max noise (floorFor which)
+       in MetricComparison
+            { metric = metricName which,
+              baselineMedian = base,
+              candidateMedian = cand,
+              delta = ratio - 1,
+              noise,
+              tolerance,
+              gating = which == Throughput,
+              regression = case which of
+                Throughput -> ratio < 1 - tolerance
+                _ -> ratio > 1 + tolerance
+            }
 
 -- | The middle value; the mean of the middle two for an even count.
 median :: [Double] -> Double

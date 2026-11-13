@@ -5,8 +5,13 @@
 -- Three subcommands:
 --
 -- * @run@ measures every workload against one binary and prints a table.
--- * @ab@ measures two binaries in alternation and prints PASS or REGRESSION per workload
---   under the rule in "Verdict".
+-- * @ab@ measures two binaries and prints PASS or REGRESSION per workload under the rule
+--   in "Verdict". By default the two run at the same time, each server limited to
+--   @--server-cores@ (default 4) capabilities, and each round is judged as a pair, so load
+--   from outside the benchmark cancels; @--sequential@ is the older design, one binary after
+--   the other with nothing limited. With @--candidate-tenants N@ the candidate serves the
+--   same database as tenant @bench@ of a tenant-mode server, beside @N - 1@ idle tenants
+--   (gates G5 and G2 of docs/masterplans/12-serve-several-isolated-tenants-from-one-en-server.md).
 -- * @interference@ measures how much a busy caller slows an idle one, inside one process
 --   and across two processes on the same machine.
 --
@@ -20,9 +25,11 @@ module Main (main) where
 import Control.Monad (forM, forM_, unless, when)
 import Data.Aeson (ToJSON, object, (.=))
 import Data.Aeson qualified as Aeson
+import Data.ByteString.Lazy.Char8 qualified as LazyChar8
+import Data.Char (toUpper)
 import Data.Foldable (traverse_)
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (sortOn)
+import Data.List (intercalate, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -61,6 +68,14 @@ data Options = Options
     baseline :: !(Maybe FilePath),
     candidate :: !(Maybe FilePath),
     candidateEnv :: ![(String, String)],
+    -- | Serve the candidate in tenant mode: the measured tenant plus this many minus one
+    --     idle tenants. 'Nothing' serves it in legacy mode, like the baseline.
+    candidateTenants :: !(Maybe Int),
+    -- | @ab@: measure one binary after the other instead of both at once.
+    sequential :: !Bool,
+    -- | Capabilities per server (@GHCRTS=-N@); 0 leaves the binary's own @-N@. Defaults to
+    --     4 for a paired @ab@ and to unlimited otherwise.
+    serverCores :: !(Maybe Int),
     -- | Extra variables for every server @interference@ starts; a diagnostic knob.
     serverEnv :: ![(String, String)],
     -- | Hidden test flag: present a wrong key and skip the pre-flight check, to show
@@ -82,6 +97,9 @@ emptyOptions =
       baseline = Nothing,
       candidate = Nothing,
       candidateEnv = [],
+      candidateTenants = Nothing,
+      sequential = False,
+      serverCores = Nothing,
       serverEnv = [],
       breakAuth = False
     }
@@ -100,6 +118,10 @@ parseArgs = \case
       [] -> Right o
       "--smoke" : xs -> go o {smoke = True} xs
       "--break-auth" : xs -> go o {breakAuth = True} xs
+      "--sequential" : xs -> go o {sequential = True} xs
+      "--server-cores" : v : xs -> case readMaybe v of
+        Just n | n >= (0 :: Int) -> go o {serverCores = Just n} xs
+        _ -> Left ("--server-cores expects a non-negative integer, got " <> v)
       "--threads" : v : xs -> number "--threads" v >>= \n -> go o {threadsOverride = Just n} xs
       "--warmup-seconds" : v : xs -> real "--warmup-seconds" v >>= \n -> go o {warmupOverride = Just n} xs
       "--measure-seconds" : v : xs -> real "--measure-seconds" v >>= \n -> go o {measureOverride = Just n} xs
@@ -112,6 +134,7 @@ parseArgs = \case
       "--baseline" : v : xs -> go o {baseline = Just v} xs
       "--candidate" : v : xs -> go o {candidate = Just v} xs
       "--candidate-env" : v : xs -> keyValue "--candidate-env" v >>= \kv -> go o {candidateEnv = candidateEnv o <> [kv]} xs
+      "--candidate-tenants" : v : xs -> number "--candidate-tenants" v >>= \n -> go o {candidateTenants = Just n} xs
       "--server-env" : v : xs -> keyValue "--server-env" v >>= \kv -> go o {serverEnv = serverEnv o <> [kv]} xs
       other : _ -> Left ("unknown argument: " <> other)
     keyValue flag v = case break (== '=') v of
@@ -129,7 +152,7 @@ usage =
   unlines
     [ "usage:",
       "  en-server-loadbench run [--server PATH] [--smoke] [--json PATH]",
-      "  en-server-loadbench ab --baseline PATH --candidate PATH [--rounds N] [--server-env KEY=VALUE]... [--candidate-env KEY=VALUE]... [--smoke] [--json PATH]",
+      "  en-server-loadbench ab --baseline PATH --candidate PATH [--rounds N] [--server-env KEY=VALUE]... [--candidate-env KEY=VALUE]... [--candidate-tenants N] [--server-cores N] [--sequential] [--smoke] [--json PATH]",
       "  en-server-loadbench interference [--server PATH] [--rounds N] [--server-env KEY=VALUE]... [--smoke] [--json PATH]",
       "",
       "common options: --threads N --warmup-seconds S --measure-seconds S --warmup-rounds N",
@@ -192,15 +215,65 @@ prepareDatabase bench binary name = do
     ExitSuccess -> pure url
     _ -> die' ("seeding " <> Text.unpack name <> " with " <> binary <> " failed:\n" <> Text.unpack err)
 
+-- | How a benchmark server is configured: as today, or in tenant mode.
+data Topology
+  = Legacy
+  | -- | The measured database is tenant @bench@; each URL is an idle tenant's database.
+    Tenants ![Text]
+
 -- | The spec for one benchmark server: stdout (the per-request log) is discarded so
 -- the load generator spends no CPU reading it.
 benchServer :: Bench -> FilePath -> [(String, String)] -> ServerProfile -> Text -> ServerSpec
-benchServer bench binary overrides profile url =
-  (serverSpec binary (override (inherited bench <> serverEnvironment profile url (schemaPath bench))))
+benchServer bench = benchServerIn bench Legacy
+
+benchServerIn :: Bench -> Topology -> FilePath -> [(String, String)] -> ServerProfile -> Text -> ServerSpec
+benchServerIn bench topology binary overrides profile url =
+  (serverSpec binary (arrange (override (inherited bench <> serverEnvironment profile url (schemaPath bench)))))
     { captureStdout = False
     }
   where
     override env = filter ((`notElem` map fst overrides) . fst) env <> overrides
+    arrange = case topology of
+      Legacy -> id
+      Tenants idle -> asTenants (schemaPath bench) idle
+
+-- | Translate a legacy environment into tenant mode, changing nothing else: the store and
+-- key variables become tenant @bench@'s, every process-wide setting (pool size, caches,
+-- rate limit, maintenance) stays process-wide and so applies to each tenant alike, and
+-- each idle database becomes a tenant @idleN@ with one key of its own that no workload
+-- presents.
+asTenants :: FilePath -> [Text] -> [(String, String)] -> [(String, String)]
+asTenants schema idle env =
+  [kv | kv@(key, _) <- env, key `notElem` perTenant]
+    <> [("EN_TENANTS", intercalate "," ("bench" : map fst idleTenants))]
+    <> [("EN_TENANT_BENCH_" <> drop 3 key, value) | (key, value) <- env, key `elem` perTenant]
+    <> concat
+      [ [ (prefix <> "DATABASE_URL", Text.unpack url),
+          (prefix <> "SCHEMA_PATH", schema),
+          (prefix <> "API_KEYS_READ_WRITE", "idle:" <> name <> "-idle-secret-0123456789")
+        ]
+      | (name, url) <- idleTenants,
+        let prefix = "EN_TENANT_" <> map toUpper name <> "_"
+      ]
+  where
+    perTenant = ["EN_DATABASE_URL", "EN_SCHEMA_PATH", "EN_API_KEYS_READ_WRITE", "EN_API_KEYS_READ_ONLY"]
+    idleTenants = zip ["idle" <> show n | n <- [1 :: Int ..]] idle
+
+-- | Refuse to measure a candidate that is not in the topology asked for: a tenant-mode
+-- server labels its metrics with the tenant, a legacy one does not.
+verifyTopology :: Topology -> RunningServer -> IO ()
+verifyTopology topology running = do
+  manager <- newVerifyManager
+  request <- Http.parseRequest (Text.unpack (baseUrl running <> "/metrics"))
+  response <-
+    Http.httpLbs
+      request {Http.requestHeaders = [("Authorization", "Bearer " <> credentialSecret PrimaryKey)]}
+      manager
+  let labelled = "tenant=\"bench\"" `isInfixOfLazy` Http.responseBody response
+  case topology of
+    Legacy | labelled -> die' "expected a legacy-mode server, but its metrics carry a tenant label"
+    Tenants _ | not labelled -> die' "expected a tenant-mode server serving tenant bench, but its metrics carry no tenant=\"bench\" label"
+    _ -> pure ()
 
 targetFor :: Bool -> RunningServer -> Credential -> Target
 targetFor broken running credential =
@@ -214,7 +287,10 @@ targetFor broken running credential =
 -- The cached profile runs first and the plain profile last, so that @write@, which grows
 -- the database, is the final workload against it. Results come back in report order.
 measureRound :: Bench -> Options -> FilePath -> [(String, String)] -> Text -> IO [WorkloadResult]
-measureRound bench o binary overrides url = do
+measureRound bench = measureRoundIn bench Legacy
+
+measureRoundIn :: Bench -> Topology -> Options -> FilePath -> [(String, String)] -> Text -> IO [WorkloadResult]
+measureRoundIn bench topology o binary overrides url = do
   -- Fresh planner statistics and a vacuumed heap before every round: otherwise
   -- autovacuum, woken by the seed or by the previous round's writes, lands inside some
   -- rounds and not others.
@@ -224,7 +300,8 @@ measureRound bench o binary overrides url = do
       settings = loadSettings o
       byProfile wanted = [w | w <- workloads, profile w == wanted]
   measured <- forM [CachedProfile, PlainProfile] \p ->
-    withServer (benchServer bench binary overrides p url) \running ->
+    withServer (benchServerIn bench topology binary overrides p url) \running -> do
+      verifyTopology topology running
       forM (byProfile p) \w -> do
         let target' = targetFor (breakAuth o) running (credential w)
         unless (breakAuth o) do
@@ -294,7 +371,147 @@ data AbRun = AbRun
   deriving anyclass (ToJSON)
 
 abCommand :: Options -> IO ()
-abCommand o = do
+abCommand o = if sequential o then abSequential o else abPaired o
+
+-- | The @GHCRTS@ that limits each server's capabilities, if any.
+coresEnvironment :: Options -> [(String, String)]
+coresEnvironment o = case fromMaybe (if sequential o then 0 else 4) (serverCores o) of
+  0 -> []
+  n -> [("GHCRTS", "-N" <> show n)]
+
+-- | One value per variable, the last given: @--candidate-env GHCRTS=...@ replaces the
+-- default core budget instead of sitting beside it.
+lastWins :: [(String, String)] -> [(String, String)]
+lastWins env = [kv | (i, kv@(key, _)) <- zip [0 :: Int ..] env, key `notElem` map fst (drop (i + 1) env)]
+
+-- | One server of a paired round.
+data Side = Side
+  { sideTopology :: !Topology,
+    sideBinary :: !FilePath,
+    sideOverrides :: ![(String, String)],
+    sideUrl :: !Text
+  }
+
+data PairedRound = PairedRound
+  { roundIndex :: !Int,
+    baselineResults :: ![WorkloadResult],
+    candidateResults :: ![WorkloadResult]
+  }
+  deriving stock (Generic)
+  deriving anyclass (ToJSON)
+
+-- | Both binaries at once, each against its own database, every workload driven at both
+-- servers over the same window by 'runGroups'. Returns baseline and candidate results in
+-- report order.
+measurePairedRound :: Bench -> Options -> Side -> Side -> IO ([WorkloadResult], [WorkloadResult])
+measurePairedRound bench o base cand = do
+  traverse_ (\side -> runDatabaseScript (sideUrl side) "VACUUM ANALYZE") [base, cand]
+  salt <- Text.pack . show <$> getMonotonicTimeNSec
+  let workloads = benchWorkloads salt
+      settings = loadSettings o
+      byProfile wanted = [w | w <- workloads, profile w == wanted]
+      specFor side p = benchServerIn bench (sideTopology side) (sideBinary side) (sideOverrides side) p (sideUrl side)
+  measured <- forM [CachedProfile, PlainProfile] \p ->
+    withServer (specFor base p) \baseRunning ->
+      withServer (specFor cand p) \candRunning -> do
+        verifyTopology (sideTopology base) baseRunning
+        verifyTopology (sideTopology cand) candRunning
+        forM (byProfile p) \w -> do
+          let targets = [targetFor (breakAuth o) running (credential w) | running <- [baseRunning, candRunning]]
+          unless (breakAuth o) $ forM_ targets \target' -> do
+            manager <- newVerifyManager
+            verifyWorkload manager target' w >>= \case
+              Right () -> pure ()
+              Left err -> die' ("workload " <> Text.unpack (name w) <> " does not measure what it claims: " <> Text.unpack err)
+          results <-
+            runGroups
+              settings
+              [ LoadGroup {label = which, groupWorkload = w, target = target', groupThreads = threads settings}
+              | (which, target') <- zip ["baseline", "candidate"] targets
+              ]
+          forM_ results \result ->
+            when (errors result > 0) $
+              die'
+                ( "workload "
+                    <> Text.unpack (name w)
+                    <> " had "
+                    <> show (errors result)
+                    <> " failed request(s); the round is invalid. First error: "
+                    <> Text.unpack (fromMaybe "" (firstError result))
+                )
+          case results of
+            [baseResult, candResult] -> pure (baseResult, candResult)
+            _ -> die' "runGroups returned the wrong number of results"
+  let order = Map.fromList (zip (map name workloads) [0 :: Int ..])
+      sorted = sortOn (\(b, _) -> Map.findWithDefault 0 b.workload order) (concat measured)
+  pure (map fst sorted, map snd sorted)
+
+abPaired :: Options -> IO ()
+abPaired o = do
+  baselinePath <- maybe (die' "ab needs --baseline PATH") pure (baseline o)
+  candidatePath <- maybe (die' "ab needs --candidate PATH") pure (candidate o)
+  let roundCount = fromMaybe 5 (rounds o)
+      cores = coresEnvironment o
+  pairedRounds <- withBench \bench -> do
+    databaseA <- prepareDatabase bench baselinePath "bench_a"
+    databaseB <- prepareDatabase bench candidatePath "bench_b"
+    candidateTopology <- case candidateTenants o of
+      Nothing -> pure Legacy
+      Just n -> Tenants <$> forM [1 .. n - 1] \i -> prepareDatabase bench candidatePath ("bench_idle_" <> Text.pack (show i))
+    -- The databases swap every round, as in the sequential design.
+    let sides r =
+          let (baselineUrl, candidateUrl) = if even r then (databaseA, databaseB) else (databaseB, databaseA)
+           in ( Side Legacy baselinePath (lastWins (cores <> serverEnv o)) baselineUrl,
+                Side candidateTopology candidatePath (lastWins (cores <> serverEnv o <> candidateEnv o)) candidateUrl
+              )
+    forM_ [1 .. warmupRoundCount o] \r -> do
+      hPutStrLn stderr ("warm-up round " <> show r <> " (discarded): baseline and candidate together")
+      _ <- uncurry (measurePairedRound bench o) (sides r)
+      pure ()
+    forM [0 .. roundCount - 1] \r -> do
+      hPutStrLn stderr ("round " <> show (r + 1) <> "/" <> show roundCount <> ": baseline and candidate together")
+      (baseResults, candResults) <- uncurry (measurePairedRound bench o) (sides r)
+      pure PairedRound {roundIndex = r, baselineResults = baseResults, candidateResults = candResults}
+  let names = case pairedRounds of
+        firstRound : _ -> map (\r -> r.workload) (baselineResults firstRound)
+        [] -> []
+      pairsOf name' =
+        [ (b, c)
+        | pr <- pairedRounds,
+          b <- baselineResults pr,
+          b.workload == name',
+          c <- candidateResults pr,
+          c.workload == name'
+        ]
+      verdicts = [pairedVerdictFor name' (pairsOf name') | name' <- names]
+      allPassed = all passed verdicts
+  printVerdicts verdicts
+  printf
+    "RESULT: %s (%d workloads, %d paired rounds)\n"
+    (if allPassed then "PASS" else "REGRESSION" :: String)
+    (length verdicts)
+    roundCount
+  forM_ (jsonPath o) \path ->
+    Aeson.encodeFile path $
+      object
+        [ "command" .= ("ab" :: Text),
+          "design" .= ("paired" :: Text),
+          "baseline" .= baselinePath,
+          "candidate" .= candidatePath,
+          "candidateEnv" .= map (\(k, v) -> k <> "=" <> v) (candidateEnv o),
+          "candidateTenants" .= candidateTenants o,
+          "serverEnv" .= map (\(k, v) -> k <> "=" <> v) (cores <> serverEnv o),
+          "settings" .= settingsJson (loadSettings o),
+          "rounds" .= roundCount,
+          "warmupRounds" .= warmupRoundCount o,
+          "pairedRounds" .= pairedRounds,
+          "verdicts" .= verdicts,
+          "result" .= (if allPassed then "PASS" else "REGRESSION" :: Text)
+        ]
+  unless allPassed exitFailure
+
+abSequential :: Options -> IO ()
+abSequential o = do
   baselinePath <- maybe (die' "ab needs --baseline PATH") pure (baseline o)
   candidatePath <- maybe (die' "ab needs --candidate PATH") pure (candidate o)
   let roundCount = fromMaybe 5 (rounds o)
@@ -304,15 +521,22 @@ abCommand o = do
     -- both binaries equally instead of on one of them for the whole run.
     databaseA <- prepareDatabase bench baselinePath "bench_a"
     databaseB <- prepareDatabase bench candidatePath "bench_b"
+    -- Idle neighbours are seeded like the measured database and never sent a request.
+    candidateTopology <- case candidateTenants o of
+      Nothing -> pure Legacy
+      Just n -> Tenants <$> forM [1 .. n - 1] \i -> prepareDatabase bench candidatePath ("bench_idle_" <> Text.pack (show i))
+    let measureAs which
+          | which == "baseline" = measureRoundIn bench Legacy
+          | otherwise = measureRoundIn bench candidateTopology
     let databaseFor which r
           | even r == (which == "baseline") = databaseA
           | otherwise = databaseB
         baselineUrl = databaseFor "baseline" (0 :: Int)
         candidateUrl = databaseFor "candidate" (0 :: Int)
     forM_ [1 .. warmupRoundCount o] \r ->
-      forM_ [(baselinePath, serverEnv o, baselineUrl), (candidatePath, serverEnv o <> candidateEnv o, candidateUrl)] \(binary, overrides, url) -> do
+      forM_ [("baseline", baselinePath, coresEnvironment o <> serverEnv o, baselineUrl), ("candidate", candidatePath, lastWins (coresEnvironment o <> serverEnv o <> candidateEnv o), candidateUrl)] \(which, binary, overrides, url) -> do
         hPutStrLn stderr ("warm-up round " <> show r <> " (discarded): " <> binary)
-        _ <- measureRound bench o binary overrides url
+        _ <- measureAs (which :: Text) o binary overrides url
         pure ()
     collected <- newIORef []
     -- Baseline, candidate, candidate, baseline, ...: slow drift in the machine lands on
@@ -323,10 +547,10 @@ abCommand o = do
         let url = databaseFor which r
             (binary, overrides) =
               if which == "baseline"
-                then (baselinePath, serverEnv o)
-                else (candidatePath, serverEnv o <> candidateEnv o)
+                then (baselinePath, coresEnvironment o <> serverEnv o)
+                else (candidatePath, lastWins (coresEnvironment o <> serverEnv o <> candidateEnv o))
         hPutStrLn stderr ("round " <> show (r + 1) <> "/" <> show roundCount <> ": " <> Text.unpack which)
-        measured <- measureRound bench o binary overrides url
+        measured <- measureAs which o binary overrides url
         modifyIORef' collected (<> [AbRun {binaryLabel = which, roundIndex = r, results = measured}])
     readIORef collected
   let names = case runs of
@@ -351,10 +575,12 @@ abCommand o = do
     Aeson.encodeFile path $
       object
         [ "command" .= ("ab" :: Text),
+          "design" .= ("sequential" :: Text),
           "baseline" .= baselinePath,
           "candidate" .= candidatePath,
           "candidateEnv" .= map (\(k, v) -> k <> "=" <> v) (candidateEnv o),
-          "serverEnv" .= map (\(k, v) -> k <> "=" <> v) (serverEnv o),
+          "candidateTenants" .= candidateTenants o,
+          "serverEnv" .= map (\(k, v) -> k <> "=" <> v) (coresEnvironment o <> serverEnv o),
           "settings" .= settingsJson (loadSettings o),
           "rounds" .= roundCount,
           "warmupRounds" .= warmupRoundCount o,
@@ -541,6 +767,9 @@ summarizeTopology roundsRun which =
 
 newVerifyManager :: IO Http.Manager
 newVerifyManager = Http.newManager Http.defaultManagerSettings
+
+isInfixOfLazy :: LazyChar8.ByteString -> LazyChar8.ByteString -> Bool
+isInfixOfLazy needle haystack = any (needle `LazyChar8.isPrefixOf`) (LazyChar8.tails haystack)
 
 die' :: String -> IO a
 die' message = do

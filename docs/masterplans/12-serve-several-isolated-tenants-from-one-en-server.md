@@ -36,6 +36,11 @@ provenance:
       at: 2026-11-13T20:03:59Z
       mode: "implement"
       note: "EP-4 complete; slot-owned serving chain recorded for EP-5's gates"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T23:03:45Z
+      mode: "implement"
+      note: "EP-5 complete; gates checked off; initiative complete"
 ---
 
 # Serve several isolated tenants from one En server
@@ -220,7 +225,7 @@ per-tenant availability is reported, not gated" (plan 75). Plan 76 performs the 
 | EP-2 | Serve tenants selected by API key, each from its own isolated stack | docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md | EP-1, gate G0 | None | Complete |
 | EP-3 | Give each tenant an independent lifecycle and contain its storage faults | docs/plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md | EP-2 | None | Complete |
 | EP-4 | Carry the tenant through logs, metrics, traces and readiness | docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md | EP-2, EP-3 | None | Complete |
-| EP-5 | Prove tenant isolation and performance, then document tenant operations | docs/plans/76-prove-tenant-isolation-and-performance-then-document-tenant-operations.md | EP-2, EP-3, EP-4 | None | Not Started |
+| EP-5 | Prove tenant isolation and performance, then document tenant operations | docs/plans/76-prove-tenant-isolation-and-performance-then-document-tenant-operations.md | EP-2, EP-3, EP-4 | None | Complete |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
 
@@ -309,9 +314,9 @@ a restart. EP-4 is complete (2026-11-13): log lines, metric samples and server s
 the tenant, `EN_METRICS_KEYS` gives operators an all-tenant scrape, and
 `en_tenant_available` and the log name an unavailable tenant while readiness stays 200
 ([ADR 10](../adr/0010-a-partially-available-en-server-stays-ready.md); the owner is asked to
-confirm the readiness wording, see Decision Log 2026-11-12). EP-5 is next and waits for the
-owner's go-ahead. EP-2 moves IR-2 to `in-progress`; EP-5
-marks it `completed`. The initiative has six gates that are not owned by a single child plan.
+confirm the readiness wording, see Decision Log 2026-11-12). EP-5 is complete (2026-11-13):
+every gate holds, the operations guide documents tenants with an executed example, and IR-2 is
+`completed`. The initiative is complete. The initiative has six gates that are not owned by a single child plan.
 Each is checked off only with benchmark or test evidence recorded in the named child plan.
 
 - [x] **G0, owner go/no-go (after EP-1).** EP-1 reports the single-tenant baseline and the
@@ -321,33 +326,44 @@ Each is checked off only with benchmark or test evidence recorded in the named c
       single-tenant deployment and an intranet multi-tenant deployment without the same
       requirements, and accepts multi-tenancy on the condition that single-tenant use pays no
       tax. G3 becomes a measured, reported figure; G5 is added; no admission bound is designed.
-- [ ] **G1, no single-tenant regression.** A server started without `EN_TENANTS` shows no
+- [x] **G1, no single-tenant regression.** A server started without `EN_TENANTS` shows no
       regression against the baseline binary under EP-1's A/B verdict rule (`--rounds 3`), on
       every workload, at two points: the end of EP-2 Milestone 1, where the legacy request path
       changes, and EP-5, against the finished behaviour. EP-2 Milestone 3, EP-3 and EP-4 run
       `just loadbench-smoke` instead, as a functional check rather than a gate.
       First point passed 2026-11-13 (EP-2, run on its Milestone 3 binary, so it covers every
       legacy-path change EP-2 made): `RESULT: PASS (7 workloads, 3 rounds)` against `09a7d6b`,
-      `en-server/loadbench/results/g1-ep2.json`. The EP-5 point remains, so the box stays open.
-- [ ] **G2, no regression with idle neighbours.** One tenant of a two-tenant server, with the
+      `en-server/loadbench/results/g1-ep2.json`. EP-5 point passed 2026-11-13 in both designs:
+      sequential `g1-final.json` and paired `g1-paired.json` (ADR 11), `RESULT: PASS`.
+- [x] **G2, no regression with idle neighbours.** One tenant of a two-tenant server, with the
       other tenant idle, shows no regression against the baseline binary serving the same
       workload alone (EP-5).
-- [ ] **G3, busy-neighbour cost, measured and reported (not go/no-go).** With the neighbour
+      Passed 2026-11-13 with G5 in one paired A/B (`ab --candidate-tenants 2`),
+      `en-server/loadbench/results/g2-g5-paired.json`: every workload within -0.6% to +0.4%.
+      `schema-read` is not evidence in the paired design (ADR 11); the same binary served it no
+      slower in tenant mode than in legacy mode (plan 76, Surprises & Discoveries).
+- [x] **G3, busy-neighbour cost, measured and reported (not go/no-go).** With the neighbour
       tenant saturated, the measured tenant's throughput and latency are recorded beside the same
       two workloads served by two separate baseline `en-server` processes on the same host, and
       the figures go into the operations guide's limits (EP-5). A large gap is expected and does
       not stop the initiative; a gap far worse than EP-1's preview is investigated as a defect
       (for example a per-tenant resource accidentally shared).
-- [ ] **G4, isolation.** `en-server-tenant-tests` passes with every case from EP-2, EP-3 and
+      Reported 2026-11-13 from EP-1's preview in the guide's limits, per the EP-5
+      simplification; not re-measured.
+- [x] **G4, isolation.** `en-server-tenant-tests` passes with every case from EP-2, EP-3 and
       EP-4, including the case that runs every route under one tenant's keys while the other
       tenant's PostgreSQL is stopped (EP-5 confirms the whole suite).
-- [ ] **G5, no regression with a single declared tenant.** A server started with
+      Passed 2026-11-13: 23 cases with the upgrade case run, plus the config (49) and
+      middleware (8) suites.
+- [x] **G5, no regression with a single declared tenant.** A server started with
       `EN_TENANTS` declaring exactly one tenant, serving the same database and settings, shows no
       regression against the baseline binary in legacy mode under EP-1's A/B verdict rule
       (`--rounds 3`), on every workload (EP-5). This covers an operator who adopts tenant
       configuration but serves one tenant, and so measures the tenant-mode request path (key to
       stack routing, availability state, tenant log and metric identity) with nothing else in
       the process.
+      Passed 2026-11-13 with G2 (see G2), which measures the same path with an idle neighbour
+      added.
 
 If G1, G2, G4 or G5 fails and cannot be fixed within the design above, stop, record the evidence
 in Surprises & Discoveries, and report to the owner. Work is committed to `master` (the
@@ -418,6 +434,23 @@ tenant (G5, added) and a tenant with idle neighbours (G2) must show no regressio
 
 
 ## Surprises & Discoveries
+
+- Observation (EP-5): the A/B instrument of EP-1 measured the machine as much as the binaries.
+  The first tenant-mode gate run failed on `schema-read` (-7.4% against 7.0%) at a load average
+  of about 20, while the same binary A/B'd against itself across modes showed tenant mode no
+  slower. At the owner's request `ab` now measures both binaries at once with four cores each
+  and judges per-round ratios (ADR 11); noise fell from 7-28% to under 5% on the same loaded
+  machine. In that design `schema-read` is pinned by an unexplained shared floor and is not
+  evidence.
+  Evidence: `docs/plans/76-prove-tenant-isolation-and-performance-then-document-tenant-operations.md`
+  (Surprises & Discoveries), `en-server/loadbench/results/paired-*.json`.
+  Date: 2026-11-13
+
+- Observation (EP-5, follow-up): in tenant mode the startup messages for a tenant whose database
+  cannot be reached say "Could not reach PostgreSQL through EN_DATABASE_URL", naming the legacy
+  variable instead of `EN_TENANT_<NAME>_DATABASE_URL`. The guide elides it; the fix belongs to
+  the area of docs/plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md.
+  Date: 2026-11-13
 
 - Observation (EP-4, affects EP-5): in tenant mode the serving chain (rate limiter, request id,
   request logger, metrics) now belongs to the tenant slot and wraps the availability switch;
@@ -575,6 +608,40 @@ tenant (G5, added) and a tenant with idle neighbours (G2) must show no regressio
   Date: 2026-11-13
 
 
+- Decision: EP-5 is simplified at the owner's request: G2 and G5 are measured by one A/B
+  (candidate in tenant mode, the measured tenant plus one idle neighbour), G3 is reported from
+  EP-1's interference preview rather than re-measured, and the guide's memory figures and a
+  new capability document are dropped. G1, G4 and AC-7's executed example are unchanged.
+  Rationale: keeps every go/no-go condition and halves the benchmark time; details in
+  `docs/plans/76-prove-tenant-isolation-and-performance-then-document-tenant-operations.md`.
+  Date: 2026-11-13
+
+- Decision: Gates G1, G2 and G5 are judged by the paired A/B of ADR 11 (both binaries measured at
+  once, four cores each, verdict on per-round ratios), validated both ways before use. The rule
+  is not loosened: the tolerance is still max(noise, 3%), now over ratios.
+  Rationale: the owner asked for a benchmark that does not depend on a quiet machine; the
+  sequential design failed a gate on machine load alone.
+  Date: 2026-11-13
+
+
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Complete, 2026-11-13. One `en-server` serves several tenants selected by key, each from its own
+database and stack, with independent lifecycles, contained storage faults and per-tenant
+observability (ADR 9, ADR 10). A server serving one tenant pays nothing measurable for it, in
+legacy mode or with one declared tenant beside an idle one (G1, G2, G5), and the isolation suite
+proves the separation (G4). IR-2 is completed; AC-2 holds in the narrower form described there
+until docs/plans/78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md lands.
+
+What went well: putting tenancy only in the standalone host kept `en-core`, `en-postgres` and
+`en-servant` unchanged, so isolation followed from construction rather than from new checks.
+
+What cost most: the benchmark. The sequential A/B of EP-1 needed an idle machine, which a shared
+desktop never is; it cost a failed gate run and a diagnostic before the instrument was replaced
+by the paired design of ADR 11. Recurring friction: FRIC-2 (port 8080 taken, EP-2 onward) and
+FRIC-3 (macOS shared memory limits for parallel ephemeral PostgreSQL), both accepted.
+
+Open after completion, each recorded where it belongs: the paired `schema-read` floor (ADR 11);
+tenant-mode startup messages that name `EN_DATABASE_URL` for a tenant's database; en-postgres
+answering 500 instead of 503 on the first request over a connection PostgreSQL terminated; the
+owner's confirmation of the readiness wording (ADR 10); plan 78 for AC-2.

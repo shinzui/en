@@ -24,10 +24,10 @@ import Data.Text.Encoding qualified as Text
 import Network.HTTP.Client qualified as Http
 import Network.HTTP.Types (Header, statusCode)
 import ServerHarness
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, getCurrentDirectory)
 import System.Environment (lookupEnv, setEnv)
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Signals (sigHUP)
 import System.Timeout (timeout)
@@ -74,7 +74,8 @@ main = do
           ],
         testGroup
           "the tenant in logs, metrics and readiness"
-          [ requestLogTest,
+          [ documentedExampleTest,
+            requestLogTest,
             metricsScopeTest,
             availabilityTest,
             unavailableAtStartupObservedTest,
@@ -651,6 +652,92 @@ expectLogLine fixture fragment = do
   found <- hasLogLine fixture fragment
   output <- capturedLines (server fixture)
   assertBool ("no log line containing " <> show fragment <> " in:\n" <> Text.unpack (Text.unlines output)) found
+
+-- * AC-7: the documented example works when followed literally
+
+-- | The example the operations guide quotes, @docs/user/examples/two-tenant/@, loaded
+-- as checked in. Only the two database URLs are replaced, by this case's own databases; the
+-- repository-relative schema paths are resolved against the repository root, where the
+-- guide runs its commands.
+documentedExampleTest :: TestTree
+documentedExampleTest = testCaseSteps "documented-example: the guide's two-tenant files serve two isolated tenants" \step -> do
+  root <- repositoryRoot
+  let exampleDir = root </> "docs" </> "user" </> "examples" </> "two-tenant"
+  documented <- parseEnvFile <$> readFile (exampleDir </> "tenants.env")
+  withPostgres \alphaPostgres ->
+    withPostgres \betaPostgres -> do
+      alphaUrl <- createMigratedDatabase alphaPostgres "en_alpha"
+      betaUrl <- createMigratedDatabase betaPostgres "en_beta"
+      base <- baseEnvironment
+      binary <- locateServerBinary
+      let localize (key, value)
+            | key == "EN_TENANT_ALPHA_DATABASE_URL" = (key, Text.unpack alphaUrl)
+            | key == "EN_TENANT_BETA_DATABASE_URL" = (key, Text.unpack betaUrl)
+            | "_SCHEMA_PATH" `Text.isSuffixOf` Text.pack key = (key, root </> value)
+            | otherwise = (key, value)
+          secretOf key = case lookup key documented of
+            Just entry -> Text.drop 1 (snd (Text.breakOn ":" (Text.pack entry)))
+            Nothing -> error ("tenants.env has no " <> key)
+      manager <- Http.newManager Http.defaultManagerSettings
+      withServer (serverSpec binary (base <> map localize documented)) \running -> do
+        let a = Client manager running (secretOf "EN_TENANT_ALPHA_API_KEYS_READ_WRITE")
+            b = Client manager running (secretOf "EN_TENANT_BETA_API_KEYS_READ_WRITE")
+            ops = Client manager running (secretOf "EN_METRICS_KEYS")
+
+        step "each tenant writes and checks its own type"
+        tokenA <- writeTuple a ("document", "d1", "viewer", "ann") >>= expectStatus 200 >>= field "token"
+        allowedA <- check a (atLeastAsFresh tokenA) ("document", "d1", "view", "ann") >>= expectStatus 200 >>= decisionOf
+        assertEqual "alpha's document" "allowed" allowedA
+        tokenB <- writeTuple b ("repo", "r1", "reader", "bob") >>= expectStatus 200 >>= field "token"
+        allowedB <- check b (atLeastAsFresh tokenB) ("repo", "r1", "read", "bob") >>= expectStatus 200 >>= decisionOf
+        assertEqual "beta's repo" "allowed" allowedB
+
+        step "each is refused a check of the other's type"
+        check a fullyConsistent ("repo", "r1", "read", "bob") >>= expectProblemAmong 400 ["unknown_relation", "schema_violation", "invalid_request"]
+        check b fullyConsistent ("document", "d1", "view", "ann") >>= expectProblemAmong 400 ["unknown_relation", "schema_violation", "invalid_request"]
+
+        step "neither sees the other's relationships, changes or schema text"
+        _ <- writeTuple a ("team", "t1", "member", "carol") >>= expectStatus 200
+        membership <- check b fullyConsistent ("team", "t1", "membership", "carol") >>= expectStatus 200 >>= decisionOf
+        assertEqual "beta's check of alpha's team" "denied" membership
+        queryBySubject b "carol" >>= expectStatus 200 >>= expectNoMention ["t1", "carol"]
+        queryBySubject b "ann" >>= expectStatus 200 >>= expectNoMention ["d1"]
+        changes <- watchFrom b Nothing >>= expectStatus 200 >>= field "changes"
+        forM_ (changes :: [Value]) (expectNoMention ["carol", "ann", "document"])
+        schemaA <- getSchema a
+        schemaB <- getSchema b
+        assertBool "alpha serves alpha.en" ("object document" `Text.isInfixOf` schemaA && not ("repo" `Text.isInfixOf` schemaA))
+        assertBool "beta serves beta.en" ("object repo" `Text.isInfixOf` schemaB && not ("document" `Text.isInfixOf` schemaB))
+
+        step "the documented scrape key sees both tenants"
+        scrape <- scrapeLines ops
+        forM_ ["alpha", "beta"] \tenant ->
+          assertBool (Text.unpack tenant <> "'s gauge") (("en_tenant_available{tenant=\"" <> tenant <> "\"} 1") `elem` scrape)
+
+-- | @KEY=value@ lines; blank lines and @#@ comments are skipped. Values are taken verbatim,
+-- as @set -a; . FILE@ reads the unquoted values the example uses.
+parseEnvFile :: String -> [(String, String)]
+parseEnvFile contents =
+  [ (key, drop 1 value)
+  | line <- lines contents,
+    not (null line),
+    take 1 line /= "#",
+    let (key, value) = break (== '=') line,
+    not (null value)
+  ]
+
+-- | The nearest ancestor of the working directory holding @cabal.project@: @cabal test@
+-- runs this suite from the package directory.
+repositoryRoot :: IO FilePath
+repositoryRoot = getCurrentDirectory >>= go
+  where
+    go dir = do
+      found <- doesFileExist (dir </> "cabal.project")
+      if found
+        then pure dir
+        else
+          let parent = takeDirectory dir
+           in if parent == dir then assertFailure "no cabal.project above the working directory" else go parent
 
 -- * AC-6: the tenant in logs, metrics and readiness
 

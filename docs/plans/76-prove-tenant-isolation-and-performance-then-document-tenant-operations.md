@@ -22,6 +22,11 @@ provenance:
       at: 2026-11-13T14:29:04Z
       mode: "update"
       note: "G0 option 2: G3 reported not gating; added gate G5 (single declared tenant, tenants single)"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T23:03:45Z
+      mode: "implement"
+      note: "EP-5 implemented: paired A/B, gates G1/G2/G4/G5 passed, tenant docs with executed example, IR-2 completed"
 ---
 
 # Prove tenant isolation and performance, then document tenant operations
@@ -60,23 +65,56 @@ AC-1 to AC-6.
 
 ## Progress
 
-- [ ] Milestone 1: the complete `en-server-tenant-tests` suite passes (gate G4) and the final
-      single-tenant A/B reports `RESULT: PASS` (gate G1).
-- [ ] Milestone 2: `en-server-loadbench tenants` exists; the single-declared-tenant comparison
-      (gate G5) and the idle-neighbour comparison (gate G2) report `RESULT: PASS`; the
-      busy-neighbour measurement (G3, reported, not gating) is recorded; their tables and the
-      memory and connection figures are recorded here.
-- [ ] Milestone 3: `docs/user/service-and-operations.md` documents tenants; its example files
-      under `docs/user/examples/two-tenant/` start a server that passes the documented-example
-      test; the capability catalog, the deployment guide and the README are updated;
-      `just openapi` reports no drift.
-- [ ] Milestone 4: ADRs are distilled, IR-2 is marked completed with evidence, friction entries
-      are triaged, and the parent MasterPlan's gates and retrospective are filled in.
+- [x] Milestone 1 (2026-11-13): `en-server-tenant-tests` passes, 23 cases including the upgrade
+      case run with `EN_BASELINE_BIN` (gate G4); config 49, middleware 8. Gate G1 passes twice: the
+      sequential A/B (`en-server/loadbench/results/g1-final.json`) and the paired A/B
+      (`g1-paired.json`), both `RESULT: PASS`.
+- [x] Milestone 2 (2026-11-13): `ab --candidate-tenants N` replaces the planned `tenants`
+      subcommand (Decision Log). Gates G2 and G5 pass by the paired A/B
+      (`g2-g5-paired.json`, every workload within -0.6% to +0.4%); the first, sequential run's
+      `schema-read` regression is explained in Surprises & Discoveries. G3 is reported from
+      EP-1's preview.
+- [x] Milestone 3 (2026-11-13): the guide's "Serving several tenants" section, the example under
+      `docs/user/examples/two-tenant/` executed by the `documented-example` case, CAP-20, the
+      deployment guide and the README; `just openapi` reports no drift.
+- [x] Milestone 4 (2026-11-13): ADR 10 and ADR 11 written, IR-2 completed, friction triaged, the
+      MasterPlan's gates and retrospective filled in.
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+- Observation: the first G2/G5 run (`ab --candidate-tenants 2`, 3 rounds) reported
+  `RESULT: REGRESSION` on `schema-read` alone: -7.4% against a 7.0% tolerance, every other
+  workload PASS. Per round the candidate read 26.5k, 26.5k, 26.2k req/s and the baseline 28.6k,
+  27.0k, 29.0k. Diagnosis, before any rerun of the gate:
+  (1) The tenant log fields are not it. A contention microbenchmark of the request logger
+  (64 threads, the same JSON line, stdout to `/dev/null`) wrote about 105k lines/s with or
+  without `tenant` and `caller`; the extra fields move nothing measurable.
+  (2) Tenant mode itself costs nothing measurable. The same binary A/B'd against itself, legacy
+  mode as baseline and tenant mode (one idle neighbour) as candidate, 5 rounds of 10 s:
+  `RESULT: PASS`, `schema-read` +5.6% for tenant mode with 28.3% noise, every workload within
+  +0.6% to +3.1%. The candidate's steadiness in the failed run was coincidence: in this run the
+  same binary ranged from 22.3k to 29.9k req/s on that workload.
+  (3) The machine was shared: load average about 20 from another repository's GHC build, two
+  virtual machines and a long-running node server.
+  Evidence: `en-server/loadbench/results/g2-g5-tenant-mode.json` (the failed run), the
+  diagnostic's figures above.
+
+- Observation: the sequential design measures the machine as much as the binary. Unlimited, the
+  two servers and the load generator each ran with `-N` (every core), so GHC's parallel
+  collector stalled whenever another process took a core. The paired design (Decision Log)
+  brought round-to-round noise from 7-28% to under 5% at a load average of 20.
+  Evidence: `paired-self-comparison.json` (baseline against itself, PASS),
+  `paired-pool-size-1.json` (EN_POOL_SIZE=1 fails every database workload by 58-82%),
+  `paired-half-cores.json` (a candidate on two cores fails six workloads by 35-45%).
+
+- Observation: in the paired design `schema-read` cannot see a slower candidate. Both servers
+  settle at about 7.4k req/s (about 4 ms per request per connection) whether they run on one,
+  two or four cores, while one four-core server alone serves 16-19k. It is not PostgreSQL (the
+  route reads memory), not the load generator's core count (an `-N8 -qg` generator changed
+  nothing) and not loopback bandwidth (the body is 238 bytes). The cause is open; until it is
+  found `schema-read` is judged sequentially, and ADR 11 says so.
+  Evidence: `paired-half-cores.json` (`schema-read` -0.0% while the rest lose 35-45%).
 
 
 ## Decision Log
@@ -109,10 +147,47 @@ AC-1 to AC-6.
   this plan, and a single pass keeps the tenant section coherent.
   Date: 2026-11-12
 
+- Decision: `ab` measures baseline and candidate at the same time by default: each workload
+  drives both servers over the same window, each server limited to four capabilities
+  (`GHCRTS=-N4`), and the verdict is the median per-round candidate/baseline ratio against
+  max(spread of the ratios, 3%). The sequential design remains as `ab --sequential`.
+  Rationale: the owner asked for a benchmark that does not depend on a quiet machine. Load from
+  outside falls on both servers of a pair and cancels in the ratio. Validated both ways on a
+  loaded machine before the gates were run with it. Recorded in ADR 11.
+  Date: 2026-11-13
+
+- Decision: Simplify this plan, at the owner's request ("let's simplify EP-5 and continue").
+  (1) G2 and G5 are one A/B: `ab --candidate-tenants 2` serves the candidate in tenant mode
+  with the measured tenant plus one idle, seeded neighbour; a pass covers both gates, since it
+  measures the single-tenant tenant-mode path with an idle neighbour added, and only a failure
+  would be split to diagnose. This replaces the `tenants` subcommand and its three modes with
+  one flag on `ab`. (2) G3 is not re-measured: the guide states EP-1's interference preview as
+  the busy-neighbour cost, saying it predates per-tenant stacks. (3) The idle-memory figures
+  for 1, 2 and 8 tenants are dropped; the guide states connections as tenants times pool size
+  and memory growth in words. (4) The pool=1 negative control for tenant mode is replaced by a
+  check, every round, that the candidate's metrics carry `tenant="bench"`; the instrument
+  itself was validated both ways in plan 72. (5) No new capability document; CAP-20's
+  description, evidence and body name tenants.
+  Rationale: the owner's go/no-go conditions are G1, G2, G4 and G5, and AC-7; everything kept
+  serves one of them. G3 was already non-gating, and the dropped figures were for the guide
+  only. Two 45-minute runs instead of four or five.
+  Date: 2026-11-13
+
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+All four milestones are complete and the owner's go/no-go gates hold: G1 (legacy mode), G2 and G5
+(tenant mode beside an idle tenant), and G4 (isolation suite). AC-7's example runs as a test. IR-2
+is completed, with AC-2 narrower than written until plan 78 lands.
+
+The largest cost was the instrument, not the feature. The sequential A/B from plan 72 needed an
+idle machine, and a shared desktop never is: one gate run failed on load, a diagnostic run was
+needed to show tenant mode costs nothing, and only then did the benchmark get fixed. The paired
+design should have been adopted when plan 72 first measured 9-17% same-binary noise. It leaves
+one gap, `schema-read`, recorded in ADR 11 as an open item.
+
+Left open: the paired `schema-read` floor; tenant-mode startup messages that say
+`EN_DATABASE_URL` for a tenant's database (owned by plan 74's area); plan 78 for AC-2.
 
 
 ## Context and Orientation
@@ -207,50 +282,22 @@ against the current binary in legacy mode. This is the last run of gate G1.
 
 ### Milestone 2: the tenant performance gates
 
-Add a `tenants` subcommand to `en-server-loadbench`, reusing the workloads and the verdict rule.
+`en-server-loadbench ab --candidate-tenants N` serves the candidate in tenant mode: the measured
+database becomes tenant `bench`, with the baseline's settings translated to their
+`EN_TENANT_BENCH_…` forms, beside `N - 1` idle tenants, each seeded like the measured database and
+holding one key no workload presents. Every round the benchmark checks that the candidate's
+`/metrics` carries `tenant="bench"`, so it cannot measure a legacy server by mistake. With `N = 2`
+one A/B covers gates G5 (tenant-mode request path) and G2 (an idle neighbour in the process); only
+a failure would be split into the two.
 
-`tenants single` (gate G5) is an A/B in which the baseline side is the baseline binary in legacy
-mode serving one database, and the candidate side is the current binary started with
-`EN_TENANTS` naming exactly one tenant whose database URL, schema, keys and settings are those of
-the baseline side (the legacy variables translated to their `EN_TENANT_<NAME>_…` forms, nothing
-else changed). All seven workloads run through that tenant's keys. A `PASS` means an operator who
-adopts tenant configuration for one tenant pays nothing for it. If it regresses where G1 does
-not, the cause is in the tenant-mode request path: key-to-stack routing, the availability check
-added by `docs/plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md`,
-or the tenant log and metric identity added by
-`docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md`.
+G3 (busy neighbour) is not re-measured: the guide states EP-1's interference preview
+(`en-server/loadbench/results/interference.json`), saying it predates per-tenant stacks.
 
-`tenants idle-neighbour` (gate G2) is an A/B in which the baseline side is the baseline binary
-serving one database alone, and the candidate side is the current binary in tenant mode serving
-two tenants on two identically seeded databases, with all load sent through the first tenant's
-key and the second tenant idle. Per-tenant settings equal the baseline's (same pool size, same
-cache sizes). All seven workloads run. A `PASS` means a tenant with idle neighbours is
-indistinguishable from a dedicated server.
-
-`tenants busy-neighbour` (G3, reported, not gating) measures a victim running `check-direct` with 8 client
-threads while an aggressor runs `check-nested` and `lookup` with 64 client threads. The
-baseline side is two baseline processes on the same machine, one database each, victim on one
-and aggressor on the other. The candidate side is one current process in tenant mode with the
-victim on one tenant and the aggressor on the other. Apply the verdict rule to the victim's
-throughput, p50 and p99 under load and print its table, but treat the verdict as information:
-EP-1's interference preview showed the shared process keeps only a few percent of the victim's
-throughput where two processes keep about 60%, and the owner accepted that cost for the intranet
-multi-tenant deployment. Also print, for the documentation, the victim's slowdown relative to
-running alone in each topology. Investigate only if the shared-process figure is clearly worse
-than the preview's (`en-server/loadbench/results/interference.json`), which would point to a
-per-tenant resource accidentally shared.
-
-Record two capacity figures for the guide, measured rather than estimated: the resident memory
-of an idle server with 1, 2 and 8 tenants (read with `ps -o rss=`), and the number of PostgreSQL
-connections opened, which is the number of tenants multiplied by the pool size.
-
-Paste the four tables (G1, G5, G2, G3), the machine description and the capacity figures
-into this plan and check the JSON results in under `en-server/loadbench/results/`. If G5 or G2
-reports a regression, investigate before anything else: likely causes are per-tenant resources
-accidentally shared (one pool, one cache, one rate-limit map, the request-log lock under
-contention) or garbage-collection pressure from the extra heap. If the cause cannot be removed
-within the design, stop, record the evidence in the parent MasterPlan's Surprises & Discoveries,
-and report to the owner; do not proceed to Milestone 3.
+If G2/G5 reports a regression, find its cause before anything else: likely causes are per-tenant
+resources accidentally shared (one pool, one cache, one rate-limit map, the request-log lock) or
+garbage-collection pressure. A same-binary A/B (the candidate as both baseline and candidate, the
+latter with `--candidate-tenants 2`) isolates the cost of tenant mode from differences between
+binaries. If the cause cannot be removed within the design, stop and report to the owner.
 
 ### Milestone 3: documentation with an executed example
 
@@ -293,10 +340,9 @@ environment or read its memory can reach every tenant. Include the gate results 
 table with the machine they were measured on.
 
 Add a "Shared service with tenants" entry to "Deployment Shapes" in
-`docs/user/production-deployment-and-performance.md`, pointing to the new section. Add a
-capability document for multi-tenant serving to `docs/capabilities/` following the bundle's
-conventions (allocate its id with the bundle's tooling, list the tenant test suite and the
-modules as evidence) and update CAP-20's description; log both changes with `okf log add`.
+`docs/user/production-deployment-and-performance.md`, pointing to the new section. Update
+CAP-20 in `docs/capabilities/` (description, evidence and body name tenants; no new capability
+document, per the Decision Log) and log the change with `okf log add`.
 Mention tenants in `README.md` where the standalone server is described. Run `just openapi`.
 
 ### Milestone 4: close out
@@ -343,32 +389,24 @@ cabal run -v0 en-server-loadbench -- ab \
   --baseline .dev/loadbench/en-server-baseline \
   --candidate "$(cabal list-bin en-server:exe:en-server)" \
   --rounds 3 \
-  --json en-server/loadbench/results/g1-final.json
+  --json en-server/loadbench/results/g1-paired.json
 ```
 
 Milestone 2:
 
 ```bash
-cabal run -v0 en-server-loadbench -- tenants single \
+cabal run -v0 en-server-loadbench -- ab \
   --baseline .dev/loadbench/en-server-baseline \
   --candidate "$(cabal list-bin en-server:exe:en-server)" \
+  --candidate-tenants 2 \
   --rounds 3 \
-  --json en-server/loadbench/results/g5-single-tenant.json
-cabal run -v0 en-server-loadbench -- tenants idle-neighbour \
-  --baseline .dev/loadbench/en-server-baseline \
-  --candidate "$(cabal list-bin en-server:exe:en-server)" \
-  --json en-server/loadbench/results/g2-idle-neighbour.json
-cabal run -v0 en-server-loadbench -- tenants busy-neighbour \
-  --baseline .dev/loadbench/en-server-baseline \
-  --candidate "$(cabal list-bin en-server:exe:en-server)" \
-  --json en-server/loadbench/results/g3-busy-neighbour.json
+  --json en-server/loadbench/results/g2-g5-paired.json
 ```
 
-`tenants single` and `tenants idle-neighbour` must each end with a line of this form;
-`tenants busy-neighbour` prints its table and verdict for the record only:
+Each must end with a line of this form:
 
 ```text
-RESULT: PASS (7 workloads)
+RESULT: PASS (7 workloads, 3 paired rounds)
 ```
 
 Milestone 3:
@@ -377,7 +415,7 @@ Milestone 3:
 cabal test en-server-tenant-tests --test-options='-p documented-example'
 just openapi
 okf validate docs/capabilities --profile docs/capabilities/profile.dhall --profile-enforce --log-enforce
-treefmt
+nix fmt
 ```
 
 Milestone 4:
@@ -401,12 +439,11 @@ The plan is accepted when:
 
 - `EN_BASELINE_BIN=… cabal test en-server-tenant-tests` passes with the upgrade case executed,
   not skipped, and with a case identifiable for each of IR-2's AC-1 to AC-6 (gate G4).
-- The single-tenant A/B (G1), `tenants single` (G5) and `tenants idle-neighbour` (G2) each end
-  with `RESULT: PASS`, run on a quiet machine with the round length that made the instrument's
-  self-comparison pass in plan 72, and their tables are recorded in this plan. The
-  `tenants busy-neighbour` table (G3) is recorded and its figures appear in the guide's limits.
-  To show the tenant scenarios can fail, run `tenants single` once with
-  `--candidate-env EN_TENANT_<NAME>_POOL_SIZE=1` and observe `REGRESSION`.
+- The single-tenant A/B (G1) and the tenant-mode A/B (`--candidate-tenants 2`, G2 and G5) each
+  end with `RESULT: PASS` in the paired design, after that design has been validated both ways
+  on the same machine: the baseline against itself passes, and a candidate with
+  `EN_POOL_SIZE=1` reports `REGRESSION`. Their figures appear in the guide with the machine
+  they were measured on, and G3 is stated from EP-1's preview.
 - A reader following only the "Serving several tenants" section, with two empty PostgreSQL
   databases, reaches a running two-tenant server and can reproduce the AC-2 checks; the
   `documented-example` case passes using the same files the section quotes (AC-7).
