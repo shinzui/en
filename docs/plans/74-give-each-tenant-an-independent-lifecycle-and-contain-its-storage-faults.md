@@ -17,6 +17,11 @@ provenance:
       at: 2026-11-13T02:19:34Z
       mode: "update"
       note: "Gate G1 reduced to EP-2 M1 and EP-5 with 3 rounds; smoke benchmark elsewhere; list-bin target fixed"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T14:29:04Z
+      mode: "update"
+      note: "Owner passed G0 with option 2: added G5 guidance for the tenant-mode request path"
 ---
 
 # Give each tenant an independent lifecycle and contain its storage faults
@@ -365,7 +370,9 @@ repeat: initialization only reads, except for minting a datastore id into a data
 the metadata table and no id, which is the existing first-start behaviour and does not happen
 when a pin is set. `import` remains idempotent as documented in `runImport`. Nothing here adds a
 migration. If the smoke benchmark, or later gate G1, regresses, the likeliest cause is work added to the legacy request path;
-legacy mode must not read a slot reference or take any new branch per request.
+legacy mode must not read a slot reference or take any new branch per request. The per-request
+availability check this plan adds to tenant mode is gated later by G5 (one declared tenant against
+the baseline binary, run by plan 76), so keep it to one read of a mutable reference per request.
 
 
 ## Interfaces and Dependencies

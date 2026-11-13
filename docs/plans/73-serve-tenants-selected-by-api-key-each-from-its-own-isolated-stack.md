@@ -301,6 +301,11 @@ constant-time comparison, same 401), applies the same read-only rule (same 403),
 application paired with the matched key. It must not read any other header, the path, or the
 body to choose an application.
 
+The tenant-mode path is gated later by G5 in the parent MasterPlan: one declared tenant must be
+no slower than the baseline binary in legacy mode. So the per-request work must equal
+`authMiddleware`'s: the same scan over the key list, with the matched entry carrying its
+tenant's application, and no second lookup by tenant name.
+
 In `Main.hs`, tenant mode builds one stack per tenant with `buildStack`. Each stack gets its own
 rate limiter (`rateLimitMiddleware` allocates its bucket map, so calling it once per stack
 separates the buckets) and its own metrics registry (`newMetrics`), so `GET /metrics` under a

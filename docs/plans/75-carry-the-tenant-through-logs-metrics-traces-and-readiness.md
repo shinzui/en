@@ -17,6 +17,11 @@ provenance:
       at: 2026-11-13T02:19:34Z
       mode: "update"
       note: "Gate G1 reduced to EP-2 M1 and EP-5 with 3 rounds; smoke benchmark elsewhere; list-bin target fixed"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T14:29:04Z
+      mode: "update"
+      note: "Owner passed G0 with option 2: added G5 guidance for the tenant-mode request path"
 ---
 
 # Carry the tenant through logs, metrics, traces and readiness
@@ -310,7 +315,9 @@ The changes are additive in tenant mode and absent in legacy mode, so they can b
 milestone by milestone and each reverted alone. Tests own their PostgreSQL instances and can be
 re-run. If the smoke benchmark, or later gate G1, regresses, look for work added to the legacy request path: legacy mode must
 call the logger and metrics code with no tenant name and take no new branch per request beyond
-that.
+that. In tenant mode the tenant identity is gated later by G5 (one declared tenant against the
+baseline binary, run by plan 76): bind each stack's tenant label once when the stack is built,
+never look it up per request.
 
 
 ## Interfaces and Dependencies

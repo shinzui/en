@@ -17,6 +17,11 @@ provenance:
       at: 2026-11-13T02:19:34Z
       mode: "update"
       note: "Gate G1 reduced to EP-2 M1 and EP-5 with 3 rounds; smoke benchmark elsewhere; list-bin target fixed"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T14:29:04Z
+      mode: "update"
+      note: "G0 option 2: G3 reported not gating; added gate G5 (single declared tenant, tenants single)"
 ---
 
 # Prove tenant isolation and performance, then document tenant operations
@@ -31,14 +36,18 @@ Record friction met while implementing in the friction-log bundle as it occurs (
 
 `en-server` can now serve several tenants from one process (independent authorization owners,
 each with its own schema file, PostgreSQL database and API keys, selected by the caller's key).
-En's owner accepted this feature on two conditions: tenants are completely isolated, and nothing
-gets slower. This plan is where both conditions are finally measured, and where the feature
-becomes usable by someone who was not involved in building it.
+En's owner accepted this feature on two conditions: tenants are completely isolated, and
+single-tenant use pays no performance tax. The owner runs both a performance-sensitive
+single-tenant deployment and an intranet multi-tenant deployment without the same requirements,
+so the cost a busy neighbour imposes is measured and documented but does not gate the feature.
+This plan is where both conditions are finally measured, and where the feature becomes usable by
+someone who was not involved in building it.
 
-After this plan: the full isolation test suite passes in one command; three performance gates
-have recorded verdicts (an existing single-tenant deployment is no slower; a tenant with idle
-neighbours is no slower than a dedicated server; a tenant with a busy neighbour is no worse off
-than if the neighbour ran in a second process on the same machine); the operations guide
+After this plan: the full isolation test suite passes in one command; three single-tenant
+performance gates have passing verdicts (an existing deployment without tenant configuration is
+no slower; a server declaring exactly one tenant is no slower; a tenant with idle neighbours is
+no slower than a dedicated server); the busy-neighbour cost is measured beside the cost of a
+second process on the same machine and stated in the guide; the operations guide
 explains how to configure, migrate, reload, back up, restore and observe tenants and states the
 limits of the isolation honestly; the guide's own example is executed by a test; and the
 decisions are distilled into ADRs.
@@ -53,9 +62,10 @@ AC-1 to AC-6.
 
 - [ ] Milestone 1: the complete `en-server-tenant-tests` suite passes (gate G4) and the final
       single-tenant A/B reports `RESULT: PASS` (gate G1).
-- [ ] Milestone 2: `en-server-loadbench tenants` exists; the idle-neighbour comparison (gate G2)
-      and the busy-neighbour comparison (gate G3) report `RESULT: PASS`, with their tables and the
-      memory and connection figures recorded here.
+- [ ] Milestone 2: `en-server-loadbench tenants` exists; the single-declared-tenant comparison
+      (gate G5) and the idle-neighbour comparison (gate G2) report `RESULT: PASS`; the
+      busy-neighbour measurement (G3, reported, not gating) is recorded; their tables and the
+      memory and connection figures are recorded here.
 - [ ] Milestone 3: `docs/user/service-and-operations.md` documents tenants; its example files
       under `docs/user/examples/two-tenant/` start a server that passes the documented-example
       test; the capability catalog, the deployment guide and the README are updated;
@@ -77,6 +87,15 @@ AC-1 to AC-6.
   construction, and IR-2 itself lists that as a limit to document. The claim that can be tested
   and kept is that sharing a process costs no more than sharing a machine.
   Date: 2026-11-12
+
+- Decision: The busy-neighbour comparison (G3) is measured and reported, not go/no-go, and a
+  single-declared-tenant gate (G5) is added. This supersedes the gate status of the entry above;
+  the comparison against two processes is kept as the reported figure.
+  Rationale: At the parent MasterPlan's gate G0 the owner chose option 2: the multi-tenant
+  deployment is an intranet without the single-tenant deployment's performance requirements,
+  and multi-tenancy is acceptable only if single-tenant use pays no tax. G5 gates the
+  tenant-mode request path when it serves one tenant alone.
+  Date: 2026-11-13
 
 - Decision: The documentation's example lives in checked-in files that the documentation quotes
   and a test executes.
@@ -187,6 +206,17 @@ against the current binary in legacy mode. This is the last run of gate G1.
 
 Add a `tenants` subcommand to `en-server-loadbench`, reusing the workloads and the verdict rule.
 
+`tenants single` (gate G5) is an A/B in which the baseline side is the baseline binary in legacy
+mode serving one database, and the candidate side is the current binary started with
+`EN_TENANTS` naming exactly one tenant whose database URL, schema, keys and settings are those of
+the baseline side (the legacy variables translated to their `EN_TENANT_<NAME>_…` forms, nothing
+else changed). All six workloads run through that tenant's keys. A `PASS` means an operator who
+adopts tenant configuration for one tenant pays nothing for it. If it regresses where G1 does
+not, the cause is in the tenant-mode request path: key-to-stack routing, the availability check
+added by `docs/plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md`,
+or the tenant log and metric identity added by
+`docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md`.
+
 `tenants idle-neighbour` (gate G2) is an A/B in which the baseline side is the baseline binary
 serving one database alone, and the candidate side is the current binary in tenant mode serving
 two tenants on two identically seeded databases, with all load sent through the first tenant's
@@ -194,21 +224,25 @@ key and the second tenant idle. Per-tenant settings equal the baseline's (same p
 cache sizes). All six workloads run. A `PASS` means a tenant with idle neighbours is
 indistinguishable from a dedicated server.
 
-`tenants busy-neighbour` (gate G3) measures a victim running `check-direct` with 8 client
+`tenants busy-neighbour` (G3, reported, not gating) measures a victim running `check-direct` with 8 client
 threads while an aggressor runs `check-nested` and `lookup` with 64 client threads. The
 baseline side is two baseline processes on the same machine, one database each, victim on one
 and aggressor on the other. The candidate side is one current process in tenant mode with the
 victim on one tenant and the aggressor on the other. Apply the verdict rule to the victim's
-throughput, p50 and p99 under load. A `PASS` means sharing a process costs the victim no more
-than sharing the machine. Also print, for the documentation, the victim's slowdown relative to
-running alone in each topology.
+throughput, p50 and p99 under load and print its table, but treat the verdict as information:
+EP-1's interference preview showed the shared process keeps only a few percent of the victim's
+throughput where two processes keep about 60%, and the owner accepted that cost for the intranet
+multi-tenant deployment. Also print, for the documentation, the victim's slowdown relative to
+running alone in each topology. Investigate only if the shared-process figure is clearly worse
+than the preview's (`en-server/loadbench/results/interference.json`), which would point to a
+per-tenant resource accidentally shared.
 
 Record two capacity figures for the guide, measured rather than estimated: the resident memory
 of an idle server with 1, 2 and 8 tenants (read with `ps -o rss=`), and the number of PostgreSQL
 connections opened, which is the number of tenants multiplied by the pool size.
 
-Paste the three verdict tables (G1, G2, G3), the machine description and the capacity figures
-into this plan and check the JSON results in under `en-server/loadbench/results/`. If G2 or G3
+Paste the four tables (G1, G5, G2, G3), the machine description and the capacity figures
+into this plan and check the JSON results in under `en-server/loadbench/results/`. If G5 or G2
 reports a regression, investigate before anything else: likely causes are per-tenant resources
 accidentally shared (one pool, one cache, one rate-limit map, the request-log lock under
 contention) or garbage-collection pressure from the extra heap. If the cause cannot be removed
@@ -246,8 +280,9 @@ End the section with "Isolation guarantees and their limits". Guarantees, each t
 that proves it: separate data, tokens, cursors, caches, rate limits, schema lifecycle, garbage
 collection, grant generations and fault domains. Limits, stated plainly: tenants share the
 process's CPU cores, garbage-collected heap, listener and TLS configuration; a busy tenant slows
-its neighbours by the measured amount, with the rate limiter as the control and a dedicated En
-as the alternative; the process-wide settings (evaluation budget, deadlines, batch size, cache
+its neighbours by the measured amount (G3), with the rate limiter as the control and a
+dedicated En as the alternative for a deployment that needs performance isolation; a server
+serving one tenant, with or without `EN_TENANTS`, pays nothing for tenancy (G1, G5); the process-wide settings (evaluation budget, deadlines, batch size, cache
 sizes, rate limit, maintenance schedule) are common to all tenants; total database connections
 and memory grow with the number of tenants (give the measured figures); one tenant's storage
 fault does not fail readiness, so alert on `en_tenant_available`; anyone who can set the process
@@ -279,7 +314,7 @@ validate the bundle.
 
 Triage friction entries recorded under the five child plans as
 `agents/skills/exec-plan/FRICTION.md` describes. In the parent MasterPlan, check off gates G1 to
-G4 with pointers to the evidence, mark this plan Complete in the registry, and write its
+G5 with pointers to the evidence, mark this plan Complete in the registry, and write its
 Outcomes & Retrospective.
 
 
@@ -303,6 +338,11 @@ cabal run -v0 en-server-loadbench -- ab \
 Milestone 2:
 
 ```bash
+cabal run -v0 en-server-loadbench -- tenants single \
+  --baseline .dev/loadbench/en-server-baseline \
+  --candidate "$(cabal list-bin en-server:exe:en-server)" \
+  --rounds 3 \
+  --json en-server/loadbench/results/g5-single-tenant.json
 cabal run -v0 en-server-loadbench -- tenants idle-neighbour \
   --baseline .dev/loadbench/en-server-baseline \
   --candidate "$(cabal list-bin en-server:exe:en-server)" \
@@ -313,7 +353,8 @@ cabal run -v0 en-server-loadbench -- tenants busy-neighbour \
   --json en-server/loadbench/results/g3-busy-neighbour.json
 ```
 
-Each must end with a line of this form:
+`tenants single` and `tenants idle-neighbour` must each end with a line of this form;
+`tenants busy-neighbour` prints its table and verdict for the record only:
 
 ```text
 RESULT: PASS (6 workloads)
@@ -349,10 +390,12 @@ The plan is accepted when:
 
 - `EN_BASELINE_BIN=… cabal test en-server-tenant-tests` passes with the upgrade case executed,
   not skipped, and with a case identifiable for each of IR-2's AC-1 to AC-6 (gate G4).
-- The three benchmark commands each end with `RESULT: PASS`, run on a quiet machine with the
-  round length that made the instrument's self-comparison pass in plan 72, and their tables are
-  recorded in this plan (gates G1, G2, G3). To show the tenant scenarios can fail, run
-  `tenants idle-neighbour` once with `--candidate-env EN_POOL_SIZE=1` and observe `REGRESSION`.
+- The single-tenant A/B (G1), `tenants single` (G5) and `tenants idle-neighbour` (G2) each end
+  with `RESULT: PASS`, run on a quiet machine with the round length that made the instrument's
+  self-comparison pass in plan 72, and their tables are recorded in this plan. The
+  `tenants busy-neighbour` table (G3) is recorded and its figures appear in the guide's limits.
+  To show the tenant scenarios can fail, run `tenants single` once with
+  `--candidate-env EN_TENANT_<NAME>_POOL_SIZE=1` and observe `REGRESSION`.
 - A reader following only the "Serving several tenants" section, with two empty PostgreSQL
   databases, reaches a running two-tenant server and can reproduce the AC-2 checks; the
   `documented-example` case passes using the same files the section quotes (AC-7).
@@ -373,7 +416,7 @@ step to do last, after every gate has passed; if a gate fails, leave IR-2 as it 
 
 ## Interfaces and Dependencies
 
-No new library. This plan adds the `tenants` subcommand (modes `idle-neighbour` and
+No new library. This plan adds the `tenants` subcommand (modes `single`, `idle-neighbour` and
 `busy-neighbour`) to `en-server-loadbench`, the `documented-example` case to
 `en-server-tenant-tests`, and the directory `docs/user/examples/two-tenant/`. It consumes the
 verdict rule and baseline binary from plan 72 and the tenant configuration from plans 73 to 75

@@ -21,6 +21,11 @@ provenance:
       at: 2026-11-13T02:19:34Z
       mode: "update"
       note: "Gate G1 reduced to two runs of 3 rounds with the owner's agreement"
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-13T14:29:04Z
+      mode: "update"
+      note: "G0 passed with option 2; G3 reported not gating; G5 single-declared-tenant gate added; EP-2 started"
 ---
 
 # Serve several isolated tenants from one En server
@@ -52,21 +57,25 @@ bar of the whole initiative, above the seven acceptance criteria of IR-2:
 1. **Complete isolation.** A tenant's requests never read, write, validate against, cache
    alongside, rate-limit against, or invalidate another tenant's state, and a fault in one
    tenant's storage or schema never makes another tenant unavailable.
-2. **No performance degradation.** A server started without tenant configuration is no slower
-   than it is today, a tenant on a shared server whose neighbours are idle is no slower than the
-   same workload on a dedicated server, and sharing a process costs a tenant with a busy
-   neighbour no more than sharing a machine with a second `en-server` process would.
+2. **No tax on single-tenant use.** A server started without tenant configuration is no slower
+   than it is today, a server declaring exactly one tenant through `EN_TENANTS` is no slower than
+   the same workload on today's server, and a tenant on a shared server whose neighbours are
+   idle is no slower than the same workload on a dedicated server.
 
-These are enforced as measured go/no-go gates (see Progress). If a gate fails and cannot be
-fixed inside the design below, the initiative stops and the result is reported to the owner
-rather than shipped with a caveat.
+The owner runs both shapes: a single-tenant deployment where performance matters, and a
+multi-tenant deployment on an intranet that does not have the same performance requirements.
+The single-tenant conditions are enforced as measured go/no-go gates (G1, G2, G5 in Progress).
+The cost a busy neighbour imposes on a tenant is measured (G3) and documented, but does not gate
+the initiative; the owner accepted it at gate G0 knowing the preview figures. If a go/no-go gate
+fails and cannot be fixed inside the design below, the initiative stops and the result is
+reported to the owner rather than shipped with a caveat.
 
 One limit must be stated plainly because no design removes it: tenants of one process share its
 CPU cores, its garbage-collected heap and its network listener. Data and authorization isolation
-can be made complete; performance isolation in a shared process can be made *no worse than
-co-located processes* and can be bounded with the existing per-caller rate limiter, but it
-cannot be absolute. Gate G3 measures exactly this, and the owner decides at gate G0 whether the
-preview of that number is acceptable before any tenant code is written.
+can be made complete; performance isolation in a shared process cannot. EP-1's preview showed a
+busy tenant inside one process costs its neighbour far more than a busy second process would.
+A deployment that needs performance isolation runs a dedicated `en-server` per tenant; the
+existing per-caller rate limiter is the only in-process control.
 
 In scope: tenant configuration, key-to-tenant routing, one complete authorization stack per
 tenant, per-tenant schema reload, `check-schema`, import, export, maintenance and migrations,
@@ -198,7 +207,7 @@ per-tenant availability is reported, not gated" (plan 75). Plan 76 performs the 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | EP-1 | Build an en-server load benchmark and record the single-tenant baseline | docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md | None | None | Complete |
-| EP-2 | Serve tenants selected by API key, each from its own isolated stack | docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md | EP-1, gate G0 | None | Not Started |
+| EP-2 | Serve tenants selected by API key, each from its own isolated stack | docs/plans/73-serve-tenants-selected-by-api-key-each-from-its-own-isolated-stack.md | EP-1, gate G0 | None | In Progress |
 | EP-3 | Give each tenant an independent lifecycle and contain its storage faults | docs/plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md | EP-2 | None | Not Started |
 | EP-4 | Carry the tenant through logs, metrics, traces and readiness | docs/plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md | EP-2, EP-3 | None | Not Started |
 | EP-5 | Prove tenant isolation and performance, then document tenant operations | docs/plans/76-prove-tenant-isolation-and-performance-then-document-tenant-operations.md | EP-2, EP-3, EP-4 | None | Not Started |
@@ -240,7 +249,7 @@ not fork it.
 **The load benchmark** (`en-server/loadbench/`, executable `en-server-loadbench`). Owner: EP-1,
 which defines the scenario interface, the result JSON and the A/B verdict rule. EP-2 runs it
 for gate G1; EP-3 and EP-4 run only its smoke mode (`just loadbench-smoke`). EP-5 runs gate G1
-for the last time and adds the two tenant scenarios (gates G2 and G3).
+for the last time and adds the three tenant scenarios (gates G2, G3 and G5).
 
 **The baseline binary** (`.dev/loadbench/en-server-baseline`, built from the commit recorded in
 EP-1). Owner: EP-1. It is the fixed reference for every A/B run and for EP-2's upgrade test of
@@ -281,20 +290,18 @@ configuration exists.
 EP-1 is complete (2026-11-13): the benchmark, the baseline binary (commit `5361988`), the
 single-tenant baseline and the interference preview are recorded in
 `docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md` and
-`en-server/loadbench/results/`, and were reported to the owner. Gate G0 is open: EP-2 does not
-start until the owner decides, and the preview (Surprises & Discoveries) suggests G3 cannot pass
-with the design as written. IR-2 stays `proposed` until the owner
-approves gate G0; EP-2 then moves it to `in-progress` and EP-5 marks it `completed`. If G0 is
-declined, IR-2 is marked `rejected` with the benchmark evidence as its resolution. The
-initiative has five gates that are not
-owned by a single child plan. Each is checked off only with benchmark or test evidence recorded
-in the named child plan.
+`en-server/loadbench/results/`, and were reported to the owner. Gate G0 passed on 2026-11-13
+(option 2 of the brief below), and EP-2 is in progress. EP-2 moves IR-2 to `in-progress`; EP-5
+marks it `completed`. The initiative has six gates that are not owned by a single child plan.
+Each is checked off only with benchmark or test evidence recorded in the named child plan.
 
-- [ ] **G0, owner go/no-go (after EP-1).** EP-1 reports the single-tenant baseline and the
+- [x] **G0, owner go/no-go (after EP-1).** EP-1 reports the single-tenant baseline and the
       in-process interference preview. The owner confirms that the preview and the stated
       shared-process limit are acceptable. If not, EP-2 to EP-5 are cancelled.
-      Status 2026-11-13: evidence reported, **decision deferred by the owner**. The brief below
-      is what the decision rests on.
+      Decided 2026-11-13: **go, with option 2.** The owner has both a performance-sensitive
+      single-tenant deployment and an intranet multi-tenant deployment without the same
+      requirements, and accepts multi-tenancy on the condition that single-tenant use pays no
+      tax. G3 becomes a measured, reported figure; G5 is added; no admission bound is designed.
 - [ ] **G1, no single-tenant regression.** A server started without `EN_TENANTS` shows no
       regression against the baseline binary under EP-1's A/B verdict rule (`--rounds 3`), on
       every workload, at two points: the end of EP-2 Milestone 1, where the legacy request path
@@ -303,14 +310,24 @@ in the named child plan.
 - [ ] **G2, no regression with idle neighbours.** One tenant of a two-tenant server, with the
       other tenant idle, shows no regression against the baseline binary serving the same
       workload alone (EP-5).
-- [ ] **G3, sharing a process costs no more than sharing a machine.** With the neighbour tenant
-      saturated, the measured tenant is no worse than the same two workloads served by two
-      separate baseline `en-server` processes on the same host (EP-5).
+- [ ] **G3, busy-neighbour cost, measured and reported (not go/no-go).** With the neighbour
+      tenant saturated, the measured tenant's throughput and latency are recorded beside the same
+      two workloads served by two separate baseline `en-server` processes on the same host, and
+      the figures go into the operations guide's limits (EP-5). A large gap is expected and does
+      not stop the initiative; a gap far worse than EP-1's preview is investigated as a defect
+      (for example a per-tenant resource accidentally shared).
 - [ ] **G4, isolation.** `en-server-tenant-tests` passes with every case from EP-2, EP-3 and
       EP-4, including the case that runs every route under one tenant's keys while the other
       tenant's PostgreSQL is stopped (EP-5 confirms the whole suite).
+- [ ] **G5, no regression with a single declared tenant.** A server started with
+      `EN_TENANTS` declaring exactly one tenant, serving the same database and settings, shows no
+      regression against the baseline binary in legacy mode under EP-1's A/B verdict rule
+      (`--rounds 3`), on every workload (EP-5). This covers an operator who adopts tenant
+      configuration but serves one tenant, and so measures the tenant-mode request path (key to
+      stack routing, availability state, tenant log and metric identity) with nothing else in
+      the process.
 
-If G1, G2, G3 or G4 fails and cannot be fixed within the design above, stop, record the evidence
+If G1, G2, G4 or G5 fails and cannot be fixed within the design above, stop, record the evidence
 in Surprises & Discoveries, and report to the owner. Work is committed to `master` (the
 repository does not use feature branches by default), so every child plan keeps legacy mode
 passing the smoke benchmark and the existing suites at its tip; if the initiative is abandoned, the commits carrying this MasterPlan's
@@ -371,6 +388,11 @@ single request-log lock add to it. As designed, **G3 is very likely to fail.**
 
 Recommendation recorded at the time: option 1 only if the owner accepts a second stop after an
 early measurement of the bound; otherwise option 3.
+
+**Decision (2026-11-13): option 2.** The owner's multi-tenant deployment is an intranet without
+the single-tenant deployment's performance requirements, so a busy neighbour's cost is accepted
+and documented. The owner's condition moved to single-tenant use: legacy mode (G1), one declared
+tenant (G5, added) and a tenant with idle neighbours (G2) must show no regression.
 
 
 ## Surprises & Discoveries
@@ -468,6 +490,23 @@ early measurement of the bound; otherwise option 3.
   an unavailable tenant, because `servant-health` cannot name a check in a passing response;
   EP-4 resolves it and the owner is asked to confirm.
   Date: 2026-11-12
+
+- Decision: Gate G0 passes with option 2. G3 is measured and reported, not go/no-go; no
+  per-tenant admission bound is designed. This supersedes the 2026-11-12 entry defining G3 as a
+  gate.
+  Rationale: The owner runs two shapes: a performance-sensitive single-tenant deployment and an
+  intranet multi-tenant deployment without the same requirements. Multi-tenancy is acceptable
+  as long as it puts no tax on single-tenant use. EP-1's preview showed G3 would fail as a gate,
+  and an admission bound was unproven work for a deployment that does not need it.
+  Date: 2026-11-13
+
+- Decision: Add gate G5: one tenant declared through `EN_TENANTS` shows no regression against
+  the baseline binary in legacy mode (EP-5), alongside G1 (legacy mode) and G2 (idle neighbour).
+  Rationale: G1 covers only the legacy request path and G2 a process with a second, idle stack.
+  An operator who adopts tenant configuration for one tenant runs the tenant-mode request path
+  alone, and with the owner's condition now centred on single-tenant use, that path must be
+  gated too.
+  Date: 2026-11-13
 
 
 ## Outcomes & Retrospective
