@@ -10,7 +10,7 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
 import Control.Exception (finally)
 import Control.Monad (replicateM_)
 import Data.Either (isRight)
-import Data.Foldable (traverse_)
+import Data.Foldable (for_, traverse_)
 import Data.Functor.Contravariant ((>$<))
 import Data.Generics.Labels ()
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
@@ -105,6 +105,8 @@ main = do
     runWatchWindowScenario connection
     resetSchema connection
     runWatchFeedScenario connection
+    resetSchema connection
+    runRecursiveLookupScenario connection
     Connection.release connection
   case result of
     Left err -> fail ("ephemeral-pg failed to start: " <> Text.unpack (Pg.renderStartError err))
@@ -1018,6 +1020,87 @@ runSchemaValidationScenario connection = do
       \  relation editor: user\n\
       \  permission view = viewer | editor\n\
       \}\n"
+
+-- | Lookup follows nested groups (self-recursive and mutually recursive usersets) over
+-- real storage, and agrees with check on every space. The same fixture as the in-memory
+-- agreement cases of docs/plans/77; this repeats them over PostgreSQL because the
+-- in-memory store is for tests and demos only (ADR 3).
+runRecursiveLookupScenario :: Connection.Connection -> IO ()
+runRecursiveLookupScenario connection = do
+  config <- testConfig
+  graph <- compile <$> parseValidSchema recursiveLookupSchemaText
+  let ref objectType objectId = ObjectRef (ObjectType objectType) objectId
+      member = RelationName "member"
+      grant object relation subject = Tuple {object, relation, subject, caveat = Nothing}
+      memberOf object subject = grant object member subject
+      viewerOf object subject = grant object (RelationName "viewer") subject
+      membersOf object = SubjectSet object member
+      alice = ref "user" "alice"
+      bob = ref "user" "bob"
+      groupRef = ref "group"
+      spaceRef = ref "space"
+      tuples =
+        [ -- Three levels of direct recursion.
+          memberOf (groupRef "g1") (SubjectId alice),
+          memberOf (groupRef "g2") (membersOf (groupRef "g1")),
+          memberOf (groupRef "g3") (membersOf (groupRef "g2")),
+          -- Mutual recursion through teams, two turns.
+          memberOf (ref "team" "t1") (SubjectId bob),
+          memberOf (groupRef "g4") (membersOf (ref "team" "t1")),
+          memberOf (ref "team" "t2") (membersOf (groupRef "g4")),
+          memberOf (groupRef "g5") (membersOf (ref "team" "t2")),
+          viewerOf (spaceRef "s0") (SubjectId alice)
+        ]
+          <> [viewerOf (spaceRef ("s" <> showText n)) (membersOf (groupRef ("g" <> showText n))) | n <- [1 :: Int .. 5]]
+      spaces = [spaceRef ("s" <> showText n) | n <- [0 :: Int .. 5]]
+  token <- runPgOrFail connection config (TupleStore.writeTuples tuples)
+  let request who permission objectType limit cursor =
+        LookupRequest
+          { subject = SubjectId who,
+            permission = RelationName permission,
+            objectType = ObjectType objectType,
+            context = CaveatContext Map.empty,
+            limit = LookupLimit limit,
+            cursor
+          }
+      pagesOf who permission objectType limit = go Nothing
+        where
+          go cursor = do
+            LookupPage {objects, state} <- runPgOrFail connection config (Lookup.lookup graph (AtLeastAsFresh token) (request who permission objectType limit cursor))
+            case state of
+              LookupExhausted -> pure [objects]
+              LookupHasMore next -> (objects :) <$> go (Just next)
+              LookupTruncated _ -> fail "recursive lookup over postgres was truncated without a deadline"
+      allowedObjects = fmap (\object -> LookupObject {object, decision = Allowed})
+  assertEqual "postgres-backed lookup follows nested groups to alice's spaces" [allowedObjects (take 4 spaces)] =<< pagesOf alice "view" "space" 10
+  assertEqual "postgres-backed lookup follows mutually nested groups to bob's spaces" [allowedObjects (drop 4 spaces)] =<< pagesOf bob "view" "space" 10
+  assertEqual "postgres-backed lookup returns every group alice is nested into" [allowedObjects (fmap groupRef ["g1", "g2", "g3"])] =<< pagesOf alice "member" "group" 10
+  assertEqual "postgres-backed lookup returns every group bob is nested into" [allowedObjects (fmap groupRef ["g4", "g5"])] =<< pagesOf bob "member" "group" 10
+  assertEqual "postgres-backed recursive lookup pages one space at a time in key order" (fmap (\object -> allowedObjects [object]) (take 4 spaces)) =<< pagesOf alice "view" "space" 1
+  for_ [alice, bob] \who -> do
+    found <- concat <$> pagesOf who "view" "space" 10
+    for_ spaces \space -> do
+      decision <- runPgOrFail connection config (check graph (AtLeastAsFresh token) (CaveatContext Map.empty) (SubjectId who) (RelationName "view") space)
+      assertEqual
+        ("postgres-backed lookup agrees with check for " <> show (who ^. #objectId) <> " on " <> show (space ^. #objectId))
+        ((decision ^. #decision) == Allowed)
+        (any (\LookupObject {object} -> object == space) found)
+
+recursiveLookupSchemaText :: Text
+recursiveLookupSchemaText =
+  """
+  object user {}
+  object team {
+    relation member: user, group#member
+  }
+  object group {
+    relation member: user, group#member, team#member
+  }
+  object space {
+    relation viewer: user, group#member
+    permission view = viewer
+  }
+  """
 
 parseValidSchema :: Text -> IO ValidSchema
 parseValidSchema text = do

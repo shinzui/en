@@ -172,6 +172,19 @@ Each `LookupObject` carries the object and its `CheckDecision`. For ordinary
 access filtering, keep `Allowed` results and treat `Conditional` as unresolved
 until context is complete.
 
+Lookup agrees with check: an object is in the result exactly when a check of it
+is `Allowed` or `Conditional`, with the same decision. That includes recursive
+schemas: nested groups (`group.member` accepting `group#member`), groups and
+teams nested in each other, and arrows that recurse (`parent->view`), to any
+depth the evaluation budget allows. A recursion deeper than the budget is an
+error (`ResolutionLimitExceeded`, HTTP 422 `resolution_limit_exceeded`), never
+a shorter list. Recursion has two costs. A permission that is itself recursive
+through an intersection or exclusion confirms every candidate on every page, so
+it pages more slowly than other lookups. And for an object on a cycle of
+caveated memberships, a `Conditional` result can name more obligations than
+check does, because lookup also follows paths that return to the same object.
+Lookup never grants more than check; it can only ask for more context.
+
 Use cursors until `LookupExhausted`:
 
 - `LookupExhausted`: no more results.

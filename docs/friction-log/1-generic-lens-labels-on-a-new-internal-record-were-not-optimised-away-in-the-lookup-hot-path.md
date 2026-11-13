@@ -6,13 +6,18 @@ generated:
   by: "claude-code/claude-opus-5-5"
   at: "2026-11-13T04:29:16Z"
 frictionId: FRIC-1
-status: logged
+status: "accepted"
 impact: slowdown
 kind: interface
 origin: "mori://shinzui/en"
 affects: "mori://ekmett/lens"
 plan: "docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md"
 workaround: "Pattern-match accessors (evaluatedObjects, evaluatedAssumed) with INLINE pragmas instead of #label lenses on Evaluated"
+resolution: "ADR 7 now records this as a second measured exception (after ExecPlan 70's snapshot predicates): label access stays the idiom, and a hot path that measures slower may use INLINE record-pattern accessors with benchmark evidence."
+amended:
+  - by: "claude-code/claude-opus-5-5"
+    at: "2026-11-13T04:34:36Z"
+    change: "Accepted under ADR 7's measured-exception policy; the same cost recurred from ExecPlan 70, which is why the ADR section was extended rather than a new rule written"
 ---
 # Generic-lens labels on a new internal record were not optimised away in the lookup hot path
 

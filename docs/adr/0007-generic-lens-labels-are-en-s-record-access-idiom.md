@@ -5,6 +5,7 @@ date: 2026-08-25
 authors: [shinzui]
 related:
   - docs/plans/68-migrate-en-s-records-to-generic-lens-label-syntax-and-a-custom-prelude.md
+  - docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md
   - docs/masterplans/11-bring-en-into-conformance-with-the-haskell-jitsurei-pattern-catalog.md
   - mori://shinzui/haskell-jitsurei/docs/core-record-patterns
   - mori://shinzui/haskell-jitsurei/docs/core-custom-prelude
@@ -89,3 +90,18 @@ patterns. Keep ordinary Generic record access as labels. This is a measured
 exception at a small pure boundary, not permission for a general access-style
 migration. Any expansion should have equivalent benchmark evidence and preserve
 behavior under the existing revision and PostgreSQL integration tests.
+
+## Measured lookup-evaluator exception — 2026-11-13
+
+[ExecPlan 77](../plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md)
+replaced the lookup evaluator's internal result, `Either EnError LookupObjects`, with
+`Either EnError Evaluated`, a record of the objects and the set of in-progress
+subproblems they depend on. Reading that record through `#objects` and `#assumed`
+measured `lookup/reachable-spaces` at 3.7–4.3 µs against a 2.8 µs baseline, with the
+evaluation itself traced as unchanged (three subproblem evaluations, against four
+before). INLINE record-pattern accessors (`evaluatedObjects`, `evaluatedAssumed`)
+measured 2.4 µs. `lookup/wide-fanout` stayed within noise of its baseline either way.
+
+Allow `En.Lookup` to read `Evaluated` through those accessors; `Evaluated` derives no
+`Generic`. This is a second measured exception, at one internal type on the lookup hot
+path; every other record in `En.Lookup`, including `EvalState`, keeps label access.

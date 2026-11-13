@@ -403,6 +403,10 @@ early measurement of the bound; otherwise option 3.
   is planned as its own fix in
   `docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md`, independent of
   this initiative. The benchmark fixture avoids it.
+  Update (2026-11-13): fixed by that plan; lookup now follows nested and mutually nested
+  usersets and agrees with check. The loadbench smoke run passes with the space grants moved
+  to the outer groups, but the fixture was not changed, so the recorded baseline's workload is
+  unchanged. Moving the grants is this initiative's call.
 
 
 ## Decision Log

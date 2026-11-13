@@ -104,8 +104,20 @@ The defect was found while building the load benchmark of
       after; new `lookup/nested-groups` (300 spaces through two levels of nesting under ten
       groups) 149 µs ± 8.9 µs, against 34 µs for the wrong pre-change answer. Check, expand and
       cache benchmarks unchanged within noise. `en-postgres` is exercised in Milestone 3.
-- [ ] Milestone 3: the fix is proved through PostgreSQL and the HTTP server, the user guide
-      states what lookup guarantees about recursion, and the ADR or plan records are updated.
+- [x] Milestone 3 (2026-11-13): the fix is proved through PostgreSQL and the HTTP server, the
+      user guide states what lookup guarantees about recursion, and the ADR and plan records are
+      updated. `cabal test en-postgres-integration-tests` passes with the new
+      `runRecursiveLookupScenario` (the Milestone 1 nested-group fixture over PostgreSQL: alice's
+      and bob's spaces and groups, one-per-page paging, and agreement with check on every
+      space). The Hurl suite was not extended: its documented precondition is the demo model
+      (`user`, `space`), which has no recursive userset. With the first 5,000 loadbench spaces
+      granted to the outer group, `cabal run -v0 en-server-loadbench -- run --smoke` passed
+      with `lookupExpectedCount = 105` and 0 lookup errors (lookup 1,470 req/s, p50 2.58 ms,
+      p99 5.28 ms in the smoke profile); the fixture change was reverted, because changing the
+      workload under the recorded baseline is MasterPlan 12's call, and the run is recorded as
+      evidence only. `docs/user/queries-and-writes.md` (Lookup), the `Fixture.hs` header, plan
+      72's Surprises & Discoveries and Outcomes, and MasterPlan 12's entry now say the defect is
+      fixed. ADR 7 records the measured accessor exception.
 
 
 ## Surprises & Discoveries
@@ -302,7 +314,37 @@ The following were found while implementing, on 2026-11-13.
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Lookup now agrees with check on recursive schemas. A revisited subproblem contributes its
+current approximation instead of nothing, and the cycle head iterates to a fixpoint bounded by
+`maxDepth` rounds and the deadline. Every fixture of Milestone 1 returns what check allows:
+nested and mutually nested groups, cyclic data, an arrow through a computed permission, a
+recursive arrow over nested groups (formerly `ResolutionLimitExceeded`), and a recursion
+through an exclusion, paged or not. The same holds over PostgreSQL and through the HTTP
+server. A chain deeper than the budget fails with `ResolutionLimitExceeded`. The public API
+and the cursor encoding are unchanged.
+
+Implementing it surfaced two more lookup/check disagreements, both fixed here. A recursive
+arrow whose tupleset accepts a second type lost the seeds reached through that type. A
+userset row dropped the decision of the userset it came through, which reported `Allowed` or
+too few obligations where check reported `Conditional`; that could over-grant to a caller who
+supplied only part of the context. One difference remains and is accepted: on a caveated
+cycle whose root is itself conditional, lookup's obligations can contain check's rather than
+equal them (Decision Log). The object sets and every `Allowed`/`Denied` answer still agree.
+
+Performance: the non-recursive lookup benchmarks are unchanged or faster
+(`reachable-spaces` 2.43 µs against 2.8 µs, `wide-fanout` 357 µs against 301–349 µs). The new
+two-level nested-group benchmark is 149 µs and is the baseline for an incremental fixpoint
+(re-reading only what the last round added), which was out of scope. Getting there took
+measurement. Strict fields on the new result record cost about 3× on `wide-fanout`, and label
+lenses on it cost about 30% on `reachable-spaces`.
+
+Friction: FRIC-1 (generic-lens labels on the new result record were not optimised away on the
+lookup hot path) is `accepted`. ADR 7's measured-exception section now covers it, and it is
+the second occurrence of the same cost after ExecPlan 70.
+
+Lesson: an agreement test that compares decisions as well as object sets found the
+decision-dropping bug in a code path the plan did not suspect. Engine changes should keep a
+check-versus-lookup oracle over small fixtures.
 
 
 ## Context and Orientation

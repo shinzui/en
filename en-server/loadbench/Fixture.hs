@@ -14,11 +14,13 @@
 -- ways), and a lookup for any user returns 105 spaces; and every folder check resolves
 -- through two levels of group membership.
 --
--- Nested membership lives on folders, not spaces, because @lookup@ does not follow a
--- self-recursive userset (@group#member@ inside @group.member@) past its first level,
--- while @check@ does: a space granted to an outer group would be allowed by @check@ but
--- missing from @lookup@. Keeping the lookup's answer to one level of groups makes this
--- benchmark's expected count independent of that engine behaviour. See Surprises &
+-- Nested membership lives on folders, not spaces, because when this fixture was built
+-- @lookup@ did not follow a self-recursive userset (@group#member@ inside
+-- @group.member@) past its first level, while @check@ did, so the lookup's answer was
+-- kept to one level of groups. Lookup now follows nested groups
+-- (docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md): granting
+-- the first 5,000 spaces to the outer group instead still returns 105 spaces. The
+-- fixture is unchanged so the recorded baseline's workload stays the same. See Surprises &
 -- Discoveries in docs/plans/72-build-an-en-server-load-benchmark-and-record-the-single-tenant-baseline.md.
 module Fixture
   ( userCount,

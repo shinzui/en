@@ -86,6 +86,10 @@ Nothing in this plan changes the `en-server` executable or any library.
   one level of groups and puts the two-level grants on a separate `folder` type, so the
   benchmark's expected answers do not change when the defect is fixed. The fix is planned in
   `docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md`.
+  Update (2026-11-13): fixed by that plan. With the first 5,000 spaces granted to the outer
+  group instead, `cabal run -v0 en-server-loadbench -- run --smoke` passes with
+  `lookupExpectedCount = 105` and no lookup errors. The fixture was left as it is so the
+  recorded baseline's workload does not change.
 
 - Observation: planner statistics dominate `lookup`. Right after seeding, `lookup` ran at about
   500 req/s with 4 threads; after `VACUUM ANALYZE` it ran at about 2,500 req/s with 8 threads.
@@ -259,8 +263,8 @@ MasterPlan's G0 report.
 
 **Other findings.** `lookup` does not follow self-recursive usersets past one level, while
 `check` does (Surprises & Discoveries); the fix is planned in
-`docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md`, and the fixture is
-built so the benchmark does not depend on it. Planner statistics dominate
+`docs/plans/77-make-lookup-follow-recursive-usersets-the-way-check-does.md` (now fixed), and the
+fixture is built so the benchmark does not depend on it. Planner statistics dominate
 `lookup` unless every round starts with `VACUUM ANALYZE`.
 
 **Friction.** No friction entries were recorded under this plan; the small costs met (an
