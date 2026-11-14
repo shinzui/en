@@ -140,8 +140,11 @@ import En.SchemaCheck
   ( OrphanReason (..),
     OrphanReport (..),
     TupleOrphan (..),
+    applyValidatedTupleWrites,
     checkTupleAgainstSchema,
     renderTupleOrphan,
+    renderWriteRefusal,
+    validateTupleWrites,
     validateTuplesAgainstSchema,
   )
 import En.Store.InMemory qualified as MutableStore
@@ -363,6 +366,7 @@ main = do
   testResidualDecision
   testSchemaCheck
   testValidateTuplesAgainstSchema
+  testValidateTupleWrites
   validKikan <- either (fail . show) pure (validateSchema kikanSchema)
   validKikanManual <- either (fail . show) pure (validateSchema kikanSchemaManual)
   validKikanReordered <- either (fail . show) pure (validateSchema kikanSchemaReordered)
@@ -1762,6 +1766,79 @@ testValidateTuplesAgainstSchema = do
     "an empty store yields no orphans and scans nothing"
     (Right OrphanReport {scanned = 0, orphans = []})
     (run [])
+
+-- | A write is refused, before the store is touched, when any tuple it would write is an orphan
+-- under the schema it is served under. Deletes are never checked.
+testValidateTupleWrites :: IO ()
+testValidateTupleWrites = do
+  valid <- either (fail . show) pure (validateSchema schemaCheckSchema)
+  let aliceUser = SubjectId ObjectRef {objectType = ObjectType "user", objectId = "alice"}
+      engMembers = SubjectSet ObjectRef {objectType = ObjectType "group", objectId = "eng"} (RelationName "member")
+      legal = schemaCheckTuple "author" aliceUser Nothing
+      writing tuples = TupleWriteRequest {preconditions = [], writes = tuples, deletes = []}
+      refusal tuple reason = Left (SchemaViolation (renderWriteRefusal TupleOrphan {tuple, reason}))
+      refuses label tuple reason =
+        assertEqual label (refusal tuple reason) (validateTupleWrites valid (writing [legal, tuple]))
+
+  assertEqual "a write of interpretable tuples is accepted" (Right ()) (validateTupleWrites valid (writing [legal]))
+  assertEqual "an empty write is accepted" (Right ()) (validateTupleWrites valid (writing []))
+
+  -- One case per 'OrphanReason': the write rule is the orphan rule, so every reason refuses.
+  let unknownType = schemaCheckTupleOn "comment" "author" aliceUser Nothing
+      unknownRelation = schemaCheckTuple "editor" aliceUser Nothing
+      unknownSubjectType = schemaCheckTuple "author" (SubjectId ObjectRef {objectType = ObjectType "service", objectId = "bot"}) Nothing
+      disallowedSubject = schemaCheckTuple "author" engMembers Nothing
+      onPermission = schemaCheckTuple "view" aliceUser Nothing
+      unknownCaveat = schemaCheckTuple "author" aliceUser (Just TupleCaveat {name = CaveatName "gone", payload = CaveatPayload Map.empty})
+      illTypedPayload = schemaCheckTuple "author" aliceUser (clearancePayload [("active", ValueInteger 1)])
+  refuses "a write of an unknown object type is refused" unknownType (OrphanUnknownObjectType (ObjectType "comment"))
+  refuses "a write of an unknown relation is refused" unknownRelation (OrphanUnknownRelation (ObjectType "post") (RelationName "editor"))
+  refuses "a write naming an unknown subject type is refused" unknownSubjectType (OrphanUnknownSubjectType (ObjectType "service"))
+  refuses "a write of a subject the relation does not accept is refused" disallowedSubject (OrphanDisallowedSubject engMembers)
+  refuses "a write to a permission is refused" onPermission (OrphanDisallowedSubject aliceUser)
+  refuses "a write naming an undefined caveat is refused" unknownCaveat (OrphanUnknownCaveat (CaveatName "gone"))
+  refuses
+    "a write whose caveat payload does not fit its parameters is refused"
+    illTypedPayload
+    (OrphanCaveatPayloadMismatch (CaveatName "clearance") ["active: expected bool, stored integer"])
+
+  assertEqual
+    "the refusal names the tuple and the reason against the served schema"
+    (Left (SchemaViolation "cannot write post:1#editor@user:alice — relation post#editor not in schema"))
+    (validateTupleWrites valid (writing [unknownRelation]))
+  assertEqual
+    "a mixed request is refused on its first written orphan"
+    (refusal unknownRelation (OrphanUnknownRelation (ObjectType "post") (RelationName "editor")))
+    (validateTupleWrites valid (writing [legal, unknownRelation, unknownType]))
+  -- Deleting an orphan is how an operator removes what a schema change stranded.
+  assertEqual
+    "an orphan only in deletes is accepted"
+    (Right ())
+    (validateTupleWrites valid TupleWriteRequest {preconditions = [], writes = [legal], deletes = [unknownRelation, unknownType]})
+  assertEqual
+    "preconditions are not checked"
+    (Right ())
+    (validateTupleWrites valid TupleWriteRequest {preconditions = [TupleMustNotExist (exactTupleFilter unknownRelation)], writes = [], deletes = []})
+
+  -- The validated operation refuses before the store sees the request, and otherwise passes it
+  -- through unchanged.
+  applied <- newIORef []
+  let recordingStore :: TupleInterpreter
+      recordingStore = interpret_ \case
+        ApplyTupleWrites request -> do
+          liftIO (modifyIORef' applied (request :))
+          pure (ConsistencyToken "validated-write")
+        _ -> error "the validated write reaches the store only through ApplyTupleWrites"
+      runValidated request =
+        runEff (runErrorNoCallStack (recordingStore (applyValidatedTupleWrites valid request)))
+  assertEqual
+    "a refused validated write raises SchemaViolation"
+    (refusal unknownRelation (OrphanUnknownRelation (ObjectType "post") (RelationName "editor")))
+    =<< runValidated (writing [unknownRelation])
+  assertEqual "a refused validated write performs no store work" [] =<< readIORef applied
+  let accepted = TupleWriteRequest {preconditions = [], writes = [legal], deletes = [unknownRelation]}
+  assertEqual "an accepted validated write returns the store's token" (Right (ConsistencyToken "validated-write")) =<< runValidated accepted
+  assertEqual "an accepted validated write reaches the store unchanged" [accepted] =<< readIORef applied
 
 testRelationshipFilterMatching :: IO ()
 testRelationshipFilterMatching = do

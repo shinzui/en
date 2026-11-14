@@ -10,6 +10,12 @@ provenance:
     model: "claude-opus-5-5"
     harness: "claude-code"
     at: 2026-11-13T19:26:30Z
+  revisions:
+    - model: "claude-opus-5-5"
+      harness: "claude-code"
+      at: 2026-11-14T00:01:51Z
+      mode: "implement"
+      note: "Milestones 1-3 implemented: validator, HTTP and import wiring, docs and ADR"
 ---
 
 # Refuse writes of tuples the active schema cannot interpret
@@ -49,8 +55,13 @@ A's schema"); see Context and Orientation.
 
 ## Progress
 
-- [ ] Milestone 1: `en-core` exports a pure write validator and a validated write operation,
+- [x] Milestone 1: `en-core` exports a pure write validator and a validated write operation,
       with unit tests for every orphan reason and for "deletes are never checked".
+      Done 2026-11-13: `validateTupleWrites`, `applyValidatedTupleWrites` and
+      `renderWriteRefusal` in `En.SchemaCheck`; `testValidateTupleWrites` in
+      `en-core/test/Main.hs` covers each reason, valid/empty writes, deletes-only and
+      precondition orphans accepted, first-orphan-wins, and that a refused validated write
+      never reaches the store. `cabal test en-core-interface-tests` passes.
 - [ ] Milestone 2: HTTP writes (`POST /v1/relationships`) and `en-server import` refuse
       uninterpretable tuples with `400 schema_violation` / a named file line; existing suites
       pass; the tenant suite's cross-type step asserts `schema_violation` again; the `write`
@@ -61,7 +72,16 @@ A's schema"); see Context and Orientation.
 
 ## Surprises & Discoveries
 
-(None yet.)
+- `en-example` (`en-example/src/En/Example/Host.hs`, `exampleActiveSchema`) is a second
+  embedded host that builds an `ActiveSchema` by hand; adding `validSchema` broke its build,
+  exactly the downstream break the Interfaces section predicted. It now validates its
+  compiled-in schema for the field.
+- The en-servant route test wrote `space:project-x#viewer@user:bob` against the kikan fixture
+  schema, whose `space` has no `viewer`. It relied on the old behaviour; it now writes
+  `space#member`, and the refusal and delete cases sit beside it.
+- `en-servant/test/hurl/relationships.hurl` is format-checked by `just hurl` but not run by it
+  (it mutates state and is opt-in; see `en-servant/test/hurl/README.md`). The new refusal and
+  orphan-delete requests were added there and run explicitly against a disposable database.
 
 
 ## Decision Log
@@ -85,6 +105,24 @@ A's schema"); see Context and Orientation.
   Rationale: the store is deliberately schema-agnostic (it stamps a schema hash, it does not
   interpret a schema), and both interpreters (PostgreSQL and in-memory) would otherwise need
   the same logic. A pure check is testable without a store and costs no database round trip.
+  Date: 2026-11-13
+
+- Decision: `applyValidatedTupleWrites` lives in `En.SchemaCheck`, not `En.Effect.TupleStore`.
+  Rationale: `En.SchemaCheck` imports `En.Effect.TupleStore`, so the reverse import is a cycle.
+  Date: 2026-11-13
+
+- Decision: The HTTP handler calls the pure `validateTupleWrites` before `engine`, rather than
+  running `applyValidatedTupleWrites` inside it.
+  Rationale: same rule and same snapshot, but a refused write never enters the engine or
+  acquires a pool connection, and the handler keeps its `TupleStore`-only constraint (adding
+  `Error EnError` would have widened the `Env es` contract). Embedded hosts calling effects
+  directly use `applyValidatedTupleWrites`.
+  Date: 2026-11-13
+
+- Decision: A refused write renders as `cannot write <tuple> — <reason> not in schema`
+  (`renderWriteRefusal`), not with `renderTupleOrphan`'s `ORPHAN … not in candidate schema`.
+  Rationale: a write is judged against the schema it is served under, not a candidate; the
+  reasons themselves are shared (`renderReasonIn`), so the two texts cannot drift apart.
   Date: 2026-11-13
 
 - Decision: No opt-out flag.

@@ -285,18 +285,15 @@ isolationTest = testCaseSteps "two tenants in one process cannot see each other"
     decisionB <- check b (atLeastAsFresh tokenB) ("repo", "r1", "read", "bob") >>= expectStatus 200 >>= decisionOf
     assertEqual "beta checks its repo" "allowed" decisionB
 
-    -- En does not validate written tuples against the schema in any mode (that is what
-    -- `check-schema` and reload's orphan report are for), so a tuple of a type only the other
-    -- tenant defines is accepted. Isolation requires that it stay in the writer's database
-    -- and be evaluated under the writer's schema, never reach the other tenant.
-    step "a type only the other tenant defines stays in the writer's store, under the writer's schema"
-    forM_ [(a, b, ("repo", "r9", "reader", "ann"), "read"), (b, a, ("document", "d9", "viewer", "bob"), "view")] \(writer, other, tuple@(objectType, objectId, _, user), permission) -> do
-      strayToken <- writeTuple writer tuple >>= expectStatus 200 >>= field "token"
+    -- A write is checked against the schema of the tenant whose key made it, so a tuple of a
+    -- type only the other tenant defines is refused as uninterpretable under the writer's
+    -- schema (docs/plans/78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md), and
+    -- lands in neither tenant's store.
+    step "a write of a type only the other tenant defines is refused under the writer's schema"
+    forM_ [(a, b, ("repo", "r9", "reader", "ann")), (b, a, ("document", "d9", "viewer", "bob"))] \(writer, other, tuple@(_, objectId, _, user)) -> do
+      writeTuple writer tuple >>= expectProblem 400 "schema_violation"
+      queryBySubject writer user >>= expectStatus 200 >>= expectNoMention [objectId]
       queryBySubject other user >>= expectStatus 200 >>= expectNoMention [objectId]
-      writerRows <- queryWith writer (atLeastAsFresh strayToken) user >>= expectStatus 200
-      assertBool "the stray tuple is in the writer's store" (mentions objectId writerRows)
-      check writer (atLeastAsFresh strayToken) (objectType, objectId, permission, user)
-        >>= expectProblemAmong 400 ["unknown_relation", "schema_violation", "invalid_request"]
 
     step "a shared type keeps separate data in every read route and the changes feed"
     forM_ [(a, b, "t-alpha", "carol"), (b, a, "t-beta", "dave")] \(writer, reader, team, user) -> do
@@ -951,6 +948,31 @@ subcommandTest = testCaseSteps "check-schema, export and import act on one tenan
       decision <- check (alpha fixture) (atLeastAsFresh token) ("document", "imported", "view", "zed") >>= expectStatus 200 >>= decisionOf
       assertEqual "alpha sees the import" "allowed" decision
       queryBySubject (beta fixture) "zed" >>= expectStatus 200 >>= expectNoMention ["zed", "imported"]
+
+      -- The same rule an HTTP write applies: a line the tenant's schema cannot interpret (here
+      -- a type only beta defines) stops the import, naming the line. With batches of two, the
+      -- first batch is already committed and the refused line's batch is not.
+      step "import --tenant alpha refuses a line alpha's schema cannot interpret"
+      let refusedFile = directory </> "refused.ndjson"
+          linesOf = LazyByteString.concat . map ((<> "\n") . Aeson.encode . tupleJson)
+          prefix = [("document", "first", "viewer", "yan"), ("document", "second", "viewer", "yan")]
+      LazyByteString.writeFile refusedFile (linesOf (prefix <> [("repo", "stray", "reader", "yan"), ("document", "fourth", "viewer", "yan")]))
+      (refused, _, refusedErr) <- run ["import", "--tenant", "alpha", "--file", refusedFile, "--batch-size", "2"]
+      assertEqual ("refused import exit: " <> Text.unpack refusedErr) (ExitFailure 1) refused
+      assertBool
+        ("names line 3 and the reason: " <> Text.unpack refusedErr)
+        ( all
+            (`Text.isInfixOf` refusedErr)
+            [Text.pack refusedFile <> ":3: cannot write repo:stray#reader@user:yan", "object type repo not in schema"]
+        )
+      afterRefusal <- queryBySubject (alpha fixture) "yan" >>= expectStatus 200
+      assertBool "the batch before the refused line is committed" (all (`mentions` afterRefusal) ["first", "second"])
+      expectNoMention ["stray", "fourth"] afterRefusal
+      LazyByteString.writeFile refusedFile (linesOf (prefix <> [("document", "fourth", "viewer", "yan")]))
+      (corrected, _, correctedErr) <- run ["import", "--tenant", "alpha", "--file", refusedFile, "--batch-size", "2"]
+      assertEqual ("corrected import exit: " <> Text.unpack correctedErr) ExitSuccess corrected
+      queryBySubject (alpha fixture) "yan" >>= expectStatus 200 >>= \rows ->
+        assertBool "the corrected file imports whole" (all (`mentions` rows) ["first", "second", "fourth"])
   where
     lastLine text = case reverse (filter (not . Text.null) (Text.lines text)) of
       line : _ -> Just line

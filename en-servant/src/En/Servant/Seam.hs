@@ -39,7 +39,7 @@ import En.Postgres.Database (Database)
 import En.Prelude
 import En.Reachability (ReachabilityGraph)
 import En.Revision (Consistency, ConsistencyToken)
-import En.Schema (RelationName)
+import En.Schema (RelationName, ValidSchema)
 import En.Servant.Problem
   ( ProblemDetails,
     ProblemSpec,
@@ -83,8 +83,15 @@ type AppEffects = '[ConsistencyStore, TupleStore, Error EnError, Database, IOE]
 -- @source@ is the verbatim text the operator wrote, not a rendering of @graph@. @origin@ names
 -- where it was read from — a file path, or @builtin-demo@ for the fallback model @en-server@
 -- serves when @EN_SCHEMA_PATH@ is unset.
+--
+-- @validSchema@ is the schema @graph@ was compiled from. Writes are checked against it
+-- ('En.SchemaCheck.validateTupleWrites'): the graph cannot answer the question, because it
+-- keys relations by @(objectType, relation)@ and so has no entry for a type with no
+-- relations, such as @object user {}@. Holding both in one snapshot is what keeps a write from
+-- being validated under one schema and evaluated under another across a reload.
 data ActiveSchema = ActiveSchema
   { graph :: !ReachabilityGraph,
+    validSchema :: !ValidSchema,
     source :: !Text,
     origin :: !Text,
     loadedAt :: !UTCTime

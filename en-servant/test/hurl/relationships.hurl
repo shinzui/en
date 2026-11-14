@@ -25,6 +25,42 @@ jsonpath "$.status" == 412
 jsonpath "$.code" == "write_precondition_failed"
 jsonpath "$.retryable" == false
 
+# A tuple the served schema cannot interpret is refused whole: the demo schema has no
+# space#viewr, so the grant could never take effect.
+POST {{base_url}}/v1/relationships
+Authorization: Bearer {{api_key}}
+Content-Type: application/json
+{
+  "tuples": [
+    {
+      "object": {"objectType": "space", "objectId": "hurl-orphan"},
+      "relation": "viewr",
+      "subject": {"kind": "id", "objectType": "user", "objectId": "hurl-alice"}
+    }
+  ]
+}
+HTTP 400
+[Asserts]
+header "Content-Type" contains "application/problem+json"
+jsonpath "$.code" == "schema_violation"
+jsonpath "$.detail" contains "space:hurl-orphan#viewr@user:hurl-alice"
+jsonpath "$.retryable" == false
+
+# Deletes are never checked, so an orphan a schema change left behind can be removed.
+POST {{base_url}}/v1/relationships/delete
+Authorization: Bearer {{api_key}}
+Content-Type: application/json
+{
+  "tuples": [
+    {
+      "object": {"objectType": "space", "objectId": "hurl-orphan"},
+      "relation": "viewr",
+      "subject": {"kind": "id", "objectType": "user", "objectId": "hurl-alice"}
+    }
+  ]
+}
+HTTP 200
+
 # The idempotent mutating flow follows this safe failure case.
 
 # Delete first so every run starts from a known state.

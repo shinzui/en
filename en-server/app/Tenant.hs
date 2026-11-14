@@ -353,6 +353,7 @@ buildRuntime shared name tenantConfig loadedSchema pool config = do
     newIORef
       ActiveSchema
         { graph = compile (loadedSchema ^. #validSchema),
+          validSchema = (loadedSchema ^. #validSchema),
           source = (loadedSchema ^. #source),
           origin = (loadedSchema ^. #origin),
           loadedAt
@@ -842,6 +843,7 @@ reloadStack stack =
             activeSchemaRef
             ActiveSchema
               { graph,
+                validSchema = (candidate ^. #validSchema),
                 source = (candidate ^. #source),
                 origin = (candidate ^. #origin),
                 loadedAt

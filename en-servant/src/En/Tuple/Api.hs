@@ -46,7 +46,7 @@ module En.Tuple.Api
   )
 where
 
-import Control.Monad.Trans.Except (runExceptT)
+import Control.Monad.Trans.Except (runExceptT, throwE)
 import Data.Aeson
   ( FromJSON (..),
     ToJSON (..),
@@ -83,6 +83,7 @@ import En.Prelude hiding ((.=))
 import En.RelationshipPagination (relationshipCursorToken)
 import En.Revision (Consistency (..), ConsistencyToken (..))
 import En.Schema (CaveatName (..), ObjectType (..), RelationName (..))
+import En.SchemaCheck (validateTupleWrites)
 import En.Servant.Problem (ProblemDetails (..), ProblemJSON)
 import En.Servant.Response
   ( EnResponses,
@@ -93,7 +94,7 @@ import En.Servant.Response
     orInvalid,
     traverseOrInvalid,
   )
-import En.Servant.Seam (EnFault (..), Env (..))
+import En.Servant.Seam (EnFault (..), Env (..), enErrorToFault)
 import En.Servant.Wire
   ( CaveatPayloadWire,
     ConsistencyWire,
@@ -659,7 +660,13 @@ writeTuplesHandler env request = enHandler do
   writes <- traverseOrInvalid tupleFromWire (request ^. #tuples)
   deletes <- traverseOrInvalid tupleFromWire (fromMaybe [] (request ^. #deletes))
   preconditions <- traverseOrInvalid preconditionFromWire (fromMaybe [] (request ^. #preconditions))
-  token <- engine env active (applyTupleWrites TupleWriteRequest {preconditions, writes, deletes})
+  let writeRequest = TupleWriteRequest {preconditions, writes, deletes}
+  -- Refuse a tuple the served schema cannot interpret before the store is touched: stored,
+  -- it would be a grant no check can reach. Deletes are not checked, so an orphan a schema
+  -- change left behind can still be removed. The same snapshot carries the graph the write
+  -- is later evaluated under, so a reload cannot split the two.
+  either (throwE . enErrorToFault) pure (validateTupleWrites (active ^. #validSchema) writeRequest)
+  token <- engine env active (applyTupleWrites writeRequest)
   pure (tokenToWire token)
 
 deleteTuplesHandler :: (TupleStore Effectful.:> es) => Env es -> DeleteTuplesRequestWire -> Handler (EnResult WriteTuplesResponseWire)

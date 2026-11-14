@@ -48,7 +48,7 @@ import En.LookupSubjects qualified as LookupSubjects
 import En.Prelude
 import En.Reachability (compileSchema)
 import En.Revision (Consistency (..), DatastoreId (..), Revision (..), SchemaHash (..))
-import En.Schema (CaveatParameterType (..), ObjectType (..), RelationName (..), Schema)
+import En.Schema (CaveatParameterType (..), ObjectType (..), RelationName (..), Schema, validateSchema)
 import En.Schema.Builder qualified as Schema
 import En.Servant.Authorize (requirePermission)
 import En.Servant.Seam (ActiveSchema (..), Env (..))
@@ -126,6 +126,8 @@ exampleActiveSchema :: ActiveSchema
 exampleActiveSchema =
   ActiveSchema
     { graph = either (error . show) id (compileSchema exampleSchema),
+      -- Writes are checked against this, so it must be the schema the graph compiles.
+      validSchema = either (error . show) id (validateSchema exampleSchema),
       source = "-- compiled in; see En.Example.Host.exampleSchema",
       origin = "en-example",
       loadedAt = UTCTime (fromGregorian 2026 1 1) 0

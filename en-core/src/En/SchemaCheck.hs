@@ -25,7 +25,10 @@ module En.SchemaCheck
     OrphanReport (..),
     checkTupleAgainstSchema,
     validateTuplesAgainstSchema,
+    validateTupleWrites,
+    applyValidatedTupleWrites,
     renderTupleOrphan,
+    renderWriteRefusal,
     renderTuple,
   )
 where
@@ -38,9 +41,20 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Effectful (Eff, (:>))
-import En.Effect.TupleStore (PageState (..), StoreCursor, TuplePage (..), TupleRow (..), TupleStore, readAllTuples)
+import Effectful.Error.Static (Error, throwError)
+import En.Effect.TupleStore
+  ( PageState (..),
+    StoreCursor,
+    TuplePage (..),
+    TupleRow (..),
+    TupleStore,
+    TupleWriteRequest (..),
+    applyTupleWrites,
+    readAllTuples,
+  )
+import En.Error (EnError (..))
 import En.Prelude
-import En.Revision (Revision)
+import En.Revision (ConsistencyToken, Revision)
 import En.Schema
   ( AllowedSubject (..),
     CaveatDefinition (..),
@@ -260,25 +274,67 @@ validateTuplesAgainstSchema validSchema revision =
 
     scanPageSize = 1000
 
+-- | Refuse a write request that would store a tuple the schema cannot interpret.
+--
+-- A tuple the schema cannot interpret is a grant that never takes effect: no check, lookup or
+-- expand can reach it. Storing it and answering success hides the client's mistake until an
+-- operator finds the orphan in a @check-schema@ report. Refusing it is the same rule as
+-- 'checkTupleAgainstSchema', applied before the row exists rather than after a schema change,
+-- so the set a write refuses and the set a report calls orphaned are one set.
+--
+-- Only @writes@ are checked, in order, and the first orphan is reported. @deletes@ are never
+-- checked: deleting an orphan a schema change left behind is the remedy @check-schema@ points
+-- operators to, and refusing it would leave no way to remove the row. @preconditions@ are
+-- filters, not grants, and are not checked either.
+validateTupleWrites :: ValidSchema -> TupleWriteRequest -> Either EnError ()
+validateTupleWrites validSchema TupleWriteRequest {writes} =
+  case mapMaybe (checkTupleAgainstSchema validSchema) writes of
+    [] -> Right ()
+    orphan : _ -> Left (SchemaViolation (renderWriteRefusal orphan))
+
+-- | 'applyTupleWrites', after refusing any written tuple the schema cannot interpret
+-- ('validateTupleWrites'). A refused request performs no store work at all.
+--
+-- The validation lives here rather than in the 'TupleStore' interpreters because the store is
+-- deliberately schema-agnostic, and every interpreter would otherwise carry the same rule.
+-- 'applyTupleWrites' itself stays unchecked for callers that own their data, such as
+-- conformance fixtures and restores.
+applyValidatedTupleWrites ::
+  (TupleStore :> es, Error EnError :> es) =>
+  ValidSchema ->
+  TupleWriteRequest ->
+  Eff es ConsistencyToken
+applyValidatedTupleWrites validSchema request =
+  either throwError (const (applyTupleWrites request)) (validateTupleWrites validSchema request)
+
+-- | A refused write as one line for the client, e.g.
+--
+-- @cannot write post:1#editor\@user:alice — relation post#editor not in schema@
+renderWriteRefusal :: TupleOrphan -> Text
+renderWriteRefusal TupleOrphan {tuple, reason} =
+  "cannot write " <> renderTuple tuple <> " — " <> renderReasonIn "schema" reason
+
 -- | An orphan as one line of an operator's report, e.g.
 --
 -- @ORPHAN post:1#author\@user:alice — relation post#author not in candidate schema@
 renderTupleOrphan :: TupleOrphan -> Text
 renderTupleOrphan TupleOrphan {tuple, reason} =
-  "ORPHAN " <> renderTuple tuple <> " — " <> renderReason reason
+  "ORPHAN " <> renderTuple tuple <> " — " <> renderReasonIn "candidate schema" reason
 
-renderReason :: OrphanReason -> Text
-renderReason = \case
+-- | A reason, naming the schema it is judged against: a report judges a /candidate/ schema, a
+-- refused write the schema the request is served under.
+renderReasonIn :: Text -> OrphanReason -> Text
+renderReasonIn schemaName = \case
   OrphanUnknownObjectType (ObjectType objectType) ->
-    "object type " <> objectType <> " not in candidate schema"
+    "object type " <> objectType <> " not in " <> schemaName
   OrphanUnknownRelation (ObjectType objectType) (RelationName relation) ->
-    "relation " <> objectType <> "#" <> relation <> " not in candidate schema"
+    "relation " <> objectType <> "#" <> relation <> " not in " <> schemaName
   OrphanUnknownSubjectType (ObjectType objectType) ->
-    "subject object type " <> objectType <> " not in candidate schema"
+    "subject object type " <> objectType <> " not in " <> schemaName
   OrphanDisallowedSubject subject ->
     "subject " <> renderSubject subject <> " is not an allowed subject of this relation"
   OrphanUnknownCaveat (CaveatName caveat) ->
-    "caveat " <> caveat <> " not in candidate schema"
+    "caveat " <> caveat <> " not in " <> schemaName
   OrphanCaveatPayloadMismatch (CaveatName caveat) errors ->
     "caveat " <> caveat <> " payload does not fit its parameters: " <> Text.intercalate "; " errors
 

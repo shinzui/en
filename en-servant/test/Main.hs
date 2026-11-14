@@ -31,6 +31,7 @@ import En.Conformance.Kikan
   ( fixtureTuples,
     inMemoryToken,
     kikanGraph,
+    kikanSchema,
     memberOwner,
     runConsistencyStoreInMemory,
     runTupleStoreInMemory,
@@ -45,7 +46,7 @@ import En.LookupSubjects qualified as LookupSubjects
 import En.Postgres.Revision (tokenMetadataFromPayload)
 import En.Prelude hiding (List, UTCTime, at)
 import En.Revision (ConsistencyToken (..), DatastoreId (..), SchemaHash (..))
-import En.Schema (ObjectType (..), RelationName (..))
+import En.Schema (ObjectType (..), RelationName (..), validateSchema)
 import En.Servant.API
   ( BatchCheckPairWire (..),
     BatchCheckRequestWire (..),
@@ -919,21 +920,33 @@ routingTests env = do
     (fmap code (decode (simpleBody oversized) :: Maybe RelayPageError))
 
   -- POST /v1/relationships routes to the write handler (the in-memory store accepts writes).
-  let writeBody =
-        WriteTuplesRequestWire
-          { tuples =
-              [ TupleWire
-                  { object = ObjectRefWire {objectType = "space", objectId = "project-x"},
-                    relation = "viewer",
-                    subject = SubjectIdWire ObjectRefWire {objectType = "user", objectId = "bob"},
-                    caveat = Nothing
-                  }
-              ],
-            deletes = Nothing,
-            preconditions = Nothing
+  let spaceTuple relation =
+        TupleWire
+          { object = ObjectRefWire {objectType = "space", objectId = "project-x"},
+            relation,
+            subject = SubjectIdWire ObjectRefWire {objectType = "user", objectId = "bob"},
+            caveat = Nothing
           }
-  writeResponse <- postJson application "/v1/relationships" (encode writeBody)
+      writeBody tuple = WriteTuplesRequestWire {tuples = [tuple], deletes = Nothing, preconditions = Nothing}
+  writeResponse <- postJson application "/v1/relationships" (encode (writeBody (spaceTuple "member")))
   assertEqual "POST /v1/relationships routes to the write handler (200, not 404)" 200 (statusCode (simpleStatus writeResponse))
+
+  -- A write the served schema cannot interpret is refused whole: `space` has no `viewer`
+  -- relation in the fixture schema, so the grant could never take effect.
+  orphanWrite <- postJson application "/v1/relationships" (encode (writeBody (spaceTuple "viewer")))
+  assertEqual "a write of an undeclared relation is a 400" 400 (statusCode (simpleStatus orphanWrite))
+  let orphanProblem = decode (simpleBody orphanWrite) :: Maybe ProblemDetails
+  assertEqual "a write of an undeclared relation is a schema_violation" (Just "schema_violation") (fmap (^. #code) orphanProblem)
+  assertBool
+    "the schema_violation names the refused tuple and its relation"
+    (maybe False (Text.isInfixOf "space:project-x#viewer@user:bob" . (^. #detail)) orphanProblem)
+  -- Deletes are never checked: removing what a schema change stranded is the remedy.
+  orphanDelete <-
+    postJson
+      application
+      "/v1/relationships/delete"
+      (encode DeleteTuplesRequestWire {tuples = [spaceTuple "viewer"], preconditions = Nothing})
+  assertEqual "a delete of an undeclared relation is accepted" 200 (statusCode (simpleStatus orphanDelete))
 
   -- POST /v1/expand routes.
   let expandBody =
@@ -2098,6 +2111,7 @@ testActiveSchema :: ActiveSchema
 testActiveSchema =
   ActiveSchema
     { graph = kikanGraph,
+      validSchema = either (error . ("invalid kikan fixture: " <>) . show) id (validateSchema kikanSchema),
       source = "object user {}\n",
       origin = "test-fixture",
       loadedAt = testLoadedAt

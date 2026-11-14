@@ -29,7 +29,7 @@ import En.Postgres.TupleStore (runTupleStorePostgres)
 import En.Prelude
 import En.Revision (ConsistencyToken (..), Revision (..))
 import En.Schema (schemaHash)
-import En.SchemaCheck (renderTupleOrphan, validateTuplesAgainstSchema)
+import En.SchemaCheck (checkTupleAgainstSchema, renderTupleOrphan, renderWriteRefusal, validateTuplesAgainstSchema)
 import En.Servant.API (tupleFromWire, tupleToWire)
 import En.Servant.OpenApi (probesApplication, servedProxy)
 import En.Tuple (Tuple)
@@ -495,8 +495,13 @@ runStoreIO pool config action =
 -- validating the whole file first, would hold every tuple in memory and forfeit the
 -- point of streaming. The line is named in the error, and the prefix is harmless --
 -- re-running the corrected file re-applies it as a no-op.
+--
+-- A line whose tuple the loaded schema cannot interpret is refused the same way, with the
+-- same rule an HTTP write applies ('En.SchemaCheck.checkTupleAgainstSchema'): every line of a
+-- batch is decoded and checked before the batch is written, so the refused line's batch is
+-- not stored.
 runImport :: FilePath -> Int -> LoadedSchema -> Pool.Pool -> ConsistencyConfig -> IO ()
-runImport path batchSize _loadedSchema pool config = do
+runImport path batchSize loadedSchema pool config = do
   contents <- LazyByteString.readFile path
   let numbered = zip [1 :: Int ..] (LazyChar8.lines contents)
       populated = [line | line <- numbered, not (LazyChar8.all isSpace (snd line))]
@@ -522,7 +527,11 @@ runImport path batchSize _loadedSchema pool config = do
     decodeLine (lineNumber, line) =
       case Aeson.eitherDecode line of
         Left err -> lineFailure lineNumber (Text.pack err)
-        Right wire -> either (lineFailure lineNumber) pure (tupleFromWire wire)
+        Right wire -> do
+          tuple <- either (lineFailure lineNumber) pure (tupleFromWire wire)
+          case checkTupleAgainstSchema (loadedSchema ^. #validSchema) tuple of
+            Nothing -> pure tuple
+            Just orphan -> lineFailure lineNumber (renderWriteRefusal orphan)
 
     lineFailure :: Int -> Text.Text -> IO a
     lineFailure lineNumber reason =
