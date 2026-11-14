@@ -549,7 +549,7 @@ unreachableAtStartupTest = testCaseSteps "a tenant unreachable at startup starts
     \fixture -> do
       let a = alpha fixture
       step "the server started; alpha is unavailable, beta serves"
-      expectLogLine fixture "[tenant alpha] UNAVAILABLE: Could not reach PostgreSQL"
+      expectLogLine fixture "[tenant alpha] UNAVAILABLE: Could not reach PostgreSQL through EN_TENANT_ALPHA_DATABASE_URL"
       check a fullyConsistent ("team", "t1", "membership", "ann") >>= expectProblem 503 "store_error"
       writeTuple (alphaReadOnly fixture) ("team", "t1", "member", "ann") >>= expectProblem 403 "permission_denied"
       requestWith (a {secret = "unknown-secret-0123456789"}) [] "GET" "/v1/schema" Nothing >>= expectProblem 401 "unauthenticated"
@@ -834,7 +834,7 @@ unavailableAtStartupObservedTest = testCaseSteps "a tenant unavailable from star
     []
     \fixture -> do
       let a = alpha fixture
-      expectLogLine fixture "[tenant alpha] UNAVAILABLE: Could not reach PostgreSQL"
+      expectLogLine fixture "[tenant alpha] UNAVAILABLE: Could not reach PostgreSQL through EN_TENANT_ALPHA_DATABASE_URL"
       checkWith a [("User-Agent", "observe-unavailable")] ("team", "t1", "membership", "ann") >>= expectProblem 503 "store_error"
       line <- onlyRequestLine fixture "observe-unavailable"
       assertEqual "tenant" (Just "alpha") (textField "tenant" line)

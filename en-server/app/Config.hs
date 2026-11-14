@@ -112,7 +112,12 @@ data StoreConfig = StoreConfig
     gcWindow :: !Text,
     -- | Reading and parsing the file stays in @Main@; this is only the path.
     schemaPath :: !(Maybe FilePath),
-    pool :: !PoolConfig
+    pool :: !PoolConfig,
+    -- | The variables @databaseUrl@ and @schemaPath@ were read from: @EN_DATABASE_URL@ and
+    --     @EN_SCHEMA_PATH@, or a tenant's @EN_TENANT_\<SEGMENT\>_DATABASE_URL@ and
+    --     @…_SCHEMA_PATH@. A message about a store names the variable the operator must fix.
+    databaseUrlVariable :: !Text,
+    schemaPathVariable :: !Text
   }
   deriving stock (Generic)
 
@@ -331,7 +336,9 @@ parseTenantStoreConfig name environment = do
       { databaseUrl = Text.pack databaseUrl,
         gcWindow,
         schemaPath = Just schemaPath,
-        pool = defaultPool & #size .~ poolSize
+        pool = defaultPool & #size .~ poolSize,
+        databaseUrlVariable = Text.pack (tenantVariable name "DATABASE_URL"),
+        schemaPathVariable = Text.pack (tenantVariable name "SCHEMA_PATH")
       }
 
 parseStoreConfig :: Map String String -> Either Text (StoreConfig, [Text])
@@ -345,7 +352,9 @@ parseStoreConfig environment = do
         { databaseUrl = Text.pack databaseUrl,
           gcWindow,
           schemaPath,
-          pool
+          pool,
+          databaseUrlVariable = "EN_DATABASE_URL",
+          schemaPathVariable = "EN_SCHEMA_PATH"
         },
       schemaWarnings schemaPath
     )
@@ -540,7 +549,9 @@ parseTenant environment shared defaultPool defaultGcWindow name = do
             { databaseUrl = Text.pack databaseUrl,
               gcWindow,
               schemaPath = Just schemaPath,
-              pool = defaultPool & #size .~ poolSize
+              pool = defaultPool & #size .~ poolSize,
+              databaseUrlVariable = Text.pack (variable "DATABASE_URL"),
+              schemaPathVariable = Text.pack (variable "SCHEMA_PATH")
             },
         auth = AuthKeys keys,
         biscuit,

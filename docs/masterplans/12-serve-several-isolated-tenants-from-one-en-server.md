@@ -642,7 +642,8 @@ desktop never is; it cost a failed gate run and a diagnostic before the instrume
 by the paired design of ADR 11. Recurring friction: FRIC-2 (port 8080 taken, EP-2 onward) and
 FRIC-3 (macOS shared memory limits for parallel ephemeral PostgreSQL), both accepted.
 
-Open after completion, each recorded where it belongs: the paired `schema-read` floor (ADR 11);
-tenant-mode startup messages that name `EN_DATABASE_URL` for a tenant's database; en-postgres
-answering 500 instead of 503 on the first request over a connection PostgreSQL terminated; the
-owner's confirmation of the readiness wording (ADR 10). Plan 78 has since closed AC-2.
+Open after completion, each recorded where it belongs: the paired `schema-read` floor (ADR 11),
+which the owner chose on 2026-11-13 to leave open; en-postgres answering 500 instead of 503 on
+the first request over a connection PostgreSQL terminated. Closed since: AC-2 (plan 78); the
+owner confirmed ADR 10's readiness wording (2026-11-13); tenant-mode startup messages now name
+the tenant's own `EN_TENANT_<NAME>_DATABASE_URL` and `…_SCHEMA_PATH`.

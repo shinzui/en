@@ -203,7 +203,7 @@ openStore say storeConfig = do
 -- healthy process.
 loadStoreSchema :: (Text.Text -> IO ()) -> StoreConfig -> IO LoadedSchema
 loadStoreSchema say storeConfig = do
-  (schemaSource, sourceText, rawSchema) <- loadSchema (storeConfig ^. #schemaPath)
+  (schemaSource, sourceText, rawSchema) <- loadSchema (storeConfig ^. #schemaPathVariable) (storeConfig ^. #schemaPath)
   validSchema <-
     either (configFailure . ("Invalid schema: " <>) . Text.pack . show) pure (validateSchema rawSchema)
   say (describeSchemaSource schemaSource)
@@ -238,12 +238,14 @@ connectStore say storeConfig pin loadedSchema = do
       runDbSession session =
         either (Left . renderUsageError) Right <$> Pool.use pool session
       fault outcome = Pool.release pool >> pure (Left outcome)
-  -- Pool connections are established lazily, so a bad EN_DATABASE_URL would
+  -- Pool connections are established lazily, so a bad database URL would
   -- otherwise surface only on the first request rather than at startup.
   runDbSession (Session.script "SELECT 1") >>= \case
     Left err ->
       fault . StoreUnavailable $
-        "Could not reach PostgreSQL through EN_DATABASE_URL. "
+        "Could not reach PostgreSQL through "
+          <> (storeConfig ^. #databaseUrlVariable)
+          <> ". "
           <> err
           <> "\n"
           <> migrationHint
@@ -954,8 +956,10 @@ schemaOrigin = \case
 -- @GET \/v1\/schema@ should return and that a candidate schema should be diffed against. The
 -- built-in demo model therefore carries a hand-written source string that must stay in step
 -- with 'demoSchema' — the startup path parses neither, so nothing checks it but this comment.
-loadSchema :: Maybe FilePath -> IO (SchemaSource, Text.Text, Schema)
-loadSchema =
+-- | The schema a store serves, from the file its @variable@ names, or the built-in demo
+-- model when none is set. @variable@ is only for messages.
+loadSchema :: Text.Text -> Maybe FilePath -> IO (SchemaSource, Text.Text, Schema)
+loadSchema variable =
   \case
     Nothing -> pure (BuiltInDemoSchema, demoSchemaSource, demoSchema)
     Just path -> do
@@ -965,14 +969,18 @@ loadSchema =
           Right value -> pure value
           Left err ->
             configFailure $
-              "Could not read schema file from EN_SCHEMA_PATH="
+              "Could not read schema file from "
+                <> variable
+                <> "="
                 <> Text.pack path
                 <> ": "
                 <> Text.pack (show err)
       case parseSchema contents of
         Left err ->
           configFailure $
-            "Failed to parse schema from EN_SCHEMA_PATH="
+            "Failed to parse schema from "
+              <> variable
+              <> "="
               <> Text.pack path
               <> ": "
               <> Text.pack (show err)

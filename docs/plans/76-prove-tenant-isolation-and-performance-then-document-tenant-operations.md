@@ -189,9 +189,8 @@ needed to show tenant mode costs nothing, and only then did the benchmark get fi
 design should have been adopted when plan 72 first measured 9-17% same-binary noise. It leaves
 one gap, `schema-read`, recorded in ADR 11 as an open item.
 
-Left open: the paired `schema-read` floor; tenant-mode startup messages that say
-`EN_DATABASE_URL` for a tenant's database (owned by plan 74's area). AC-2's refusal was closed by
-plan 78.
+Left open: the paired `schema-read` floor. Closed since: tenant-mode startup messages name the
+tenant's own variables; AC-2's refusal (plan 78).
 
 
 ## Context and Orientation
