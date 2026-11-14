@@ -21,7 +21,8 @@ Accepted, 2026-11-13. Implemented by
 [ExecPlan 74](../plans/74-give-each-tenant-an-independent-lifecycle-and-contain-its-storage-faults.md)
 (readiness) and
 [ExecPlan 75](../plans/75-carry-the-tenant-through-logs-metrics-traces-and-readiness.md)
-(reporting).
+(reporting). The owner confirmed this wording on 2026-11-13, as the deliberate difference
+from IR-2 AC-6's "the readiness probe names a tenant whose storage is unavailable".
 
 ## Context
 
