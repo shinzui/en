@@ -132,3 +132,27 @@ time but has never released it — Hackage still serves `biscuit-haskell-0.4.0.0
 0 from 2024-07-31 — and the open "Release 0.5.0.0" PR does not touch the crypton bound. So
 the fork cannot be dropped on that release either; it needs a release carrying the crypton
 1.1 change as well.
+
+## Amendment — 2026-11-14
+
+**The fork is retired; the pin is not.** Upstream merged the same change as PR #115 ("Use ram
+instead of memory", 2026-10-02), so `main` at `469eaedc66be6e7629954bfd631b1842a968a33a`
+now depends on `crypton >= 1.1 && < 2` and `ram >= 0.20.1 && < 0.23`, and its
+`template-haskell < 2.25` admits GHC 9.12.4. `cabal.project` and the `biscuit-haskell-src`
+flake input now pin `mori://eclipse-biscuit/biscuit-haskell` at that commit, not
+`mori://shinzui/biscuit-haskell`. Between the old fork pin (`8c0b3c5a`) and that commit,
+`biscuit/src` is byte-identical. Only `biscuit-haskell.cabal` (version 0.4.0.0 → 0.5.0.0,
+wider bounds, test-suite `autogen-modules`) and `ChangeLog.md` differ. `cabal test
+en-biscuit` passes on a clean build, and the plan resolves `crypton-1.1.5` and `ram-0.22.1`
+with no `memory`.
+
+**Hackage still cannot be used, and the version number is now a trap.** The upstream 0.5.0.0
+release (2026-09-27) went out before PR #115, and its revision 1 (2026-10-02) narrowed the
+bound to `crypton >= 1.0 && < 1.1` with `memory`. That makes Hackage `biscuit-haskell-0.5.0.0`
+and the pinned commit two different packages with the same name and version. Swapping the
+`source-repository-package` for a plain `biscuit-haskell ==0.5.0.0` dependency would bring
+back the solver conflict described in the Context section. The `crypton >= 1.1` constraint
+in `cabal.project` is therefore load-bearing again, not redundant: it stops the solver from
+settling on the Hackage 0.5.0.0 if the pin is ever dropped too early.
+
+The pin can go once a Hackage release after 0.5.0.0 depends on `crypton >= 1.1` and `ram`.

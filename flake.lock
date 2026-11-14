@@ -19,17 +19,17 @@
     "biscuit-haskell-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1787662906,
-        "narHash": "sha256-BtqFq5O48892O2y4M+FyC4npA0mxRo9Zv2jJrWjfCIY=",
-        "owner": "shinzui",
+        "lastModified": 1790949873,
+        "narHash": "sha256-52ZS8uAchOY4pBEzq3J4nNtZX2jTGTCTWYzb9ROOJfU=",
+        "owner": "eclipse-biscuit",
         "repo": "biscuit-haskell",
-        "rev": "8c0b3c5a13ce4a310737c0336f2ae167a1597588",
+        "rev": "469eaedc66be6e7629954bfd631b1842a968a33a",
         "type": "github"
       },
       "original": {
-        "owner": "shinzui",
+        "owner": "eclipse-biscuit",
         "repo": "biscuit-haskell",
-        "rev": "8c0b3c5a13ce4a310737c0336f2ae167a1597588",
+        "rev": "469eaedc66be6e7629954bfd631b1842a968a33a",
         "type": "github"
       }
     },

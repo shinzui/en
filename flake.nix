@@ -55,9 +55,9 @@
     # via ./flake.module.nix). They are the one edit that reconflicts on every
     # nix-haskell-flake upgrade — re-apply this block after each `seihou run`.
     # Keep these aligned with cabal.project.
-    # mori://shinzui/biscuit-haskell
+    # mori://eclipse-biscuit/biscuit-haskell
     biscuit-haskell-src = {
-      url = "github:shinzui/biscuit-haskell/8c0b3c5a13ce4a310737c0336f2ae167a1597588";
+      url = "github:eclipse-biscuit/biscuit-haskell/469eaedc66be6e7629954bfd631b1842a968a33a";
       flake = false;
     };
     # mori://shinzui/hs-opentelemetry-instrumentation-servant
