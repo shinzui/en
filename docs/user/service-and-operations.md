@@ -452,23 +452,26 @@ connection, so it returns to the pool:
 {"error":"StoreError \"Unexpected number of rows\n  sql: SELECT pg_current_snapshot()::text\n  expectedMin: 1\n  expectedMax: 1\n  actual: 1\"}
 ```
 
-(`expectedMin: 1, expectedMax: 1, actual: 1` is self-contradictory — read it as
-"the connection died", not as a decoding bug.) The second session on that same
-connection reports the connection-level error, and the pool discards it:
+(`expectedMin: 1, expectedMax: 1, actual: 1` is self-contradictory — it means
+"the connection died", not a decoding bug, and en reads it that way: the request
+answers `503 store_error`, retryable, like any other outage. A row-count error
+outside its bounds is still a `500`.) The second session on that same connection
+reports the connection-level error, and the pool discards it:
 
 ```text
 {"error":"StoreError \"Connection error\n  reason: no connection to the server\""}
 ```
 
 So a restart costs roughly `2 × (established connections)` failed requests — with
-five established connections, ten `500`s, recovering on the eleventh. Note that a
-single API request runs several database sessions, and each borrows its own
-pooled connection, so one failing request may burn more than one stale
-connection. Established connections are usually fewer than `EN_POOL_SIZE`, since
+five established connections, ten `503 store_error` responses, recovering on the
+eleventh. Note that a single API request runs several database sessions, and
+each borrows its own pooled connection, so one failing request may burn more than
+one stale connection. Established connections are usually fewer than `EN_POOL_SIZE`, since
 the pool grows lazily under load.
 
-Clients must retry `5xx` responses. A burst of the two errors above immediately
-after a database restart is expected; sustained occurrences are not. Also expect
+Clients must retry responses with `retryable: true`. A burst of the two errors
+above immediately after a database restart is expected; sustained occurrences are
+not. Also expect
 `timed out acquiring a pooled database connection` when the pool is exhausted for
 longer than `EN_POOL_ACQUISITION_TIMEOUT_MS` — that one means `EN_POOL_SIZE` is
 too small for the offered load, not that the database is down.

@@ -298,6 +298,12 @@ testSessionErrorClassification = do
   store "connection" (Hasql.ConnectionSessionError "connection lost")
   store "server statement" (statement (Hasql.ServerStatementError serverError))
   internal "decoder statement" (statement (Hasql.UnexpectedColumnCountStatementError 2 1))
+  -- A row count outside its bounds is a decoder meeting SQL that returned the wrong rows; one
+  -- inside them is hasql's report of a statement that got the wrong number of libpq results,
+  -- which is what a connection whose backend was terminated produces.
+  internal "row count outside its bounds" (statement (Hasql.UnexpectedRowCountStatementError 1 1 0))
+  internal "row count above its bounds" (statement (Hasql.UnexpectedRowCountStatementError 1 1 2))
+  store "row count within its bounds (a lost connection)" (statement (Hasql.UnexpectedRowCountStatementError 1 1 1))
   store "script" (Hasql.ScriptSessionError "SELECT broken" serverError)
   internal "missing types" (Hasql.MissingTypesSessionError mempty)
   internal "driver" (Hasql.DriverSessionError "protocol invariant failed")

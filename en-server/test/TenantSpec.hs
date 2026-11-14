@@ -519,17 +519,12 @@ outageWhileRunningTest = testCaseSteps "an outage while running affects only tha
     _ <- writeTuple a ("team", "t1", "member", "ann") >>= expectStatus 200
     step "take alpha's database out of service"
     setDatabaseAccepting (alphaPostgres fixture) "en_alpha" False
-    -- The first request on a pooled connection the outage closed is classified by
-    -- en-postgres as an internal error (500) rather than a store error (503); see plan 74's
-    -- Surprises & Discoveries. Containment requires that alpha fails closed throughout and
-    -- settles on the retryable store error once its stale connections are gone.
-    awaitCondition 30 "alpha to answer 503 store_error" do
-      reply@(status, _) <- check a fullyConsistent ("team", "t1", "membership", "ann")
-      assertBool ("alpha must fail closed during its outage, got " <> show reply) (status >= 500)
-      pure (status == 503)
+    -- Every request fails closed with the retryable store error from the first one on,
+    -- including the first over a pooled connection the outage terminated, which en-postgres
+    -- once misread as an internal error (500).
+    check a fullyConsistent ("team", "t1", "membership", "ann") >>= expectProblem 503 "store_error"
     output <- capturedLines (server fixture)
-    forM_ (take 1 (filter ("en: internal error:" `Text.isInfixOf`) output)) \line ->
-      step ("server logged, before settling: " <> Text.unpack (Text.take 300 line))
+    assertEqual "no internal error logged during the outage" [] (filter ("en: internal error:" `Text.isInfixOf`) output)
     check a fullyConsistent ("team", "t1", "membership", "ann") >>= expectProblem 503 "store_error"
     writeTuple a ("team", "t2", "member", "ann") >>= expectProblem 503 "store_error"
     _ <- writeTuple b ("team", "t1", "member", "bob") >>= expectStatus 200

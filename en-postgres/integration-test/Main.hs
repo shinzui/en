@@ -14,7 +14,7 @@ import Data.Foldable (for_, traverse_)
 import Data.Functor.Contravariant ((>$<))
 import Data.Generics.Labels ()
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
-import Data.Int (Int64)
+import Data.Int (Int32, Int64)
 import Data.List (nub, sort, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Monoid qualified as EphemeralMonoid
@@ -107,6 +107,7 @@ main = do
     runWatchFeedScenario connection
     resetSchema connection
     runRecursiveLookupScenario connection
+    runTerminatedConnectionScenario database connection
     Connection.release connection
   case result of
     Left err -> fail ("ephemeral-pg failed to start: " <> Text.unpack (Pg.renderStartError err))
@@ -1941,6 +1942,47 @@ isInternalError = \case
   _ -> False
 
 -- | The 'ConsistencyConfig' every scenario shares.
+-- | A connection whose backend PostgreSQL terminated (a failover, an administrator's
+-- @pg_terminate_backend@, an idle-session kill) is an outage, not a bug in en: every store
+-- operation over it must report a retryable 'StoreError', including the first one.
+runTerminatedConnectionScenario :: Pg.Database -> Connection.Connection -> IO ()
+runTerminatedConnectionScenario database admin = do
+  config <- testConfig
+  revision <- runPgOrFail admin config TupleStore.headRevision
+  let probeSpace = ObjectRef (ObjectType "space") "terminated"
+      operations :: [(String, Eff PostgresEffects ())]
+      operations =
+        [ ("headRevision", () <$ TupleStore.headRevision),
+          ("writeTuples", () <$ TupleStore.writeTuples [Tuple {object = probeSpace, relation = RelationName "viewer", subject = SubjectId (ObjectRef (ObjectType "user") "t"), caveat = Nothing}]),
+          ("optimizedRevision", () <$ TupleStore.optimizedRevision),
+          ("readObjectRelation", () <$ TupleStore.readObjectRelation revision probeSpace (RelationName "viewer") 10 Nothing),
+          ("probeTuples", () <$ TupleStore.probeTuples revision probeSpace (RelationName "viewer") [SubjectId (ObjectRef (ObjectType "user") "t")]),
+          ("readAllTuples", () <$ TupleStore.readAllTuples revision 10 Nothing),
+          ("resolveConsistency", () <$ ConsistencyStore.resolveConsistency FullyConsistent)
+        ]
+  for_ operations \(label, operation) -> do
+    victim <- acquire database
+    pid <- runSessionOrFail victim (Session.statement () backendPidStatement)
+    _ <- runSessionOrFail admin (Session.statement pid terminateBackendStatement)
+    threadDelay 200000
+    outcome <- runPg victim config operation
+    Connection.release victim
+    case outcome of
+      Left (StoreError _) -> pure ()
+      other -> fail ("a terminated connection must fail " <> label <> " as a retryable StoreError, got: " <> show other)
+  putStrLn "PASS: every store operation over a terminated connection is a retryable StoreError"
+
+backendPidStatement :: Statement () Int32
+backendPidStatement =
+  Statement.preparable "SELECT pg_backend_pid()" Encoders.noParams (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.int4)))
+
+terminateBackendStatement :: Statement Int32 Bool
+terminateBackendStatement =
+  Statement.preparable
+    "SELECT pg_terminate_backend($1)"
+    (Encoders.param (Encoders.nonNullable Encoders.int4))
+    (Decoders.singleRow (Decoders.column (Decoders.nonNullable Decoders.bool)))
+
 testConfig :: IO ConsistencyConfig
 testConfig = do
   validCheckSchema <- either (fail . show) pure (Schema.validateSchema checkSchema)

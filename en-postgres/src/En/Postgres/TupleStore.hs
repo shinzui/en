@@ -184,12 +184,23 @@ interpretTupleStorePostgres config readOptimizedRevision =
 -- decoder/schema/driver mismatches as bugs in en. 'Hasql.isTransient' is too coarse
 -- here: it marks every statement error non-transient, including PostgreSQL's
 -- @deadlock_detected@ and other server-side arbitration failures that callers may retry.
+--
+-- A row-count error whose actual count lies /within/ its own bounds is an outage too. No
+-- decoder produces it: hasql (1.10) reports a statement that received the wrong number of
+-- libpq results — what a connection whose backend PostgreSQL terminated yields on its next
+-- statement — as @UnexpectedRowCountStatementError 1 1 n@, which for @n = 1@ contradicts
+-- itself. Without this case, the first request over such a pooled connection answered 500
+-- instead of 503 (the integration suite's terminated-connection scenario). Row-count errors
+-- outside their bounds stay 'InternalError': a decoder expecting one row and getting none
+-- is a bug in en's SQL.
 sessionErrorToEnError :: Hasql.SessionError -> EnError
 sessionErrorToEnError sessionError =
   let details = Hasql.toDetailedText sessionError
    in case sessionError of
         Hasql.ConnectionSessionError _ -> StoreError details
         Hasql.StatementSessionError _ _ _ _ _ (Hasql.ServerStatementError _) -> StoreError details
+        Hasql.StatementSessionError _ _ _ _ _ (Hasql.UnexpectedRowCountStatementError expectedMin expectedMax actual)
+          | expectedMin <= actual && actual <= expectedMax -> StoreError details
         Hasql.StatementSessionError {} -> InternalError details
         Hasql.ScriptSessionError {} -> StoreError details
         Hasql.MissingTypesSessionError _ -> InternalError details
