@@ -53,6 +53,49 @@ unconditional grant silently outliving the caveated one meant to replace it.
 Deletes work on the same identity and ignore the `caveat` field of the tuple you
 pass, so you never need to know a grant's current caveat in order to revoke it.
 
+### Writes must fit the schema
+
+A tuple the schema cannot interpret is a grant that never takes effect: no check,
+lookup or expand can reach it. So a write is refused, whole and before anything is
+stored, when any tuple it would write
+
+- names an object type the schema does not define, or a relation that type does
+  not have;
+- names a subject whose type is undefined, or a userset (`group:eng#member`)
+  whose relation is undefined;
+- names a subject the relation does not accept — including a wildcard where none
+  is allowed, and any subject at all on a permission, which is computed and cannot
+  be assigned;
+- carries a caveat the schema does not define, or a payload key that is not a
+  declared parameter or whose value has the wrong type.
+
+Over HTTP the answer is `400` with code `schema_violation`, naming the first
+offending tuple:
+
+```json
+{"code": "schema_violation", "status": 400, "retryable": false,
+ "detail": "cannot write space:s1#viewr@user:ann — relation space#viewr not in schema"}
+```
+
+The rule is exactly what `en-server check-schema` and a schema reload call an
+*orphan*, so the only way an orphan can now exist is a schema change that strands
+tuples already written. **Deletes are never refused for this reason**, nor is the
+delete half of a mixed write: deleting an orphan is how you clean up after such a
+change.
+
+A write is checked against the schema the request is served under — in tenant mode,
+the schema of the tenant whose key made the request — and the same snapshot is used
+to evaluate it, so a reload cannot validate it under one schema and serve it under
+another.
+
+In `en-core`, `En.SchemaCheck.validateTupleWrites` is the check itself and
+`applyValidatedTupleWrites` is `applyTupleWrites` behind it. `applyTupleWrites`,
+`writeTuples` and `deleteTuples` remain unchecked, for code that owns its data.
+
+**Behavior change.** Before this rule, such writes answered `200` and stored a grant
+that silently never applied. A client that relied on that was already writing
+grants with no effect; the fix is in the tuple, not in en.
+
 ### Preconditions and atomic mixed writes
 
 `writeTuples` and `deleteTuples` are shorthands for the one real write operation,

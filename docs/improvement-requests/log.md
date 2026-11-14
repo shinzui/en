@@ -1,5 +1,8 @@
 # Bundle Update Log
 
+## 2026-11-14
+* **Update**: IR-2 AC-2 now holds as written: writes are validated against the active schema (docs/plans/78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md, ADR 12), so a write of another tenant's type is refused with schema_violation.
+
 ## 2026-11-13
 
 * **Update**: IR-2 completed under docs/masterplans/12-serve-several-isolated-tenants-from-one-en-server.md: tenants selected by key, one database per tenant, per-tenant lifecycle, fault containment and observability, with no single-tenant regression. AC-2 holds in a narrower form until docs/plans/78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md lands; AC-6's readiness wording differs per ADR 10.

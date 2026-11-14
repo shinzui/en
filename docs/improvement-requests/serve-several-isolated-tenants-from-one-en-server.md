@@ -6,19 +6,20 @@ description: >-
 timestamp: "2026-11-12T22:51:59Z"
 generated:
   by: process:claude-code
-  at: "2026-11-13T23:03:45Z"
+  at: "2026-11-14T00:04:41Z"
 requestId: IR-2
 status: completed
 completedAt: "2026-11-13T23:03:45Z"
 resolution: >-
-  Delivered by docs/masterplans/12-serve-several-isolated-tenants-from-one-en-server.md (ADR 9-11).
+  Delivered by docs/masterplans/12-serve-several-isolated-tenants-from-one-en-server.md (ADR 9-11),
+  with AC-2's refusal by docs/plans/78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md (ADR 12).
   AC-1: unchanged suites pass and the tenant suite's upgrade case keeps datastore id, old tokens and
   schema hash across the upgrade; single-tenant throughput shows no regression
   (en-server/loadbench/results/g1-paired.json, g1-final.json). AC-2: en-server-tenant-tests proves
-  routing by key only and that neither tenant reads the other's tuples, changes, lookups or schema;
-  narrower than written, because En accepts writes of undeclared types in every mode, such a write
-  is accepted but stays in the writer's tenant; docs/plans/78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md
-  is the open follow-up that makes it a refusal. AC-3, AC-4: the tenant suite (cross-tenant tokens
+  routing by key only, that a write of an object type only the other tenant's schema defines is
+  refused with 400 schema_violation under the writer's schema and lands in neither store (writes
+  are validated against the active schema since plan 78), and that neither tenant reads the other's
+  tuples, changes, lookups or schema. AC-3, AC-4: the tenant suite (cross-tenant tokens
   and cursors rejected, per-tenant reload, check-schema --tenant, grant generation and GC horizon
   untouched). AC-5: one database per tenant; every route of one tenant answers while the other's
   PostgreSQL is stopped; per-tenant backup and restore documented. AC-6: MiddlewareSpec and the

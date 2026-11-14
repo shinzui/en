@@ -67,8 +67,9 @@ hurl --test --variables-file vars.env \
 ## Opt-in flows
 
 `relationships.hurl` is not in the default run list because it mutates authorization
-state. It first proves a failed precondition returns 412 without changing state, then
-deletes and writes the exact fixture
+state. It first proves a failed precondition returns 412 without changing state and that
+a tuple the demo schema cannot interpret (`space#viewr`) is refused with `schema_violation`
+while deleting it is accepted, then deletes and writes the exact fixture
 `space:hurl-write-flow#viewer@user:hurl-alice`, captures the write's consistency token,
 and proves visibility through `POST /v1/check` at that token. The delete-first setup makes
 the flow idempotent; it passes on consecutive runs and leaves that one tuple present until

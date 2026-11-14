@@ -178,7 +178,10 @@ AC-1 to AC-6.
 
 All four milestones are complete and the owner's go/no-go gates hold: G1 (legacy mode), G2 and G5
 (tenant mode beside an idle tenant), and G4 (isolation suite). AC-7's example runs as a test. IR-2
-is completed, with AC-2 narrower than written until plan 78 lands.
+is completed. AC-2 first held only in a narrower form (a write of the other tenant's type was
+accepted and stayed in the writer's tenant);
+[plan 78](78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md) made it hold as
+written, and IR-2's resolution cites it.
 
 The largest cost was the instrument, not the feature. The sequential A/B from plan 72 needed an
 idle machine, and a shared desktop never is: one gate run failed on load, a diagnostic run was
@@ -187,7 +190,8 @@ design should have been adopted when plan 72 first measured 9-17% same-binary no
 one gap, `schema-read`, recorded in ADR 11 as an open item.
 
 Left open: the paired `schema-read` floor; tenant-mode startup messages that say
-`EN_DATABASE_URL` for a tenant's database (owned by plan 74's area); plan 78 for AC-2.
+`EN_DATABASE_URL` for a tenant's database (owned by plan 74's area). AC-2's refusal was closed by
+plan 78.
 
 
 ## Context and Orientation

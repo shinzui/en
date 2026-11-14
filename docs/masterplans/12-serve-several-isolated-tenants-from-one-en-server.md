@@ -630,8 +630,9 @@ Complete, 2026-11-13. One `en-server` serves several tenants selected by key, ea
 database and stack, with independent lifecycles, contained storage faults and per-tenant
 observability (ADR 9, ADR 10). A server serving one tenant pays nothing measurable for it, in
 legacy mode or with one declared tenant beside an idle one (G1, G2, G5), and the isolation suite
-proves the separation (G4). IR-2 is completed; AC-2 holds in the narrower form described there
-until docs/plans/78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md lands.
+proves the separation (G4). IR-2 is completed; AC-2 first held in the narrower form described
+there, and holds as written since
+docs/plans/78-refuse-writes-of-tuples-the-active-schema-cannot-interpret.md (ADR 12).
 
 What went well: putting tenancy only in the standalone host kept `en-core`, `en-postgres` and
 `en-servant` unchanged, so isolation followed from construction rather than from new checks.
@@ -644,4 +645,4 @@ FRIC-3 (macOS shared memory limits for parallel ephemeral PostgreSQL), both acce
 Open after completion, each recorded where it belongs: the paired `schema-read` floor (ADR 11);
 tenant-mode startup messages that name `EN_DATABASE_URL` for a tenant's database; en-postgres
 answering 500 instead of 503 on the first request over a connection PostgreSQL terminated; the
-owner's confirmation of the readiness wording (ADR 10); plan 78 for AC-2.
+owner's confirmation of the readiness wording (ADR 10). Plan 78 has since closed AC-2.

@@ -259,6 +259,20 @@ en-server: graph.ndjson:41732: Error in $.caveat.payload: key "values" not found
 
 Correct the line and re-run; the committed prefix re-applies as a no-op.
 
+A line the loaded schema cannot interpret — an unknown type or relation, a subject the
+relation does not accept, an undefined caveat — is refused the same way, by the rule an
+HTTP write applies (see [Writes must fit the schema](queries-and-writes.md#writes-must-fit-the-schema)).
+Every line of a batch is checked before the batch is written, so the refused line's batch
+is not stored:
+
+```text
+en-server: graph.ndjson:3: cannot write repo:r1#reader@user:ann — object type repo not in schema
+```
+
+An export of a store holding orphans (left by a forced schema reload) therefore does not
+import into a server running that schema; run `en-server check-schema` first and delete
+or migrate what it reports.
+
 `en-server import` of an `en-server export` reproduces the graph exactly, which makes
 the pair a migration path between databases:
 
@@ -1195,7 +1209,7 @@ change. `retryable` is the whole retry policy: it is `true` only for `store_erro
 | Status | `code` | Meaning |
 | --- | --- | --- |
 | `400` | `unknown_relation` | The permission or relation is not in the active schema |
-| `400` | `schema_violation` | A tuple referenced a subject or object the schema forbids |
+| `400` | `schema_violation` | A written tuple names a type, relation, subject or caveat the active schema cannot interpret |
 | `400` | `missing_caveat_context` | A caveat needed context the request did not supply |
 | `400` | `invalid_consistency_token` | The token is malformed or outside the GC window |
 | `400` | `invalid_request` | A field failed validation (e.g. an empty `relation`) |

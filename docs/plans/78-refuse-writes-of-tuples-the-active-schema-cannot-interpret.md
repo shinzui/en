@@ -62,12 +62,40 @@ A's schema"); see Context and Orientation.
       `en-core/test/Main.hs` covers each reason, valid/empty writes, deletes-only and
       precondition orphans accepted, first-orphan-wins, and that a refused validated write
       never reaches the store. `cabal test en-core-interface-tests` passes.
-- [ ] Milestone 2: HTTP writes (`POST /v1/relationships`) and `en-server import` refuse
+- [x] Milestone 2: HTTP writes (`POST /v1/relationships`) and `en-server import` refuse
       uninterpretable tuples with `400 schema_violation` / a named file line; existing suites
       pass; the tenant suite's cross-type step asserts `schema_violation` again; the `write`
       workload shows no throughput regression.
-- [ ] Milestone 3: the user guide and OpenAPI description state the rule, the change is noted
+      Done 2026-11-13 (commit 1b4e6ee). `cabal test all` passes (with `EN_BASELINE_BIN`);
+      the tenant suite asserts `schema_violation` for both cross-tenant writes and gains an
+      import case (line 3 refused, first batch committed, corrected re-run succeeds); the
+      default Hurl run and the opt-in `relationships.hurl` (new refusal and orphan-delete
+      requests) pass; `just loadbench-smoke` passes with zero errors. A live server answers
+      `space:s1#viewr@user:ann` with `400`, detail
+      `cannot write space:s1#viewr@user:ann — relation space#viewr not in schema`.
+      Paired A/B of `fc48b65` against the candidate
+      (`en-server/loadbench/results/write-validation-paired.json`):
+
+      ```text
+      workload         metric      baseline   candidate    delta   noise  tolerance  verdict
+      check-direct     req/s       4998.867    4925.700    -1.2%    0.9%       3.0%  PASS
+      check-nested     req/s       2220.167    2203.467    -0.5%    0.7%       3.0%  PASS
+      check-cached     req/s       6124.467    6017.400    +0.6%    3.8%       3.8%  PASS
+      lookup           req/s        715.967     719.900    -0.3%    1.8%       3.0%  PASS
+      check-last-key   req/s       4588.667    4580.467    -0.1%    0.3%       3.0%  PASS
+      schema-read      req/s       7410.567    7410.833    +0.0%    0.0%       3.0%  PASS
+      write            req/s       5436.567    5401.700    -0.6%    0.1%       3.0%  PASS
+      RESULT: PASS (7 workloads, 3 paired rounds)
+      ```
+
+- [x] Milestone 3: the user guide and OpenAPI description state the rule, the change is noted
       for clients, and IR-2's record points here.
+      Done 2026-11-13. `docs/user/queries-and-writes.md` "Writes must fit the schema" (rule,
+      delete exception, en-core functions, behaviour-change note);
+      `docs/user/service-and-operations.md` import paragraph and error-table row;
+      [ADR 12](../adr/0012-writes-are-validated-against-the-active-schema.md). The OpenAPI
+      source lists no per-cause `400`s, so `docs/api/openapi.json` is unchanged. IR-2's
+      resolution, its log, plan 76 and MasterPlan 12 now cite this plan for AC-2.
 
 
 ## Surprises & Discoveries
@@ -134,7 +162,21 @@ A's schema"); see Context and Orientation.
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+Complete, 2026-11-13. A write that names anything the served schema cannot interpret is refused
+whole with `400 schema_violation` before the store is touched, `en-server import` refuses the
+line, and deletes are never checked. The rule is the orphan rule, so orphans now arise only from
+schema changes. IR-2 AC-2 holds as written. The check costs nothing measurable (`write` −0.6%,
+inside its 0.1% noise plus 3% tolerance).
+
+It went as planned; the only design changes were placement (`applyValidatedTupleWrites` sits in
+`En.SchemaCheck` to avoid a module cycle; the handler calls the pure check before `engine`) and
+wording (`renderWriteRefusal`). Two existing artifacts depended on the old behaviour or on the
+`ActiveSchema` shape: the en-servant route test and `en-example`'s host, both fixed.
+
+Friction: FRIC-4 (`just hurl` does not run the mutating `relationships.hurl`) — accepted; the
+split is deliberate and documented, and this plan names the opt-in command.
+
+Durable context: [ADR 12](../adr/0012-writes-are-validated-against-the-active-schema.md).
 
 
 ## Context and Orientation
@@ -316,7 +358,9 @@ just loadbench-smoke
 ```
 
 The Hurl suite needs a server on a free port (port 8080 may be taken; see friction entry
-FRIC-2). With the local PostgreSQL from `just process-up` running:
+FRIC-2). `just hurl` runs only the read-only files; `relationships.hurl`, which holds the write
+cases, is opt-in (FRIC-4) and is run explicitly below. With the local PostgreSQL from
+`just process-up` running:
 
 ```bash
 just process-up && just run-migrations
@@ -324,6 +368,9 @@ EN_PORT=18181 EN_DATABASE_URL="$PG_CONNECTION_STRING" \
   EN_API_KEYS_READ_WRITE=dev:dev-secret-0123456789 \
   "$(cabal list-bin en-server:exe:en-server)" > .dev/hurl-server.log 2>&1 & echo $! > .dev/hurl-server.pid
 EN_SERVER_URL=http://127.0.0.1:18181 just hurl
+(cd en-servant/test/hurl && hurl --test --variables-file vars.env \
+  --variable base_url=http://127.0.0.1:18181 --secret api_key=dev-secret-0123456789 \
+  relationships.hurl)
 kill "$(cat .dev/hurl-server.pid)"
 just process-down
 ```

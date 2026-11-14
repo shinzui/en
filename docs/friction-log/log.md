@@ -1,5 +1,11 @@
 # Bundle Update Log
 
+## 2026-11-14
+
+* **Update**: FRIC-4 accepted: Status set to accepted.
+
+* **Addition**: FRIC-4 records detour tooling friction with mori://shinzui/en: just hurl does not run the write-path Hurl flow
+
 ## 2026-11-13
 
 * **Update**: FRIC-3 accepted: Status set to accepted.
