@@ -386,17 +386,17 @@
     "otel-servant-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1787763893,
-        "narHash": "sha256-oi3E1KjZLdI7Ezahz/3khwS5uxoLNwrPCzRIO1m7/80=",
+        "lastModified": 1794579192,
+        "narHash": "sha256-ncZCc+dgasU1PCER5eH7DIEIO1E5p5irUNZNdjqYobc=",
         "owner": "shinzui",
         "repo": "hs-opentelemetry-instrumentation-servant",
-        "rev": "7a6f692e85295f965cd1827f9354c28af9e62742",
+        "rev": "d79a26337faedc37fd9301e58a207cb5834fc909",
         "type": "github"
       },
       "original": {
         "owner": "shinzui",
         "repo": "hs-opentelemetry-instrumentation-servant",
-        "rev": "7a6f692e85295f965cd1827f9354c28af9e62742",
+        "rev": "d79a26337faedc37fd9301e58a207cb5834fc909",
         "type": "github"
       }
     },

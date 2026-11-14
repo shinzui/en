@@ -62,7 +62,7 @@
     };
     # mori://shinzui/hs-opentelemetry-instrumentation-servant
     otel-servant-src = {
-      url = "github:shinzui/hs-opentelemetry-instrumentation-servant/7a6f692e85295f965cd1827f9354c28af9e62742";
+      url = "github:shinzui/hs-opentelemetry-instrumentation-servant/d79a26337faedc37fd9301e58a207cb5834fc909";
       flake = false;
     };
     # mori://ekmett/lens/packages/generic-lens
